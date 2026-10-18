@@ -8,6 +8,7 @@
 // consumer that keeps the issuer until its run ends (issuer_owner).
 
 #include "potal.h"
+#include "stripe-api.hpp"
 #include "tiling.hpp"
 
 #include <gemmini/trace-context.h>
@@ -98,18 +99,9 @@ issuer_info get_issuer_info();
 
 // ---- stripe pipeline consumer (matmul/stripe.hpp) ----------------------------
 
-// One planned logical GEMM (potal_tiled_matmul_stripe) on the accelerator
-// owner thread, inside the owner's safety policy (issuer: hart-0 affinity
-// check, then TLB FLUSH + FENCE before the GEMM's DMA).
-struct planned_result {
-    bool                     ok          = false;
-    bool                     fatal       = false;   // hardware state unknown
-    potal_status             status      = POTAL_OK;
-    const char *             stage       = nullptr; // failing step, nullptr when ok
-    uint64_t                 tlb_flushes = 0;       // TLB FLUSH + FENCE pairs before the GEMM
-    potal_stripe_gemm_report report      = {};
-};
-
+// One planned logical GEMM on the accelerator owner thread, inside the owner's
+// safety policy (issuer: hart-0 affinity check, then run_planned_stripe_gemm:
+// preflight, TLB FLUSH + FENCE, the GEMM; see stripe-api.hpp).
 using planned_runner = std::function<planned_result(const potal_stripe_gemm_desc &)>;
 
 // How a consumer ended. fatal: the accelerator state is unknown; the issuer

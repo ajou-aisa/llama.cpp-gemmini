@@ -54,14 +54,16 @@ struct potal_scale_operand {
     uint32_t         block_k;
 };
 
-// Hardware operations of the leaf. potal_hw_ops() binds them to potal.h;
-// host tests bind an RTL-semantics emulator.
+// Hardware operations of a session: the leaf's commands, and the TLB FLUSH the
+// accelerator owner issues before a planned GEMM (run_planned_stripe_gemm).
+// potal_hw_ops() binds them to potal.h; host tests bind an RTL-semantics emulator.
 struct potal_ws_ops {
     potal_status (*scale_write)(void * ctx, uint32_t slot, uint32_t generation, uint32_t column, uint32_t carrier);
     potal_status (*scale_release)(void * ctx, uint32_t slot, uint32_t generation, uint32_t column);
     potal_status (*gemm_ws_issue)(void * ctx, const potal_gemm_ws * gemm);
     potal_status (*loop_ws_issue)(void * ctx, const potal_loop_ws * loop);
     potal_status (*fence)(void * ctx);
+    potal_status (*tlb_flush)(void * ctx);
     void *       ctx;
 };
 

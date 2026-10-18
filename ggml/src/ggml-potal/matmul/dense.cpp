@@ -96,30 +96,6 @@ bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, si
     return true;
 }
 
-void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_t out_stride, ggml_gemmini_args_t & merge) {
-    merge.I                          = args.I;
-    merge.J                          = args.J;
-    merge.K                          = args.K;
-    merge.sA                         = args.sA;
-    merge.sC                         = args.sC;
-    merge.residual_route             = args.residual_route;
-    merge.weight_format              = args.weight_format;
-    merge.q8_hp1_blocks              = args.q8_hp1_blocks;
-    merge.q8_hp1_blocks_per_row      = args.q8_hp1_blocks_per_row;
-    merge.q8_hp1_block_count         = args.q8_hp1_block_count;
-    merge.native_weight_bytes        = args.native_weight_bytes;
-    merge.block_size_k               = args.block_size_k;
-    merge.f_out                      = out;
-    merge.col_stride_f_out           = 1;
-    merge.stride_f_out               = out_stride;
-    merge.model_arch                 = args.model_arch;
-    merge.matmul_layer               = args.matmul_layer;
-    merge.tile_I                     = args.tile_I;
-    merge.tile_J                     = args.tile_J;
-    merge.tile_K                     = args.tile_K;
-    merge.activation_rows_per_stripe = args.activation_rows_per_stripe;
-}
-
 ggml_potal_reject check_mul_mat_hp1(const ggml_tensor * op, bool require_data, hp1_shape * shape) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];

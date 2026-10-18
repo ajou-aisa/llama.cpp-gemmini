@@ -379,7 +379,12 @@ Residual GEMM (WS residual on PoTal, `potal_ws`), then on its CPU the F32 Main
 reconstruction, the radix INT64 reconstruction and the checked merge; only then
 the slot is free again. dst is written once, from the run's private output,
 after every stripe completed. RMD OFF runs the same pipeline with Main GEMMs
-only (the control). Planned GEMMs use the C API `potal_tiled_matmul_stripe()`.
+only (the control). Each planned GEMM runs as the issuer's owner step
+(`run_planned_stripe_gemm`: preflight, TLB FLUSH + FENCE, then the execution of
+the C API `potal_tiled_matmul_stripe()`); a descriptor the preflight refuses
+issues no command. The residual merge uses the prepared weight's channel scales
+(no per-stripe HP1 revalidation), and every `[POTAL_STRIPE] event=` stage record
+carries the run's `event_sequence`, written in that order.
 
 ```
 producer (graph_compute thread)          consumer (hart-0 issuer)

@@ -8,11 +8,19 @@
 //      reference: every stripe of one plan, the tail stripe lowering tile_i
 //      only, an N tail, K chunks accumulated in the ACC, the validated
 //      single-GEMM path; no tile search while executing
-//   C  every refused descriptor issues no command
+//   C  every refused descriptor issues no command, through the C API and
+//      through the accelerator owner's planned step (run_planned_stripe_gemm,
+//      what the hart-0 issuer runs after its affinity check): not even its
+//      TLB FLUSH; stage "preflight", not fatal, the session stays usable
 //   D  generation wrap 255 -> 1 over real invocations; WRITE == RELEASE
 //   E  a fatal report disables the session; the legacy tiled API shares the
 //      session's generation sequence
-//   F  host only: the hardware session reports POTAL_ERR_NO_HARDWARE
+//   F  host only: the hardware session reports POTAL_ERR_NO_HARDWARE; the
+//      owner step reaches potal_tlb_flush() only for an accepted descriptor
+//   G  the owner step on accepted descriptors: TLB FLUSH -> FENCE -> per
+//      invocation SCALE_WRITE -> LOOP_WS -> FENCE -> SCALE_RELEASE, the same
+//      work and C as the C API; a failed TLB FLUSH is fatal and disables the
+//      session; a disabled session issues nothing; generation wrap
 //
 // The emulator is a test double: passing proves the software contract, not
 // the hardware (potal-stripe-smoke on FireSim).
@@ -31,6 +39,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -208,6 +217,77 @@ struct emu_session {
     potal_stripe_session session = { { &ops, 0, {} } };
 };
 
+// The emulator's command record of one accepted planned GEMM: "TF" (TLB FLUSH,
+// FENCE), then per invocation W..W (L|G) F R..R with as many releases as
+// writes. Returns the invocations, -1 when the record has another shape.
+long owner_invocations(const std::string & c) {
+    if (c.size() < 2 || c[0] != 'T' || c[1] != 'F') {
+        return -1;
+    }
+    size_t i = 2;
+    long   n = 0;
+    while (i < c.size()) {
+        size_t writes = 0, releases = 0;
+        for (; i < c.size() && c[i] == 'W'; ++i) {
+            writes++;
+        }
+        if (writes == 0 || i + 1 >= c.size() || (c[i] != 'L' && c[i] != 'G') || c[i + 1] != 'F') {
+            return -1;
+        }
+        for (i += 2; i < c.size() && c[i] == 'R'; ++i) {
+            releases++;
+        }
+        if (releases != writes) {
+            return -1;
+        }
+        n++;
+    }
+    return n;
+}
+
+// One descriptor through both entry points, each on a fresh emulator session.
+struct both_runs {
+    potal_status             api_status = POTAL_OK;
+    potal_stripe_gemm_report api        = {};
+    std::string              api_commands;
+    planned_result           owner;
+    std::string              owner_commands;
+    bool                     owner_session_fatal = false;
+    uint64_t                 owner_tlb_flushes   = 0; // the session's count
+};
+
+both_runs run_both(const potal_stripe_gemm_desc & d) {
+    both_runs   b;
+    emu_session api;
+    b.api_status   = potal_tiled_matmul_stripe(&api.session, &d, &b.api);
+    b.api_commands = api.emu.commands;
+    emu_session owner;
+    b.owner               = run_planned_stripe_gemm(owner.session, d);
+    b.owner_commands      = owner.emu.commands;
+    b.owner_session_fatal = owner.session.ws.report.fatal;
+    b.owner_tlb_flushes   = owner.session.ws.report.tlb_flushes;
+    return b;
+}
+
+// Refused by both before any command: the C API with its own stage, the owner
+// step with stage "preflight" (report.stage the same check), neither fatal,
+// no TLB FLUSH, no LOOP_WS, no command at all, the session still usable.
+bool refused_by_both(const potal_stripe_gemm_desc & d, std::string * stage = nullptr) {
+    const both_runs b = run_both(d);
+    const bool api = b.api_status != POTAL_OK && b.api.status == b.api_status && b.api.stage != nullptr &&
+                     b.api.fatal == 0 && b.api.loop_ws == 0 && b.api.scale_writes == 0 && b.api_commands.empty();
+    const bool owner = api && !b.owner.ok && b.owner.status == b.api_status && !b.owner.fatal &&
+                       b.owner.stage != nullptr && std::string(b.owner.stage) == "preflight" &&
+                       b.owner.report.stage != nullptr && std::string(b.owner.report.stage) == b.api.stage &&
+                       b.owner.report.fatal == 0 && b.owner.tlb_flushes == 0 && b.owner.report.loop_ws == 0 &&
+                       b.owner.report.scale_writes == 0 && b.owner_commands.empty() && b.owner_tlb_flushes == 0 &&
+                       !b.owner_session_fatal;
+    if (stage != nullptr) {
+        *stage = b.api.stage != nullptr ? b.api.stage : "-";
+    }
+    return api && owner;
+}
+
 // ---- B ------------------------------------------------------------------------
 
 // Every stripe of a plan selected for the whole M, executed with the frozen tiles.
@@ -291,6 +371,8 @@ void test_rejections() {
         { "C NULL", [](potal_stripe_gemm_desc & d, problem &) { d.c = nullptr; } },
         { "carriers NULL", [](potal_stripe_gemm_desc & d, problem &) { d.carriers = nullptr; } },
         { "m = 0", [](potal_stripe_gemm_desc & d, problem &) { d.m = 0; } },
+        { "n = 0", [](potal_stripe_gemm_desc & d, problem &) { d.n = 0; } },
+        { "k = 0", [](potal_stripe_gemm_desc & d, problem &) { d.k = 0; } },
         { "work_kind 2", [](potal_stripe_gemm_desc & d, problem &) { d.work_kind = 2; } },
         { "lda < k", [](potal_stripe_gemm_desc & d, problem &) { d.lda = d.k - 1; } },
         { "ldb < n", [](potal_stripe_gemm_desc & d, problem &) { d.ldb = d.n - 1; } },
@@ -304,6 +386,8 @@ void test_rejections() {
         { "scale_block_k not a DIM multiple", [](potal_stripe_gemm_desc & d, problem &) { d.scale_block_k = 24; } },
         { "k not whole scale blocks", [](potal_stripe_gemm_desc & d, problem &) { d.k = 80; } },
         { "tile_i 0", [](potal_stripe_gemm_desc & d, problem &) { d.tile_i = 0; } },
+        { "tile_j 0", [](potal_stripe_gemm_desc & d, problem &) { d.tile_j = 0; } },
+        { "tile_k 0", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 0; } },
         { "tile_j beyond N", [](potal_stripe_gemm_desc & d, problem &) { d.tile_j = 4; } },
         { "tile_k beyond K", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 8; } },
         { "tile_k not whole scale blocks", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 3; } },
@@ -312,45 +396,172 @@ void test_rejections() {
               p.carriers.get()[(d.k / 32 - 1) * d.carrier_stride + d.n - 1] = 40000;
           } },
         { "C overlaps A", [](potal_stripe_gemm_desc & d, problem & p) { d.c = (int32_t *) (void *) p.a.get(); } },
-        { "A extent beyond the 32-bit DRAM offset",
-          [](potal_stripe_gemm_desc & d, problem &) { d.lda = (size_t) 1 << 30; } },
+        { "C overlaps B", [](potal_stripe_gemm_desc & d, problem & p) { d.c = (int32_t *) (void *) p.b.get(); } },
     };
     for (const mutation & mu : mutations) {
-        emu_session            es;
         potal_stripe_gemm_desc d = p.stripe(0, 40, plan);
         mu.apply(d, p);
-        potal_stripe_gemm_report r;
-        const potal_status       st = potal_tiled_matmul_stripe(&es.session, &d, &r);
-        check(std::string("C refused without a command: ") + mu.name,
-              st != POTAL_OK && r.status == st && r.stage != nullptr && r.fatal == 0 && r.loop_ws == 0 &&
-                  r.scale_writes == 0 && es.emu.writes == 0 && es.emu.loops == 0 && es.emu.fences == 0 &&
-                  !es.session.ws.report.fatal);
+        std::string stage;
+        const bool  refused = refused_by_both(d, &stage);
+        check(std::string("C refused without a command (C API and owner step, stage ") + stage + "): " + mu.name,
+              refused);
         p.carriers.get()[(96 / 32 - 1) * p.cstride + 48 - 1] = 1; // undo the carrier mutation
     }
     {
-        // 8 x 8 output tiles need 1024 ACC rows: over one LOOP_WS half (and WorkIdsPerLoop).
-        problem                  big(128, 128, 64, 17, 0);
-        emu_session              es;
-        potal_tile_plan          wide = plan;
+        // A, B and C copied to chosen offsets of one buffer: exact overlap and
+        // adjacency, and an over-limit operand placed above the other two, so
+        // that each refusal can only come from the check its case names.
+        problem         q(40, 48, 128, 41, 0); // A extent 5120, B 8176, C 7680 bytes
+        potal_tile_plan qp;
+        (void) potal_tile_select(40, 48, 128, 2, &qp);
+        buffer<int8_t>             mem(1 << 16);
+        const std::vector<int32_t> want = q.reference();
+        const auto place = [&](size_t a_at, size_t b_at, size_t c_at) {
+            potal_stripe_gemm_desc d = q.stripe(0, 40, qp);
+            std::memset(mem.get(), 0, 1 << 16);
+            for (size_t i = 0; i < q.m; ++i) {
+                std::memcpy(mem.get() + a_at + i * q.lda, q.a.get() + i * q.lda, q.k);
+            }
+            for (size_t kk = 0; kk < q.k; ++kk) {
+                std::memcpy(mem.get() + b_at + kk * q.ldb, q.b.get() + kk * q.ldb, q.n);
+            }
+            d.a = mem.get() + a_at;
+            d.b = mem.get() + b_at;
+            d.c = (int32_t *) (void *) (mem.get() + c_at);
+            return d;
+        };
+        const auto bytes = [](size_t rows, size_t cols, size_t ld, size_t elem) { return ((rows - 1) * ld + cols) * elem; };
+        const auto disjoint = [](const void * x, size_t xb, const void * y, size_t yb) {
+            return (uintptr_t) x + xb <= (uintptr_t) y || (uintptr_t) y + yb <= (uintptr_t) x;
+        };
+        // Accepted: C right behind A's last byte and right before B's first.
+        const potal_stripe_gemm_desc adjacent = place(0, 12800, 5120);
+        bool                         runs     = disjoint(adjacent.a, 5120, adjacent.c, 7680) &&
+                            (uintptr_t) adjacent.a + 5120 == (uintptr_t) adjacent.c &&
+                            (uintptr_t) adjacent.c + 7680 == (uintptr_t) adjacent.b;
+        for (const bool owner_step : { false, true }) {
+            std::memset((void *) adjacent.c, 0, 7680);
+            emu_session es;
+            potal_stripe_gemm_report r;
+            const bool ok = owner_step ? run_planned_stripe_gemm(es.session, adjacent).ok
+                                       : potal_tiled_matmul_stripe(&es.session, &adjacent, &r) == POTAL_OK;
+            for (size_t i = 0; ok && i < q.m; ++i) {
+                for (size_t j = 0; j < q.n; ++j) {
+                    runs = runs && adjacent.c[i * q.ldc + j] == want[i * q.n + j];
+                }
+            }
+            runs = runs && ok;
+        }
+        check("C accepted: C adjacent to the end of A and the start of B (disjoint) runs == reference, both entry points",
+              runs);
+        const potal_stripe_gemm_desc in_a = place(0, 32768, 5120 - 64);
+        const potal_stripe_gemm_desc in_b = place(0, 12800 - 64, 5120);
+        std::string                  stage_a, stage_b;
+        check("C refused without a command (C API and owner step): C starts inside A's last row",
+              !disjoint(in_a.a, 5120, in_a.c, 7680) && disjoint(in_a.b, 8176, in_a.c, 7680) &&
+                  refused_by_both(in_a, &stage_a) && stage_a == "operands");
+        check("C refused without a command (C API and owner step): C ends inside B's first row",
+              !disjoint(in_b.b, 8176, in_b.c, 7680) && disjoint(in_b.a, 5120, in_b.c, 7680) &&
+                  refused_by_both(in_b, &stage_b) && stage_b == "operands");
+        // Over the 32-bit DRAM offset, placed above the other operands (no overlap).
+        potal_stripe_gemm_desc big_a = place(40960, 8192, 0);
+        big_a.lda                    = (size_t) 1 << 30;
+        potal_stripe_gemm_desc big_b = place(0, 40960, 8192);
+        big_b.ldb                    = (size_t) 1 << 30;
+        potal_stripe_gemm_desc big_c = place(0, 8192, 40960);
+        big_c.ldc                    = (size_t) 1 << 28;
+        const size_t a_big = bytes(40, 128, big_a.lda, 1), b_big = bytes(128, 48, big_b.ldb, 1),
+                     c_big = bytes(40, 48, big_c.ldc, 4);
+        const struct {
+            const char *                   name;
+            const potal_stripe_gemm_desc & d;
+            bool                           apart; // no overlap: only the DRAM-offset limit can refuse it
+        } over[] = {
+            { "A", big_a, a_big > ((uint64_t) 1 << 32) && disjoint(big_a.a, a_big, big_a.c, 7680) },
+            { "B", big_b, b_big > ((uint64_t) 1 << 32) && disjoint(big_b.b, b_big, big_b.c, 7680) },
+            { "C", big_c, c_big > ((uint64_t) 1 << 32) && disjoint(big_c.c, c_big, big_c.a, 5120) &&
+                              disjoint(big_c.c, c_big, big_c.b, 8176) },
+        };
+        for (const auto & o : over) {
+            std::string stage;
+            check(std::string("C refused without a command (C API and owner step): ") + o.name +
+                      " extent beyond the 32-bit DRAM offset, disjoint from the other operands",
+                  o.apart && refused_by_both(o.d, &stage) && stage == "operands");
+        }
+    }
+    {
+        // Per-invocation capacity (potal_frozen_plan): POTAL_ERR_CAPACITY at
+        // "tiles", from each limit alone.
+        // SPAD: 1 x 1 x 258 tiles = (258 + 258) * 16 rows > the 8192-row half.
+        problem         spad(16, 16, 4128, 23, 0);
+        potal_tile_plan t = plan;
+        t.tile_I = t.tile_J = 1;
+        t.tile_K            = 258;
+        const potal_stripe_gemm_desc d_spad = spad.stripe(0, 16, t);
+        // ACC: 8 x 8 output tiles need 1024 ACC rows (over the 512-row half).
+        problem         acc(128, 128, 64, 17, 0);
+        potal_tile_plan wide = plan;
         wide.tile_I = wide.tile_J = 8;
-        wide.tile_K                  = 2;
-        const potal_stripe_gemm_desc d  = big.stripe(0, 128, wide);
-        potal_stripe_gemm_report     r;
-        const potal_status           st = potal_tiled_matmul_stripe(&es.session, &d, &r);
-        check("C refused without a command: tiles beyond the ACC half",
-              st == POTAL_ERR_CAPACITY && std::string(r.stage) == "tiles" && es.emu.writes == 0 && es.emu.loops == 0);
+        wide.tile_K               = 2;
+        const potal_stripe_gemm_desc d_acc = acc.stripe(0, 128, wide);
+        // Scale window: 16-wide scale blocks (1 pass each), 1 x 2 x 130 tiles
+        // fit SPAD (6240 rows) and ACC but need 2 * 130 = 260 > 256 slots.
+        problem          window(16, 32, 2080, 29, 0);
+        buffer<uint32_t> narrow(2080 / 16 * window.cstride);
+        potal_tile_plan  u = plan;
+        u.tile_I = 1;
+        u.tile_J = 2;
+        u.tile_K = 130;
+        potal_stripe_gemm_desc d_window = window.stripe(0, 16, u);
+        d_window.carriers               = narrow.get();
+        d_window.scale_block_k          = 16;
+        for (const auto & c : { std::make_pair("scratchpad half (SPAD)", d_spad),
+                                std::make_pair("accumulator half (ACC)", d_acc),
+                                std::make_pair("ScaleMemory window", d_window) }) {
+            const both_runs b = run_both(c.second);
+            check(std::string("C refused without a command (C API and owner step): tiles beyond the ") + c.first,
+                  refused_by_both(c.second) && b.api_status == POTAL_ERR_CAPACITY && std::string(b.api.stage) == "tiles");
+        }
+        // The same tiles with 32-wide blocks (2 passes per block) need 130
+        // slots: they fit and run, so the refusal above is the window's.
+        const both_runs fit_b = run_both(window.stripe(0, 16, u));
+        check("C control: the same tiles with 32-wide scale blocks fit the window (130 slots) and run",
+              fit_b.api_status == POTAL_OK && fit_b.owner.ok);
     }
     emu_session              es;
     potal_stripe_gemm_desc   d = p.stripe(0, 40, plan);
     potal_stripe_gemm_report r;
+    // The owner step takes the descriptor by reference: a NULL descriptor
+    // exists for the C API only (its NULL operands are refused above).
     check("C NULL report refused", potal_tiled_matmul_stripe(&es.session, &d, nullptr) == POTAL_ERR_INVALID_ARGUMENT);
     check("C NULL session refused", potal_tiled_matmul_stripe(nullptr, &d, &r) == POTAL_ERR_INVALID_ARGUMENT);
     check("C NULL descriptor refused", potal_tiled_matmul_stripe(&es.session, nullptr, &r) ==
                                            POTAL_ERR_INVALID_ARGUMENT);
     potal_stripe_session unbound = {};
     check("C session without ops refused", potal_tiled_matmul_stripe(&unbound, &d, &r) == POTAL_ERR_INVALID_ARGUMENT);
+    const planned_result unbound_owner = run_planned_stripe_gemm(unbound, d);
+    check("C owner step: session without ops refused, not fatal",
+          unbound_owner.status == POTAL_ERR_INVALID_ARGUMENT && !unbound_owner.fatal &&
+              std::string(unbound_owner.stage) == "preflight" && unbound_owner.tlb_flushes == 0);
     check("C refusals left the session usable", potal_tiled_matmul_stripe(&es.session, &d, &r) == POTAL_OK &&
                                                     p.equals(p.reference()));
+
+    // Every refusal above on one owner session, then an accepted descriptor:
+    // a refused preflight never disables the owner.
+    emu_session owner;
+    size_t      refused = 0;
+    for (const mutation & mu : mutations) {
+        potal_stripe_gemm_desc bad = p.stripe(0, 40, plan);
+        mu.apply(bad, p);
+        refused += !run_planned_stripe_gemm(owner.session, bad).ok;
+        p.carriers.get()[(96 / 32 - 1) * p.cstride + 48 - 1] = 1;
+    }
+    std::fill(p.c.get(), p.c.get() + up(40, D) * p.ldc, 0);
+    const planned_result after = run_planned_stripe_gemm(owner.session, d);
+    check("C owner step: " + std::to_string(refused) + " refusals on one session, nothing issued, then the next "
+          "descriptor runs",
+          refused == sizeof(mutations) / sizeof(mutations[0]) && after.ok && after.tlb_flushes == 1 &&
+              owner_invocations(owner.emu.commands) == (long) after.report.loop_ws && p.equals(p.reference()));
 }
 
 // ---- D ------------------------------------------------------------------------
@@ -449,9 +660,182 @@ void test_hardware_session() {
           created && st == POTAL_ERR_NO_HARDWARE && r.stage != nullptr && std::string(r.stage) == "scale_write" &&
               r.loop_ws == 0);
     potal_stripe_session_destroy(s);
+
+    // The owner step on the real potal.h binding: a refused descriptor never
+    // reaches potal_tlb_flush() (which answers NO_HARDWARE on the host), an
+    // accepted one reaches it first.
+    potal_stripe_session * hw = nullptr;
+    const bool             made = potal_stripe_session_create(&hw) == POTAL_OK && hw != nullptr;
+    potal_stripe_gemm_desc bad  = d;
+    bad.tile_k                  = 3;
+    const planned_result refused = made ? run_planned_stripe_gemm(*hw, bad) : planned_result{};
+    check("F owner step, hardware binding: a refused descriptor stops before the TLB FLUSH (no NO_HARDWARE)",
+          made && refused.status == POTAL_ERR_INVALID_ARGUMENT && std::string(refused.stage) == "preflight" &&
+              !refused.fatal && refused.tlb_flushes == 0 && !hw->ws.report.fatal);
+    const planned_result first = made ? run_planned_stripe_gemm(*hw, d) : planned_result{};
+    check("F owner step, hardware binding: an accepted descriptor's first command is the TLB FLUSH",
+          made && first.status == POTAL_ERR_NO_HARDWARE && std::string(first.stage) == "tlb_flush" && first.fatal &&
+              first.report.loop_ws == 0 && first.report.scale_writes == 0 && hw->ws.report.fatal);
+    potal_stripe_session_destroy(hw);
 #else
     std::printf("[SKIP] F hardware session: on RISC-V it would issue RoCC commands from an unpinned thread\n");
 #endif
+}
+
+// ---- G ------------------------------------------------------------------------
+
+// The owner step (the issuer's planned GEMM after its affinity check) on
+// accepted descriptors: the command order, and the same work and result as
+// the C API on a session of its own.
+void owner_matches_api(const char * name, size_t M, size_t N, size_t K, size_t rows, int carrier_mode) {
+    problem         p(M, N, K, (uint32_t) (M * 7 + N + K), carrier_mode);
+    potal_tile_plan plan;
+    const bool      planned = potal_tile_select(M, N, K, 32 / D, &plan) == POTAL_OK;
+    // The last stripe of the plan: a tail when M is not a multiple of its rows.
+    const size_t                 row = planned ? (M - 1) / (plan.tile_I * D) * (plan.tile_I * D) : 0;
+    const potal_stripe_gemm_desc d    = p.stripe(row, std::min(rows, M - row), plan);
+    const std::vector<int32_t>   want = p.reference();
+    both_runs                    b;
+    // Each run writes the stripe's rows of C from zero; both must be the reference.
+    const auto rows_ok = [&] {
+        bool ok = true;
+        for (size_t i = row; i < row + d.m; ++i) {
+            for (size_t j = 0; j < N; ++j) {
+                ok = ok && p.c.get()[i * p.ldc + j] == want[i * N + j];
+                p.c.get()[i * p.ldc + j] = 0;
+            }
+        }
+        return ok;
+    };
+    bool same_c = planned;
+    if (planned) {
+        emu_session api;
+        b.api_status   = potal_tiled_matmul_stripe(&api.session, &d, &b.api);
+        b.api_commands = api.emu.commands;
+        same_c         = rows_ok();
+        emu_session owner;
+        b.owner             = run_planned_stripe_gemm(owner.session, d);
+        b.owner_commands    = owner.emu.commands;
+        b.owner_tlb_flushes = owner.session.ws.report.tlb_flushes;
+        same_c              = same_c && rows_ok();
+    }
+    const long invocations = owner_invocations(b.owner_commands);
+    check(std::string("G owner step ") + name + " (" + std::to_string(d.m) + "x" + std::to_string(N) + "x" +
+              std::to_string(K) + ", tile_i " + std::to_string(b.owner.report.tile_i) +
+              "): TLB FLUSH, FENCE, then per invocation SCALE_WRITE..LOOP_WS..FENCE..SCALE_RELEASE",
+          planned && b.owner.ok && b.owner.tlb_flushes == 1 && b.owner_tlb_flushes == 1 && invocations > 0 &&
+              (uint64_t) invocations == b.owner.report.loop_ws);
+    check(std::string("G owner step ") + name + ": same LOOP_WS/FENCE/WRITE/RELEASE as the C API, C == reference",
+          b.api_status == POTAL_OK && b.owner.report.loop_ws == b.api.loop_ws &&
+              b.owner.report.fences == b.api.fences && b.owner.report.fences == b.owner.report.loop_ws &&
+              b.owner.report.scale_writes == b.api.scale_writes &&
+              b.owner.report.scale_releases == b.api.scale_releases &&
+              b.owner.report.validated_gemms == b.api.validated_gemms && b.owner.report.tile_i == b.api.tile_i &&
+              b.owner_commands.substr(2) == b.api_commands && same_c);
+}
+
+void test_owner_step() {
+    owner_matches_api("tail stripe", 200, 312, 128, 200, 0);
+    owner_matches_api("saturating carriers", 77, 48, 256, 77, 2);
+    owner_matches_api("K chunks", 48, 160, 4096, 48, 0);
+    owner_matches_api("zero carriers, one stripe", 150, 40, 256, 150, 1);
+    owner_matches_api("validated 16x16x32", 16, 16, 32, 16, 0);
+
+    problem         p(40, 48, 96, 31, 0);
+    potal_tile_plan plan;
+    (void) potal_tile_select(40, 48, 96, 2, &plan);
+    const potal_stripe_gemm_desc d = p.stripe(0, 40, plan);
+    {
+        emu_session es;
+        es.emu.fail_tlb            = true;
+        const planned_result first = run_planned_stripe_gemm(es.session, d);
+        check("G a failed TLB FLUSH is fatal: stage tlb_flush, no SCALE_WRITE/LOOP_WS, the session disabled",
+              first.status == POTAL_HW_BAD_COMMAND && first.fatal && std::string(first.stage) == "tlb_flush" &&
+                  first.report.fatal == 1 && first.tlb_flushes == 0 && es.emu.commands == "T" &&
+                  es.session.ws.report.fatal);
+        es.emu.fail_tlb             = false;
+        const planned_result second = run_planned_stripe_gemm(es.session, d);
+        check("G after it the session issues nothing, not even a TLB FLUSH (session_disabled, fatal)",
+              !second.ok && second.fatal && std::string(second.stage) == "session_disabled" &&
+                  es.emu.commands == "T");
+    }
+    {
+        emu_session es;
+        es.emu.fail_fence = true;
+        const planned_result failed = run_planned_stripe_gemm(es.session, d);
+        check("G a failed TLB FENCE is fatal at tlb_flush too", failed.fatal && std::string(failed.stage) ==
+                                                                                 "tlb_flush" &&
+                                                                    es.emu.commands == "TF");
+    }
+    {
+        // Hardware failures inside the GEMM, after the TLB FLUSH + FENCE: fatal,
+        // with the leaf's stage, exactly as through the C API; the session is
+        // disabled and the next owner step issues nothing.
+        const struct {
+            const char * stage;
+            void (*arm)(emulator &, bool owner_step);
+        } injections[] = {
+            { "scale_write", [](emulator & e, bool) { e.fail_write_at = 0; } },
+            { "issue", [](emulator & e, bool) { e.fail_issue = true; } },
+            // The owner step's FENCE 0 is the TLB FENCE: fail its first GEMM FENCE.
+            { "fence", [](emulator & e, bool owner_step) { e.fail_fence_at = owner_step ? 1 : 0; } },
+            { "scale_release", [](emulator & e, bool) { e.fail_release = true; } },
+        };
+        for (const auto & inj : injections) {
+            emu_session api, owner;
+            inj.arm(api.emu, false);
+            inj.arm(owner.emu, true);
+            potal_stripe_gemm_report ar;
+            const potal_status       ast      = potal_tiled_matmul_stripe(&api.session, &d, &ar);
+            const planned_result     o        = run_planned_stripe_gemm(owner.session, d);
+            const size_t             commands = owner.emu.commands.size();
+            const planned_result     next     = run_planned_stripe_gemm(owner.session, d);
+            check(std::string("G a ") + inj.stage + " failure inside the owner step's GEMM: fatal at " + inj.stage +
+                      " as through the C API, the session disabled, nothing issued after it",
+                  ast != POTAL_OK && ar.fatal == 1 && ar.stage != nullptr && std::string(ar.stage) == inj.stage &&
+                      o.status == ast && o.fatal && o.report.fatal == 1 && o.stage != nullptr &&
+                      std::string(o.stage) == inj.stage && o.tlb_flushes == 1 &&
+                      owner.emu.commands.compare(0, 2, "TF") == 0 && owner.session.ws.report.fatal && next.fatal &&
+                      std::string(next.stage) == "session_disabled" && owner.emu.commands.size() == commands);
+        }
+    }
+    {
+        // A GEMM fence failure disables the session (here through the C API,
+        // which issues no TLB FLUSH); the owner step then issues nothing.
+        emu_session es;
+        es.emu.fail_fence = true;
+        potal_stripe_gemm_report broken;
+        const potal_status       st = potal_tiled_matmul_stripe(&es.session, &d, &broken);
+        es.emu.fail_fence           = false;
+        const size_t         commands = es.emu.commands.size();
+        const planned_result refused  = run_planned_stripe_gemm(es.session, d);
+        check("G a GEMM fence failure disables the session; the next owner step issues no command, no TLB FLUSH",
+              st == POTAL_HW_BAD_COMMAND && broken.fatal == 1 && std::string(broken.stage) == "fence" &&
+                  refused.fatal && std::string(refused.stage) == "session_disabled" && refused.tlb_flushes == 0 &&
+                  es.emu.commands.size() == commands && es.emu.tlb_flushes == 0);
+    }
+    {
+        // Generation wrap through the owner step: 2 * 255 + 7 calls of one invocation each.
+        problem         q(16, 16, 32, 37, 0);
+        potal_tile_plan one;
+        (void) potal_tile_select(16, 16, 32, 2, &one);
+        emu_session                  es;
+        const potal_stripe_gemm_desc g     = q.stripe(0, 16, one);
+        const int                    calls = 2 * (int) POTAL_GENERATION_MAX + 7;
+        bool                         ok    = true;
+        for (int i = 0; i < calls && ok; ++i) {
+            const planned_result r = run_planned_stripe_gemm(es.session, g);
+            ok = r.ok && r.tlb_flushes == 1 && r.report.loop_ws == 1 &&
+                 r.report.last_generation == (uint32_t) (i % (int) POTAL_GENERATION_MAX) + 1;
+        }
+        const auto & gens = es.emu.loop_generations;
+        check("G owner step: generation 1..255 then 1 again over " + std::to_string(calls) +
+                  " LOOP_WS, one TLB FLUSH each, WRITE == RELEASE",
+              ok && gens.size() == (size_t) calls && gens[POTAL_GENERATION_MAX - 1] == POTAL_GENERATION_MAX &&
+                  gens[POTAL_GENERATION_MAX] == 1 && es.emu.tlb_flushes == (uint64_t) calls &&
+                  es.session.ws.report.tlb_flushes == (uint64_t) calls && es.emu.writes == es.emu.releases &&
+                  es.emu.scales.empty() && q.equals(q.reference()));
+    }
 }
 
 #endif // POTAL_HW_DIM == 16
@@ -467,6 +851,7 @@ int main() {
     test_generation_wrap();
     test_session();
     test_hardware_session();
+    test_owner_step();
 #else
     std::printf("[SKIP] B-F: the planned GEMM cases use the DIM16 HP1 layout (scale_block_k 32 = 2 passes)\n");
 #endif

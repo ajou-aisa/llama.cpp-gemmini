@@ -229,10 +229,4 @@ void reconstruct_row(const int32_t * c, size_t n, double activation_scale, const
 // or the rows are outside it.
 bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda);
 
-// The fields of args a residual merge reads, and nothing the activation
-// quantizer writes: I/J/K, the Q8_HP1 weight view, the layer identity, the
-// tile geometry and the residual route; f_out = out (row stride out_stride,
-// column stride 1). No activation buffer, no metadata, no stripe sink.
-void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_t out_stride, ggml_gemmini_args_t & merge);
-
 } // namespace ggml::potal

@@ -122,11 +122,15 @@ potal_status hw_fence(void *) {
     return potal_fence();
 }
 
+potal_status hw_tlb_flush(void *) {
+    return potal_tlb_flush();
+}
+
 } // namespace
 
 const potal_ws_ops & potal_hw_ops() {
     static const potal_ws_ops ops = { hw_scale_write, hw_scale_release, hw_gemm_ws_issue, hw_loop_ws_issue,
-                                      hw_fence, nullptr };
+                                      hw_fence, hw_tlb_flush, nullptr };
     return ops;
 }
 

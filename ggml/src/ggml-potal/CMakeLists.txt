@@ -284,10 +284,13 @@ endif()
 # Hardware-free checks (host and target): the PoTal WS residual of one packet
 # (run-aware rows/runs, K32 padded lowering, gather from the prepared weight)
 # against an independent compact-run SCU/Sat32 golden, radix INT64
-# reconstruction, checked merge, failures.
+# reconstruction, the prepared checked merge against the Gemmini merge
+# (bitwise) without weight revalidation, failures.
 add_executable(potal-residual-unit-test tests/potal-residual-unit-test.cpp ${POTAL_BACKEND_SOURCES})
 potal_add_backend_settings(potal-residual-unit-test)
 target_include_directories(potal-residual-unit-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# The Gemmini reader's call counters (this target only): the prepared merge never validates the weight.
+target_compile_definitions(potal-residual-unit-test PRIVATE GGML_GEMMINI_TESTING)
 target_link_libraries(potal-residual-unit-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-residual-unit-test COMMAND potal-residual-unit-test)
@@ -296,10 +299,13 @@ endif()
 # Hardware-free checks (host and target): the stripe pipeline with real ExSIA
 # stripe-ready events, the production queue/consumer on an emulator thread:
 # overlap and backpressure gates, semantic capacity, serialized == pipelined,
-# immutability of accepted stripes, failure wake-up, no partial commit.
+# immutability of accepted stripes, failure wake-up, no partial commit, the
+# event order and debug JSONL order of every run, no weight revalidation.
 add_executable(potal-stripe-pipeline-test tests/potal-stripe-pipeline-test.cpp ${POTAL_BACKEND_SOURCES})
 potal_add_backend_settings(potal-stripe-pipeline-test)
 target_include_directories(potal-stripe-pipeline-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# The Gemmini reader's call counters (this target only): no weight revalidation inside a run.
+target_compile_definitions(potal-stripe-pipeline-test PRIVATE GGML_GEMMINI_TESTING)
 target_link_libraries(potal-stripe-pipeline-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-stripe-pipeline-test COMMAND potal-stripe-pipeline-test)
@@ -312,6 +318,16 @@ add_executable(potal-weight-prep-bench tests/potal-weight-prep-bench.cpp ${POTAL
 potal_add_backend_settings(potal-weight-prep-bench)
 target_compile_definitions(potal-weight-prep-bench PRIVATE GGML_GEMMINI_TESTING)
 target_link_libraries(potal-weight-prep-bench PRIVATE ggml)
+
+# Benchmark (host and target, not a test): one stripe's residual merge, the
+# prepared HP1 merge against the Gemmini checked merge it replaced, on a real
+# correction (EXSIA, RMD ON); merge time, reader validations per merge
+# (GGML_GEMMINI_TESTING counters, this target only) and bitwise agreement.
+add_executable(potal-residual-merge-bench tests/potal-residual-merge-bench.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-residual-merge-bench)
+target_include_directories(potal-residual-merge-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_definitions(potal-residual-merge-bench PRIVATE GGML_GEMMINI_TESTING)
+target_link_libraries(potal-residual-merge-bench PRIVATE ggml)
 
 # FireSim hardware test: real GGML MUL_MAT graphs computed by the POTAL backend.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")

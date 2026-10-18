@@ -1,11 +1,12 @@
 // Hardware-free tests of the stripe pipeline (matmul/stripe.hpp) with real
 // ExSIA stripe-ready events and the production run, sink and driver
 // (run_stripe_pipeline). The accelerator owner is a test thread whose planned
-// GEMMs run on the RTL-semantics emulator through potal_tiled_matmul_stripe;
-// a gate in that runner holds one GEMM of one stripe so the overlap and
-// backpressure order is checked deterministically (condition variables, no
-// sleeps, no timestamp comparisons). This shows what the software allows to
-// overlap on the host; it is not a measurement of NPU overlap.
+// GEMMs run on the RTL-semantics emulator through the issuer's own step
+// (run_planned_stripe_gemm: preflight, TLB FLUSH + FENCE, the GEMM); a gate in
+// that runner holds one GEMM of one stripe so the overlap and backpressure
+// order is checked deterministically (condition variables, no sleeps, no
+// timestamp comparisons). This shows what the software allows to overlap on
+// the host; it is not a measurement of NPU overlap.
 //
 //   A  overlap: Main(0) starts before quantization ends; Quantize(1) and
 //      submit(1) complete while stripe 0's last GEMM is held; submit(2) waits
@@ -27,6 +28,25 @@
 //      and no Main tile search inside the run
 //   F  producer placement (Linux): pin to one CPU other than the excluded one,
 //      restore the caller's mask
+//   O  event order: every run's records against the order the pipeline
+//      guarantees (sequence 1..n without gaps or duplicates; per stripe
+//      folding_commit < submit_accepted < main_begin < main_end < residual
+//      prepare/GEMM/reconstruction/merge < semantic_complete <
+//      capacity_release; capacity_release(s) < submit_accepted(s + capacity);
+//      main_begin(s + 1) after semantic_complete(s)); observers that query,
+//      abort or throw on either thread; a merge failure; 24 gated runs
+//      alternating capacity 1/2, with and without packets, with forced
+//      failures; and (LOG_DEBUG) the debug JSONL written in sequence order
+//
+// Event positions are logical: an event's sequence (stamped with the state
+// change under the run's lock), a test marker right after the highest
+// sequence observed when it was set. Observers on the producer and the
+// consumer run concurrently, so their call order alone is not the run's order.
+// The stamping placement itself holds by construction (stripe.hpp); a stamp
+// moved out of its critical section would show up here only when the threads
+// interleave inside that window, i.e. under stress, not deterministically.
+// Without GEMMINI_LOG_DIR the test logs to a fresh private directory, so the
+// JSONL it checks is its own (ctest may run the potal tests side by side).
 //
 // Needs GGML_GEMMINI_ACTIVATION_QUANT=EXSIA (the pipeline's only activation);
 // other configurations check the refusal and skip the rest.
@@ -47,6 +67,7 @@
 
 #include "quants/act/exsia/types.hpp"
 #include "quants/act/quantize.hpp"
+#include "quants/common/weight_reader.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -55,14 +76,19 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -74,6 +100,7 @@
 using namespace ggml::potal;
 namespace grmd     = ggml::gemmini::rmd;
 namespace exsia_ns = ggml::gemmini::quants::act::exsia;
+namespace wreader  = ggml::gemmini::quants::wreader;
 using kind         = stripe_event_kind;
 
 namespace {
@@ -168,6 +195,14 @@ struct golden_node {
         }
     }
 
+    std::set<size_t> packet_stripes() const {
+        std::set<size_t> ids;
+        for (const auto & p : packets) {
+            ids.insert(p.first);
+        }
+        return ids;
+    }
+
     // Main INT32 of rows [row_begin, row_end) from the golden codes.
     std::vector<int32_t> main_c(const node & nd, size_t row_begin, size_t row_end) const {
         std::vector<int32_t> c(o.m_pad * o.ldc, 0);
@@ -180,7 +215,8 @@ struct golden_node {
     }
 };
 
-// Every event of a run, in the order they happened, plus the data views.
+// Every event of a run with its sequence (the run's logical order), test
+// markers, and the data views.
 struct recorder {
     struct rec {
         kind        k;
@@ -188,12 +224,17 @@ struct recorder {
         size_t      slot;
         uint64_t    slot_generation;
         size_t      outstanding;
+        uint64_t    sequence; // event: its sequence; marker: the highest sequence observed before it
+        uint64_t    t_ns;
         std::string marker;
+
+        long position() const { return (long) (2 * sequence + (marker.empty() ? 0 : 1)); }
     };
 
     std::mutex                                mu;
     std::condition_variable                   cv;
     std::vector<rec>                          log;
+    uint64_t                                  max_sequence = 0;
     std::map<size_t, std::vector<int32_t>>    main_c;
     std::map<size_t, std::vector<int32_t>>    residual_c;
     std::map<size_t, std::vector<int64_t>>    correction;
@@ -202,7 +243,9 @@ struct recorder {
     void on(const stripe_event & ev) {
         {
             std::lock_guard<std::mutex> lock(mu);
-            log.push_back({ ev.kind, ev.stripe_id, ev.slot, ev.slot_generation, ev.outstanding, {} });
+            log.push_back(
+                { ev.kind, ev.stripe_id, ev.slot, ev.slot_generation, ev.outstanding, ev.sequence, ev.t_ns, {} });
+            max_sequence = std::max(max_sequence, ev.sequence);
             if (ev.kind == kind::main_end && ev.c != nullptr) {
                 copy(main_c[ev.stripe_id], ev.c, ev.ldc, ev.rows, ev.cols);
             }
@@ -226,31 +269,46 @@ struct recorder {
         }
     }
 
+    // A marker sits right after every step observed so far: a step stamped
+    // later (e.g. after a gate this marker records opening) comes after it.
     void marker(const std::string & m) {
         std::lock_guard<std::mutex> lock(mu);
-        log.push_back({ kind::run_failed, no_stripe, no_stripe, 0, 0, m });
+        log.push_back({ kind::run_failed, no_stripe, no_stripe, 0, 0, max_sequence, 0, m });
         cv.notify_all();
     }
 
-    // Index of the first record of (k, stripe), -1 if none.
+    // Logical position of the first (k, stripe) step, -1 if none.
     long seq(kind k, size_t stripe = no_stripe) {
         std::lock_guard<std::mutex> lock(mu);
-        for (size_t i = 0; i < log.size(); ++i) {
-            if (log[i].marker.empty() && log[i].k == k && (stripe == no_stripe || log[i].stripe == stripe)) {
-                return (long) i;
+        long first = -1;
+        for (const rec & r : log) {
+            if (r.marker.empty() && r.k == k && (stripe == no_stripe || r.stripe == stripe) &&
+                (first < 0 || r.position() < first)) {
+                first = r.position();
             }
         }
-        return -1;
+        return first;
     }
 
     long seq_marker(const std::string & m) {
         std::lock_guard<std::mutex> lock(mu);
-        for (size_t i = 0; i < log.size(); ++i) {
-            if (log[i].marker == m) {
-                return (long) i;
+        for (const rec & r : log) {
+            if (r.marker == m) {
+                return r.position();
             }
         }
         return -1;
+    }
+
+    std::vector<rec> events() {
+        std::lock_guard<std::mutex> lock(mu);
+        std::vector<rec> e;
+        for (const rec & r : log) {
+            if (r.marker.empty()) {
+                e.push_back(r);
+            }
+        }
+        return e;
     }
 
     size_t max_outstanding() {
@@ -276,6 +334,153 @@ struct recorder {
         });
     }
 };
+
+// ---- order -----------------------------------------------------------------------
+
+// The run's steps against the order the pipeline guarantees; empty when it
+// holds, else the first violation. complete: the run committed, so stripes
+// 0..stripes-1 have every step; otherwise each stripe's steps are a prefix of
+// its chain. packets: the stripes that must carry the residual steps
+// (nullptr: the stripes that show a residual_prepare_begin).
+std::string order_violation(recorder & rec, size_t capacity, size_t stripes, bool complete,
+                            const std::set<size_t> * packets = nullptr) {
+    const std::vector<recorder::rec> ev = rec.events();
+    std::vector<uint64_t>            seqs;
+    for (const recorder::rec & r : ev) {
+        seqs.push_back(r.sequence);
+    }
+    std::sort(seqs.begin(), seqs.end());
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        if (seqs[i] != i + 1) {
+            return "sequence " + std::to_string(seqs[i]) + " at rank " + std::to_string(i + 1) +
+                   " (gap or duplicate)";
+        }
+    }
+    // t_ns is stamped with the sequence: set, and never decreasing along it.
+    std::vector<recorder::rec> by_sequence = ev;
+    std::sort(by_sequence.begin(), by_sequence.end(),
+              [](const recorder::rec & x, const recorder::rec & y) { return x.sequence < y.sequence; });
+    for (size_t i = 0; i < by_sequence.size(); ++i) {
+        if (by_sequence[i].t_ns == 0 || (i > 0 && by_sequence[i].t_ns < by_sequence[i - 1].t_ns)) {
+            return "t_ns of sequence " + std::to_string(by_sequence[i].sequence) + " unset or before its predecessor";
+        }
+    }
+    std::map<std::pair<kind, size_t>, std::vector<const recorder::rec *>> at;
+    uint64_t                                                              last = 0;
+    for (const recorder::rec & r : ev) {
+        at[{ r.k, r.stripe }].push_back(&r);
+        last = std::max(last, r.sequence);
+        if (r.outstanding > capacity) {
+            return std::string(stripe_event_name(r.k)) + " records " + std::to_string(r.outstanding) +
+                   " outstanding stripes";
+        }
+    }
+    for (const auto & e : at) {
+        if (e.second.size() > 1) {
+            return std::string("duplicated ") + stripe_event_name(e.first.first) + "(" +
+                   (e.first.second == no_stripe ? std::string("run") : std::to_string(e.first.second)) + ")";
+        }
+    }
+    const auto one = [&](kind k, size_t s) -> const recorder::rec * {
+        const auto it = at.find({ k, s });
+        return it == at.end() ? nullptr : it->second.front();
+    };
+    const auto name = [](kind k, size_t s) { return std::string(stripe_event_name(k)) + "(" + std::to_string(s) + ")"; };
+    for (size_t s = 0; s < stripes; ++s) {
+        const bool        residual = packets != nullptr ? packets->count(s) != 0
+                                                        : one(kind::residual_prepare_begin, s) != nullptr;
+        std::vector<kind> chain    = { kind::folding_commit, kind::submit_accepted, kind::main_begin, kind::main_end };
+        if (residual) {
+            chain.insert(chain.end(), { kind::residual_prepare_begin, kind::residual_prepare_end, kind::residual_begin,
+                                        kind::residual_end, kind::radix_reconstruct_begin,
+                                        kind::radix_reconstruct_end, kind::merge_begin, kind::merge_end });
+        }
+        chain.insert(chain.end(), { kind::semantic_complete, kind::capacity_release });
+        const recorder::rec * previous = nullptr;
+        kind                  prev_k   = chain.front();
+        bool                  gap      = false;
+        for (kind k : chain) {
+            const recorder::rec * r = one(k, s);
+            if (r == nullptr) {
+                if (complete) {
+                    return "missing " + name(k, s);
+                }
+                gap = true;
+                continue;
+            }
+            if (gap) {
+                return name(k, s) + " after a missing earlier step";
+            }
+            if (previous != nullptr && r->sequence <= previous->sequence) {
+                return name(k, s) + " not after " + name(prev_k, s);
+            }
+            previous = r;
+            prev_k   = k;
+        }
+        if (!residual && one(kind::residual_begin, s) != nullptr) {
+            return "residual steps for " + name(kind::main_begin, s) + " without a packet";
+        }
+        const recorder::rec * wait = one(kind::queue_wait, s);
+        const recorder::rec * fold = one(kind::folding_commit, s);
+        const recorder::rec * acc  = one(kind::submit_accepted, s);
+        if (wait != nullptr && (fold == nullptr || wait->sequence < fold->sequence ||
+                                (acc != nullptr && acc->sequence < wait->sequence))) {
+            return name(kind::queue_wait, s) + " outside folding_commit..submit_accepted";
+        }
+        const recorder::rec * begin = one(kind::main_begin, s);
+        const recorder::rec * rel   = one(kind::capacity_release, s);
+        if (begin != nullptr && acc != nullptr &&
+            (begin->slot != acc->slot || begin->slot_generation != acc->slot_generation)) {
+            return name(kind::main_begin, s) + " in another slot or generation than its acceptance";
+        }
+        if (begin != nullptr && rel != nullptr &&
+            (rel->slot != begin->slot || rel->slot_generation != begin->slot_generation + 1)) {
+            return name(kind::capacity_release, s) + " does not advance its slot's generation by one";
+        }
+        if (s + 1 < stripes) {
+            const recorder::rec * next_main = one(kind::main_begin, s + 1);
+            const recorder::rec * sem       = one(kind::semantic_complete, s);
+            if (next_main != nullptr && (sem == nullptr || rel == nullptr || next_main->sequence < sem->sequence ||
+                                         next_main->sequence < rel->sequence)) {
+                return name(kind::main_begin, s + 1) + " before the semantic completion of stripe " + std::to_string(s);
+            }
+            const recorder::rec * next_fold = one(kind::folding_commit, s + 1);
+            const recorder::rec * next_acc  = one(kind::submit_accepted, s + 1);
+            if ((next_fold != nullptr && (fold == nullptr || next_fold->sequence < fold->sequence)) ||
+                (next_acc != nullptr && (acc == nullptr || next_acc->sequence < acc->sequence))) {
+                return "stripe " + std::to_string(s + 1) + " handed over before stripe " + std::to_string(s);
+            }
+        }
+        const recorder::rec * reuse = s + capacity < stripes ? one(kind::submit_accepted, s + capacity) : nullptr;
+        if (reuse != nullptr && (rel == nullptr || reuse->sequence < rel->sequence)) {
+            return name(kind::submit_accepted, s + capacity) + " before " + name(kind::capacity_release, s);
+        }
+    }
+    const recorder::rec * qbegin = one(kind::quant_begin, no_stripe);
+    const recorder::rec * qend   = one(kind::quant_end, no_stripe);
+    const recorder::rec * commit = one(kind::run_commit, no_stripe);
+    const recorder::rec * failed = one(kind::run_failed, no_stripe);
+    if (qbegin != nullptr && qbegin->sequence != 1) {
+        return "quant_begin is not the run's first step";
+    }
+    if ((commit != nullptr && commit->sequence != last) || (failed != nullptr && failed->sequence != last) ||
+        (complete && failed != nullptr) || (commit != nullptr && failed != nullptr)) {
+        return "run_commit/run_failed is not the run's one last step";
+    }
+    for (const recorder::rec & r : ev) {
+        if (qend != nullptr && (r.k == kind::folding_commit || r.k == kind::submit_accepted || r.k == kind::queue_wait) &&
+            r.sequence > qend->sequence) {
+            return name(r.k, r.stripe) + " after quant_end";
+        }
+    }
+    return {};
+}
+
+void check_order(const std::string & name, recorder & rec, size_t capacity, size_t stripes, bool complete,
+                 const std::set<size_t> * packets = nullptr) {
+    const std::string why = order_violation(rec, capacity, stripes, complete, packets);
+    check(name + (why.empty() ? std::string() : " -- " + why), why.empty());
+}
 
 // The emulator runner with one gate: the GEMM (stripe, work kind) waits until
 // open(); it may then be failed instead of run.
@@ -449,11 +654,15 @@ void test_overlap(node & nd, const golden_node & g) {
         const stripe_completion & c = r.report.completions[s];
         const size_t rb = s * nd.plan.tile_I * D;
         records = c.stripe_id == s && c.row_begin == rb && c.row_end == std::min(nd.M, rb + nd.plan.tile_I * D) &&
-                  c.accepted_ns <= c.main_begin_ns && c.main_begin_ns <= c.semantic_done_ns &&
+                  c.accepted_ns > 0 && c.accepted_ns <= c.main_begin_ns && c.main_begin_ns <= c.semantic_done_ns &&
                   c.residual == (g.packets.count(s) == 1) && (!c.residual || (c.residual_rows > 0 &&
                                                                               c.k_execution >= c.k_compact));
     }
     check("A completion records: one per stripe, in order, rows and residual work as executed", records);
+    const std::set<size_t> packets = g.packet_stripes();
+    check_order("A event order: sequence 1..n, per-stripe chain, capacity_release(s) < submit_accepted(s+2), "
+                "Main(s+1) after SemanticDone(s)",
+                rec, 2, nd.stripes(), true, &packets);
 }
 
 // ---- B ------------------------------------------------------------------------------
@@ -461,9 +670,21 @@ void test_overlap(node & nd, const golden_node & g) {
 void test_serialized_vs_pipelined(node & nd, const golden_node & g) {
     gated_runner run1, run2;
     recorder     rec1, rec2;
+    // The weight was prepared (validated) with the fixture: from here on no
+    // Gemmini reader call may touch it (GGML_GEMMINI_TESTING counters).
+    wreader::test_reset_weight_reader_counters();
     const run_result serial = run_pipeline(nd, 1, run1, rec1);
     const std::vector<float> serial_dst(nd.dst(), nd.dst() + nd.M * nd.N);
     const run_result piped = run_pipeline(nd, 2, run2, rec2);
+    const size_t     validations = wreader::test_weight_reader_storage_validations();
+    const size_t     reads       = wreader::test_weight_reader_code_address_resolutions();
+    check("B no weight revalidation in the pipeline: " + std::to_string(validations) + " wreader::validate and " +
+              std::to_string(reads) + " weight reads over " +
+              std::to_string(serial.report.counts.merges_completed + piped.report.counts.merges_completed) +
+              " residual merges",
+          validations == 0 && reads == 0 && serial.report.ok && piped.report.ok &&
+              (!options::compensation ||
+               serial.report.counts.merges_completed + piped.report.counts.merges_completed > 0));
 
     bool serial_order = true;
     for (size_t s = 0; s + 1 < nd.stripes(); ++s) {
@@ -471,6 +692,9 @@ void test_serialized_vs_pipelined(node & nd, const golden_node & g) {
     }
     check("B capacity 1: one stripe at a time (submit(s+1) after capacity_release(s))",
           serial.report.ok && serial_order && serial.report.counts.max_outstanding_semantic == 1);
+    const std::set<size_t> packets = g.packet_stripes();
+    check_order("B event order, capacity 1", rec1, 1, nd.stripes(), true, &packets);
+    check_order("B event order, capacity 2", rec2, 2, nd.stripes(), true, &packets);
 
     const auto at = [](const auto & m, size_t key) {
         const auto it = m.find(key);
@@ -543,6 +767,8 @@ void test_immutability(const golden_node & g2, node & two) {
           two.stripes() == 2 && scribbled && rec.seq(kind::quant_end) < rec.seq(kind::main_end, 0));
     check("C accepted A rows, theta and packets are the run's own: dst == golden after the producer scribbled",
           r.report.ok && bitwise(two.dst(), g2.want));
+    const std::set<size_t> packets = g2.packet_stripes();
+    check_order("C event order", rec, 2, two.stripes(), true, &packets);
 }
 
 // ---- D ------------------------------------------------------------------------------
@@ -564,6 +790,7 @@ void test_failures(node & nd) {
                   std::string(r.report.stage) == (options::compensation ? "residual" : "main") &&
                   r.committed_untouched && r.report.counts.stripes_accepted == 2 &&
                   rec.seq(kind::submit_accepted, 2) < 0 && rec.seq(kind::run_failed) >= 0 && !r.consumer.fatal);
+        check_order("D event order of the run failed while the producer waited", rec, 2, nd.stripes(), false);
     }
     {
         // The last stripe fails after quantization ended: finish() wakes.
@@ -581,6 +808,7 @@ void test_failures(node & nd) {
               !r.report.ok && r.committed_untouched && r.report.stage != nullptr &&
                   std::string(r.report.stage) == "main" && rec.seq(kind::quant_end) >= 0 &&
                   r.report.counts.stripes_accepted == nd.stripes());
+        check_order("D event order of the run failed after quantization", rec, 2, nd.stripes(), false);
     }
     {
         gated_runner runner;
@@ -590,6 +818,21 @@ void test_failures(node & nd) {
         const run_result r = run_pipeline(nd, 2, runner, rec);
         check("D fatal hardware failure: reported fatal by the run and the consumer, nothing committed",
               !r.report.ok && r.report.fatal && r.consumer.fatal && r.committed_untouched);
+        check_order("D event order of the fatal run", rec, 2, nd.stripes(), false);
+    }
+    {
+        // The emulator itself fails inside the owner step (not the gate):
+        // FENCE 0 is Main(0)'s TLB FENCE, FENCE 1 its first GEMM FENCE.
+        gated_runner runner;
+        recorder     rec;
+        runner.es.emu.fail_fence_at = 1;
+        const run_result r          = run_pipeline(nd, 2, runner, rec);
+        check("D emulated GEMM fence failure inside the owner step: Main(0) fatal at fence, run and consumer fatal, "
+              "nothing committed, the session disabled",
+              !r.report.ok && r.report.fatal && r.consumer.fatal && r.committed_untouched && r.report.stage != nullptr &&
+                  std::string(r.report.stage) == "main" && r.report.detail.find("step=fence fatal=1") != std::string::npos &&
+                  runner.es.session.ws.report.fatal && rec.seq(kind::main_begin, 1) < 0);
+        check_order("D event order of the run with an emulated hardware failure", rec, 2, nd.stripes(), false);
     }
     {
         potal_test::refusing_owner owner;
@@ -706,11 +949,20 @@ void test_repeated(node & nd, const golden_node & g) {
     uint64_t       selects = 0, packets = 0, loops = 0;
     size_t         reused  = 0, runs = 0;
     const uint64_t before  = potal_tile_select_count();
+    const std::set<size_t> packet_ids = g.packet_stripes();
+    std::string            order;
+    uint64_t               first_sequences = 0;
     while (runner.es.emu.loops <= 2u * POTAL_GENERATION_MAX + 3 && runs < 64) {
         recorder         rec;
         const run_result r = run_pipeline(nd, 2, runner, rec);
         all_ok             = all_ok && r.report.ok;
         same               = same && bitwise(nd.dst(), g.want);
+        if (order.empty()) {
+            order = order_violation(rec, 2, nd.stripes(), true, &packet_ids);
+        }
+        for (const auto & e : rec.events()) {
+            first_sequences += e.sequence == 1;
+        }
         packets += r.report.counts.residual_nonempty_packets;
         loops += r.report.counts.main_loop_ws + r.report.counts.residual_loop_ws;
         for (const auto & e : rec.log) {
@@ -732,6 +984,9 @@ void test_repeated(node & nd, const golden_node & g) {
           wrapped && runner.es.emu.writes == runner.es.emu.releases && runner.es.emu.scales.empty() &&
               loops == runner.es.emu.loops);
     check("E one Residual plan per packet, no Main tile search inside the runs", selects == packets);
+    check("E every run's event order holds and numbers its steps from 1, while slot generations and the SCU "
+          "generation (wrapping) keep their own counts" + (order.empty() ? std::string() : " -- " + order),
+          order.empty() && first_sequences == runs);
 }
 
 // ---- F ------------------------------------------------------------------------------
@@ -779,9 +1034,290 @@ void test_affinity() {
 #endif
 }
 
+// ---- O ------------------------------------------------------------------------------
+
+// A run driven directly: the production stripe_run and consumer thread, fed
+// the stripe-ready events the golden's FULL-style ExSIA output describes
+// (codes, theta, packets), so that its observer can reach the run.
+struct direct_result {
+    pipeline_report report;
+    bool            finished = false; // finish() returned true
+    bool            exact    = false; // private output == golden, bitwise
+    size_t          accepted = 0;     // submit() returned true
+};
+
+direct_result run_direct(const node & nd, const golden_node & g, size_t capacity, recorder & rec,
+                         const std::function<void(stripe_run &, const stripe_event &)> & hook) {
+    direct_result   out;
+    const auto *    meta = std::get_if<exsia_ns::Meta>(&g.args.act_quant.storage());
+    stripe_run *    self = nullptr;
+    pipeline_config cfg;
+    cfg.job_capacity = capacity;
+    cfg.residual     = options::compensation;
+    cfg.layer        = "pipeline-test";
+    cfg.backend      = "EMULATED";
+    cfg.observer     = [&](const stripe_event & ev) {
+        rec.on(ev);
+        if (hook && self != nullptr) {
+            hook(*self, ev);
+        }
+    };
+    gated_runner runner;
+    stripe_run   run(cfg, g.args, nd.weight, nd.plan);
+    self = &run;
+    std::string why;
+    if (meta == nullptr || meta->theta.size() < nd.stripes() || !run.begin(why)) {
+        out.report.stage = "fixture";
+        return out;
+    }
+    std::thread  consumer([&] { (void) run.consume([&](const potal_stripe_gemm_desc & d) { return runner.run(d); }); });
+    const size_t rows = nd.plan.tile_I * D;
+    for (size_t s = 0; s < nd.stripes(); ++s) {
+        exsia_ns::StripeReadyEvent e;
+        e.run_id                     = 5;
+        e.stripe_id                  = s;
+        e.row_begin                  = s * rows;
+        e.row_end                    = std::min(nd.M, (s + 1) * rows);
+        e.activation_metadata        = exsia_ns::StripeMetadataSnapshot{};
+        e.activation_metadata->theta = meta->theta[s];
+        const auto p                 = g.packets.find(s);
+        if (p != g.packets.end()) {
+            e.rmd_packet = p->second;
+        }
+        if (!run.submit(e, g.args)) {
+            break;
+        }
+        out.accepted++;
+    }
+    out.finished = run.finish();
+    consumer.join();
+    out.report = run.report();
+    out.exact  = out.report.ok && std::memcmp(run.output(), g.want.data(), g.want.size() * sizeof(float)) == 0;
+    return out;
+}
+
+void test_observers(const node & nd, const golden_node & g) {
+    const std::set<size_t> packets = g.packet_stripes();
+    {
+        // Every callback queries the run (report, poll_completed): no lock of
+        // the run is held, nothing waits on it. Both threads call it.
+        recorder            rec;
+        std::atomic<size_t> polled{ 0 }, reports{ 0 };
+        const direct_result r = run_direct(nd, g, 2, rec, [&](stripe_run & run, const stripe_event &) {
+            reports += run.report().expected_stripes == nd.stripes() ? 1 : 0;
+            polled += run.poll_completed().size();
+        });
+        check("O observer querying the run on every step (both threads): committed == golden, every completion "
+              "polled once",
+              r.finished && r.exact && polled == nd.stripes() && reports == rec.events().size());
+        check_order("O event order with a querying observer", rec, 2, nd.stripes(), true, &packets);
+    }
+    {
+        // The consumer's observer aborts the run at main_end(1).
+        recorder            rec;
+        const direct_result r = run_direct(nd, g, 2, rec, [&](stripe_run & run, const stripe_event & ev) {
+            if (ev.kind == kind::main_end && ev.stripe_id == 1) {
+                run.abort("observer", "test: abort from the observer");
+            }
+        });
+        check("O observer aborting the run (consumer thread, main_end(1)): run fails, producer and finish() "
+              "released, no later Main",
+              !r.finished && !r.report.ok && r.report.stage != nullptr && std::string(r.report.stage) == "observer" &&
+                  rec.seq(kind::main_begin, 2) < 0);
+        check_order("O event order of the aborted run", rec, 2, nd.stripes(), false, &packets);
+    }
+    {
+        // An observer throwing on the consumer thread fails the run (not fatal).
+        recorder            rec;
+        const direct_result r = run_direct(nd, g, 2, rec, [&](stripe_run &, const stripe_event & ev) {
+            if (ev.kind == kind::semantic_complete && ev.stripe_id == 0) {
+                throw std::runtime_error("test: observer exception");
+            }
+        });
+        check("O observer throwing on the consumer thread: run fails (exception, not fatal), everything released",
+              !r.finished && !r.report.ok && !r.report.fatal && r.report.stage != nullptr &&
+                  std::string(r.report.stage) == "exception" && rec.seq(kind::capacity_release, 0) < 0);
+        check_order("O event order of the run whose consumer observer threw", rec, 2, nd.stripes(), false,
+                    &packets);
+    }
+    {
+        // An observer throwing on capacity_release(0) while the producer waits
+        // (capacity 1): the slot is already the producer's again, so the
+        // failure names stripe 0 and counts its work once.
+        recorder            rec;
+        const direct_result r = run_direct(nd, g, 1, rec, [&](stripe_run &, const stripe_event & ev) {
+            if (ev.kind == kind::capacity_release && ev.stripe_id == 0) {
+                throw std::runtime_error("test: observer exception");
+            }
+        });
+        check("O observer throwing on capacity_release(0): run fails (exception, not fatal) for stripe 0, its work "
+              "counted once",
+              !r.finished && !r.report.ok && !r.report.fatal && r.report.stage != nullptr &&
+                  std::string(r.report.stage) == "exception" && r.report.detail.rfind("stripe 0: ", 0) == 0 &&
+                  r.report.counts.main_logical_gemms == 1 && r.report.counts.stripes_semantic_completed == 1 &&
+                  rec.seq(kind::main_begin, 1) < 0);
+        check_order("O event order of the run whose capacity_release observer threw", rec, 1, nd.stripes(), false,
+                    &packets);
+    }
+    {
+        // An observer throwing on the producer thread fails its submit.
+        recorder            rec;
+        const direct_result r = run_direct(nd, g, 2, rec, [&](stripe_run &, const stripe_event & ev) {
+            if (ev.kind == kind::submit_accepted && ev.stripe_id == 1) {
+                throw std::runtime_error("test: observer exception");
+            }
+        });
+        check("O observer throwing on the producer thread: submit fails, run fails, consumer released",
+              !r.finished && !r.report.ok && r.report.stage != nullptr && std::string(r.report.stage) == "submit" &&
+                  r.accepted == 1);
+        check_order("O event order of the run whose producer observer threw", rec, 2, nd.stripes(), false,
+                    &packets);
+    }
+}
+
+// A merge that fails (a non-finite prepared channel scale makes the prepared
+// merge refuse) fails the run at merge, drained, nothing committed.
+void test_merge_failure(node & nd, const golden_node & g) {
+    if (!options::compensation || g.packets.empty()) {
+        std::printf("[SKIP] O merge failure needs RMD ON and a residual packet\n");
+        return;
+    }
+    const size_t col   = 3;
+    const float  saved = nd.weight.scale[col];
+    nd.weight.scale[col] = std::numeric_limits<float>::quiet_NaN();
+    gated_runner     runner;
+    recorder         rec;
+    const run_result r   = run_pipeline(nd, 2, runner, rec);
+    nd.weight.scale[col] = saved;
+    const size_t first   = *g.packet_stripes().begin();
+    check("O merge failure (stripe " + std::to_string(first) + "): run fails at merge, not fatal, nothing committed",
+          !r.report.ok && !r.report.fatal && r.report.stage != nullptr && std::string(r.report.stage) == "merge" &&
+              r.committed_untouched && !r.consumer.fatal && rec.seq(kind::merge_begin, first) >= 0 &&
+              rec.seq(kind::merge_end, first) < 0 && rec.seq(kind::semantic_complete, first) < 0 &&
+              rec.seq(kind::run_failed) >= 0);
+    check_order("O event order of the run failed at merge", rec, 2, nd.stripes(), false);
+}
+
+// 24 gated runs: capacity 2 and 1 alternating, nodes with and without
+// packets, a forced failure of the held GEMM every sixth run. Stripe 0's last
+// GEMM is held until the producer waits for capacity (stripe `capacity`).
+void test_repetition(node & nd, const golden_node & g, node & calm, const golden_node & gc) {
+    size_t      runs = 0, passed = 0, failed_runs = 0, waits = 0;
+    std::string first_problem;
+    for (int i = 0; i < 24; ++i) {
+        const size_t        capacity = i % 2 == 0 ? 2 : 1;
+        const bool          with     = i % 3 != 2;
+        node &              n        = with ? nd : calm;
+        const golden_node & gold     = with ? g : gc;
+        const bool          fail     = i % 6 == 5;
+        const bool          held_res = options::compensation && gold.packets.count(0) == 1;
+        gated_runner        runner;
+        recorder            rec;
+        runner.arm(0, held_res ? POTAL_STRIPE_WORK_RESIDUAL : POTAL_STRIPE_WORK_MAIN);
+        std::thread opener([&] {
+            const bool waited = rec.wait_for(kind::queue_wait, capacity) && (!held_res || rec.wait_for(kind::main_end, 0));
+            rec.marker(waited ? "gate_open" : "gate_open_timeout");
+            runner.open(fail, false);
+        });
+        const run_result r = run_pipeline(n, capacity, runner, rec);
+        opener.join();
+        const std::set<size_t> ids     = gold.packet_stripes();
+        const long             gate    = rec.seq_marker("gate_open");
+        std::string            problem = order_violation(rec, capacity, n.stripes(), !fail, &ids);
+        if (problem.empty() && gate < 0) {
+            problem = "the producer never waited for capacity";
+        }
+        for (size_t s = 1; problem.empty() && s < capacity; ++s) {
+            const long acc = rec.seq(kind::submit_accepted, s);
+            if (acc < 0 || acc > gate) {
+                problem = "stripe " + std::to_string(s) + " not accepted while stripe 0 was held";
+            }
+        }
+        const long wait = rec.seq(kind::queue_wait, capacity);
+        if (problem.empty() && (wait < 0 || wait > gate)) {
+            problem = "no queue_wait of stripe " + std::to_string(capacity) + " before the gate opened";
+        }
+        if (!fail) {
+            const long rel0 = rec.seq(kind::capacity_release, 0);
+            if (problem.empty() && !(r.report.ok && bitwise(n.dst(), gold.want))) {
+                problem = "result differs from the golden";
+            } else if (problem.empty() && !(rel0 > gate && rec.seq(kind::submit_accepted, capacity) > rel0)) {
+                problem = "stripe " + std::to_string(capacity) + " accepted before stripe 0 released its capacity";
+            }
+        } else {
+            failed_runs++;
+            if (problem.empty() && !(!r.report.ok && !r.report.fatal && r.committed_untouched &&
+                                     rec.seq(kind::submit_accepted, capacity) < 0 && rec.seq(kind::run_failed) >= 0)) {
+                problem = "forced failure not contained (waiter released, nothing committed)";
+            }
+        }
+        waits += r.report.counts.producer_capacity_waits;
+        runs++;
+        passed += problem.empty() ? 1 : 0;
+        if (!problem.empty() && first_problem.empty()) {
+            first_problem = "run " + std::to_string(i) + " (capacity " + std::to_string(capacity) +
+                            (with ? ", packets" : ", no packets") + (fail ? ", failure" : "") + "): " + problem;
+        }
+    }
+    check("R " + std::to_string(runs) + " gated runs (capacity 2/1, with and without packets, " +
+              std::to_string(failed_runs) + " forced failures, " + std::to_string(waits) +
+              " capacity waits): event order, overlap, backpressure, golden or contained failure" +
+              (first_problem.empty() ? std::string() : " -- " + first_problem),
+          runs == 24 && passed == runs && failed_runs == 4);
+}
+
+// The debug JSONL of this process (truncated when the logger opened it): the
+// [POTAL_STRIPE] records of every run in sequence order 1, 2, ... without gaps.
+void test_jsonl_order() {
+#if LOG_DEBUG
+    std::fflush(nullptr);
+    const char *      dir  = std::getenv("GEMMINI_LOG_DIR");
+    const std::string path = dir != nullptr && *dir != '\0' ? std::string(dir) + "/debug-log.jsonl"
+                                                            : std::string("output/log/debug-log.jsonl");
+    std::ifstream     in(path);
+    std::string       line, bad;
+    size_t            records = 0, runs = 0;
+    uint64_t          previous = 0;
+    while (in && std::getline(in, line)) {
+        if (line.find("[POTAL_STRIPE] event=") == std::string::npos) {
+            continue; // e.g. a producer-affinity failure record
+        }
+        const size_t at = line.find("event_sequence=");
+        if (at == std::string::npos) {
+            bad = " -- a record without event_sequence";
+            break;
+        }
+        const uint64_t sequence = std::strtoull(line.c_str() + at + std::strlen("event_sequence="), nullptr, 10);
+        if (sequence == 1) {
+            runs++;
+        } else if (sequence != previous + 1) {
+            bad = " -- event_sequence " + std::to_string(sequence) + " written after " + std::to_string(previous);
+            break;
+        }
+        previous = sequence;
+        records++;
+    }
+    check("O debug JSONL (" + path + "): " + std::to_string(records) + " [POTAL_STRIPE] records of " +
+              std::to_string(runs) + " runs, each run written in sequence order without gaps" + bad,
+          bad.empty() && records > 0 && runs > 0);
+#else
+    std::printf("[SKIP] O debug JSONL order: built with LOG_DEBUG=0 (no records)\n");
+#endif
+}
+
 } // namespace
 
 int main() {
+    const char * log_dir = std::getenv("GEMMINI_LOG_DIR");
+    if (log_dir == nullptr || *log_dir == '\0') {
+        const char *      tmp  = std::getenv("TMPDIR");
+        const std::string base = std::string(tmp && *tmp ? tmp : "/tmp") + "/potal-stripe-pipeline-test-XXXXXX";
+        std::vector<char> dir(base.begin(), base.end());
+        dir.push_back('\0');
+        if (mkdtemp(dir.data()) != nullptr) {
+            setenv("GEMMINI_LOG_DIR", dir.data(), 1);
+        }
+    }
     ggml::potal::log::ensure_outputs(); // Gemmini debug/cycle JSONL, not stdout
     std::printf("potal-stripe-pipeline-test DIM=%u backend=EMULATED (host threads, no hardware) activation=%s "
                 "compensation=%s residual_executor=%s\n",
@@ -820,6 +1356,10 @@ int main() {
         } else {
             check("C fixture", false);
         }
+        if (nd.ok && g.ok && nd.stripes() >= 3) {
+            test_observers(nd, g);
+            test_merge_failure(nd, g);
+        }
         node calm(200, 320, 128, 11, 0.0f);
         // Constant activations: one exponent per stripe (ExSIA's second exponent
         // is -inf), so no top block is promoted and no packet is sealed.
@@ -836,6 +1376,12 @@ int main() {
               r.report.ok && bitwise(calm.dst(), gc.want) && gc.packets.empty() &&
                   r.report.counts.residual_logical_gemms == gc.packets.size() &&
                   r.report.counts.stripes_semantic_completed == calm.stripes());
+        const std::set<size_t> none;
+        check_order("empty residual: event order without residual steps", rec, 2, calm.stripes(), true, &none);
+        if (nd.ok && g.ok && calm.ok && gc.ok && nd.stripes() >= 3 && calm.stripes() >= 3) {
+            test_repetition(nd, g, calm, gc);
+        }
+        test_jsonl_order();
     }
     if (failures != 0) {
         std::printf("POTAL_STRIPE_PIPELINE_TEST FAIL (%d)\n", failures);

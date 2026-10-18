@@ -34,10 +34,13 @@
 // then the INT64 range check. C_r already went through the SCU and Sat32: the
 // HP1 exponent is never applied again on the CPU.
 //
-// Merge: rmd::detail::merge_rmd_correction_with_metadata on the run's private
-// output with the stripe's own post-fold theta (rmd-compose.cpp):
+// Merge (merge_prepared_hp1): the checked merge of Gemmini rmd-compose.cpp
+// (merge_rmd_correction_checked), cell for cell, with the stripe's own
+// post-fold theta and the prepared weight's channel scales:
 //   out = out + float(double(R) * double(channel_scale) * double(2^theta)),
-// NaN/Inf, INT64 overflow and missing metadata failing, all or nothing.
+// NaN/Inf and missing metadata failing, all or nothing. The weight's HP1
+// metadata is not validated again per stripe: prepare_weight() validated the
+// whole weight once (weight_cache), and the prepared weight is immutable.
 
 #include "matmul/dense.hpp"
 #include "matmul/tiling.hpp"
@@ -122,12 +125,24 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
 rmd::RmdStatus reconstruct(const rmd::StripePacket & packet, const request & req,
                            rmd::BlockScaledInt64Correction & out);
 
-// Adds `correction` to rows [row_begin, row_end) of args.f_out with the
-// stripe's snapshot metadata: an ExSIA Meta holding this stripe's theta only.
-// args: the run's merge view (init_merge_args). nonzero: raw nonzero
-// correction entries. All or nothing.
-rmd::RmdStatus merge(const ggml_gemmini_args_t & args, size_t row_begin, size_t row_end, uint64_t run_id,
-                     const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & snapshot,
-                     rmd::BlockScaledInt64Correction && correction, size_t * nonzero);
+// Adds `correction` (stripe-local rows x weight.n, row-major) to rows
+// [row_begin, row_end) of the F32 output out[row * row_stride + col *
+// col_stride] (out_rows rows) with the stripe's post-fold theta and
+// weight.scale, in merge_rmd_correction_checked's order per cell:
+//   domain = double(R) * double(weight.scale[col])
+//   scaled = domain * double(std::ldexp(1.0f, theta))
+//   delta  = float(scaled), merged = out + delta
+// The route-plan and reader checks of the Gemmini merge are replaced by the
+// weight's own preparation; what the merge itself checks stays: bounds, sizes
+// and strides (invalid_arguments), a non-finite channel scale
+// (unsupported_route), theta missing or without a finite positive F32 scale
+// (invalid_arguments), any non-finite domain/scaled/delta/merged value
+// (overflow; bit tests, valid under -ffast-math). Transactional: every cell is
+// staged first; out and *nonzero (raw nonzero corrections) are written only
+// on success.
+rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+                                  const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & metadata,
+                                  const rmd::BlockScaledInt64Correction & correction, float * out, size_t out_rows,
+                                  size_t row_stride, size_t col_stride, size_t * nonzero);
 
 } // namespace ggml::potal::residual

@@ -2,11 +2,10 @@
 
 #include "potal_hw_params.h"
 
-#include "quants/act/meta.hpp"
 #include "residual/rmd/rmd-builder.hpp"
-#include "residual/rmd/rmd-compose.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -36,6 +35,22 @@ int lane_position(const rmd::BlockDescriptor & block, uint8_t lane) {
         }
     }
     return -1;
+}
+
+// Finite tests on the bits, as rmd-compose.cpp's finite_*_representation: an
+// -ffast-math build may assume std::isfinite true.
+bool finite_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const volatile uint32_t observed = bits;
+    return (observed & 0x7f800000u) != 0x7f800000u;
+}
+
+bool finite_bits(double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const volatile uint64_t observed = bits;
+    return (observed & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
 } // namespace
@@ -230,19 +245,78 @@ rmd::RmdStatus reconstruct(const rmd::StripePacket & packet, const request & req
     return rmd::RmdStatus::overflow;
 }
 
-rmd::RmdStatus merge(const ggml_gemmini_args_t & args, size_t row_begin, size_t row_end, uint64_t run_id,
-                     const exsia::StripeMetadataSnapshot & snapshot, rmd::BlockScaledInt64Correction && correction,
-                     size_t * nonzero) try {
-    // This stripe's metadata only: local metadata row 0 is global row row_begin.
-    ggml::gemmini::quants::act::Meta meta;
-    exsia::Meta &                    e = meta.storage().emplace<exsia::Meta>();
-    e.run_id                           = run_id;
-    e.e_s                              = snapshot.e_s;
-    e.rho                              = snapshot.rho;
-    e.sigma                            = snapshot.sigma;
-    e.theta.assign(1, snapshot.theta);
-    const rmd::Correction tagged = std::move(correction);
-    return rmd::detail::merge_rmd_correction_with_metadata(args, row_begin, row_end, tagged, meta, nonzero, nullptr);
+rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+                                  const exsia::StripeMetadataSnapshot & metadata,
+                                  const rmd::BlockScaledInt64Correction & correction, float * out, size_t out_rows,
+                                  size_t row_stride, size_t col_stride, size_t * nonzero) try {
+    // Layout: rmd-compose.cpp prepare_merge_layout.
+    const size_t n = weight.n;
+    if (out == nullptr || weight.scale == nullptr || n == 0 || row_begin > row_end || row_end > out_rows ||
+        row_stride == 0 || col_stride == 0) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+    const size_t rows   = row_end - row_begin;
+    size_t       values = 0, row_offset = 0, col_offset = 0, last = 0;
+    if (__builtin_mul_overflow(rows, n, &values) || correction.values.size() != values) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+    if (rows != 0 && (__builtin_mul_overflow(row_end - 1, row_stride, &row_offset) ||
+                      __builtin_mul_overflow(n - 1, col_stride, &col_offset) ||
+                      __builtin_add_overflow(row_offset, col_offset, &last))) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+
+    // Column scales: validated with the whole weight by prepare_weight(), only
+    // re-tested here as the Gemmini merge tests its prepared ones.
+    for (size_t col = 0; col < n; ++col) {
+        if (!finite_bits(weight.scale[col])) {
+            return rmd::RmdStatus::unsupported_route;
+        }
+    }
+
+    // ActivationMetadataView over this stripe's one theta: rows present, a
+    // theta, and float(2^theta) finite and positive.
+    if (rows == 0 || metadata.theta == std::numeric_limits<int16_t>::min()) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+    const float activation_scale = std::ldexp(1.0f, metadata.theta);
+    if (!finite_bits(activation_scale) || !(activation_scale > 0.0f)) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+
+    // merge_rmd_correction_checked, integer route: count the raw corrections
+    // (lane terms may cancel; a zero scale must not hide them), stage every
+    // cell, then commit.
+    std::vector<float> staged(values);
+    size_t             staged_nonzero = 0;
+    for (size_t row = 0; row < rows; ++row) {
+        const float *   dst = out + (row_begin + row) * row_stride;
+        const int64_t * src = correction.values.data() + row * n;
+        float *         stg = staged.data() + row * n;
+        for (size_t col = 0; col < n; ++col) {
+            const int64_t value = src[col];
+            staged_nonzero += value != 0;
+            const double domain_value = static_cast<double>(value) * static_cast<double>(weight.scale[col]);
+            const double scaled       = domain_value * static_cast<double>(activation_scale);
+            const float  delta        = static_cast<float>(scaled);
+            const float  merged       = dst[col * col_stride] + delta;
+            if (!finite_bits(domain_value) || !finite_bits(scaled) || !finite_bits(delta) || !finite_bits(merged)) {
+                return rmd::RmdStatus::overflow;
+            }
+            stg[col] = merged;
+        }
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        float *       dst = out + (row_begin + row) * row_stride;
+        const float * stg = staged.data() + row * n;
+        for (size_t col = 0; col < n; ++col) {
+            dst[col * col_stride] = stg[col];
+        }
+    }
+    if (nonzero != nullptr) {
+        *nonzero = staged_nonzero;
+    }
+    return rmd::RmdStatus::success;
 } catch (const std::bad_alloc &) {
     return rmd::RmdStatus::allocation_failure;
 }

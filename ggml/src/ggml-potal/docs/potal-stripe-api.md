@@ -127,7 +127,23 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session,
   fatal report the session refuses all work (`stage="session_disabled"`) and
   the operands of that GEMM must never be freed. Destroy only when no call runs.
 * TLB: the caller's job. The issuer flushes (FLUSH + FENCE) before every
-  planned GEMM, since stripe slots and residual operands may be fresh pages.
+  planned GEMM, since stripe slots and residual operands may be fresh pages,
+  through the owner step below.
+* Owner step (internal, `matmul/stripe-api.hpp`): `prepare_stripe_gemm()` is
+  the one preflight (all the refusals above, one carrier scan, no command, no
+  session access); `run_planned_stripe_gemm(session, desc)` is what the hart-0
+  issuer runs after its affinity check and what the host tests run on an
+  emulator session: session check -> preflight -> TLB FLUSH -> FENCE -> the
+  prepared GEMM (per invocation SCALE_WRITE -> LOOP_WS -> FENCE ->
+  SCALE_RELEASE; the leaf keeps its per-invocation `potal_loop_ws_check` and
+  carrier checks). The prepared descriptor holds the values that were checked;
+  the descriptor and the memory it names must not change until the GEMM
+  returns. A refused descriptor issues no command at all, not even the TLB
+  FLUSH: `stage="preflight"` (the report's stage names the check), not fatal,
+  the session and the issuer stay usable. A failed TLB FLUSH/FENCE:
+  `stage="tlb_flush"`, fatal, the session disabled (and the issuer, as for every
+  fatal outcome). `potal_tiled_matmul_stripe()` runs the same preflight and the
+  same execution without the TLB step; its ABI and stages are unchanged.
 * C callers link `potal-tiled-api` (it contains C++); `potal-api` (potal.c)
   stays the C11 low-level API and the bare-metal build is unchanged.
 
@@ -148,8 +164,8 @@ without a packet `MAIN_DONE -> RECONSTRUCT_MERGE`.
   true. false only for a failed run: a full pipeline never fails a stripe.
 * Ownership: the slot copy, not ExSIA's workspace or `args.A` (ExSIA reuses
   its slot, and its failure path zero-fills `args.A`). The consumer never reads
-  the producer's arguments, metadata or ExSIA state; the merge uses a separate
-  view (`init_merge_args`: weight view + private output).
+  the producer's arguments, metadata or ExSIA state; the merge reads the
+  prepared weight's channel scales and writes the run's private output.
 * Capacity returns after SEMANTIC_DONE only: Main raw completion and Residual
   completion do not release it. Pool slot index, stripe id, slot reuse
   generation and the SCU generation are different numbers in the records.
@@ -168,6 +184,22 @@ without a packet `MAIN_DONE -> RECONSTRUCT_MERGE`.
   buffers. An abort cannot interrupt a running GEMM: POTAL_FENCE blocks in
   hardware until the GEMM drained, and only then does the issuer see it.
 * dst: written once, from the private output, after every stripe completed.
+* Records: every step is a `stripe_event` stamped under the run's lock in the
+  critical section of the state change it reports, with `sequence` (1, 2, ...
+  per run, no gaps) and the CPU time of the step. `submit_accepted(s)` is
+  stamped with READY and the queue push, `main_begin(s)` with the pop, so
+  `submit_accepted(s) < main_begin(s)`; `capacity_release(s)` with the slot's
+  FREE, before a waiting producer can reserve it, so `capacity_release(s) <
+  submit_accepted(s + capacity)`; the consumer's steps of a stripe follow its
+  chain (`main_end`, residual prepare/GEMM, radix reconstruction, merge,
+  `semantic_complete`, `capacity_release`), and `main_begin(s+1)` follows
+  `capacity_release(s)`. Debug JSONL records are written in sequence order: a
+  writer waits only until the record stamped just before its own is written
+  (by its thread, right after it released the lock, without blocking), so
+  neither side waits for the other's work and producer/consumer overlap is
+  unchanged. Observers are called after the record, holding no lock of the run
+  (they may query or abort it); across the two threads only `sequence` orders
+  them.
 
 ## 5. Numerics
 
@@ -207,11 +239,23 @@ Reconstruction: `R[row][n] = sum C_r[lane, row][n] * 256^lane` in checked
 lanes including the carry). C_r already went through the SCU and Sat32; the
 HP1 exponent is never applied again. Tagged `BlockScaledInt64Correction`.
 
-Merge: `rmd::detail::merge_rmd_correction_with_metadata` with an ExSIA Meta
-holding only this stripe's theta: `delta = float(double(R) * double(channel_scale)
-* double(float(2^theta)))`, `out = main_f32 + delta`; NaN/Inf, INT64 overflow or
-missing metadata fail the stripe; all cells or none. An empty residual (no
-packet) merges nothing and runs no Residual GEMM.
+Merge: `residual::merge_prepared_hp1`, the arithmetic of the Gemmini checked
+merge (`rmd-compose.cpp merge_rmd_correction_checked`, integer route) cell for
+cell with this stripe's theta and the prepared weight's channel scales:
+`domain = double(R) * double(channel_scale)`, `scaled = domain *
+double(float(2^theta))`, `delta = float(scaled)`, `out = main_f32 + delta`.
+Bounds/sizes/strides, a missing theta or one without a finite positive F32
+scale, a non-finite channel scale and any non-finite domain/scaled/delta/merged
+value (bit tests, valid under `-ffast-math`) fail the stripe; every cell is
+staged first, so the output and the nonzero count change only on success. The
+Gemmini merge resolved the HP1 route plan per call, i.e. ran
+`wreader::validate()` over the whole weight and read every block's column scale
+for every stripe; the run's prepared weight was validated by `prepare_weight()`
+before the run (on a weight cache MISS, or for every node of an uncached or
+bypassed weight; a HIT reuses one validated earlier) and is immutable, so the
+merges of its stripes read nothing of the GGUF blocks. The two merges agree
+bit for bit (potal-residual-unit-test M). An empty residual (no packet) merges
+nothing and runs no Residual GEMM.
 
 ## 6. Records and counters
 
@@ -225,8 +269,8 @@ the stripe's trace context):
 [POTAL_STRIPE] event=quant_begin|folding_commit|queue_wait|submit_accepted|main_begin|main_end|
   residual_prepare_begin|residual_prepare_end|residual_begin|residual_end|
   radix_reconstruct_begin|radix_reconstruct_end|merge_begin|merge_end|semantic_complete|
-  capacity_release|quant_end|run_commit|run_failed  run_id= stripe= slot= slot_generation= rows=a..b
-  outstanding= capacity= executor=POTAL/potal_ws backend=HARDWARE|EMULATED t_ns= ...
+  capacity_release|quant_end|run_commit|run_failed  event_sequence= run_id= stripe= slot= slot_generation=
+  rows=a..b outstanding= capacity= executor=POTAL/potal_ws backend=HARDWARE|EMULATED t_ns= ...
 submit_accepted adds: producer_slot= quantization_start_ns= quantization_end_ns= folding_commit_ns=
   (ExSIA's own values; 0 when its profiling is compiled out)
 main_end/residual_end add: gemm_rows= N= loop_ws= validated_api= fences= scale_writes= scale_releases=
@@ -245,15 +289,23 @@ summary at free and `ggml_backend_potal_stats` carry the same counters
 still counts nodes. `t_ns` values are CPU steady-clock observations of
 submission/completion, not device cycles; the NPU record stays
 `unavailable_device_counter`. Logical GEMMs, LOOP_WS invocations, GEMM
-fences and TLB flushes are separate counters.
+fences and TLB flushes are separate counters. `event_sequence` restarts at 1
+with every run (`quant_begin`) and is written in increasing order within a
+run; `stripe=` is the stripe id, `slot=` the pool slot, `slot_generation=` its
+reuse count (on `capacity_release` the count after the release) and the SCU
+`generation=` (main_end/residual_end) the 8-bit scale generation: four
+different numbers. A planned GEMM refused by the preflight logs
+`status=POTAL_ERR_... step=<check>` with `loop_ws=0` and the run fails with
+`step=preflight fatal=0` (no TLB flush counted).
 
 ## 7. Tests
 
 | Binary | Where | What |
 |---|---|---|
-| `potal-stripe-api-test` | host/target, emulator | C11 caller + layout, frozen plans, tails, K chunks, refusals without commands, generation wrap, fatal session, shared generations |
-| `potal-residual-unit-test` | host/target, emulator | run-aware request, K32 lowering == compact golden (1/15/16/17/31/32, multi-run, carry lanes, carriers, saturation, cancellation), INT64 reconstruction, merge, failures |
-| `potal-stripe-pipeline-test` | host/target, emulator thread | real ExSIA events, overlap/backpressure gates, capacity, serialized == pipelined == golden, immutability, failure wake-up, no partial commit, repeated runs, producer placement |
+| `potal-stripe-api-test` | host/target, emulator | C11 caller + layout, frozen plans, tails, K chunks, refusals without commands through the C API and the issuer's owner step (no TLB FLUSH either; SPAD/ACC/ScaleMemory capacity, overlap, DRAM offset, ...), owner-step command order and counts, TLB failure, generation wrap, fatal session, shared generations |
+| `potal-residual-unit-test` | host/target, emulator | run-aware request, K32 lowering == compact golden (1/15/16/17/31/32, multi-run, carry lanes, carriers, saturation, cancellation), INT64 reconstruction, prepared merge == Gemmini merge bitwise (signs, INT64 extremes, theta limits, channel-scale extremes, strides, tail, several stripes), no weight revalidation (reader counters), failures |
+| `potal-stripe-pipeline-test` | host/target, emulator thread | real ExSIA events, overlap/backpressure gates, capacity, serialized == pipelined == golden, immutability, failure wake-up, no partial commit, repeated runs, producer placement, event order of every run (sequence, per-stripe chain, capacity), observers that query/abort/throw, merge failure, 24 gated runs, debug JSONL order |
+| `potal-residual-merge-bench` | host/target, emulator (benchmark) | one stripe's merge: prepared vs Gemmini merge time, reader validations per merge, bitwise (default 320x128, 2304x768, 50257x768) |
 | `potal-stripe-smoke` | FireSim | backend graphs, Main/Residual on the hart-0 issuer, == CPU golden |
 
 The host tests run the production code with an RTL-semantics emulator in
@@ -280,10 +332,11 @@ STRIPE_OPTS=(-DGGML_POTAL=ON -DGGML_GEMMINI=OFF -DPOTAL_API_ONLY=OFF -DGGML_BACK
   -DLOG_DEBUG=1 -DLOG_CYCLE=1 -DCYCLE_SIM=0 -DLLAMA_CURL=OFF)
 cmake -S . -B build-potal-stripe-host "${STRIPE_OPTS[@]}"
 cmake --build build-potal-stripe-host --target potal-stripe-api-test potal-residual-unit-test \
-  potal-stripe-pipeline-test -j
+  potal-stripe-pipeline-test potal-residual-merge-bench -j
 for t in potal-stripe-api-test potal-residual-unit-test potal-stripe-pipeline-test; do
   build-potal-stripe-host/bin/$t; echo "$t exit=$?"
 done
+build-potal-stripe-host/bin/potal-residual-merge-bench --reps 20   # host CPU times, not NPU numbers
 ```
 
 RISC-V cross build (does not run anything):
@@ -394,6 +447,9 @@ grep -o 'residual_loop_ws=[0-9]*' "$D" | sort | uniq -c | tail                  
 grep '\[POTAL\] summary' "$D" | grep -o 'stripe_pipeline_failed=[0-9]*\|merges_completed=[0-9]*\|hp1_failed=[0-9]*\|residual_loop_ws=[0-9]*\|stripes_semantic_completed=[0-9]*'
 grep -c 'dispatch=FAILED\|event=run_failed' "$D"                               # must be 0
 grep 'event=queue_wait' "$D" | head -3                                            # backpressure actually happened
+# [POTAL_STRIPE] records in event_sequence order (1 starts a run): prints nothing when ordered
+grep -o 'POTAL_STRIPE\] event=[a-z_]* event_sequence=[0-9]*' "$D" |
+  awk -F'event_sequence=' '{ s = $2 + 0; if (s != 1 && s != p + 1) print "order break: " $0; p = s }'
 ```
 
    A run counts only with `llama-cli exit=0`, `stripe_pipeline_failed=0`,
@@ -401,6 +457,6 @@ grep 'event=queue_wait' "$D" | head -3                                          
    one node with `stripe_count >= 2`, and no `dispatch=FAILED`/`run_failed`.
    Decode (M=1) nodes are one stripe each: a decode success alone shows no
    inter-stripe overlap; use the prefill nodes' `stripe_count` and their
-   `[POTAL_STRIPE]` order (`submit_accepted` of stripe s+1 before
-   `semantic_complete` of stripe s) for that. `t_ns` are CPU observations;
-   there is no device cycle counter (`unavailable_device_counter`).
+   `[POTAL_STRIPE]` order by `event_sequence` (`submit_accepted` of stripe s+1
+   before `semantic_complete` of stripe s) for that. `t_ns` are CPU
+   observations; there is no device cycle counter (`unavailable_device_counter`).

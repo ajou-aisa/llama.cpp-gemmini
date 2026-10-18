@@ -478,34 +478,19 @@ tiled_report issuer::execute_tiled(const tiled_job & job) {
     return r;
 }
 
-// One planned stripe GEMM on the issuer: affinity, TLB FLUSH + FENCE, then
-// potal_tiled_matmul_stripe() on the issuer's session.
+// One planned stripe GEMM on the issuer: the hart-0 affinity check, then
+// run_planned_stripe_gemm() on the issuer's session. A stripe GEMM may read
+// buffers allocated since the previous GEMM (the run's slots, a residual's
+// operands), so that step drops every accelerator translation before the
+// GEMM's first DMA, and only for a descriptor its preflight accepted.
 planned_result issuer::execute_planned(const potal_stripe_gemm_desc & desc) {
-    planned_result r;
     if (sched_getcpu() != cpu) {
+        planned_result r;
         r.stage = "affinity"; // custom-3 would trap off hart 0
         r.fatal = true;
         return r;
     }
-    // A stripe GEMM may read buffers allocated since the previous GEMM (the
-    // run's slots, a residual's operands): drop every accelerator translation
-    // before its first DMA. The previous GEMM ended with a FENCE.
-    r.status = potal_tlb_flush();
-    if (r.status == POTAL_OK) {
-        r.status = potal_fence();
-    }
-    if (r.status != POTAL_OK) {
-        r.stage = "tlb_flush";
-        r.fatal = true;
-        return r;
-    }
-    session.ws.report.tlb_flushes++;
-    r.tlb_flushes = 1;
-    r.status      = potal_tiled_matmul_stripe(&session, &desc, &r.report);
-    r.stage       = r.report.stage;
-    r.fatal       = r.report.fatal != 0;
-    r.ok          = r.status == POTAL_OK;
-    return r;
+    return run_planned_stripe_gemm(session, desc);
 }
 
 std::mutex g_issuer_mutex;

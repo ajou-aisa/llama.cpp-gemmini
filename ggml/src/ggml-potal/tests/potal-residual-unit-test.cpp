@@ -19,6 +19,15 @@
 //      (refused without a command), duplicate/unordered/out-of-range rows,
 //      INT64 overflow (and the INT64_MIN edge that fits), non-finite merge and
 //      missing theta (output unchanged); a stripe without residual seals no packet
+//   M  the prepared merge (merge_prepared_hp1) == the Gemmini checked merge it
+//      replaced (support/gemmini-merge.hpp), status, nonzero count and every
+//      output bit: corrections of every A/B/D case (saturating SCU included),
+//      signs, zeros, INT64 extremes, theta < 0 / 0 / > 0 and its limits, tiny
+//      and huge channel scales, wrong sizes and bounds, strides, offsets and a
+//      tail stripe, several stripes of one weight; a non-finite prepared scale
+//      refused; the output and the count untouched by every failure; repeated
+//      merges never run the Gemmini reader's weight validation (its test
+//      counters, GGML_GEMMINI_TESTING), while the Gemmini merge runs it per call
 //
 // The golden is independent of the lowering: it never pads, never tiles and
 // accumulates per (lane, row, column) in run order with Sat32. CPU-direct RMD
@@ -33,9 +42,11 @@
 #include "potal.h"
 #include "potal_hw_params.h"
 #include "residual/stripe-residual.hpp"
+#include "support/gemmini-merge.hpp"
 #include "support/stripe-golden.hpp"
 #include "support/stripe-owner.hpp"
 
+#include "quants/common/weight_reader.hpp"
 #include "residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
@@ -50,11 +61,13 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace ggml::potal;
 namespace grmd = ggml::gemmini::rmd;
 namespace exsia_ns = ggml::gemmini::quants::act::exsia;
+namespace wreader  = ggml::gemmini::quants::wreader;
 
 namespace {
 
@@ -89,7 +102,8 @@ struct fixture {
     bool                 ok = false;
 
     fixture(size_t M_, size_t N_, size_t K_, uint32_t seed, const std::function<int16_t(size_t, size_t)> & exponent,
-            const std::function<int8_t(size_t, size_t, std::mt19937 &)> & code) :
+            const std::function<int8_t(size_t, size_t, std::mt19937 &)> & code,
+            const std::function<float(size_t)> & channel_scale = {}) :
         M(M_), N(N_), K(K_) {
         ggml_init_params ip = { (M * K + N * K) * 8 + 4 * 1024 * 1024, nullptr, false };
         ctx.reset(ggml_init(ip));
@@ -101,7 +115,7 @@ struct fixture {
         exps.resize(K / 32 * N);
         scales.resize(N);
         for (size_t n = 0; n < N; ++n) {
-            scales[n] = 0.003f * (float) (1 + n % 7);
+            scales[n] = channel_scale ? channel_scale(n) : 0.003f * (float) (1 + n % 7);
         }
         auto * blocks = static_cast<block_q8_hp1 *>(w->data);
         for (size_t n = 0; n < N; ++n) {
@@ -188,6 +202,50 @@ bool golden_of(const fixture & f, const grmd::StripePacket & p, std::vector<pota
     return potal_test::residual_golden(
         p, f.N, D, [&f](size_t k, size_t n) { return f.code_at(k, n); },
         [&f](size_t blk, size_t n) { return f.carrier_at(blk, n); }, g);
+}
+
+// One merge through the prepared HP1 path and through the Gemmini checked
+// merge it replaced, each on its own copy of `base` (rows of f.M with
+// row_stride, columns with col_stride): status, nonzero count, every bit.
+struct merge_outcome {
+    grmd::RmdStatus    prepared         = grmd::RmdStatus::invalid_arguments;
+    grmd::RmdStatus    gemmini          = grmd::RmdStatus::invalid_arguments;
+    size_t             prepared_nonzero = SIZE_MAX; // SIZE_MAX: not written
+    size_t             gemmini_nonzero  = SIZE_MAX;
+    std::vector<float> prepared_out;
+    std::vector<float> gemmini_out;
+
+    bool ok() const { return prepared == grmd::RmdStatus::success; }
+    bool same() const {
+        return prepared == gemmini && prepared_nonzero == gemmini_nonzero &&
+               prepared_out.size() == gemmini_out.size() &&
+               std::memcmp(prepared_out.data(), gemmini_out.data(), prepared_out.size() * sizeof(float)) == 0;
+    }
+    // A failure leaves both outputs and both counts as they were.
+    bool untouched(const std::vector<float> & base) const {
+        return !ok() && prepared_nonzero == SIZE_MAX && gemmini_nonzero == SIZE_MAX &&
+               std::memcmp(prepared_out.data(), base.data(), base.size() * sizeof(float)) == 0 &&
+               std::memcmp(gemmini_out.data(), base.data(), base.size() * sizeof(float)) == 0;
+    }
+};
+
+merge_outcome merge_both(const fixture & f, size_t row_begin, size_t row_end, int16_t theta,
+                         const grmd::BlockScaledInt64Correction & correction, const std::vector<float> & base,
+                         size_t row_stride = 0, size_t col_stride = 1) {
+    merge_outcome m;
+    const size_t  rs = row_stride != 0 ? row_stride : f.N;
+    m.prepared_out   = base;
+    m.gemmini_out    = base;
+    exsia_ns::StripeMetadataSnapshot snap;
+    snap.theta = theta;
+    m.prepared = residual::merge_prepared_hp1(f.weight, row_begin, row_end, snap, correction, m.prepared_out.data(),
+                                              f.M, rs, col_stride, &m.prepared_nonzero);
+    ggml_gemmini_args_t args;
+    potal_test::init_merge_args(f.args, m.gemmini_out.data(), rs, args);
+    args.col_stride_f_out                = col_stride;
+    grmd::BlockScaledInt64Correction copy = correction;
+    m.gemmini = potal_test::gemmini_merge(args, row_begin, row_end, 11, snap, std::move(copy), &m.gemmini_nonzero);
+    return m;
 }
 
 bool same_as_golden(const residual::request & req, const std::vector<potal_test::golden_lane_row> & g, size_t N) {
@@ -321,18 +379,15 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
     check(tag + ": radix INT64 reconstruction == golden (row/lane mapping)",
           composed && golden_r && corr.values == want_r);
 
-    std::vector<float> out(f.M * f.N);
-    for (size_t i = 0; i < out.size(); ++i) {
-        out[i] = 0.125f * (float) ((int) (i % 17) - 8);
+    std::vector<float> before(f.M * f.N);
+    for (size_t i = 0; i < before.size(); ++i) {
+        before[i] = 0.125f * (float) ((int) (i % 17) - 8);
     }
-    const std::vector<float> before = out;
-    ggml_gemmini_args_t      merge_args;
-    init_merge_args(f.args, out.data(), f.N, merge_args);
-    exsia_ns::StripeMetadataSnapshot snap;
-    snap.theta         = theta;
-    size_t     nonzero = 0;
-    const bool merged  = composed && residual::merge(merge_args, row_begin, row_begin + rows, 11, snap,
-                                                    std::move(corr), &nonzero) == grmd::RmdStatus::success;
+    const merge_outcome      m       = merge_both(f, row_begin, row_begin + rows, theta, corr, before);
+    const std::vector<float> out     = m.prepared_out;
+    const size_t             nonzero = m.prepared_nonzero;
+    const bool               merged  = composed && m.ok();
+    check(tag + ": prepared merge == Gemmini checked merge (status, nonzero, every output bit)", composed && m.same());
     bool   exact    = merged && golden_r;
     size_t want_nz  = 0;
     for (size_t m = 0; exact && m < f.M; ++m) {
@@ -581,20 +636,12 @@ void test_failures() {
         execute(f, *packet, es, run); // fresh GEMM results
         grmd::BlockScaledInt64Correction good;
         const bool composed = residual::reconstruct(*packet, run.req, good) == grmd::RmdStatus::success;
-        std::vector<float>  out(f.M * f.N, 1.0f);
-        ggml_gemmini_args_t merge_args;
-        init_merge_args(f.args, out.data(), f.N, merge_args);
-        exsia_ns::StripeMetadataSnapshot huge;
-        huge.theta = 127; // 2^127 x R: not finite as F32
-        grmd::BlockScaledInt64Correction copy = good;
-        size_t                           nz   = 0;
-        const grmd::RmdStatus inf = residual::merge(merge_args, 0, 16, 1, huge, std::move(copy), &nz);
-        exsia_ns::StripeMetadataSnapshot missing; // theta INT16_MIN: no metadata
-        copy = good;
-        const grmd::RmdStatus none = residual::merge(merge_args, 0, 16, 1, missing, std::move(copy), &nz);
+        const std::vector<float> out(f.M * f.N, 1.0f);
+        const merge_outcome      inf  = merge_both(f, 0, 16, 127, good, out); // 2^127 x R: not finite as F32
+        const merge_outcome none = merge_both(f, 0, 16, std::numeric_limits<int16_t>::min(), good, out); // no theta
         check("E non-finite merge and missing theta refused, output unchanged",
-              composed && inf == grmd::RmdStatus::overflow && none != grmd::RmdStatus::success &&
-                  std::all_of(out.begin(), out.end(), [](float v) { return v == 1.0f; }));
+              composed && inf.prepared == grmd::RmdStatus::overflow && none.prepared != grmd::RmdStatus::success &&
+                  inf.same() && none.same() && inf.untouched(out) && none.untouched(out));
     }
     {
         grmd::RmdStripeBuilder b;
@@ -602,6 +649,223 @@ void test_failures() {
         b.add_residual(0, 3, 0);
         check("E a stripe without nonzero residual seals no packet (residual GEMM skipped)", b.finish() == nullptr);
     }
+}
+
+// ---- M ---------------------------------------------------------------------------
+
+// Correction of `rows` x N stripe-local values: value(row, col).
+grmd::BlockScaledInt64Correction correction_of(size_t rows, size_t N,
+                                               const std::function<int64_t(size_t, size_t)> & value) {
+    grmd::BlockScaledInt64Correction c;
+    c.values.resize(rows * N);
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t n = 0; n < N; ++n) {
+            c.values[r * N + n] = value(r, n);
+        }
+    }
+    return c;
+}
+
+std::vector<float> base_output(size_t count) {
+    std::vector<float> out(count);
+    for (size_t i = 0; i < count; ++i) {
+        out[i] = 0.375f * (float) ((int) (i % 23) - 11);
+    }
+    return out;
+}
+
+void test_merge() {
+    const auto shift1 = [](size_t, size_t) { return (int16_t) 1; };
+    fixture    f(40, 48, 64, 5, shift1, random_code);
+    if (!f.ok) {
+        check("M fixture", false);
+        return;
+    }
+    const std::vector<float> base = base_output(f.M * f.N);
+    const int64_t            big  = std::numeric_limits<int64_t>::max();
+    const int64_t            low  = std::numeric_limits<int64_t>::min();
+    // Signs, zeros, small and INT64-extreme values in one stripe.
+    const auto mixed = [&](size_t r, size_t n) -> int64_t {
+        switch ((r * 7 + n) % 9) {
+            case 0:  return 0;
+            case 1:  return 1;
+            case 2:  return -1;
+            case 3:  return (int64_t) (r * 1000 + n);
+            case 4:  return -(int64_t) (r * 977 + n * 31);
+            case 5:  return big;
+            case 6:  return low;
+            case 7:  return (int64_t) 1 << 62;
+            default: return -((int64_t) 1 << 61) + (int64_t) n;
+        }
+    };
+    const grmd::BlockScaledInt64Correction corr = correction_of(16, f.N, mixed);
+
+    bool   same = true, any_ok = false, any_overflow = false;
+    size_t cases = 0;
+    for (int16_t theta : { -60, -40, -20, -1, 0, 1, 10, 40, 100 }) {
+        const merge_outcome m = merge_both(f, 8, 24, theta, corr, base);
+        same                  = same && m.same() && (m.ok() || m.untouched(base));
+        any_ok                = any_ok || m.ok();
+        any_overflow          = any_overflow || m.prepared == grmd::RmdStatus::overflow;
+        cases++;
+    }
+    check("M1-4,6 signs, zeros, INT64 extremes, theta -60..100 (" + std::to_string(cases) +
+              " merges): prepared == Gemmini bitwise, failures untouched",
+          same && any_ok && any_overflow);
+
+    const grmd::BlockScaledInt64Correction zeros = correction_of(16, f.N, [](size_t, size_t) { return (int64_t) 0; });
+    const merge_outcome                    z     = merge_both(f, 0, 16, -3, zeros, base);
+    check("M3 all-zero correction: success, nonzero 0, output bits unchanged (x + 0.0f)",
+          z.same() && z.ok() && z.prepared_nonzero == 0 &&
+              std::memcmp(z.prepared_out.data(), base.data(), base.size() * sizeof(float)) == 0);
+
+    // Theta at and beyond the F32 scale limits: INT16_MIN (missing), 2^-150
+    // (0), 2^128 (inf) refused; 2^-149 (smallest subnormal) and 2^127 run.
+    const grmd::BlockScaledInt64Correction small = correction_of(16, f.N, [](size_t r, size_t n) {
+        return (int64_t) ((r + 1) * (n % 5)) - 2;
+    });
+    bool limits = true;
+    for (int16_t theta : { std::numeric_limits<int16_t>::min(), (int16_t) -150, (int16_t) 128, (int16_t) 200 }) {
+        const merge_outcome m = merge_both(f, 0, 16, theta, small, base);
+        limits = limits && m.same() && m.untouched(base) && m.prepared == grmd::RmdStatus::invalid_arguments;
+    }
+    const merge_outcome tiny = merge_both(f, 0, 16, -149, small, base);
+    const merge_outcome edge = merge_both(f, 0, 16, 127, small, base);
+    check("M6,8 theta INT16_MIN/-150/128/200 refused (invalid_arguments), -149 and 127 == Gemmini",
+          limits && tiny.same() && tiny.ok() && edge.same());
+
+    // Wrong sizes and bounds.
+    bool sizes = true;
+    for (size_t count : { (size_t) 0, 16 * f.N - 1, 16 * f.N + 1 }) {
+        grmd::BlockScaledInt64Correction c = corr;
+        c.values.resize(count);
+        const merge_outcome m = merge_both(f, 0, 16, -5, c, base);
+        sizes = sizes && m.same() && m.untouched(base) && m.prepared == grmd::RmdStatus::invalid_arguments;
+    }
+    const merge_outcome past  = merge_both(f, 32, 48, -5, corr, base);           // row_end > M
+    const merge_outcome order = merge_both(f, 20, 4, -5, corr, base);            // row_begin > row_end
+    const merge_outcome empty = merge_both(f, 8, 8, -5, grmd::BlockScaledInt64Correction{}, base); // no rows
+    check("M9 wrong correction size (0, -1, +1), rows past M, reversed and empty ranges refused == Gemmini",
+          sizes && past.same() && past.untouched(base) && order.same() && order.untouched(base) && empty.same() &&
+              empty.untouched(base) && empty.prepared == grmd::RmdStatus::invalid_arguments);
+
+    // A non-finite main output inside the stripe makes its merged cell
+    // non-finite (overflow); strides whose last offset overflows size_t are
+    // refused before any access (invalid_arguments). Both paths, untouched.
+    std::vector<float> inf_out = base, nan_out = base;
+    inf_out[(8 + 3) * f.N + 7]  = std::numeric_limits<float>::infinity();
+    nan_out[(8 + 3) * f.N + 7]  = std::numeric_limits<float>::quiet_NaN();
+    const merge_outcome inf_dst  = merge_both(f, 8, 24, -6, corr, inf_out);
+    const merge_outcome nan_dst  = merge_both(f, 8, 24, -6, corr, nan_out);
+    const merge_outcome row_over = merge_both(f, 8, 24, -6, corr, base, SIZE_MAX / 2, 1);
+    const merge_outcome col_over = merge_both(f, 8, 24, -6, corr, base, f.N, SIZE_MAX / 4);
+    check("M8,9,11 Inf/NaN main output in the stripe (overflow) and size_t-overflowing row/column strides "
+          "(invalid_arguments) refused == Gemmini, output and count untouched",
+          inf_dst.same() && inf_dst.untouched(inf_out) && inf_dst.prepared == grmd::RmdStatus::overflow &&
+              nan_dst.same() && nan_dst.untouched(nan_out) && nan_dst.prepared == grmd::RmdStatus::overflow &&
+              row_over.same() && row_over.untouched(base) && row_over.prepared == grmd::RmdStatus::invalid_arguments &&
+              col_over.same() && col_over.untouched(base) && col_over.prepared == grmd::RmdStatus::invalid_arguments);
+
+    // Strided destination: row stride 2N + 3, column stride 2, stripes at
+    // rows 0, 16 and the 8-row tail 32..40, merged one after the other into
+    // the same buffer (one weight, several stripes); the gaps never change.
+    const size_t       rs = 2 * f.N + 3, cs = 2;
+    std::vector<float> strided_p = base_output((f.M - 1) * rs + (f.N - 1) * cs + 1);
+    std::vector<float> strided_g = strided_p;
+    const std::vector<float> strided_base = strided_p;
+    bool strided = true;
+    size_t stripes = 0;
+    for (const auto & range : { std::make_pair((size_t) 0, (size_t) 16), std::make_pair((size_t) 16, (size_t) 32),
+                                std::make_pair((size_t) 32, f.M) }) {
+        const grmd::BlockScaledInt64Correction c = correction_of(range.second - range.first, f.N, mixed);
+        const merge_outcome m = merge_both(f, range.first, range.second, -24, c, strided_p, rs, cs);
+        // Chain: each path continues on its own previous output.
+        const merge_outcome g = merge_both(f, range.first, range.second, -24, c, strided_g, rs, cs);
+        strided = strided && m.ok() && g.ok() && m.same() && g.same() &&
+                  std::memcmp(m.prepared_out.data(), g.gemmini_out.data(), m.prepared_out.size() * sizeof(float)) == 0;
+        strided_p = m.prepared_out;
+        strided_g = g.gemmini_out;
+        stripes++;
+    }
+    bool gaps = true;
+    for (size_t i = 0; i < strided_p.size(); ++i) {
+        const bool cell = (i % rs) < f.N * cs && (i % rs) % cs == 0;
+        gaps = gaps && (cell || std::memcmp(&strided_p[i], &strided_base[i], sizeof(float)) == 0);
+    }
+    check("M10,12 row stride 2N+3, column stride 2, " + std::to_string(stripes) +
+              " stripes of one weight incl. the 8-row tail: == Gemmini after each, gaps untouched",
+          strided && gaps && stripes == 3);
+
+    // Channel scales at the ends of the normal F32 range (1e-30 / 1e30): the
+    // huge ones overflow F32 for large corrections, in both paths alike.
+    fixture extreme(40, 48, 64, 6, shift1, random_code, [](size_t n) { return n % 2 ? 1e30f : 1e-30f; });
+    bool    scales_same = extreme.ok, scales_ok = false, scales_overflow = false;
+    for (int16_t theta : { -40, 0, 10 }) {
+        for (int64_t magnitude : { (int64_t) 3, (int64_t) 1 << 20, (int64_t) 1 << 40 }) {
+            const grmd::BlockScaledInt64Correction c = correction_of(16, extreme.N, [&](size_t r, size_t n) {
+                return (r + n) % 3 == 0 ? -magnitude : magnitude + (int64_t) r;
+            });
+            const merge_outcome m = extreme.ok ? merge_both(extreme, 0, 16, theta, c, base) : merge_outcome{};
+            scales_same           = scales_same && m.same() && (m.ok() || m.untouched(base));
+            scales_ok             = scales_ok || m.ok();
+            scales_overflow       = scales_overflow || m.prepared == grmd::RmdStatus::overflow;
+        }
+    }
+    check("M7 channel scales 1e-30 / 1e30: prepared == Gemmini bitwise (successes and overflows)",
+          scales_same && scales_ok && scales_overflow);
+
+    // A non-finite prepared scale cannot come out of prepare_weight(); the
+    // prepared merge still refuses it (unsupported_route), output untouched.
+    bool nonfinite = true;
+    for (float bad : { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                       -std::numeric_limits<float>::infinity() }) {
+        const float saved = f.weight.scale[5];
+        f.weight.scale[5] = bad;
+        std::vector<float>               out = base;
+        size_t                           nz  = SIZE_MAX;
+        exsia_ns::StripeMetadataSnapshot snap;
+        snap.theta              = -4;
+        const grmd::RmdStatus st = residual::merge_prepared_hp1(f.weight, 0, 16, snap, corr, out.data(), f.M, f.N, 1,
+                                                                &nz);
+        f.weight.scale[5] = saved;
+        nonfinite = nonfinite && st == grmd::RmdStatus::unsupported_route && nz == SIZE_MAX &&
+                    std::memcmp(out.data(), base.data(), base.size() * sizeof(float)) == 0;
+    }
+    check("M8,11 NaN/+Inf/-Inf channel scale refused (unsupported_route), output and count untouched", nonfinite);
+
+    // A failure in the last cell leaves every earlier staged cell unwritten.
+    grmd::BlockScaledInt64Correction late = correction_of(16, f.N, [](size_t, size_t) { return (int64_t) 7; });
+    late.values.back()                    = big; // x 2^100: the last cell overflows
+    const merge_outcome last_cell         = merge_both(f, 0, 16, 100, late, base);
+    check("M11 overflow in the last cell: nothing committed, count untouched (both paths)",
+          last_cell.same() && last_cell.untouched(base) && last_cell.prepared == grmd::RmdStatus::overflow);
+
+    // Weight revalidation: the Gemmini reader's storage validations
+    // (wreader::validate) per merge, prepared vs Gemmini path.
+    wreader::test_reset_weight_reader_counters();
+    std::vector<float>               out = base;
+    exsia_ns::StripeMetadataSnapshot snap;
+    snap.theta    = -6;
+    size_t merges = 0;
+    bool   all_ok = true;
+    for (size_t round = 0; round < 8; ++round) {
+        for (size_t row = 0; row + 16 <= f.M; row += 16) {
+            size_t nz = 0;
+            all_ok    = all_ok && residual::merge_prepared_hp1(f.weight, row, row + 16, snap, corr, out.data(), f.M,
+                                                               f.N, 1, &nz) == grmd::RmdStatus::success;
+            merges++;
+        }
+    }
+    const size_t prepared_validations = wreader::test_weight_reader_storage_validations();
+    const size_t prepared_reads       = wreader::test_weight_reader_code_address_resolutions();
+    wreader::test_reset_weight_reader_counters();
+    const merge_outcome reference          = merge_both(f, 0, 16, -6, corr, base);
+    const size_t        gemmini_validations = wreader::test_weight_reader_storage_validations();
+    std::printf("     weight validations: prepared %zu over %zu merges, Gemmini merge %zu per merge\n",
+                prepared_validations, merges, gemmini_validations);
+    check("M13 " + std::to_string(merges) + " prepared merges of one weight: no wreader::validate(), no weight read "
+          "(the Gemmini merge validates the whole weight on every call)",
+          all_ok && prepared_validations == 0 && prepared_reads == 0 && reference.same() && gemmini_validations >= 1);
 }
 
 } // namespace
@@ -613,6 +877,7 @@ int main() {
     test_carriers();
     test_cancellation();
     test_failures();
+    test_merge();
     if (failures != 0) {
         std::printf("POTAL_RESIDUAL_UNIT_TEST FAIL (%d)\n", failures);
         return 1;

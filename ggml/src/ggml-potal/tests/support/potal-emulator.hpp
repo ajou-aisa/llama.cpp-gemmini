@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,8 +34,16 @@ struct emulator {
     bool                 scale_miss    = false; // hardware would hang
     int                  fail_write_at = -1;    // inject a SCALE_WRITE failure on this write
     bool                 fail_fence    = false;
-    uint64_t             writes = 0, releases = 0, loops = 0, gemms = 0, fences = 0;
+    int                  fail_fence_at = -1;    // inject a FENCE failure on this FENCE (0: the first received)
+    bool                 fail_issue    = false; // inject a LOOP_WS / GEMM issue failure
+    bool                 fail_release  = false; // inject SCALE_RELEASE failures
+    bool                 fail_tlb      = false; // inject a TLB FLUSH failure
+    uint64_t             writes = 0, releases = 0, loops = 0, gemms = 0, fences = 0, tlb_flushes = 0;
+    uint64_t             fence_calls = 0;
     std::vector<uint32_t> loop_generations; // scale_generation of every LOOP_WS, in order
+    // Every command received, accepted or not, in order: T TLB FLUSH, W SCALE_WRITE,
+    // G potal_gemm_ws_issue, L potal_loop_ws_issue, F FENCE, R SCALE_RELEASE.
+    std::string          commands;
 
     emulator() {
         acc[0].assign((size_t) POTAL_HW_ACC_ROWS / 2 * EMU_DIM, 0);
@@ -152,13 +161,22 @@ struct emulator {
     }
 
     static potal_status op_write(void * ctx, uint32_t s, uint32_t g, uint32_t c, uint32_t v) {
+        static_cast<emulator *>(ctx)->commands += 'W';
         return static_cast<emulator *>(ctx)->write(s, g, c, v);
     }
     static potal_status op_release(void * ctx, uint32_t s, uint32_t g, uint32_t c) {
+        static_cast<emulator *>(ctx)->commands += 'R';
+        if (static_cast<emulator *>(ctx)->fail_release) {
+            return POTAL_HW_BAD_COMMAND;
+        }
         return static_cast<emulator *>(ctx)->release(s, g, c);
     }
     static potal_status op_gemm(void * ctx, const potal_gemm_ws * g) {
         auto *             e  = static_cast<emulator *>(ctx);
+        e->commands += 'G';
+        if (e->fail_issue) {
+            return POTAL_HW_BAD_COMMAND;
+        }
         const potal_status st = potal_gemm_ws_check(g);
         if (st != POTAL_OK) {
             return st;
@@ -170,19 +188,38 @@ struct emulator {
         return e->run(l);
     }
     static potal_status op_loop(void * ctx, const potal_loop_ws * l) {
+        static_cast<emulator *>(ctx)->commands += 'L';
+        if (static_cast<emulator *>(ctx)->fail_issue) {
+            return POTAL_HW_BAD_COMMAND;
+        }
         return static_cast<emulator *>(ctx)->run(*l);
     }
     static potal_status op_fence(void * ctx) {
         auto * e = static_cast<emulator *>(ctx);
-        if (e->fail_fence) {
+        e->commands += 'F';
+        const int64_t index = (int64_t) e->fence_calls++;
+        if (e->fail_fence || index == e->fail_fence_at) {
             return POTAL_HW_BAD_COMMAND;
         }
         e->in_flight = false;
         e->fences++;
         return POTAL_OK;
     }
+    // Translations may only be dropped while no DMA is in flight (after a FENCE).
+    static potal_status op_tlb_flush(void * ctx) {
+        auto * e = static_cast<emulator *>(ctx);
+        e->commands += 'T';
+        if (e->fail_tlb) {
+            return POTAL_HW_BAD_COMMAND;
+        }
+        if (e->in_flight) {
+            return POTAL_ERR_BUSY;
+        }
+        e->tlb_flushes++;
+        return POTAL_OK;
+    }
 
-    potal_ws_ops ops() { return { op_write, op_release, op_gemm, op_loop, op_fence, this }; }
+    potal_ws_ops ops() { return { op_write, op_release, op_gemm, op_loop, op_fence, op_tlb_flush, this }; }
 };
 
 } // namespace potal_test

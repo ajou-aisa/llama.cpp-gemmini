@@ -139,9 +139,7 @@ stripe_run::stripe_run(const pipeline_config & cfg, const ggml_gemmini_args_t & 
     m_(args.I),
     n_(args.J),
     k_(args.K),
-    stripe_rows_(plan.tile_I * HW_DIM) {
-    init_merge_args(args, nullptr, n_, merge_);
-}
+    stripe_rows_(plan.tile_I * HW_DIM) {}
 
 stripe_run::~stripe_run() = default;
 
@@ -180,7 +178,6 @@ bool stripe_run::begin(std::string & why) {
         why = "out of memory for the private output";
         return false;
     }
-    merge_.f_out = out_.data();
     return true;
 }
 
@@ -247,65 +244,104 @@ void stripe_run::set_state(slot & s, slot_state state) {
     s.state = state;
 }
 
-stripe_event stripe_run::event_of(stripe_event_kind kind, const slot & s) const {
+void stripe_run::stamp_locked(stripe_event & ev) {
+    ev.sequence    = next_event_sequence_++;
+    ev.t_ns        = now_ns();
+    ev.outstanding = outstanding_;
+}
+
+stripe_event stripe_run::slot_event_locked(stripe_event_kind kind, const slot & s) {
     stripe_event ev{ kind };
     ev.run_bound       = true;
     ev.run_id          = s.run_id;
     ev.stripe_id       = s.stripe_id;
     ev.slot            = s.index;
+    ev.slot_generation = s.generation;
     ev.row_begin       = s.row_begin;
     ev.row_end         = s.row_end;
-    std::lock_guard<std::mutex> lock(mutex_);
-    ev.slot_generation = s.generation;
-    ev.outstanding     = outstanding_;
+    stamp_locked(ev);
     return ev;
 }
 
-void stripe_run::emit(stripe_event & ev) const {
-    ev.t_ns = now_ns();
+stripe_event stripe_run::event_of(stripe_event_kind kind, const slot & s) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return slot_event_locked(kind, s);
+}
+
+stripe_event stripe_run::advance(slot & s, slot_state state, stripe_event_kind kind) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    s.state = state;
+    return slot_event_locked(kind, s);
+}
+
+void stripe_run::emit(const stripe_event & ev) {
 #if LOG_DEBUG
-    char run[32] = "-", stripe[32] = "-", slot[32] = "-", extra[384] = "";
-    if (ev.run_bound) {
-        std::snprintf(run, sizeof(run), "%llu", (unsigned long long) ev.run_id);
+    {
+        // The record of the step stamped just before this one comes first. Its
+        // thread writes it right after releasing mutex_, so this waits for one
+        // record write, never for a later step of either thread.
+        std::unique_lock<std::mutex> lock(log_mutex_);
+        log_cv_.wait(lock, [&] { return logged_sequence_ + 1 == ev.sequence; });
     }
-    if (ev.stripe_id != no_stripe) {
-        std::snprintf(stripe, sizeof(stripe), "%zu", ev.stripe_id);
+    {
+        struct next_record {
+            stripe_run &   run;
+            const uint64_t sequence;
+            ~next_record() {
+                {
+                    std::lock_guard<std::mutex> lock(run.log_mutex_);
+                    run.logged_sequence_ = sequence;
+                }
+                run.log_cv_.notify_all();
+            }
+        } written{ *this, ev.sequence }; // also when the record fails
+
+        char run[32] = "-", stripe[32] = "-", slot[32] = "-", extra[384] = "";
+        if (ev.run_bound) {
+            std::snprintf(run, sizeof(run), "%llu", (unsigned long long) ev.run_id);
+        }
+        if (ev.stripe_id != no_stripe) {
+            std::snprintf(stripe, sizeof(stripe), "%zu", ev.stripe_id);
+        }
+        if (ev.slot != no_stripe) {
+            std::snprintf(slot, sizeof(slot), "%zu", ev.slot);
+        }
+        if (ev.gemm != nullptr) {
+            const potal_stripe_gemm_report & g = *ev.gemm;
+            std::snprintf(extra, sizeof(extra),
+                          " gemm_rows=%zu N=%zu loop_ws=%llu validated_api=%llu fences=%llu scale_writes=%llu "
+                          "scale_releases=%llu generation=%u tile_i=%u tile_j=%u tile_k=%u i0=%u j0=%u k0=%u "
+                          "k_compact=%zu k_execution=%zu runs=%zu status=POTAL_%s%s%s",
+                          ev.rows, ev.cols, (unsigned long long) g.loop_ws, (unsigned long long) g.validated_gemms,
+                          (unsigned long long) g.fences, (unsigned long long) g.scale_writes,
+                          (unsigned long long) g.scale_releases, g.last_generation, g.tile_i, g.tile_j, g.tile_k,
+                          g.i0, g.j0, g.k0, ev.k_compact, ev.k_execution, ev.runs, potal_status_name(g.status),
+                          g.stage ? " step=" : "", g.stage ? g.stage : "");
+        } else if (ev.kind == stripe_event_kind::residual_prepare_end) {
+            std::snprintf(extra, sizeof(extra), " active_lane_rows=%zu k_compact=%zu k_execution=%zu runs=%zu",
+                          ev.rows, ev.k_compact, ev.k_execution, ev.runs);
+        } else if (ev.kind == stripe_event_kind::merge_end) {
+            std::snprintf(extra, sizeof(extra), " corrections_nonzero=%zu", ev.nonzero);
+        } else if (ev.kind == stripe_event_kind::submit_accepted) {
+            std::snprintf(extra, sizeof(extra),
+                          " producer_slot=%zu quantization_start_ns=%llu quantization_end_ns=%llu "
+                          "folding_commit_ns=%llu",
+                          ev.producer_slot, (unsigned long long) ev.quantization_start_ns,
+                          (unsigned long long) ev.quantization_end_ns, (unsigned long long) ev.folding_commit_ns);
+        } else if (ev.detail != nullptr) {
+            std::snprintf(extra, sizeof(extra), " detail=%s", ev.detail);
+        }
+        log::debug(cfg_.layer.c_str(),
+                   "[POTAL_STRIPE] event=%s event_sequence=%llu run_id=%s stripe=%s slot=%s slot_generation=%llu "
+                   "rows=%zu..%zu outstanding=%zu capacity=%zu executor=POTAL/%s backend=%s t_ns=%llu%s %s",
+                   stripe_event_name(ev.kind), (unsigned long long) ev.sequence, run, stripe, slot,
+                   (unsigned long long) ev.slot_generation, ev.row_begin, ev.row_end, ev.outstanding,
+                   cfg_.job_capacity, options::residual_executor_name(options::MatmulInvocationMode::stripe_pipeline),
+                   cfg_.backend, (unsigned long long) ev.t_ns, extra, log::trace_fields().c_str());
     }
-    if (ev.slot != no_stripe) {
-        std::snprintf(slot, sizeof(slot), "%zu", ev.slot);
-    }
-    if (ev.gemm != nullptr) {
-        const potal_stripe_gemm_report & g = *ev.gemm;
-        std::snprintf(extra, sizeof(extra),
-                      " gemm_rows=%zu N=%zu loop_ws=%llu validated_api=%llu fences=%llu scale_writes=%llu "
-                      "scale_releases=%llu generation=%u tile_i=%u tile_j=%u tile_k=%u i0=%u j0=%u k0=%u "
-                      "k_compact=%zu k_execution=%zu runs=%zu status=POTAL_%s%s%s",
-                      ev.rows, ev.cols, (unsigned long long) g.loop_ws, (unsigned long long) g.validated_gemms,
-                      (unsigned long long) g.fences, (unsigned long long) g.scale_writes,
-                      (unsigned long long) g.scale_releases, g.last_generation, g.tile_i, g.tile_j, g.tile_k, g.i0,
-                      g.j0, g.k0, ev.k_compact, ev.k_execution, ev.runs, potal_status_name(g.status),
-                      g.stage ? " step=" : "", g.stage ? g.stage : "");
-    } else if (ev.kind == stripe_event_kind::residual_prepare_end) {
-        std::snprintf(extra, sizeof(extra), " active_lane_rows=%zu k_compact=%zu k_execution=%zu runs=%zu", ev.rows,
-                      ev.k_compact, ev.k_execution, ev.runs);
-    } else if (ev.kind == stripe_event_kind::merge_end) {
-        std::snprintf(extra, sizeof(extra), " corrections_nonzero=%zu", ev.nonzero);
-    } else if (ev.kind == stripe_event_kind::submit_accepted) {
-        std::snprintf(extra, sizeof(extra),
-                      " producer_slot=%zu quantization_start_ns=%llu quantization_end_ns=%llu folding_commit_ns=%llu",
-                      ev.producer_slot, (unsigned long long) ev.quantization_start_ns,
-                      (unsigned long long) ev.quantization_end_ns, (unsigned long long) ev.folding_commit_ns);
-    } else if (ev.detail != nullptr) {
-        std::snprintf(extra, sizeof(extra), " detail=%s", ev.detail);
-    }
-    log::debug(cfg_.layer.c_str(),
-               "[POTAL_STRIPE] event=%s run_id=%s stripe=%s slot=%s slot_generation=%llu rows=%zu..%zu "
-               "outstanding=%zu capacity=%zu executor=POTAL/%s backend=%s t_ns=%llu%s %s",
-               stripe_event_name(ev.kind), run, stripe, slot, (unsigned long long) ev.slot_generation, ev.row_begin,
-               ev.row_end, ev.outstanding, cfg_.job_capacity,
-               options::residual_executor_name(options::MatmulInvocationMode::stripe_pipeline), cfg_.backend,
-               (unsigned long long) ev.t_ns, extra, log::trace_fields().c_str());
 #endif
+    // After the record and outside every lock of the run: an observer may
+    // query or abort the run, and never holds up another step's record.
     if (cfg_.observer) {
         cfg_.observer(ev);
     }
@@ -315,9 +351,9 @@ void stripe_run::emit_run(stripe_event_kind kind, const char * detail) {
     stripe_event ev{ kind };
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ev.run_bound   = run_bound_;
-        ev.run_id      = run_id_;
-        ev.outstanding = outstanding_;
+        ev.run_bound = run_bound_;
+        ev.run_id    = run_id_;
+        stamp_locked(ev);
     }
     ev.row_end = m_;
     ev.detail  = detail;
@@ -334,6 +370,10 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
             ev.stripe_id = e.stripe_id;
             ev.row_begin = e.row_begin;
             ev.row_end   = e.row_end;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stamp_locked(ev);
+            }
             emit(ev);
         }
         std::string why = check_event(e, rows);
@@ -357,16 +397,16 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
                 waited = true;
                 counts_.producer_capacity_waits++;
                 stripe_event ev{ stripe_event_kind::queue_wait };
-                ev.run_bound   = true;
-                ev.run_id      = e.run_id;
-                ev.stripe_id   = e.stripe_id;
-                ev.row_begin   = e.row_begin;
-                ev.row_end     = e.row_end;
-                ev.outstanding = outstanding_;
+                ev.run_bound = true;
+                ev.run_id    = e.run_id;
+                ev.stripe_id = e.stripe_id;
+                ev.row_begin = e.row_begin;
+                ev.row_end   = e.row_end;
+                stamp_locked(ev);
                 lock.unlock();
                 emit(ev);
                 lock.lock();
-                continue;
+                continue; // the state may have changed while the lock was released
             }
             cv_.wait(lock);
         }
@@ -408,7 +448,6 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
         s->folding_commit_ns     = e.folding_commit_ns;
         const bool copied        = copy_activation_rows(producer_args, e.row_begin, rows, s->a, lda_);
 
-        s->accepted_ns = now_ns();
         lock.lock();
         if (!copied || failed_) {
             s->state = slot_state::free;
@@ -419,17 +458,21 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
             }
             return false;
         }
-        s->state = slot_state::ready;
+        // READY, its record stamped before the consumer can take it: the
+        // stripe's main_begin always follows its submit_accepted. The queue
+        // push (it may allocate) comes first, so nothing that can throw lies
+        // between the stamp and the record.
         ready_.push_back(s);
         counts_.stripes_accepted++;
-        cv_.notify_all();
-        lock.unlock();
-
-        stripe_event ev          = event_of(stripe_event_kind::submit_accepted, *s);
+        s->state                 = slot_state::ready;
+        stripe_event ev          = slot_event_locked(stripe_event_kind::submit_accepted, *s);
         ev.producer_slot         = s->producer_slot;
         ev.quantization_start_ns = s->quantization_start_ns;
         ev.quantization_end_ns   = s->quantization_end_ns;
         ev.folding_commit_ns     = s->folding_commit_ns;
+        s->accepted_ns           = ev.t_ns;
+        cv_.notify_all();
+        lock.unlock();
         emit(ev);
         return true;
     } catch (const std::exception & ex) {
@@ -460,7 +503,8 @@ void stripe_run::abort(const char * stage, const std::string & detail) {
 consume_outcome stripe_run::consume(const planned_runner & exec) {
     consume_outcome out;
     for (;;) {
-        slot * s = nullptr;
+        slot *       s = nullptr;
+        stripe_event begin{ stripe_event_kind::main_begin };
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return failed_ || !ready_.empty() || (closing_ && outstanding_ == 0); });
@@ -470,10 +514,11 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
             s = ready_.front();
             ready_.pop_front();
             s->state = slot_state::main_running;
+            begin    = slot_event_locked(stripe_event_kind::main_begin, *s);
         }
         stripe_result r;
         try {
-            r = execute(*s, exec);
+            r = execute(*s, begin, exec);
         } catch (...) {
             // Only a failure while reporting a failure gets here (no memory for
             // its text): the accelerator state is not known for sure, fail-stop.
@@ -492,10 +537,11 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
     return out;
 }
 
-stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & exec) {
+stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const planned_runner & exec) {
     ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
     stripe_result                       res;
     bool                                gemm_fatal = false; // a planned GEMM left the accelerator state unknown
+    bool                                released   = false; // capacity returned: slot and counts are the run's
     pipeline_counts                     n; // this stripe's counts, merged into the run's under the lock
     const size_t                        rows = s.row_end - s.row_begin;
     stripe_completion                   done; // this stripe's record, published with its capacity
@@ -543,10 +589,14 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
         n.issue_s += g.issue_s;
         n.fence_s += g.fence_s;
     };
+    // After the release (a failing capacity_release record) the slot may be
+    // the producer's again: use this stripe's own id, merge nothing twice.
     const auto failed = [&](const char * stage, potal_status status, bool fatal, std::string detail) {
         std::lock_guard<std::mutex> lock(mutex_);
-        merge_counts();
-        fail_locked(stage, status, fatal, "stripe " + std::to_string(s.stripe_id) + ": " + detail);
+        if (!released) {
+            merge_counts();
+        }
+        fail_locked(stage, status, fatal, "stripe " + std::to_string(done.stripe_id) + ": " + detail);
         res.fatal  = fatal;
         res.status = status;
         res.stage  = stage;
@@ -558,13 +608,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
     };
 
     try {
-        // 1. Main GEMM with the frozen Main plan.
-        {
-            stripe_event ev = event_of(stripe_event_kind::main_begin, s);
-            emit(ev);
-            done.main_begin_ns   = ev.t_ns;
-            done.slot_generation = ev.slot_generation;
-        }
+        // 1. Main GEMM with the frozen Main plan (main_begin was stamped when
+        //    the stripe left the queue).
+        emit(main_begin);
+        done.main_begin_ns   = main_begin.t_ns;
+        done.slot_generation = main_begin.slot_generation;
         potal_stripe_gemm_desc d = {};
         d.run_id                 = s.run_id;
         d.stripe_id              = s.stripe_id;
@@ -589,7 +637,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
         gemm_fatal                = main.fatal;
         account(main, true);
         {
-            stripe_event ev = event_of(stripe_event_kind::main_end, s);
+            stripe_event ev = main.ok ? advance(s, slot_state::main_done, stripe_event_kind::main_end)
+                                      : event_of(stripe_event_kind::main_end, s);
             ev.gemm         = &main.report;
             ev.rows         = rows;
             ev.cols         = n_;
@@ -602,17 +651,12 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
         if (!main.ok) {
             return failed("main", main.status, main.fatal, "Main GEMM " + gemm_detail(main));
         }
-        set_state(s, slot_state::main_done);
 
         // 2. Residual GEMM of the sealed packet, on the same accelerator.
         residual::request               req;
         rmd::BlockScaledInt64Correction correction;
         if (s.packet) {
-            set_state(s, slot_state::residual_prepare);
-            {
-                stripe_event ev = event_of(stripe_event_kind::residual_prepare_begin, s);
-                emit(ev);
-            }
+            emit(advance(s, slot_state::residual_prepare, stripe_event_kind::residual_prepare_begin));
             const rmd::RmdStatus built = residual::build_request(*s.packet, w_, req);
             if (built != rmd::RmdStatus::success) {
                 return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(built));
@@ -626,11 +670,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
                 ev.runs         = req.runs.size();
                 emit(ev);
             }
-            set_state(s, slot_state::residual_running);
-            {
-                stripe_event ev = event_of(stripe_event_kind::residual_begin, s);
-                emit(ev);
-            }
+            emit(advance(s, slot_state::residual_running, stripe_event_kind::residual_begin));
             potal_stripe_gemm_desc r = d;
             r.work_kind              = POTAL_STRIPE_WORK_RESIDUAL;
             r.m                      = (uint32_t) req.m;
@@ -659,7 +699,9 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
             done.k_compact     = req.k_compact;
             done.k_execution   = req.k_execution;
             {
-                stripe_event ev = event_of(stripe_event_kind::residual_end, s);
+                stripe_event ev = residual_gemm.ok
+                                      ? advance(s, slot_state::residual_done, stripe_event_kind::residual_end)
+                                      : event_of(stripe_event_kind::residual_end, s);
                 ev.gemm         = &residual_gemm.report;
                 ev.rows         = req.m;
                 ev.cols         = n_;
@@ -676,7 +718,6 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
                 return failed("residual", residual_gemm.status, residual_gemm.fatal,
                               "Residual GEMM " + gemm_detail(residual_gemm));
             }
-            set_state(s, slot_state::residual_done);
         }
 
         // 3. CPU: Main reconstruction into the private output, then the
@@ -687,10 +728,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
             reconstruct_row(s.c + r * ldc_, n_, s.activation_scale, w_.scale, out + r * n_, 1);
         }
         if (s.packet) {
-            {
-                stripe_event ev = event_of(stripe_event_kind::radix_reconstruct_begin, s);
-                emit(ev);
-            }
+            emit(event_of(stripe_event_kind::radix_reconstruct_begin, s));
             const rmd::RmdStatus composed = residual::reconstruct(*s.packet, req, correction);
             if (composed != rmd::RmdStatus::success) {
                 return failed("radix_reconstruct", POTAL_OK, false, rmd::rmd_status_message(composed));
@@ -702,12 +740,13 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
                 ev.rows         = rows;
                 ev.cols         = n_;
                 emit(ev);
-                ev = event_of(stripe_event_kind::merge_begin, s);
-                emit(ev);
             }
+            emit(event_of(stripe_event_kind::merge_begin, s));
+            // The prepared weight (validated once, immutable) gives the channel
+            // scales: no HP1 metadata pass per stripe.
             size_t               nonzero = 0;
-            const rmd::RmdStatus merged =
-                residual::merge(merge_, s.row_begin, s.row_end, s.run_id, s.meta, std::move(correction), &nonzero);
+            const rmd::RmdStatus merged  = residual::merge_prepared_hp1(w_, s.row_begin, s.row_end, s.meta, correction,
+                                                                       out_.data(), m_, n_, 1, &nonzero);
             if (merged != rmd::RmdStatus::success) {
                 return failed("merge", POTAL_OK, false, rmd::rmd_status_message(merged));
             }
@@ -726,9 +765,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
                 emit(ev);
             }
         }
-        set_state(s, slot_state::semantic_done);
         {
-            stripe_event ev = event_of(stripe_event_kind::semantic_complete, s);
+            stripe_event ev = advance(s, slot_state::semantic_done, stripe_event_kind::semantic_complete);
             ev.out          = out;
             ev.out_stride   = n_;
             ev.rows         = rows;
@@ -738,28 +776,24 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const planned_runner & e
         }
 
         // 4. Capacity back only now: after Main, Residual and the checked merge.
-        stripe_event released{ stripe_event_kind::capacity_release };
+        //    Stamped with the release, before a waiting producer can reserve
+        //    the slot: capacity_release(s) precedes submit_accepted(s + capacity).
+        stripe_event release{ stripe_event_kind::capacity_release };
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            completions_.push_back(done); // may allocate: before anything changes
             merge_counts();
             counts_.stripes_semantic_completed++;
-            completions_.push_back(done);
             s.state = slot_state::free;
             s.packet.reset();
             s.generation++;
             outstanding_--;
             completed_++;
-            released.run_bound       = true;
-            released.run_id          = s.run_id;
-            released.stripe_id       = s.stripe_id;
-            released.slot            = s.index;
-            released.slot_generation = s.generation;
-            released.row_begin       = s.row_begin;
-            released.row_end         = s.row_end;
-            released.outstanding     = outstanding_;
+            released = true;
+            release  = slot_event_locked(stripe_event_kind::capacity_release, s);
             cv_.notify_all();
         }
-        emit(released);
+        emit(release);
         res.ok = true;
         return res;
     } catch (const std::exception & ex) {

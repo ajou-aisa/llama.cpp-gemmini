@@ -45,6 +45,22 @@
 // the buffers freeable; a fatal one (hardware state unknown) makes the caller
 // abandon() them, and the issuer disables itself. An abort cannot interrupt a
 // GEMM that is already running: the hardware FENCE blocks until it drains.
+//
+// Records: each step is one stripe_event, stamped under the run's lock in the
+// same critical section as the state change it reports (READY + queue push ->
+// submit_accepted, queue pop -> main_begin, slot FREE -> capacity_release),
+// with a per-run sequence 1, 2, ... and the CPU time of the step: sequence is
+// the logical order of the run (submit_accepted(s) < main_begin(s),
+// capacity_release(s) < submit_accepted(s + job_capacity)). The debug JSONL
+// records are written in sequence order: a writer waits only for the record
+// of the step stamped before its own, which its thread writes next without
+// blocking, so the wait never depends on future steps and neither side waits
+// for the other's work. Observers run after the step's record, outside every
+// lock of the run, on the step's thread: per thread in sequence order, across
+// the producer and the consumer ordered by sequence only. A record or observer
+// that fails fails the run like any other step; after capacity_release the
+// failure no longer touches the slot (it may be the producer's again) or
+// counts the stripe's work a second time.
 
 #include "dense.hpp"
 #include "execution.hpp"
@@ -114,6 +130,7 @@ constexpr size_t no_stripe = SIZE_MAX;
 
 struct stripe_event {
     stripe_event_kind kind;
+    uint64_t          sequence        = 0;     // logical order of the step in its run: 1, 2, ... (no gaps)
     bool              run_bound       = false; // run_id known (the first stripe was accepted)
     uint64_t          run_id          = 0;     // ExSIA run id (0 is valid)
     size_t            stripe_id       = no_stripe;
@@ -122,7 +139,7 @@ struct stripe_event {
     size_t            row_begin       = 0;
     size_t            row_end         = 0;
     size_t            outstanding     = 0; // semantic stripes held right after this step
-    uint64_t          t_ns            = 0; // steady clock: a CPU observation, not a device cycle
+    uint64_t          t_ns            = 0; // steady clock at the step: a CPU observation, not a device cycle
 
     // Views valid during the observer call only.
     const potal_stripe_gemm_report * gemm = nullptr;     // main_end, residual_end
@@ -152,7 +169,10 @@ struct pipeline_config {
     bool            residual     = false;      // compensation ON: ws_packet packets may arrive
     std::string     layer;                     // log layer of the node
     const char *    backend      = "HARDWARE"; // records' owner label: HARDWARE (issuer), EMULATED (host tests)
-    stripe_observer observer;                  // optional; called on the thread of each step
+    // Optional; called on the thread of each step after its record, holding no
+    // lock of the run (it may query or abort the run). Order across threads:
+    // stripe_event::sequence.
+    stripe_observer observer;
 };
 
 // One semantically completed stripe, in completion order (poll_completed).
@@ -229,7 +249,7 @@ class stripe_run {
     stripe_run(const stripe_run &)             = delete;
     stripe_run & operator=(const stripe_run &) = delete;
 
-    // Slots (DMA buffers), private output, merge view. false: why says it.
+    // Slots (DMA buffers), private output. false: why says it.
     bool begin(std::string & why);
 
     // ---- producer -------------------------------------------------------------
@@ -260,14 +280,21 @@ class stripe_run {
     struct slot;
     struct stripe_result;
 
-    stripe_result execute(slot & s, const planned_runner & exec);
+    stripe_result execute(slot & s, const stripe_event & main_begin, const planned_runner & exec);
     std::string   check_event(const exsia::StripeReadyEvent & e, size_t rows) const;
     std::string   check_order_locked(const exsia::StripeReadyEvent & e, size_t rows) const;
     void          fail_locked(const char * stage, potal_status status, bool fatal, std::string detail);
     void          fail(const char * stage, potal_status status, bool fatal, std::string detail);
     void          set_state(slot & s, slot_state state);
-    void          emit(stripe_event & ev) const;
-    stripe_event  event_of(stripe_event_kind kind, const slot & s) const;
+
+    // Events: stamped under mutex_ (sequence, t_ns, outstanding), emitted
+    // after it is released. Every stamped event must be emitted exactly once,
+    // with nothing that blocks or throws in between (the JSONL order waits for it).
+    void         stamp_locked(stripe_event & ev);
+    stripe_event slot_event_locked(stripe_event_kind kind, const slot & s);
+    stripe_event event_of(stripe_event_kind kind, const slot & s);
+    stripe_event advance(slot & s, slot_state state, stripe_event_kind kind); // state change + its event
+    void         emit(const stripe_event & ev);
 
     const pipeline_config cfg_;
     const hp1_weight &    w_;
@@ -277,8 +304,7 @@ class stripe_run {
     size_t                expected_ = 0;
     size_t                lda_ = 0, ldc_ = 0;
 
-    ggml_gemmini_args_t merge_; // init_merge_args view on out_
-    std::vector<float>  out_;   // private output, M x N
+    std::vector<float> out_; // private output, M x N
 
     mutable std::mutex      mutex_;
     std::condition_variable cv_;
@@ -298,6 +324,12 @@ class stripe_run {
     std::string                        first_detail_;
     pipeline_counts                    counts_;
     std::vector<stripe_completion>     completions_; // not yet polled
+    uint64_t                           next_event_sequence_ = 1;
+
+    // JSONL records in sequence order (emit): the last sequence written.
+    std::mutex              log_mutex_;
+    std::condition_variable log_cv_;
+    uint64_t                logged_sequence_ = 0;
 };
 
 // The pipeline of one MUL_MAT, from quantization to commit:

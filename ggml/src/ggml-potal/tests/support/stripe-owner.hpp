@@ -3,8 +3,9 @@
 // Accelerator owners for host tests of the stripe pipeline: the production
 // consumer (stripe_run::consume) runs on a std::thread of the test instead of
 // the hart-0 issuer, and its planned GEMMs run on an emulator session through
-// the production potal_tiled_matmul_stripe(). Nothing here pretends to be a
-// RISC-V hart: no affinity, no TLB (tlb_flushes stays 0, backend=EMULATED).
+// the issuer's own step after its affinity check, run_planned_stripe_gemm()
+// (preflight, TLB FLUSH + FENCE, the GEMM; the emulator records every command).
+// Nothing here pretends to be a RISC-V hart: no affinity check, backend=EMULATED.
 
 #include "matmul/execution.hpp"
 #include "matmul/stripe-api.hpp"
@@ -27,12 +28,7 @@ struct emu_session {
     emu_session & operator=(const emu_session &) = delete;
 
     ggml::potal::planned_result run(const potal_stripe_gemm_desc & d) {
-        ggml::potal::planned_result r;
-        r.status = potal_tiled_matmul_stripe(&session, &d, &r.report);
-        r.stage  = r.report.stage;
-        r.fatal  = r.report.fatal != 0;
-        r.ok     = r.status == POTAL_OK;
-        return r;
+        return ggml::potal::run_planned_stripe_gemm(session, d);
     }
 };
 
