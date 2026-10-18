@@ -10,6 +10,7 @@
 
 #include "ggml.h"
 #include "ggml-potal.h"
+#include "matmul/weight_cache.hpp"
 
 #include <cstdint>
 #include <string>
@@ -20,6 +21,7 @@ namespace ggml::potal {
 struct backend_state {
     ggml_backend_potal_stats stats = {};
     std::string              model_arch; // device init params, used for layer names
+    weight_cache             weights;    // prepared Q8_HP1 weights, freed with the backend
 };
 
 // supports_op contract for any op.

@@ -8,6 +8,8 @@
 #include "potal.h"
 #include "tiling.hpp"
 
+#include <gemmini/trace-context.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -53,6 +55,9 @@ struct tiled_job {
     uint32_t         block_k;
     int32_t *        c;
     size_t           ldc;
+    // Caller's trace context (layer/node/request), bound on the issuer thread
+    // while the job runs so its logs keep the operation's identity.
+    gemmini_trace_context trace = gemmini_trace_capture();
 };
 
 struct tiled_report {
@@ -79,6 +84,10 @@ gemm_report run_gemm(const gemm_job & job);
 // Same issuer; off RISC-V the tiled path stops at its first hardware command
 // with POTAL_ERR_NO_HARDWARE.
 tiled_report run_tiled(const tiled_job & job);
+
+// The job on a caller-owned session, on the calling thread: what the issuer
+// runs after its affinity check and TLB flush. Tests bind an emulator session.
+tiled_report run_tiled_in_session(const tiled_job & job, potal_ws_session & session);
 
 issuer_info get_issuer_info();
 

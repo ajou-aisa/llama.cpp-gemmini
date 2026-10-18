@@ -6,15 +6,21 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-potal-buffer.hpp"
+#include "log.hpp"
 #include "matmul/execution.hpp"
+#include "matmul/options.hpp"
 #include "matmul/pack.hpp"
 #include "ops.hpp"
 #include "potal.h"
 
 #include <gemmini/log.hpp>
+#include <gemmini/semantic.h>
+#include <gemmini/trace-context.hpp>
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
 
 namespace {
 
@@ -42,20 +48,48 @@ const char * potal_get_name(ggml_backend_t backend) {
 }
 
 void potal_free(ggml_backend_t backend) {
-    // End-of-run evidence for tools (llama-cli) that do not read the stats API.
-    const ggml_backend_potal_stats & st = static_cast<const potal_context *>(backend->context)->stats;
-    GGML_LOG_INFO("[POTAL] summary i8_completed=%llu i8_failed=%llu hp1_nodes=%llu hp1_completed=%llu "
-                  "hp1_failed=%llu invocations=%llu validated_api=%llu fences=%llu scale_writes=%llu "
-                  "scale_releases=%llu zero_carriers=%llu cpu_fallback_mul_mat_answers=%llu "
-                  "act_quant_s=%.3f weight_pack_s=%.3f scale_s=%.3f issue_s=%.3f fence_s=%.3f reconstruct_s=%.3f\n",
-                  (unsigned long long) st.gemm_completed, (unsigned long long) st.gemm_failed,
-                  (unsigned long long) st.hp1_nodes, (unsigned long long) st.hp1_completed,
-                  (unsigned long long) st.hp1_failed, (unsigned long long) st.tiled_invocations,
-                  (unsigned long long) st.tiled_validated, (unsigned long long) st.tiled_fences,
-                  (unsigned long long) st.scale_writes, (unsigned long long) st.scale_releases,
-                  (unsigned long long) st.zero_carriers,
-                  (unsigned long long) ggml::potal::supports_mul_mat_rejected(), st.act_quant_s, st.weight_pack_s,
-                  st.scale_s, st.issue_s, st.fence_s, st.reconstruct_s);
+    // End-of-run evidence for tools (llama-cli) that do not read the stats API,
+    // written before the stats and the weight cache are destroyed.
+    const ggml_backend_potal_stats & st    = static_cast<const potal_context *>(backend->context)->stats;
+    const auto                       cache = static_cast<const potal_context *>(backend->context)->weights.snapshot();
+    ggml::potal::log::debug(
+        "potal.summary",
+        "[POTAL] summary i8_completed=%llu i8_failed=%llu hp1_nodes=%llu hp1_completed=%llu "
+        "hp1_failed=%llu prefill_shaped=%llu decode_shaped=%llu route_tensor_block=%llu "
+        "route_token_block=%llu route_stripe_block=%llu route_exsia_block=%llu route_block_block=%llu "
+        "tiled_jobs=%llu loop_ws_issued=%llu validated_api=%llu fences=%llu scale_writes=%llu "
+        "scale_releases=%llu tlb_flushes=%llu zero_carriers=%llu shift_carriers=%llu "
+        "compensation=%s residual_payloads=%llu compensation_executed=%llu residual_events=%llu "
+        "supports_op_mul_mat_rejected_answers=%llu act_quant_s=%.3f weight_pack_s=%.3f scale_s=%.3f "
+        "issue_s=%.3f fence_s=%.3f route_wall_s=%.3f compensation_s=%.3f weight_cache_hits=%llu "
+        "weight_cache_misses=%llu weight_cache_bypasses=%llu weight_cache_uncached=%llu "
+        "weight_cache_entries=%llu weight_cache_bytes=%llu weight_validations=%llu weight_packs=%llu "
+        "weight_pack_bytes=%llu weight_alloc_s=%.3f weight_lookup_s=%.6f",
+        (unsigned long long) st.gemm_completed, (unsigned long long) st.gemm_failed,
+        (unsigned long long) st.hp1_nodes, (unsigned long long) st.hp1_completed,
+        (unsigned long long) st.hp1_failed, (unsigned long long) st.prefill_shaped_nodes,
+        (unsigned long long) st.decode_shaped_nodes,
+        (unsigned long long) st.route_completed[GGML_POTAL_ROUTE_TENSOR_BLOCK],
+        (unsigned long long) st.route_completed[GGML_POTAL_ROUTE_TOKEN_BLOCK],
+        (unsigned long long) st.route_completed[GGML_POTAL_ROUTE_STRIPE_BLOCK],
+        (unsigned long long) st.route_completed[GGML_POTAL_ROUTE_EXSIA_BLOCK],
+        (unsigned long long) st.route_completed[GGML_POTAL_ROUTE_BLOCK_BLOCK],
+        (unsigned long long) st.tiled_jobs, (unsigned long long) st.tiled_invocations,
+        (unsigned long long) st.tiled_validated, (unsigned long long) st.tiled_fences,
+        (unsigned long long) st.scale_writes, (unsigned long long) st.scale_releases,
+        (unsigned long long) st.tlb_flushes, (unsigned long long) st.zero_carriers,
+        (unsigned long long) st.shift_carriers, ggml::potal::options::compensation_name,
+        (unsigned long long) st.residual_payloads, (unsigned long long) st.compensation_executed,
+        (unsigned long long) st.residual_events,
+        (unsigned long long) ggml::potal::supports_mul_mat_rejected(), st.act_quant_s, st.weight_pack_s,
+        st.scale_s, st.issue_s, st.fence_s, st.route_wall_s, st.compensation_s,
+        (unsigned long long) st.weight_cache_hits, (unsigned long long) st.weight_cache_misses,
+        (unsigned long long) st.weight_cache_bypasses, (unsigned long long) st.weight_cache_uncached,
+        (unsigned long long) cache.entries, (unsigned long long) cache.bytes,
+        (unsigned long long) st.weight_validations, (unsigned long long) st.weight_packs,
+        (unsigned long long) st.weight_pack_bytes, st.weight_alloc_s, st.weight_lookup_s);
+    // Debug records are flushed per record; drain the buffered cycle log too.
+    (void) ggml::gemmini::log::cycle.flush();
     delete static_cast<potal_context *>(backend->context);
     delete backend;
 }
@@ -71,17 +105,39 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
         if (reason != GGML_POTAL_REJECT_NONE) {
             ctx.stats.rejected_nodes++;
             ggml::potal::poison_dst(node);
-            GGML_LOG_ERROR("[POTAL_BACKEND] node=%s op=%s rejected at compute (%s); nothing issued\n", node->name,
-                           ggml_op_desc(node), ggml_potal_reject_name(reason));
+            ggml::potal::log::failure("potal.backend",
+                                      "[POTAL_BACKEND] node=%s op=%s rejected at compute (%s); nothing issued",
+                                      node->name, ggml_op_desc(node), ggml_potal_reject_name(reason));
             return GGML_STATUS_FAILED;
         }
     }
 
+    // Same per-operator trace context as the Gemmini backend: the issuer binds
+    // it while it runs this node's jobs.
+    const gemmini_trace_context graph_trace = gemmini_trace_capture();
+    const uint64_t graph_id = gemmini_trace_reserve_ids(static_cast<uint64_t>(cgraph->n_nodes) + 1);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
             continue; // view ops: metadata only, the data is already in place
         }
+#if LOG_CYCLE || CYCLE_SIM
+        // The node's semantic identity (phase, graph occurrence, ordinal) for the
+        // records below, bound as the Gemmini and CPU backends do; one issuing
+        // worker. The C entry turns a node outside the captured graph into a
+        // failed run (the session records why) instead of an exception.
+        const std::unique_ptr<void, void (*)(void *)> semantic_scope(gemmini_semantic_enter(node, 1),
+                                                                     gemmini_semantic_exit);
+        if (!semantic_scope) {
+            ggml::potal::log::failure("potal.backend",
+                                      "[POTAL_BACKEND] node=%s semantic context unavailable; nothing issued",
+                                      node->name);
+            return GGML_STATUS_FAILED;
+        }
+#endif
+        ggml::gemmini::trace::ScopedContext operator_context(
+            gemmini_trace_operator(graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
+                                   static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
         const ggml_status status = ggml::potal::compute_mul_mat(ctx, node, i); // passed the loop above
         if (status != GGML_STATUS_SUCCESS) {
             return status;
@@ -115,12 +171,14 @@ const char * potal_device_get_name(ggml_backend_dev_t dev) {
 
 const char * potal_device_get_description(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    static char description[192];
+    static char description[256];
     static const int written = std::snprintf(
         description, sizeof(description),
         "PoTal A8W8 WS Sat32 DIM%u RoCC custom-3 on hart 0: MUL_MAT I8 x I8 -> F32 (x1 carriers, M=N=16, "
-        "K=16|32); F32 x Q8_HP1 -> F32 (TENSOR act quant, HP1 SCU carriers, tiled, no compensation)",
-        (unsigned) potal_hw_dim());
+        "K=16|32); F32 x Q8_HP1 -> F32 (%s act quant, HP1 SCU carriers, potal_tiled_matmul_auto, "
+        "compensation %s)",
+        (unsigned) potal_hw_dim(), ggml::potal::options::activation_quant_name(),
+        ggml::potal::options::compensation_name);
     GGML_UNUSED(written);
     return description;
 }
@@ -144,7 +202,7 @@ void potal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * pro
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
     };
 }
@@ -158,10 +216,19 @@ ggml_backend_t potal_device_init_backend(ggml_backend_dev_t dev, const char * pa
 }
 
 // Tensors stay in ordinary host memory; the backend packs them into its own
-// DMA staging buffers, so the CPU buffer type is the right default.
+// DMA staging buffers. The POTAL buffer type is that host memory under its own
+// identity: llama.cpp lists an ACCEL device as a weight buffer candidate only
+// when its default buffer type is not the CPU one (make_cpu_buft_list).
 ggml_backend_buffer_type_t potal_device_get_buffer_type(ggml_backend_dev_t dev) {
-    GGML_UNUSED(dev);
-    return ggml_backend_cpu_buffer_type();
+    return ggml::potal::potal_buffer_type(dev);
+}
+
+// The model loader's mmap path: the buffer aliases the mapping, which the
+// loader keeps alive for the life of the model.
+ggml_backend_buffer_t potal_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size,
+                                                        size_t max_tensor_size) {
+    GGML_UNUSED(max_tensor_size);
+    return ggml::potal::potal_buffer_from_host_ptr(dev, ptr, size);
 }
 
 bool potal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -173,12 +240,15 @@ bool potal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         g_supports_rejected[reason].fetch_add(1, std::memory_order_relaxed);
     }
     if (op->op == GGML_OP_MUL_MAT) {
-        ggml::potal::note_supports_mul_mat(op, reason);
-        GGML_LOG_DEBUG("[POTAL_BACKEND] supports_op op=MUL_MAT name=%s result=%d reason=%s src0_type=%s "
-                       "src1_type=%s ne0=%lld ne1=%lld K=%lld\n",
-                       op->name, reason == GGML_POTAL_REJECT_NONE, ggml_potal_reject_name(reason),
-                       type_name_of(op->src[0]), type_name_of(op->src[1]), (long long) op->ne[0],
-                       (long long) op->ne[1], op->src[0] ? (long long) op->src[0]->ne[0] : -1LL);
+        ggml::potal::note_supports_mul_mat(op, reason); // records rejections
+        if (reason == GGML_POTAL_REJECT_NONE) {
+            ggml::potal::log::debug("potal.supports_op",
+                                    "[POTAL_BACKEND] supports_op op=MUL_MAT name=%s result=1 reason=none src0_type=%s "
+                                    "src1_type=%s ne0=%lld ne1=%lld K=%lld",
+                                    op->name, type_name_of(op->src[0]), type_name_of(op->src[1]),
+                                    (long long) op->ne[0], (long long) op->ne[1],
+                                    op->src[0] ? (long long) op->src[0]->ne[0] : -1LL);
+        }
     }
     return reason == GGML_POTAL_REJECT_NONE;
 }
@@ -197,7 +267,7 @@ const ggml_backend_device_i potal_device_i = {
     /* .init_backend         = */ potal_device_init_backend,
     /* .get_buffer_type      = */ potal_device_get_buffer_type,
     /* .get_host_buffer_type = */ nullptr,
-    /* .buffer_from_host_ptr = */ nullptr,
+    /* .buffer_from_host_ptr = */ potal_device_buffer_from_host_ptr,
     /* .supports_op          = */ potal_device_supports_op,
     /* .supports_buft        = */ potal_device_supports_buft,
     /* .offload_op           = */ nullptr,
@@ -238,18 +308,17 @@ const ggml_backend_reg_i potal_reg_i = {
 } // namespace
 
 ggml_backend_t ggml_backend_potal_init(void) {
-    GGML_LOG_INFO("[POTAL_BACKEND] device_init dim=%u precision=A8W8 params_sha256=%s\n", (unsigned) potal_hw_dim(),
-                  potal_hw_params_sha256());
-    // Same default outputs as the Gemmini backend (GEMMINI_LOG_DIR), unless a tool set them.
-    static const bool outputs = [] {
-        const auto result = ggml::gemmini::log::setup_default_outputs();
-        if (!result.cycle || !result.debug) {
-            GGML_LOG_WARN("[POTAL_BACKEND] default log outputs: cycle=%d debug=%d\n", result.cycle ? 1 : 0,
-                          result.debug ? 1 : 0);
-        }
+    // Registration runs while a tool still parses its arguments, before it
+    // routes the logs (--gemmini-debug-log): its record is written here, on the
+    // first backend instance, so it lands in the same debug JSONL as the rest.
+    static const bool registered = [] {
+        ggml::potal::log::debug("potal.backend", "[POTAL_BACKEND] registered name=POTAL dim=%u params_sha256=%s",
+                                (unsigned) potal_hw_dim(), potal_hw_params_sha256());
         return true;
     }();
-    GGML_UNUSED(outputs);
+    GGML_UNUSED(registered);
+    ggml::potal::log::debug("potal.backend", "[POTAL_BACKEND] device_init dim=%u precision=A8W8 params_sha256=%s",
+                            (unsigned) potal_hw_dim(), potal_hw_params_sha256());
     return new ggml_backend{
         /* .guid      = */ potal_guid(),
         /* .interface = */ potal_backend_i,
@@ -268,12 +337,6 @@ ggml_backend_reg_t ggml_backend_potal_reg(void) {
         /* .iface       = */ potal_reg_i,
         /* .context     = */ nullptr,
     };
-    static const bool logged = [] {
-        GGML_LOG_INFO("[POTAL_BACKEND] registered name=POTAL dim=%u params_sha256=%s\n", (unsigned) potal_hw_dim(),
-                      potal_hw_params_sha256());
-        return true;
-    }();
-    GGML_UNUSED(logged);
     return &reg;
 }
 
@@ -305,5 +368,15 @@ bool ggml_backend_potal_get_stats(ggml_backend_t backend, ggml_backend_potal_sta
     stats->issuer_cpu                     = issuer.cpu;
     stats->issuer_tid                     = issuer.tid;
     stats->supports_mul_mat_rejected      = ggml::potal::supports_mul_mat_rejected();
+    const auto cache                      = static_cast<const potal_context *>(backend->context)->weights.snapshot();
+    stats->weight_cache_entries           = cache.entries;
+    stats->weight_cache_bytes             = cache.bytes;
+    stats->weight_cache_budget            = cache.budget;
     return true;
+}
+
+void ggml_backend_potal_clear_weight_cache(ggml_backend_t backend) {
+    if (ggml_backend_is_potal(backend)) {
+        static_cast<potal_context *>(backend->context)->weights.clear();
+    }
 }

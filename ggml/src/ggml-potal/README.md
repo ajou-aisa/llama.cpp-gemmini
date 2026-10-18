@@ -22,17 +22,15 @@ backend by default (`GGML_GEMMINI=OFF`, `GGML_POTAL=ON`).
 | `../../include/ggml-potal.h` | GGML backend API: init/reg, reject reasons, counters |
 | `ggml-potal.cpp` | Backend, device and registry; `supports_op`, `graph_compute` |
 | `ops.{hpp,cpp}` | GGML op validation and dispatch (I8 and Q8_HP1 MUL_MAT), logging |
-| `matmul/options.hpp` | Fixed W4-5 policy: TENSOR activation quant, Q8_HP1, compensation OFF, scale window |
-| `matmul/dense.{hpp,cpp}` | F32 x Q8_HP1 contract, DMA staging operands, F32 reconstruction, integer golden |
+| `matmul/options.hpp` | The configured options (activation algorithm, compensation ON/OFF) for logs and checks; no fixed policy |
+| `matmul/dense.{hpp,cpp}` | F32 x Q8_HP1 contract, DMA staging operands, args as Gemmini sets them, route selection and execution, compensation step, integer golden |
 | `matmul/tiling.{hpp,cpp}` | `potal_tiled_matmul_auto/_tiled_matmul/_outer/_sp_tiled_matmul_ws` (gemmini.h layering) |
 | `matmul/pack.{hpp,cpp}` | I8 MUL_MAT <-> validated PoTal GEMM contract, A/B packing, C -> F32 |
-| `matmul/execution.{hpp,cpp}` | hart-0 issuer thread: TLB flush, then validated GEMMs and tiled jobs |
-| `ggml-potal-args.h` | `ggml_potal_args_t`: copy of `ggml_gemmini_args_t` reduced to TENSOR + Q8_HP1 |
-| `quants/act/{buffer,meta}.hpp`, `quants/act/quantize.*`, `quants/act/tensor/*` | Activation quantization copied from `ggml-gemmini/quants/act` (TENSOR only, no RMD) |
-| `quants/common/{hp1_scu,math,tensor_util}.hpp`, `quants/common/weight_reader.*` | Copied from `ggml-gemmini/quants/common` (Q8_HP1 branches only) |
-| `quants/weight/hp1/hp1.{hpp,cpp}` | Q8_HP1 -> B / carriers / channel scales on the copied reader, PoTal row checks |
+| `matmul/execution.{hpp,cpp}` | hart-0 issuer thread: TLB flush, then validated GEMMs and tiled jobs (TLB flush per job, caller trace context) |
+| `quants/weight/hp1/hp1.{hpp,cpp}` | Q8_HP1 -> B / carriers / channel scales on the Gemmini weight reader (HP1 SCU route), PoTal row checks |
+| `../ggml-gemmini/{quants,residual,matmul/options.cpp,ggml-gemmini-telemetry.cpp}` | Unmodified Gemmini sources compiled into ggml-potal: `ggml_gemmini_args_t`, the five activation quantizers and their metadata, the weight reader/route, cpu_direct residual compensation, matmul options (see CMakeLists.txt `POTAL_GEMMINI_SHARED_SOURCES`) |
 | `tests/potal-ggml-unit-test.cpp` | Hardware-free backend test (`potal-ggml-unit-test`) |
-| `tests/potal-tiling-unit-test.cpp` | Hardware-free W4-5 test (`potal-tiling-unit-test`) |
+| `tests/potal-tiling-unit-test.cpp` | Hardware-free tiling/route/compensation test (`potal-tiling-unit-test`) |
 | `tests/potal-ggml-smoke.cpp` | FireSim GGML MUL_MAT hardware test (`potal-ggml-smoke`) |
 | `tests/potal-hp1-smoke.cpp` | FireSim F32 x Q8_HP1 hardware test (`potal-hp1-smoke`) |
 | `../../../cmake/potal-hw-params.cmake` | Hardware header validation (single implementation) |
@@ -198,8 +196,17 @@ batches, transposed/permuted/strided operands, `op_params[1..]` tags
 are rejected by `supports_op` with a reason (`ggml_potal_reject_name()`);
 `ggml_backend_sched` then places supported ones on the CPU backend. Metadata
 view ops (NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE) of host tensors are accepted
-and are no-ops. The default buffer type is the CPU (host) buffer type; the
-backend copies operands into its own DMA staging buffers.
+and are no-ops. The default buffer type is the POTAL buffer type
+(`ggml-potal-buffer.cpp`): aligned host memory the CPU backend reads directly,
+under its own identity so llama.cpp's model loader lists POTAL as an ACCEL
+weight buffer candidate (`make_cpu_buft_list()` skips an ACCEL device whose
+default is the CPU buffer type). `buffer_from_host_ptr` aliases the loader's
+mmap without copying or owning it; each buffer carries a generation that is
+part of the weight cache key. A shared GPT-2 `token_embd.weight` is placed
+twice: CPU buffer for the input GET_ROWS, POTAL buffer for the output MUL_MAT
+(with mmap both alias the same file bytes). The backend copies operands into
+its own DMA staging buffers. `potal-gguf-load-test` (tests/) checks this
+placement on a real GGUF without computing anything.
 
 `graph_compute` first checks every node; a node outside the contract fails
 the graph with `GGML_STATUS_FAILED` before any hardware command (no CPU
@@ -234,14 +241,20 @@ graph_compute thread: C int32 -> dst F32                  (unpack_us)
 - One process at a time, as for the API. Off RISC-V the request is validated
   by `potal_gemm_ws_issue()` and fails with `POTAL_ERR_NO_HARDWARE`.
 
-Logs (GGML log, INFO unless noted): `[POTAL_BACKEND] registered`,
-`device_init`, per node `node=... op=MUL_MAT src0_type=i8 ... M N K`,
+Logs: the existing Gemmini debug JSONL (`$GEMMINI_LOG_DIR/debug-log.jsonl`,
+else `./output/log/debug-log.jsonl`, or `--gemmini-debug-log`), one
+`{"layer","msg"}` record per event through `log.hpp`; nothing routine is
+printed to stdout/stderr. Layers `potal.backend` (`[POTAL_BACKEND] registered`,
+written with the first `device_init`), `potal.issuer`, `potal.tlb`,
+`potal.matmul`, `potal.supports_op`, `potal.summary`, and the resolved matmul
+layer for HP1 per-node records. Per node `node=... op=MUL_MAT src0_type=i8 ... M N K`,
 `[POTAL_MATMUL] pack_A_bytes/pack_B_bytes`, `scale_base/generation`,
 `dispatch=HARDWARE issue_status=POTAL_OK` (printed only after the issue
 returned `POTAL_OK`), `fence_status=POTAL_OK`, `scale_release=POTAL_OK`,
 `output_type=F32`, `[POTAL_BACKEND] hw_gemm_count`; errors as
-`dispatch=FAILED stage=... status=...`; `supports_op` decisions for MUL_MAT at
-DEBUG. `ggml_backend_potal_get_stats()` returns per-backend counters (nodes,
+`dispatch=FAILED stage=... status=...` (the node still fails; with `LOG_DEBUG=0`
+failure records go to the GGML error log instead); `supports_op` decisions for
+MUL_MAT. `ggml_backend_potal_get_stats()` returns per-backend counters (nodes,
 hardware requests, issued, fenced, completed, failed, last status/slot/
 generation), cumulative pack/stage/scale/issue/fence/unpack times, device-wide
 `supports_op` answers by reason and the issuer CPU/tid. Times are guest
@@ -262,30 +275,49 @@ Not implemented in the I8 form: other shapes; those go through the Q8_HP1 form
 only. Not implemented in the backend: F16/other quantized MUL_MAT,
 Stripe/Paired execution, DIM32/64, dynamic backend loading, concurrent processes.
 
-## Q8_HP1 tiled path (W4-5)
+## Q8_HP1 path: configured activation quantization, routes, compensation
 
 `GGML_OP_MUL_MAT` with `src0` `GGML_TYPE_Q8_HP1` (`ne = {K, N}`, contiguous)
-and `src1` F32 (`ne = {K, M}`, contiguous), 2-D, any M and N,
-`K % 32 == 0`:
+and `src1` F32 (`ne = {K, M}`, contiguous), 2-D, any M and N, `K % 32 == 0`.
+Four separate notions: the *activation granularity* (the quantizer's
+metadata), the *weight granularity* (HP1: one carrier per 32-wide K block and
+column, `block`), the *weight format* (Q8_HP1 payload/scale contract) and the
+*hardware tile* (SPAD/ACC capacity, `potal_tile_select`).
 
 ```
-src1 F32 --tensor quant (one scale for the whole tensor)--> A int8 [M][K]
-src0 HP1 --validate + unpack--> B int8 [K][N], carrier[K/32][N], channel_scale[N]
-potal_tiled_matmul_auto(M, N, K, A, B, NULL, C, ...)          on the hart-0 issuer
-  per LOOP_WS invocation: SCALE_WRITE every (block, column) carrier
-                          -> potal_gemm_ws_issue (validated 16x16x16|32 tile)
-                             or potal_loop_ws_issue (everything else)
-                          -> POTAL_FENCE -> SCALE_RELEASE
-dst[m][n] = float(double(C[m][n]) * activation_scale * channel_scale[n])
+matmul options          ggml::gemmini::resolve_matmul_options() (FULL only; rmd backend)
+tile plan               potal_tile_select() -> args.tile_I/J/K, activation_rows_per_stripe
+src1 F32 --ggml::gemmini::quants::quantize_activation--> A int8 [M][K] + act::Meta (+ residuals if RMD)
+                         GGML_GEMMINI_ACTIVATION_QUANT: EXSIA | TENSOR | TOKEN | BLOCK | STRIPE
+src0 HP1 --weight reader (HP1 SCU route)--> B int8 [K][N], carrier[K/32][N], channel_scale[N]
+route = activation metadata x block weight
+  Tensor/Token/Stripe/ExSIA+block: one potal_tiled_matmul_auto over K,
+      dst[m][n] = C[m][n] * row_scale[m] * channel_scale[n]
+  Block+block: one potal_tiled_matmul_auto per 32-wide K group,
+      dst[m][n] = sum_g C_g[m][n] * scale[m][g] * channel_scale[n]
+  per LOOP_WS invocation: SCALE_WRITE every (block, column) carrier -> LOOP_WS
+                          -> POTAL_FENCE -> SCALE_RELEASE        (hart-0 issuer)
+compensation (GGML_GEMMINI_ENABLE_RMD=ON, cpu_direct): residual::execute_direct_stripe
+      + rmd::merge_rmd_correction into dst, as in the Gemmini dense path
 ```
 
-| gemmini.h | PoTal | Notes |
-|---|---|---|
-| `tiled_matmul_auto` | `potal_tiled_matmul_auto` | same arguments, plus the carrier operand and the issuer session |
-| `tiled_matmul` | `potal_tiled_matmul` | GEMMINI_ASSERTIONS returned as statuses |
-| `tiled_matmul_outer` | `potal_tiled_matmul_outer` | same I0/J0/K0, last tile, padding, A/B/C addressing, i0-j0-k0 order; bias/C only with the first/last K chunk |
-| `sp_tiled_matmul_ws` | `potal_sp_tiled_matmul_ws` | `ex_accumulate = !no_bias \|\| D == NULL`; adds scale write/fence/release |
-| `gemmini_loop_ws` | `potal_gemm_ws_issue` / `potal_loop_ws_issue` | one encoder and one RoCC issue sequence in `potal.c` |
+The quantizers, metadata, weight reader and residual code are the Gemmini
+files themselves (no copies): all five algorithms keep their own metadata,
+reset and failure handling, and none is replaced by TENSOR. The row scale of
+the constant-along-K routes is `act::activation_scales()` (tensor scale, token
+scale, stripe scale, ExSIA `2^theta`); BLOCK changes scale along K, so it is
+never post-scaled after a whole-K accumulation.
+
+Compensation keeps the Gemmini meaning. OFF (`GGML_GEMMINI_ENABLE_RMD=OFF`) is
+the original OFF build: no outlier selection, no residual capture, the scale
+from all finite values, no correction work at all. ON captures outlier
+residuals in the quantizer and corrects dst on the CPU (`cpu_direct`, the
+`GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU` route). Not available on PoTal (blocked,
+never silently dropped): the WS residual route (`gemmini_ws_compact`, it needs
+the Gemmini WS executor `rmd-executor.cpp`, gemmini.h/IM2P): configure fails
+for `DEFAULT_RMD_BACKEND=WS`, and a node that gets a ws_packet payload (e.g.
+`GEMMINI_RMD_BACKEND=WS` at run time) fails. The stripe pipeline
+(`GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE`) is not part of PoTal.
 
 Tile selection is `tiled_matmul_auto`'s WS branch (start from the `db_` sizes,
 grow J, I, K while A+B fit half the SPAD and C half the ACC), plus the PoTal
@@ -295,57 +327,91 @@ limits: `tile_K` starts and grows in whole scale blocks (`passes_per_block =
 `passes_per_block = 1`) the choice equals gemmini.h's (`potal-tiling-unit-test`
 section A). Supported request subset: WS, no D/bias, no activation, identity
 scale factors, no transpose, `full_C`; anything else is
-`POTAL_ERR_UNSUPPORTED` before a command. Operand reuse (`a/b_spad_id`) is not
-used (as `GEMMINI_DISABLE_WS_REUSE=1`).
+`POTAL_ERR_UNSUPPORTED` before a command. Operand reuse (`a/b_spad_id`) and the
+overlap of consecutive invocations are not used (every invocation is fenced and
+releases its scale slots before the next one writes).
 
-Q8_HP1 validation: the copied `wreader::validate` (storage contract, zero
-padding, finite `channel_scale`, `m` in `0..32767` or `INT16_MIN` = zero
-carrier), plus in `quants/weight/hp1` one bit-identical, non-negative
-`channel_scale` per row (a row of 0 only with all blocks zero); any violation
-fails the node. The HP1 exponent is applied only by the SCU, never again in
-reconstruction, and weights are never dequantized and requantized.
-
-Activation quantization is selected by the existing build option
-`GGML_GEMMINI_ACTIVATION_QUANT` (must be `TENSOR`; `build-riscv.sh` defaults to
-it) with `GGML_GEMMINI_ACTIVATION_BITS=8`; other values fail configure.
-(`quants/act/tensor`, copied from Gemmini with RMD removed): `scale = max_abs /
-127` over the finite values of the whole tensor, `lrint` (half to even), clip
-`[-128, 127]`; NaN/Inf -> code 0; all-zero tensor -> scale 1, codes 0; no
-finite value -> the node fails. src1 must be contiguous.
-
-Error compensation is OFF and absent: no outlier selection, residual
-extraction, RMD/direct correction, compensation GEMM or recomposition exists in
-`ggml-potal` (`options::compensation` is only reported).
+Q8_HP1 validation: the Gemmini `wreader::validate` / block readers (storage
+contract, zero padding, finite `channel_scale`, `m` in `0..32767` or
+`INT16_MIN` = zero carrier), plus one bit-identical, non-negative
+`channel_scale` per row (a row of 0 only with all blocks zero). The HP1
+exponent is applied only by the SCU, never again in reconstruction, and
+weights are never dequantized and requantized.
 
 Integer contract (golden `reference_gemm_i32`): for each output, K passes of
 DIM elements in order; `partial << carrier` with Sat32 (PoTalSCU), first pass
 overwrites, later passes Sat32-add (AccPipe).
 
-Unvalidated on hardware until `potal-hp1-smoke` passes on FireSim: multiple I/J
-tiles, padding, K accumulation across invocations (`C == NULL`), tile origins
-at DIM-byte offsets. A failure after a command was sent disables the issuer
-(fail-stop) and leaks that job's DMA buffers on purpose.
+DMA buffers and TLB: each node allocates its own staging buffers; before each
+tiled job the issuer issues TLB FLUSH + FENCE (no DMA is in flight then, every
+earlier job ended with a FENCE), so a reallocated virtual page never reuses a
+stale accelerator translation. A failure after a command was sent disables the
+issuer (fail-stop) and leaks that job's DMA buffers on purpose.
 
-Logging uses the existing `ggml-gemmini-utils` system (no PoTal logger):
-`log::debug` JSONL (`LOG_DEBUG=1`, file `debug-log.jsonl` under
-`GEMMINI_LOG_DIR`) with `[POTAL]` records per node (backend, node, layer via
-`resolve_matmul_layer`, `weight_type=Q8_HP1`, `activation_quant=TENSOR`,
-`compensation=OFF`, M/N/K, tile_I/J/K, I0/J0/K0, pads, SPAD/ACC rows used/
-available, scale slots, generation, activation scale, channel-scale and
-exponent statistics, zero carriers, GEMM issue count, fences, status) and
-`cpu_fallback` records for rejected MUL_MATs; `log::cycle` intervals
-(`LOG_CYCLE=1`: `potal.act_quant_tensor`, `potal.weight_pack_hp1`,
-`potal.tiled_gemm`, `potal.output_reconstruct`, target `rdcycle`). Counters:
-`ggml_backend_potal_stats` `hp1_*`, `tiled_*`, `scale_writes/releases`,
-`zero_carriers`, `act_clipped`, guest seconds per stage, and
-`supports_mul_mat_rejected`. Guest seconds are not FPGA cycles. The CPU
-backend does not run Q8_HP1 MUL_MAT, so an HP1 GEMM is never silently computed
-on the CPU.
+Logging uses the existing `ggml-gemmini-utils` system (no PoTal logger, no new
+schema): `log::debug` JSONL (`LOG_DEBUG=1`, `debug-log.jsonl` under
+`GEMMINI_LOG_DIR`), per HP1 node with the caller's trace context
+(`gemmini_trace_operator`, bound on the issuer thread for the node's jobs):
+
+| Record | Proves |
+|---|---|
+| `[POTAL] config backend=POTAL node= ... weight_type=Q8_HP1 weight_granularity=block activation_quant= compensation= rmd_backend= M= N= K= rows=prefill_shaped\|decode_shaped params_sha256=` | the configuration this node ran with |
+| `[POTAL] route=Tensor+block activation_meta=Tensor dispatcher=potal_tiled_matmul_auto ... shift_carrier_count=` | the route chosen from the metadata the quantizer actually produced; HP1 carrier statistics |
+| `[POTAL] route= ... jobs= k_groups= tile_I/J/K I0/J0/K0 pads spad/acc rows scale_slots generation= tlb_flushes= loop_ws_issued= fence_ok= scale_writes= scale_releases= status=` | the hardware work actually issued and fenced |
+| `[POTAL] weight= weight_cache=HIT\|MISS\|BYPASS\|UNCACHED validation=performed\|skipped pack=performed\|skipped prepare_ms= alloc_ms= lookup_ms= weight_bytes= cache_entries= cache_bytes= cache_budget=` | whether this node validated and unpacked its weight or reused the prepared one |
+| `[POTAL] compensation= residual_payloads= corrections_merged= residual_events=` | what the compensation step actually did (OFF: all 0) |
+| `[POTAL] node= route= dispatch=HARDWARE fence=POTAL_OK completed=` | completion |
+| `[POTAL] supports_op_reject op=MUL_MAT ...` | a `supports_op` answer, not a CPU execution |
+
+### Prepared weights (`matmul/weight_cache.hpp`)
+
+A Q8_HP1 weight is validated and unpacked into B / carriers / channel_scale
+once per backend instance and reused by every later MUL_MAT of it, so decode
+steps do no O(N x K) weight work. Only a weight in a
+`GGML_BACKEND_BUFFER_USAGE_WEIGHTS` buffer is cached (llama.cpp sets it on
+every model buffer; the model outlives the context and its backends). The key
+is buffer, data address (a view's offset included), type, ne and nb. Anything
+else (compute buffers, tensors without a buffer, e.g. the smoke tests) is
+prepared per call as before (`UNCACHED`). A weight that fails validation is
+never cached. `GGML_POTAL_WEIGHT_CACHE_MB` (default 1024, 0 = off) bounds the
+cache; a weight that does not fit is prepared per call (`BYPASS`), nothing is
+ever evicted while the backend lives. Entries are freed with the backend or by
+`ggml_backend_potal_clear_weight_cache()`, which is required before a weight
+buffer is mutated or freed while the backend lives (a hit never re-reads the
+weight) and must not overlap a graph_compute. After a fatal hardware failure
+the entry is abandoned (leaked), never freed or reused. `weight_pack_s` counts
+only nodes that prepared their weight; the `[POTAL] summary` adds
+`weight_cache_hits/misses/bypasses/uncached/entries/bytes`,
+`weight_validations`, `weight_packs`, `weight_pack_bytes`, `weight_alloc_s` and
+`weight_lookup_s`. The first preparation reads the validated blocks' `qs`
+directly in column tiles instead of one checked reader call per element.
+`potal-weight-prep-bench [--gguf model.gguf]` measures both on the host.
+
+`log::cycle` intervals with `LOG_CYCLE=1`: `potal.act_quant`,
+`potal.weight_pack_hp1` (preparing nodes only), `potal.route_call` (caller side: submission, issuer
+wait and reconstruction, not SCU time), `potal.compensation`, each with the
+node's semantic identity (phase, graph occurrence, ordinal) and source role.
+Every completed node adds a performance NPU record `POTAL/dense/work_total_cycles`
+with `collected=false reason=unavailable_device_counter` (PoTal has no cycle
+counter; none is derived from CPU `rdcycle`, LOOP_WS or FENCE counts) and marks
+the phase's CPU work wall incomplete (its host stages are not CPU-resource
+samples). In the semantic graph, POTAL nodes are `TARGET_NPU`; a GGML_POTAL
+build is never a CPU-only (FULL_CPU) build. llama passes the model architecture
+to POTAL as to Gemmini, so layers resolve (`blk.N.attn_qkv`, `lm_head`) and
+`model_arch=unknown` marks a direct caller without one. At backend free one
+`potal.summary` record gives the stats: per-route completions,
+prefill/decode-shaped node counts, jobs, LOOP_WS, fences, scale writes/
+releases, TLB flushes, zero/shift carriers, compensation counters and
+`supports_op_mul_mat_rejected_answers` (answers, not executions). Which backend
+the scheduler assigned is printed by ggml itself with `GGML_SCHED_DEBUG=2`.
+Guest seconds are not FPGA cycles. The CPU backend does not run Q8_HP1
+MUL_MAT, so an HP1 GEMM is never silently computed on the CPU.
 
 | Binary | Runs on | Checks | Final line |
 |---|---|---|---|
-| `potal-tiling-unit-test` | host and target (emulator, no accelerator) | tile choice vs gemmini.h, tiled execution on an RTL-semantics emulator == integer golden (multi-tile, K chunks, padding, zero carriers, Sat32), scale release, fail-stop, HP1 validation, tensor quantization, exact F32 reconstruction, GGML contract | `POTAL_TILING_UNIT_TEST PASS` |
-| `potal-hp1-smoke` | FireSim (RISC-V Linux) | F32 x Q8_HP1 graphs on the POTAL backend, every element == CPU golden, invocations fenced, scales released; 2-layer chain; generation wrap | `POTAL_HP1_SMOKE PASS` |
+| `potal-tiling-unit-test` | host and target (emulator, no accelerator) | tile choice vs gemmini.h, tiled execution on an RTL-semantics emulator == integer golden (multi-tile, K chunks, padding, zero carriers, Sat32), scale release, fail-stop, HP1 validation, the configured dispatcher (metadata kind, route, never TENSOR in its place), all five algorithms through their own quantizer and route vs a golden from the raw metadata and vs their own dequantization, compensation as configured, generation wrap, GGML contract | `POTAL_TILING_UNIT_TEST PASS` |
+| `potal-tiling-unit-test` (W) | host and target | prepared-weight cache: MISS then HIT, operands == the reader's per-element values, cached dst == per-call dst bitwise for all five algorithms, distinct weights and views, uncached/bypass/budget, invalid weights never cached, mutation only after clear(), concurrent first use, fatal abandon through the backend | (same) |
+| `potal-hp1-smoke` | FireSim (RISC-V Linux) | F32 x Q8_HP1 graphs on the POTAL backend (configured route), every element == CPU golden of the same route, invocations fenced, scales released, one TLB flush per job, compensation counters; GPT-2 qkv/lm_head shapes; 2-layer chain; DMA reallocation; generation wrap asserted from the totals | `POTAL_HP1_SMOKE PASS` |
 
 ## Commands
 
@@ -378,35 +444,44 @@ OMP_NUM_THREADS=3 OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE OMP_DISPLAY_ENV=TRUE \
 # Bare-metal ELF (needs riscv64-unknown-elf-gcc: source chipyard env.sh)
 scripts/potal-build-baremetal.sh build-potal-host
 
-# GGML backend, host (expects "POTAL_GGML_UNIT_TEST PASS")
-cmake -S . -B build-potal-ggml-host -DGGML_GEMMINI=OFF -DGGML_POTAL=ON -DGGML_BACKEND_DL=OFF \
-  -DLLAMA_CURL=OFF -DPOTAL_EXPECTED_DIM=16 -DPOTAL_HW_PARAMS:FILEPATH="$PARAMS/gemmini_potal_params.h"
-cmake --build build-potal-ggml-host --target potal-ggml-unit-test potal-tiling-unit-test potal-api-test -j
-build-potal-ggml-host/bin/potal-ggml-unit-test
+# GGML backend, host. The HP1 validation configuration is spelled out; plain
+# cmake defaults differ (GGML_GEMMINI_ACTIVATION_QUANT=EXSIA, GGML_GEMMINI_ENABLE_RMD=ON).
+POTAL_OPTS=(-DGGML_GEMMINI=OFF -DGGML_POTAL=ON -DPOTAL_API_ONLY=OFF -DGGML_BACKEND_DL=OFF -DLLAMA_CURL=OFF
+  -DPOTAL_EXPECTED_DIM=16 -DPOTAL_HW_PARAMS:FILEPATH="$PARAMS/gemmini_potal_params.h"
+  -DGGML_GEMMINI_ACTIVATION_QUANT=TENSOR -DGGML_GEMMINI_ENABLE_RMD=OFF -DGGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU
+  -DGGML_GEMMINI_ENABLE_OPENMP=OFF -DLOG_DEBUG=1)
+cmake -S . -B build-potal-ggml-host "${POTAL_OPTS[@]}"
+cmake --build build-potal-ggml-host --target potal-api-test potal-ggml-unit-test potal-tiling-unit-test -j
+build-potal-ggml-host/bin/potal-ggml-unit-test     # expects "POTAL_GGML_UNIT_TEST PASS"
 build-potal-ggml-host/bin/potal-tiling-unit-test   # expects "POTAL_TILING_UNIT_TEST PASS"
+# Other selections build and test the same way (one build directory each), e.g.
+#   -DGGML_GEMMINI_ACTIVATION_QUANT=BLOCK            (Block+block route)
+#   -DGGML_GEMMINI_ENABLE_RMD=ON                     (compensation ON, cpu_direct)
 
-# GGML backend, RISC-V Linux cross build: the default of build-riscv.sh
-# (bin/potal-*-test, bin/potal-*-smoke, bin/libggml*.so, bin/llama-cli, bin/llama-perplexity)
-BUILD_DIR=build-potal-ggml-d16 ./build-riscv.sh -DPOTAL_HW_CONFIG=PoTalSat32GemminiRocketConfig
+# GGML backend, RISC-V Linux cross build (build-riscv.sh defaults to the same
+# selection; the options are spelled out anyway)
+BUILD_DIR=build-potal-ggml-d16 ./build-riscv.sh "${POTAL_OPTS[@]}" -DLOG_CYCLE=1 \
+  -DPOTAL_HW_CONFIG=FireSimQuadRocketSinglePoTalD16Config
 
-# Guest (FireSim Linux): copy potal-ggml-smoke with libggml.so, libggml-base.so,
-# libggml-cpu.so and libggml-potal.so (RPATH is $ORIGIN, or set LD_LIBRARY_PATH)
-./potal-ggml-smoke --case=k16 --verbose
-./potal-ggml-smoke --case=k32 --verbose
-./potal-ggml-smoke --case=sched
+# Guest (FireSim Linux). host-init.sh copies the whole software/workspace tree
+# to /root/workspace, so the build and the GGUF are at:
+B=/root/workspace/llama.cpp-potal/build-potal-ggml-d16/bin
+MODEL=/root/workspace/llama.cpp-potal/models/gpt2/gpt2.Q8_HP1.gguf
+cd "$B"
+./potal-ggml-smoke --case=k16 --verbose; ./potal-ggml-smoke --case=k32 --verbose; ./potal-ggml-smoke --case=sched
 ./potal-hp1-smoke --quick && ./potal-hp1-smoke      # expects "POTAL_HP1_SMOKE PASS"
 
-# Q8_HP1 model (host): the registered llama-quantize type
-cmake -S . -B build-host-quant -DGGML_GEMMINI=OFF -DLLAMA_CURL=OFF && cmake --build build-host-quant --target llama-quantize -j
-build-host-quant/bin/llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1
-
-# End to end (model path and prompt are yours). Logs in $GEMMINI_LOG_DIR.
-export GEMMINI_LOG_DIR=$PWD/potal-log
-./llama-cli -m <model.Q8_HP1.gguf> -p "<short prompt>" -n 4 -t 1 --no-warmup
-./llama-perplexity -m <model.Q8_HP1.gguf> -f <text file> -c 128 --chunks 1
+# End to end: short prompt, prefill + decode. Exit status kept separately from the logs.
+export GEMMINI_LOG_DIR=/root/potal-log-gpt2; mkdir -p "$GEMMINI_LOG_DIR"
+GGML_SCHED_DEBUG=2 ./llama-cli -m "$MODEL" -p "The capital of France is" -n 8 -no-cnv --no-warmup \
+  --temp 0 -s 1 -t 3 > "$GEMMINI_LOG_DIR/llama-cli.out" 2> "$GEMMINI_LOG_DIR/llama-cli.err"
+echo "llama-cli exit=$?"
 ```
 
-Build with `-DLOG_DEBUG=1 -DLOG_CYCLE=1` (`build-riscv.sh` arguments) for the
-`[POTAL]` JSONL records and stage cycles. A run counts as PoTal end to end only
-if `hp1_completed > 0` and `hp1_failed == 0` in the stats / the debug log shows
-`dispatch=HARDWARE` for the model's MUL_MATs.
+A run counts as PoTal end to end only if `llama-cli` exits 0, the
+`potal.summary` record (`[POTAL] summary`) in the debug log shows `hp1_failed=0`, `hp1_completed > 0` with every
+completion on `route_tensor_block`, `prefill_shaped > 0` and `decode_shaped >
+0`, `residual_payloads=0 compensation_executed=0` (compensation OFF), `fences
+== loop_ws_issued`, `scale_writes == scale_releases`, `tlb_flushes ==
+tiled_jobs`, and the debug log has `dispatch=HARDWARE` records (including the
+lm_head, `result_output`) and no `dispatch=FAILED`.

@@ -1,8 +1,11 @@
 #include "execution.hpp"
 
 #include "ggml-impl.h"
+#include "log.hpp"
 
 #include "potal_hw_params.h"
+
+#include <gemmini/trace-context.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -73,6 +76,7 @@ potal_ws_report work_since(const potal_ws_report & now, const potal_ws_report & 
     d.fences          = now.fences - before.fences;
     d.scale_writes    = now.scale_writes - before.scale_writes;
     d.scale_releases  = now.scale_releases - before.scale_releases;
+    d.tlb_flushes     = now.tlb_flushes - before.tlb_flushes;
     d.scale_s         = now.scale_s - before.scale_s;
     d.issue_s         = now.issue_s - before.issue_s;
     d.fence_s         = now.fence_s - before.fence_s;
@@ -234,7 +238,7 @@ void issuer::start() {
         failure        = std::string("cannot start the issuer thread: ") + e.what();
         failure_status = POTAL_ERR_NO_HARDWARE;
         st             = state::failed;
-        GGML_LOG_ERROR("[POTAL_ISSUER] FAIL %s\n", failure.c_str());
+        log::failure("potal.issuer", "[POTAL_ISSUER] FAIL %s", failure.c_str());
     }
 }
 
@@ -288,7 +292,7 @@ void issuer::main_loop() {
             failure        = why;
             failure_status = status;
             st             = state::failed;
-            GGML_LOG_ERROR("[POTAL_ISSUER] disabled for this process after %s\n", failure.c_str());
+            log::failure("potal.issuer", "[POTAL_ISSUER] disabled for this process after %s", failure.c_str());
         }
         done = true;
         cv.notify_all();
@@ -309,11 +313,11 @@ bool issuer::bring_up() {
     if (!find_hart0_cpu(hart0_cpu, err) || !pin_self(hart0_cpu, err)) {
         failure        = err;
         failure_status = POTAL_ERR_NO_HARDWARE;
-        GGML_LOG_ERROR("[POTAL_ISSUER] FAIL tid=%ld: %s; no PoTal command issued\n", tid, err.c_str());
+        log::failure("potal.issuer", "[POTAL_ISSUER] FAIL tid=%ld: %s; no PoTal command issued", tid, err.c_str());
         return false;
     }
     cpu = hart0_cpu;
-    GGML_LOG_INFO("[POTAL_ISSUER] tid=%ld cpu=%d hart=0 affinity={%d}\n", tid, cpu, cpu);
+    log::debug("potal.issuer", "[POTAL_ISSUER] tid=%ld cpu=%d hart=0 affinity={%d}", tid, cpu, cpu);
 
     // Drop accelerator TLB entries an earlier process left behind. FLUSH has
     // no response; the FENCE behind it completing means it was applied.
@@ -326,10 +330,10 @@ bool issuer::bring_up() {
     if (s != POTAL_OK) {
         failure        = std::string(step) + ": POTAL_" + potal_status_name(s);
         failure_status = s;
-        GGML_LOG_ERROR("[POTAL_TLB] FAIL %s\n", failure.c_str());
+        log::failure("potal.tlb", "[POTAL_TLB] FAIL %s", failure.c_str());
         return false;
     }
-    GGML_LOG_INFO("[POTAL_TLB] flush PASS (FLUSH issued, FENCE=POTAL_OK)\n");
+    log::debug("potal.tlb", "[POTAL_TLB] flush PASS (FLUSH issued, FENCE=POTAL_OK)");
     return true;
 }
 
@@ -375,9 +379,10 @@ gemm_report issuer::execute(const gemm_job & job) {
         r.fatal = true;
         return r;
     }
-    GGML_LOG_INFO("[POTAL_MATMUL] scale_base=%u generation=%u carrier=x1 columns=%u passes_per_block=%u "
-                  "scale_write=POTAL_OK\n",
-                  r.scale_slot, r.generation, DIM, g.passes_per_block);
+    log::debug("potal.matmul",
+               "[POTAL_MATMUL] scale_base=%u generation=%u carrier=x1 columns=%u passes_per_block=%u "
+               "scale_write=POTAL_OK",
+               r.scale_slot, r.generation, DIM, g.passes_per_block);
 
     t         = clock_type::now();
     r.status  = potal_gemm_ws_issue(&g);
@@ -390,8 +395,8 @@ gemm_report issuer::execute(const gemm_job & job) {
         return r;
     }
     r.issued = true;
-    GGML_LOG_INFO("[POTAL_MATMUL] dispatch=HARDWARE issue_status=POTAL_OK K=%u issue_us=%.1f\n", job.k,
-                  r.issue_s * 1e6);
+    log::debug("potal.matmul", "[POTAL_MATMUL] dispatch=HARDWARE issue_status=POTAL_OK K=%u issue_us=%.1f", job.k,
+               r.issue_s * 1e6);
 
     t         = clock_type::now();
     r.status  = potal_fence();
@@ -403,7 +408,7 @@ gemm_report issuer::execute(const gemm_job & job) {
         return r;
     }
     r.fenced = true;
-    GGML_LOG_INFO("[POTAL_MATMUL] fence_status=POTAL_OK fence_us=%.1f\n", r.fence_s * 1e6);
+    log::debug("potal.matmul", "[POTAL_MATMUL] fence_status=POTAL_OK fence_us=%.1f", r.fence_s * 1e6);
 
     t = clock_type::now();
     std::memcpy(job.c, stage_c, sizeof(stage_c));
@@ -419,12 +424,12 @@ gemm_report issuer::execute(const gemm_job & job) {
         r.fatal = true;
         return r;
     }
-    GGML_LOG_INFO("[POTAL_MATMUL] scale_release=POTAL_OK\n");
+    log::debug("potal.matmul", "[POTAL_MATMUL] scale_release=POTAL_OK");
 
     const long unwritten = static_cast<long>(std::count(job.c, job.c + DIM * DIM, C_UNWRITTEN));
     if (unwritten != 0) {
-        GGML_LOG_ERROR("[POTAL_MATMUL] %ld of %u C elements kept the pre-issue sentinel after FENCE\n", unwritten,
-                       DIM * DIM);
+        log::failure("potal.matmul", "[POTAL_MATMUL] %ld of %u C elements kept the pre-issue sentinel after FENCE",
+                     unwritten, DIM * DIM);
         r.stage = "c_unwritten";
         r.fatal = true;
         return r;
@@ -435,13 +440,30 @@ gemm_report issuer::execute(const gemm_job & job) {
 
 // Tiled GEMM on the issuer: every invocation is Scale WRITE -> LOOP_WS -> FENCE -> RELEASE.
 tiled_report issuer::execute_tiled(const tiled_job & job) {
+    ggml::gemmini::trace::ScopedContext trace_scope(job.trace);
+    tiled_report                        r;
     if (sched_getcpu() != cpu) {
-        tiled_report r;
         r.stage = "affinity"; // custom-3 would trap off hart 0
         r.fatal = true;
         return r;
     }
-    return tiled_matmul(job, session);
+    // The staging buffers of this job are freshly allocated: their virtual
+    // pages may have backed other physical pages in an earlier job. Drop every
+    // accelerator translation before the first DMA. Every earlier job ended
+    // with a FENCE, so no DMA is in flight while the TLB is flushed.
+    r.status = potal_tlb_flush();
+    if (r.status == POTAL_OK) {
+        r.status = potal_fence();
+    }
+    if (r.status != POTAL_OK) {
+        r.stage = "tlb_flush";
+        r.fatal = true;
+        return r;
+    }
+    session.report.tlb_flushes++;
+    r = tiled_matmul(job, session);
+    r.work.tlb_flushes = 1;
+    return r;
 }
 
 std::mutex g_issuer_mutex;
@@ -521,6 +543,10 @@ tiled_report run_tiled(const tiled_job & job) {
     potal_ws_session session = { &potal_hw_ops(), 0, {} };
     return tiled_matmul(job, session);
 #endif
+}
+
+tiled_report run_tiled_in_session(const tiled_job & job, potal_ws_session & session) {
+    return tiled_matmul(job, session);
 }
 
 issuer_info get_issuer_info() {

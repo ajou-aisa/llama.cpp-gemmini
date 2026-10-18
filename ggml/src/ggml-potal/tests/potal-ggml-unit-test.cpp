@@ -13,14 +13,21 @@
  *                NaN dst (no fake hardware success)
  *   F scheduler  POTAL + CPU: I8 MUL_MAT placed on POTAL, F32 ops on CPU (and
  *                computed there), an op neither backend supports is not placed
+ *   G buffer     POTAL buffer type: own identity (not CPU/GEMMINI), host memory
+ *                the CPU backend accepts, owned allocation, zero size, tensor
+ *                I/O and copies, host-pointer and read-only mmap aliases that
+ *                are never freed by the buffer, per-buffer generations, and the
+ *                Q8_HP1 ops placed by llama.cpp (GET_ROWS on CPU, MUL_MAT on POTAL)
  *
  * The accelerator is never used: on RISC-V the one graph POTAL could execute
  * (E3) is skipped; potal-ggml-smoke covers hardware execution.
  * Output: "PASS <name>" / "FAIL <name>: ...", final "POTAL_GGML_UNIT_TEST PASS|FAIL".
  */
 #include "ggml-cpp.h"
+#include "ggml-potal-buffer.hpp"
 #include "ggml-potal.h"
 #include "matmul/pack.hpp"
+#include "matmul/weight_cache.hpp"
 #include "ops.hpp"
 #include "potal.h"
 
@@ -31,6 +38,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 
@@ -178,8 +189,8 @@ void test_backend(ggml_backend_t potal, ggml_backend_t cpu) {
           ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(potal)));
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
-    check("B props: synchronous, no events, no pinned or host-pointer buffers",
-          !props.caps.async && !props.caps.events && !props.caps.host_buffer && !props.caps.buffer_from_host_ptr);
+    check("B props: synchronous, no events, no pinned host buffer type, host-pointer buffers",
+          !props.caps.async && !props.caps.events && !props.caps.host_buffer && props.caps.buffer_from_host_ptr);
 
     ggml_backend_potal_stats st = {};
     check("B stats of a fresh backend",
@@ -552,6 +563,188 @@ void test_scheduler(ggml_backend_t potal, ggml_backend_t cpu) {
     }
 }
 
+// ---- G. POTAL buffer type ---------------------------------------------------
+
+void test_buffer(ggml_backend_t potal, ggml_backend_t cpu) {
+    using ggml::potal::is_potal_buffer;
+    using ggml::potal::potal_buffer_generation;
+    ggml_backend_dev_t         dev  = ggml_backend_get_device(potal);
+    ggml_backend_dev_t         cdev = ggml_backend_get_device(cpu);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+
+    check("G1 device default = backend default buffer type", buft == ggml_backend_get_default_buffer_type(potal));
+    check("G1 POTAL buffer type is not the CPU buffer type", buft != cpu_buft);
+    check("G1 named POTAL (not CPU, not GEMMINI)", std::strcmp(ggml_backend_buft_name(buft), "POTAL") == 0);
+    check("G1 no GEMMINI device whose buffer type it could be", ggml_backend_dev_by_name("GEMMINI") == nullptr);
+    check("G1 buffer type device is the POTAL ACCEL device",
+          ggml_backend_buft_get_device(buft) == dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
+    check("G1 host memory, CPU alignment", ggml_backend_buft_is_host(buft) &&
+                                               ggml_backend_buft_get_alignment(buft) ==
+                                                   ggml_backend_buft_get_alignment(cpu_buft));
+    check("G1 POTAL accepts POTAL and CPU buffers; CPU accepts POTAL buffers",
+          ggml_backend_dev_supports_buft(dev, buft) && ggml_backend_dev_supports_buft(dev, cpu_buft) &&
+              ggml_backend_dev_supports_buft(cdev, buft) && ggml_backend_supports_buft(cpu, buft));
+
+    // G2: owned allocations.
+    {
+        ggml_backend_buffer_ptr a(ggml_backend_buft_alloc_buffer(buft, 1000));
+        ggml_backend_buffer_ptr b(ggml_backend_buft_alloc_buffer(buft, 1000));
+        const bool              ok = a && b;
+        check("G2 alloc: POTAL buffers, aligned, sized, host",
+              ok && is_potal_buffer(a.get()) && ggml_backend_buffer_get_type(a.get()) == buft &&
+                  ggml_backend_buffer_get_size(a.get()) == 1000 && ggml_backend_buffer_is_host(a.get()) &&
+                  reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(a.get())) %
+                          ggml_backend_buft_get_alignment(buft) == 0);
+        check("G2 independent buffers: distinct memory and nonzero distinct generations",
+              ok && ggml_backend_buffer_get_base(a.get()) != ggml_backend_buffer_get_base(b.get()) &&
+                  potal_buffer_generation(a.get()) != 0 && potal_buffer_generation(b.get()) != 0 &&
+                  potal_buffer_generation(a.get()) != potal_buffer_generation(b.get()));
+        if (ok) {
+            ggml_backend_buffer_clear(a.get(), 0x5a);
+            ggml_backend_buffer_clear(b.get(), 0xa5);
+            const uint8_t * pa = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(a.get()));
+            const uint8_t * pb = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(b.get()));
+            check("G2 clear fills the whole buffer, the other untouched",
+                  std::all_of(pa, pa + 1000, [](uint8_t v) { return v == 0x5a; }) &&
+                      std::all_of(pb, pb + 1000, [](uint8_t v) { return v == 0xa5; }));
+        }
+        check("G2 null buffer: not a POTAL buffer, generation 0",
+              !is_potal_buffer(nullptr) && potal_buffer_generation(nullptr) == 0);
+        ggml_backend_buffer_ptr c(ggml_backend_buft_alloc_buffer(cpu_buft, 64));
+        check("G2 CPU buffer is not a POTAL buffer", c && !is_potal_buffer(c.get()) && potal_buffer_generation(c.get()) == 0);
+    }
+
+    // G3: zero size is GGML's dummy buffer (no allocation, no POTAL context).
+    {
+        ggml_backend_buffer_ptr z(ggml_backend_buft_alloc_buffer(buft, 0));
+        check("G3 zero-size buffer: dummy of the POTAL type, size 0",
+              z && ggml_backend_buffer_get_type(z.get()) == buft && ggml_backend_buffer_get_size(z.get()) == 0 &&
+                  !is_potal_buffer(z.get()) && potal_buffer_generation(z.get()) == 0);
+    }
+
+    // G4: tensor I/O, offsets, memset and copies between POTAL and CPU buffers.
+    {
+        ggml_context_ptr ctx = make_context(false);
+        ggml_tensor *    t   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+        ggml_tensor *    u   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        ggml_context_ptr cctx = make_context(false);
+        ggml_tensor *    c    = ggml_new_tensor_1d(cctx.get(), GGML_TYPE_F32, 64);
+        ggml_backend_buffer_ptr cbuf(ggml_backend_alloc_ctx_tensors_from_buft(cctx.get(), cpu_buft));
+        bool ok = buf && cbuf && t->buffer == buf.get() && u->buffer == buf.get() && t->data != u->data;
+        std::vector<float> in(64), out(64, -1.0f);
+        for (int i = 0; i < 64; ++i) {
+            in[i] = 0.25f * (float) i - 3.0f;
+        }
+        if (ok) {
+            ggml_backend_tensor_set(t, in.data(), 0, 64 * sizeof(float));
+            ggml_backend_tensor_get(t, out.data(), 0, 64 * sizeof(float));
+            ok = std::memcmp(in.data(), out.data(), 64 * sizeof(float)) == 0 &&
+                 std::memcmp(t->data, in.data(), 64 * sizeof(float)) == 0;
+        }
+        check("G4 set/get round trip, CPU-readable data", ok);
+        if (ok) {
+            const float v = 7.5f;
+            ggml_backend_tensor_set(t, &v, 10 * sizeof(float), sizeof(float));
+            float back = 0.0f;
+            ggml_backend_tensor_get(t, &back, 10 * sizeof(float), sizeof(float));
+            ggml_backend_tensor_memset(t, 0, 60 * sizeof(float), 4 * sizeof(float));
+            const float * d = static_cast<const float *>(t->data);
+            check("G4 offset set/get and tail memset touch only their range",
+                  back == v && d[9] == in[9] && d[11] == in[11] && d[59] == in[59] && d[60] == 0.0f && d[63] == 0.0f);
+            ggml_backend_tensor_copy(t, c);
+            ggml_backend_tensor_copy(c, u);
+            check("G4 POTAL -> CPU -> POTAL copies", std::memcmp(c->data, t->data, ggml_nbytes(t)) == 0 &&
+                                                         std::memcmp(u->data, t->data, ggml_nbytes(t)) == 0);
+        }
+    }
+
+    // G5: host-pointer alias (the loader's mmap path).
+    {
+        const size_t size = 4096;
+        void *       mem  = std::aligned_alloc(64, size);
+        std::memset(mem, 0x11, size);
+        ggml_backend_buffer_t alias = ggml_backend_dev_buffer_from_host_ptr(dev, mem, size, size);
+        const bool            ok    = alias != nullptr;
+        check("G5 host-pointer buffer: POTAL type, base is the pointer, not owned memory",
+              ok && is_potal_buffer(alias) && ggml_backend_buffer_get_type(alias) == buft &&
+                  ggml_backend_buffer_get_base(alias) == mem && ggml_backend_buffer_get_size(alias) == size &&
+                  potal_buffer_generation(alias) != 0);
+        if (ok) {
+            ggml_backend_buffer_clear(alias, 0x22);
+            ggml_backend_buffer_free(alias); // must not free mem
+        }
+        check("G5 writes reach the caller memory, which outlives the buffer",
+              ok && static_cast<uint8_t *>(mem)[0] == 0x22 && static_cast<uint8_t *>(mem)[size - 1] == 0x22);
+        std::free(mem); // a double free here would abort
+        alignas(64) static uint8_t raw[128];
+        check("G5 misaligned host pointer refused",
+              ggml_backend_dev_buffer_from_host_ptr(dev, raw + 1, 64, 64) == nullptr);
+    }
+
+    // G6: read-only file mapping, as llama_mmap creates it.
+    {
+        char       path[] = "/tmp/potal-buffer-test-XXXXXX";
+        const int  fd     = mkstemp(path);
+        const size_t size = 8192;
+        std::vector<uint8_t> bytes(size);
+        for (size_t i = 0; i < size; ++i) {
+            bytes[i] = (uint8_t) (i * 131 + 7);
+        }
+        bool ok = fd >= 0 && write(fd, bytes.data(), size) == (ssize_t) size;
+        void * map = ok ? mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+        ok         = ok && map != MAP_FAILED;
+        if (ok) {
+            ggml_backend_buffer_t alias = ggml_backend_dev_buffer_from_host_ptr(dev, map, size, size);
+            ggml_context_ptr      ctx   = make_context(false);
+            ggml_tensor *         t     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, 256);
+            const bool alloc = alias && ggml_backend_tensor_alloc(alias, t, static_cast<char *>(map) + 1024) ==
+                                            GGML_STATUS_SUCCESS;
+            std::vector<uint8_t> got(256);
+            if (alloc) {
+                ggml_backend_tensor_get(t, got.data(), 0, 256);
+            }
+            check("G6 read-only mmap alias: tensor reads the mapped file bytes",
+                  alloc && t->data == static_cast<char *>(map) + 1024 &&
+                      std::memcmp(got.data(), bytes.data() + 1024, 256) == 0);
+            if (alias) {
+                ggml_backend_buffer_free(alias);
+            }
+            check("G6 mapping intact after the buffer is freed",
+                  std::memcmp(map, bytes.data(), size) == 0 && munmap(map, size) == 0);
+        } else {
+            check("G6 read-only mmap alias: temporary file mapped", false);
+        }
+        if (fd >= 0) {
+            close(fd);
+            unlink(path);
+        }
+    }
+
+    // G7: Q8_HP1 weights in a POTAL weights buffer, as llama.cpp places GPT-2's
+    // token_embd.weight: GET_ROWS on CPU, MUL_MAT on POTAL, cache-eligible.
+    {
+        ggml_context_ptr ctx = make_context(false);
+        ggml_tensor *    w   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_HP1, 64, 32);
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (buf) {
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        ggml_tensor * ids  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 4);
+        ggml_tensor * rows = ggml_get_rows(ctx.get(), w, ids);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 64, 4);
+        ggml_tensor * y    = ggml_mul_mat(ctx.get(), w, x);
+        check("G7 Q8_HP1 weights buffer: usage WEIGHTS, cache-eligible",
+              buf && ggml_backend_buffer_get_usage(buf.get()) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                  ggml::potal::weight_cache::eligible(w));
+        check("G7 GET_ROWS of a POTAL-buffer Q8_HP1 weight: CPU yes, POTAL no",
+              ggml_backend_dev_supports_op(cdev, rows) && !ggml_backend_dev_supports_op(dev, rows));
+        check("G7 F32 x Q8_HP1 MUL_MAT of it: POTAL yes, CPU no",
+              ggml_backend_dev_supports_op(dev, y) && !ggml_backend_dev_supports_op(cdev, y));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -575,6 +768,7 @@ int main() {
     test_view_packing();
     test_refusal(potal.get());
     test_scheduler(potal.get(), cpu.get());
+    test_buffer(potal.get(), cpu.get());
 
     if (g_failures != 0) {
         std::printf("POTAL_GGML_UNIT_TEST FAIL (%d)\n", g_failures);

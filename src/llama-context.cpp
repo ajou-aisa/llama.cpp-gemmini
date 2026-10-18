@@ -144,9 +144,11 @@ llama_context::llama_context(
                 if (prefer_gemmini && ((pass == 0) != is_gemmini)) {
                     continue;
                 }
+                // Gemmini and PoTal name their matmul layers from the model architecture.
+                const bool is_potal = std::strcmp(ggml_backend_dev_name(dev), "POTAL") == 0;
                 const char * backend_params = nullptr;
                 std::string gemmini_model_arch;
-                if (is_gemmini) {
+                if (is_gemmini || is_potal) {
                     gemmini_model_arch = model.arch_name();
                     backend_params = gemmini_model_arch.c_str();
                 }

@@ -348,7 +348,8 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
         if (!semantic_session) return;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const auto *node = cgraph->nodes[i];
-            std::string kind = cpu_execution ? "ORDINARY_CPU" : "UNSUPPORTED";
+            // POTAL computes its nodes on the accelerator (view nodes are excluded by the graph capture).
+            std::string kind = cpu_execution ? "ORDINARY_CPU" : backend_name == "POTAL" ? "TARGET_NPU" : "UNSUPPORTED";
 #if CYCLE_SIM
             if (std::find(selected_npu_nodes.begin(), selected_npu_nodes.end(), node) != selected_npu_nodes.end())
                 kind = "TARGET_NPU";

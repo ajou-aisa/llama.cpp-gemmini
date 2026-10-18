@@ -73,6 +73,11 @@ im2p_provision_host_artifacts() {
     return 2
   fi
 
+  if [[ ! -d "$sim_root" ]]; then
+    printf '%s\n' \
+      "IM2P_SIM_ROOT='$sim_root' does not exist; set IM2P_SIM_ROOT for the Gemmini IM2P_SIM lane" >&2
+    return 2
+  fi
   local sim_root_abs
   sim_root_abs="$(cd "$sim_root" && pwd)"
   local make_args=(

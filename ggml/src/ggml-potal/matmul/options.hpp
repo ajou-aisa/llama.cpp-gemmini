@@ -1,36 +1,48 @@
 #pragma once
 
-// Fixed execution policy of the PoTal MUL_MAT path (W4-5). These are not
-// run-time options: each value names a contract the code implements and the
-// logs report, so a run can be identified from its output.
+// Configuration of the PoTal MUL_MAT path. Every value comes from the existing
+// Gemmini build options (cmake/ggml-gemmini-options.cmake -> compile
+// definitions -> ggml-gemmini-config.hpp); nothing is fixed here, and the
+// selected values are logged with every node so a run identifies itself.
+//
+//   GGML_GEMMINI_ACTIVATION_QUANT  EXSIA | TENSOR | TOKEN | BLOCK | STRIPE
+//                                  (quants/act/dispatch.cpp of ggml-gemmini)
+//   GGML_GEMMINI_ENABLE_RMD        error compensation ON/OFF: outlier residual
+//                                  capture in the quantizer + correction/merge
+//   GEMMINI_RMD_BACKEND / GGML_GEMMINI_DEFAULT_RMD_BACKEND
+//                                  residual route (matmul/options.cpp); PoTal
+//                                  executes cpu_direct only
 
+#include "ggml-gemmini-config.hpp"
 #include "potal.h"
 
 #include <cstdint>
 
 namespace ggml::potal::options {
 
-// Activation quantization: the existing build options GGML_GEMMINI_ACTIVATION_QUANT
-// (ActivationQuantAlgo: 0 EXSIA, 1 TENSOR, ...) and GGML_GEMMINI_ACTIVATION_BITS,
-// passed by ggml-potal/CMakeLists.txt. TENSOR: one scale per logical src1
-// tensor, computed over the whole tensor before tiling.
-#if !defined(GGML_GEMMINI_ACTIVATION_QUANT) || !defined(GGML_GEMMINI_ACTIVATION_BITS)
-#    error "ggml-potal needs GGML_GEMMINI_ACTIVATION_QUANT and GGML_GEMMINI_ACTIVATION_BITS from CMake"
-#endif
-static_assert(GGML_GEMMINI_ACTIVATION_QUANT == 1, "ggml-potal implements GGML_GEMMINI_ACTIVATION_QUANT=TENSOR only");
-static_assert(GGML_GEMMINI_ACTIVATION_BITS == 8, "PoTal hardware is A8W8");
-constexpr const char * activation_quant = "TENSOR";
-constexpr int32_t      activation_qmin  = -(int32_t{ 1 } << (GGML_GEMMINI_ACTIVATION_BITS - 1));
-constexpr int32_t      activation_qmax  = (int32_t{ 1 } << (GGML_GEMMINI_ACTIVATION_BITS - 1)) - 1;
+static_assert(GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8, "PoTal hardware is A8W8");
+
+using ggml::gemmini::config::ActivationQuantAlgo;
+constexpr ActivationQuantAlgo activation_quant = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT;
+
+// Upper-case name of the configured algorithm (the CMake option value).
+constexpr const char * activation_quant_name() {
+    switch (activation_quant) {
+        case ActivationQuantAlgo::EXSIA:  return "EXSIA";
+        case ActivationQuantAlgo::TENSOR: return "TENSOR";
+        case ActivationQuantAlgo::TOKEN:  return "TOKEN";
+        case ActivationQuantAlgo::BLOCK:  return "BLOCK";
+        case ActivationQuantAlgo::STRIPE: return "STRIPE";
+    }
+    return "UNKNOWN";
+}
+
+constexpr bool         compensation      = GGML_GEMMINI_ENABLE_RMD != 0;
+constexpr const char * compensation_name = compensation ? "ON" : "OFF";
 
 // Weight format consumed natively: GGML_TYPE_Q8_HP1 (qs, m -> SCU carrier, channel_scale).
-constexpr const char * weight_type = "Q8_HP1";
-
-// Error compensation is not part of ggml-potal: no outlier selection, residual
-// extraction, RMD/direct correction, compensation GEMM or recomposition exists
-// in this backend. The value is reported, never consulted.
-constexpr bool         compensation      = false;
-constexpr const char * compensation_name = "OFF";
+constexpr const char * weight_type        = "Q8_HP1";
+constexpr const char * weight_granularity = "block"; // one carrier per (32-wide K block, output column)
 
 // Scale slots the tiled path may use; every invocation releases its slots
 // before the next one writes, so the whole ScaleMemory is one window.

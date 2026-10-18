@@ -197,12 +197,10 @@ foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-ris
         string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${stderr}")
         set(config "${CMAKE_MATCH_1}")
         foreach(pair IN ITEMS
-                "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
-                "IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1"
-                "GGML_GEMMINI_OPTION=WS" "GGML_GEMMINI_ENABLE_RMD=ON"
-                "GGML_GEMMINI_ACTIVATION_BITS=8" "GGML_GEMMINI_WEIGHT_BITS=8"
-                "GGML_GEMMINI_DIM=16" "GGML_GEMMINI_DEFAULT_RMD_BACKEND=WS"
-                "GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE")
+                "GGML_GEMMINI=OFF" "GGML_POTAL=ON" "GGML_BACKEND_DL=OFF"
+                "POTAL_EXPECTED_DIM=16" "GGML_GEMMINI_EXECUTION_BACKEND=HARDWARE"
+                "GGML_GEMMINI_ACTIVATION_QUANT=TENSOR"
+                "GGML_GEMMINI_ACTIVATION_BITS=8" "GGML_GEMMINI_WEIGHT_BITS=8")
             string(REPLACE "=" ";" fields "${pair}")
             list(GET fields 0 key)
             list(GET fields 1 expected)

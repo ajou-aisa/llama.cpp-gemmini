@@ -1699,3 +1699,15 @@ add_compile_definitions(
     GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
+
+# POTAL: the real GPT-2 Q8_HP1 GGUF through the production model loader (buffer
+# placement only; no graph is computed). Skipped (77) when the model is absent.
+if (GGML_POTAL)
+    add_executable(potal-gguf-load-test test-potal-gguf-load.cpp)
+    target_link_libraries(potal-gguf-load-test PRIVATE llama ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-gguf-load-test
+                 COMMAND potal-gguf-load-test ${CMAKE_CURRENT_SOURCE_DIR}/../models/gpt2/gpt2.Q8_HP1.gguf)
+        set_property(TEST potal-gguf-load-test PROPERTY SKIP_RETURN_CODE 77)
+    endif()
+endif()

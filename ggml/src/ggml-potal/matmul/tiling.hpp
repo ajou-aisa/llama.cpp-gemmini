@@ -73,6 +73,7 @@ struct potal_ws_report {
     uint64_t fences          = 0; // POTAL_FENCE == POTAL_OK
     uint64_t scale_writes    = 0;
     uint64_t scale_releases  = 0;
+    uint64_t tlb_flushes     = 0; // TLB FLUSH + FENCE before a job's first DMA (issuer)
     uint32_t last_generation = 0;
     uint32_t max_scale_slots = 0; // largest slot window of one invocation
     double   scale_s         = 0; // guest seconds in SCALE_WRITE/RELEASE

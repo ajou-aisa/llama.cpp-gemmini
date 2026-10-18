@@ -14,10 +14,12 @@ extern "C" {
 //   - src0 and src1 GGML_TYPE_I8, contiguous, M = N = 16, K = 16 or 32: one
 //     validated GEMM, every scale carrier x1; dst gets the exact INT32 sums.
 //   - src0 GGML_TYPE_Q8_HP1 and src1 GGML_TYPE_F32, both contiguous (no
-//     row gaps), any M, N and K % 32 == 0: per-tensor INT8 activation
-//     quantization, HP1 exponents as SCU carriers, Gemmini-compatible tiling
-//     (potal_tiled_matmul_auto), dst = C * activation_scale * channel_scale.
-//     No error compensation.
+//     row gaps), any M, N and K % 32 == 0: INT8 activation quantization by the
+//     configured Gemmini algorithm (GGML_GEMMINI_ACTIVATION_QUANT = EXSIA,
+//     TENSOR, TOKEN, BLOCK or STRIPE), HP1 exponents as SCU carriers,
+//     Gemmini-compatible tiling (potal_tiled_matmul_auto) on the route of the
+//     activation metadata ("<activation>+block"), F32 reconstruction and, with
+//     GGML_GEMMINI_ENABLE_RMD, the cpu_direct residual correction.
 // Metadata-only view ops are accepted; every other op is rejected by
 // supports_op, so ggml_backend_sched places it on another backend.
 // graph_compute never computes on the CPU: a request it cannot run in hardware
@@ -44,6 +46,16 @@ enum ggml_potal_reject {
 };
 
 GGML_BACKEND_API const char * ggml_potal_reject_name(enum ggml_potal_reject reason);
+
+// Route of an F32 x Q8_HP1 MUL_MAT: activation metadata x HP1 block-scaled weight.
+enum ggml_potal_route {
+    GGML_POTAL_ROUTE_TENSOR_BLOCK = 0, // one activation scale
+    GGML_POTAL_ROUTE_TOKEN_BLOCK,      // one scale per row
+    GGML_POTAL_ROUTE_STRIPE_BLOCK,     // one scale per row stripe
+    GGML_POTAL_ROUTE_EXSIA_BLOCK,      // one power-of-two scale per row stripe
+    GGML_POTAL_ROUTE_BLOCK_BLOCK,      // one scale per (row, 32-wide K group)
+    GGML_POTAL_ROUTE_COUNT,
+};
 
 // Counters of one POTAL backend instance, plus device- and process-wide state.
 // Times are cumulative guest CLOCK_MONOTONIC seconds, not FPGA cycles.
@@ -74,27 +86,64 @@ struct ggml_backend_potal_stats {
     int      issuer_cpu;      // Linux CPU whose /proc/cpuinfo hart is 0, -1 if not ready
     long     issuer_tid;      // -1 if not ready
 
-    // Q8_HP1 x F32 tiled path (hw_requests, scale_s, issue_s, fence_s and
+    // Q8_HP1 x F32 path (hw_requests, scale_s, issue_s, fence_s and
     // last_status above include it).
     uint64_t hp1_nodes;          // HP1 MUL_MAT nodes accepted by graph_compute
-    uint64_t hp1_completed;      // dst reconstructed from fenced hardware C
+    uint64_t hp1_completed;      // dst reconstructed from fenced hardware C (and compensated, if ON)
     uint64_t hp1_failed;         // dst set to NaN
+    uint64_t prefill_shaped_nodes; // HP1 nodes with M > 1
+    uint64_t decode_shaped_nodes;  // HP1 nodes with M == 1
+    uint64_t route_completed[GGML_POTAL_ROUTE_COUNT]; // completed HP1 nodes per route
+    uint64_t tiled_jobs;         // potal_tiled_matmul_auto calls (Block+block: one per K group)
     uint64_t tiled_invocations;  // LOOP_WS invocations issued
     uint64_t tiled_validated;    // of which through the validated potal_gemm_ws_issue()
     uint64_t tiled_fences;       // POTAL_FENCE == POTAL_OK, one per invocation
     uint64_t scale_writes;       // SCALE_WRITE == POTAL_OK
     uint64_t scale_releases;     // SCALE_RELEASE == POTAL_OK
+    uint64_t tlb_flushes;        // TLB FLUSH + FENCE before each tiled job's first DMA
     uint64_t zero_carriers;      // HP1 blocks with m = INT16_MIN
-    double   act_quant_s;        // per-tensor activation quantization
-    double   weight_pack_s;      // HP1 validation and B/carrier/scale unpacking
-    double   reconstruct_s;      // C -> F32
+    uint64_t shift_carriers;     // HP1 blocks with m > 0 (the SCU shifts, not x1)
+    uint64_t residual_payloads;      // residual payloads the quantizers captured (0 with compensation OFF)
+    uint64_t compensation_executed;  // residual corrections computed and merged into dst
+    uint64_t residual_events;        // residual entries those corrections consumed
+    uint64_t compensation_failed;    // nodes failed in the compensation step
+    double   act_quant_s;        // activation quantization (configured algorithm)
+    double   weight_pack_s;      // HP1 validation and B/carrier/scale unpacking, only for nodes
+                                 // that prepared their weight (cache miss/bypass/uncached);
+                                 // a cache hit adds nothing (see weight_cache_* below)
+    double   route_wall_s;       // caller wall time of the route: submission, issuer wait,
+                                 // reconstruction; not SCU or array time
+    double   compensation_s;     // residual correction and merge
 
-    // Device-wide MUL_MAT supports_op rejections: each such node runs on
-    // another backend (CPU fallback). The scheduler asks repeatedly per node.
+    // Device-wide MUL_MAT supports_op answers that were false. This counts
+    // answers, not nodes or CPU executions: the scheduler asks repeatedly per
+    // node, and where a rejected node runs is the scheduler's decision.
     uint64_t supports_mul_mat_rejected;
+
+    // Prepared Q8_HP1 weights of this backend (matmul/weight_cache.hpp). A
+    // weight in a GGML_BACKEND_BUFFER_USAGE_WEIGHTS buffer is validated and
+    // unpacked on its first MUL_MAT and reused afterwards; any other src0 is
+    // prepared per call. Budget: GGML_POTAL_WEIGHT_CACHE_MB (default 1024, 0 = off).
+    uint64_t weight_cache_hits;      // nodes that reused a prepared weight (no validation, no unpacking)
+    uint64_t weight_cache_misses;    // nodes that prepared a weight and cached it
+    uint64_t weight_cache_bypasses;  // nodes that prepared a cacheable weight over the budget (not kept)
+    uint64_t weight_cache_uncached;  // nodes whose src0 is not in a weights buffer (prepared, not kept)
+    uint64_t weight_cache_entries;   // cached weights now
+    uint64_t weight_cache_bytes;     // their B + carrier + channel_scale buffers
+    uint64_t weight_cache_budget;    // bytes
+    uint64_t weight_validations;     // full HP1 validations run (= weight preparations started)
+    uint64_t weight_packs;           // complete B/carrier/scale unpackings
+    uint64_t weight_pack_bytes;      // B + carrier + channel_scale bytes those unpackings wrote
+    double   weight_alloc_s;         // zeroed weight buffer allocation of those preparations
+    double   weight_lookup_s;        // cache hits: lookup only
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);
+
+// Frees every prepared weight of this backend. Required before a weight buffer
+// is mutated or freed (and another one possibly allocated at its address)
+// while the backend lives; must not overlap ggml_backend_graph_compute on it.
+GGML_BACKEND_API void ggml_backend_potal_clear_weight_cache(ggml_backend_t backend);
 
 #ifdef __cplusplus
 }

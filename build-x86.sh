@@ -7,14 +7,21 @@ source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   printf 'Usage: %s [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
-  printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*.'
-  printf '%s\n' 'GGML_GEMMINI_DIM=16|32|64 selects host tiling; IM2P_DIM is a deprecated alias.'
+  printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*, POTAL_*.'
+  printf '%s\n' 'Default: GGML PoTal backend host build (GGML_GEMMINI=OFF, GGML_POTAL=ON, GGML_BACKEND_DL=OFF,'
+  printf '%s\n' '  POTAL_EXPECTED_DIM=16, POTAL_HW_PARAMS=<potal>/software/gemmini-rocc-tests/include/gemmini_potal_params.h).'
+  printf '%s\n' '  No accelerator exists on x86: builds the host tests potal-api-test, potal-ggml-unit-test,'
+  printf '%s\n' '  potal-tiling-unit-test, then llama-cli, llama-perplexity and llama-quantize (CPU compute).'
+  printf '%s\n' '  Q8_HP1 models: llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1.'
+  printf '%s\n' 'Gemmini backend: -DGGML_POTAL=OFF -DGGML_GEMMINI=ON -DGEMMINI_SW_PATH=/abs/gemmini/include/tree'
+  printf '%s\n' '  -DGGML_GEMMINI_ACTIVATION_QUANT=EXSIA; IM2P_SIM (default there) needs IM2P_SIM_ROOT (default ../IM2P.sim).'
+  printf '%s\n' '  GGML_GEMMINI_DIM=16|32|64 selects host tiling; IM2P_DIM is a deprecated alias.'
   printf '%s\n' 'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON enables PoTal Q/K/P/V quantization; default OFF.'
   printf '%s\n' 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON additionally requires native WS+IM2P_SIM+GEMMINI_HP1; default OFF.'
   exit 0
 fi
 
-# Build the selected Gemmini backend on x86; outputs live in build-x86/bin by default.
+# Build the selected backend on x86 (PoTal by default); outputs live in build-x86/bin by default.
 
 # Shell controls; these are not CMake cache defaults.
 BUILD_DIR=${BUILD_DIR:-${BUILD_DIR_DEFAULT:-build-x86}}
@@ -24,7 +31,8 @@ IM2P_CACHE_JOBS_DEFAULT=${IM2P_CACHE_JOBS_DEFAULT:-}
 
 # Backends: ON | OFF; override with -DGGML_<NAME>=ON|OFF or GGML_<NAME>=ON|OFF.
 GGML_CPU_DEFAULT=${GGML_CPU_DEFAULT:-ON}
-GGML_GEMMINI_DEFAULT=${GGML_GEMMINI_DEFAULT:-ON}
+GGML_GEMMINI_DEFAULT=${GGML_GEMMINI_DEFAULT:-OFF}
+GGML_POTAL_DEFAULT=${GGML_POTAL_DEFAULT:-ON}
 if [[ "$(uname -s)" == Darwin ]]; then
   GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-ON}
   GGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT:-ON}
@@ -37,6 +45,11 @@ GGML_VULKAN_DEFAULT=${GGML_VULKAN_DEFAULT:-OFF}
 GGML_OPENCL_DEFAULT=${GGML_OPENCL_DEFAULT:-OFF}
 GGML_RPC_DEFAULT=${GGML_RPC_DEFAULT:-OFF}
 GGML_BACKEND_DL_DEFAULT=${GGML_BACKEND_DL_DEFAULT:-OFF}
+
+# PoTal hardware parameters: the RTL-generated header (validated by
+# cmake/potal-hw-params.cmake); dropped unless GGML_POTAL is ON.
+POTAL_HW_PARAMS_DEFAULT=${POTAL_HW_PARAMS_DEFAULT:-"$SCRIPT_ROOT/../../gemmini-rocc-tests/include/gemmini_potal_params.h"}
+POTAL_EXPECTED_DIM_DEFAULT=${POTAL_EXPECTED_DIM_DEFAULT:-16}
 
 # Gemmini backend and platform policy.
 GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT:-IM2P_SIM}
@@ -72,11 +85,13 @@ GGML_GEMMINI_ENABLE_STRIPE_PIPELINE_DEFAULT=${GGML_GEMMINI_ENABLE_STRIPE_PIPELIN
 GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT=${GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT:-STRIPE_PIPELINE}
 GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT:-2}
 GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT=${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT:-ON}
-GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-ON}
-GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-WS}
+# Error compensation is a selectable path; the HP1 validation runs it OFF.
+# PoTal executes the CPU (cpu_direct) residual backend only.
+GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-OFF}
+GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-CPU}
 
 # ExSIA activation staging.
-GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-EXSIA}
+GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-TENSOR} # HP1 validation setting; all five are supported
 GGML_GEMMINI_EXSIA_SIGMA_DEFAULT=${GGML_GEMMINI_EXSIA_SIGMA_DEFAULT:-2}
 GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT=${GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT:-SEQUENTIAL}
 GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT:-4}
@@ -115,4 +130,11 @@ if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == IM2P_SIM && "$CYCLE_SIM_DEFAU
 fi
 
 im2p_configure_build "$BUILD_DIR" "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
-cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"${BUILD_JOBS_DEFAULT}"
+if [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
+  # Host-runnable PoTal tests first; the RISC-V-only smokes are not defined here.
+  cmake --build "$BUILD_DIR" --target potal-api-test potal-ggml-unit-test potal-tiling-unit-test \
+    -j"${BUILD_JOBS_DEFAULT}"
+  cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
+else
+  cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"${BUILD_JOBS_DEFAULT}"
+fi

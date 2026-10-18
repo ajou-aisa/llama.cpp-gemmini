@@ -14,7 +14,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' '  Builds potal-api-test, potal-api-smoke, potal-multicore-smoke, potal-ggml-unit-test,'
   printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, then llama-cli and llama-perplexity.'
   printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>] selects another header.'
-  printf '%s\n' '  GGML_GEMMINI_ACTIVATION_QUANT=TENSOR (default here) and 8-bit activations/weights are required.'
+  printf '%s\n' '  Defaults here: GGML_GEMMINI_ACTIVATION_QUANT=TENSOR, GGML_GEMMINI_ENABLE_RMD=OFF (compensation),'
+  printf '%s\n' '  GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU. PoTal accepts EXSIA|TENSOR|TOKEN|BLOCK|STRIPE and RMD ON with'
+  printf '%s\n' '  the CPU (cpu_direct) backend; 8-bit activations/weights and block size 32 are required.'
   printf '%s\n' '  Q8_HP1 models: llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1 (host build).'
   printf '%s\n' 'PoTal API only: -DGGML_POTAL=OFF -DPOTAL_API_ONLY=ON [-DPOTAL_EXPECTED_DIM=16|32|64]'
   printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
@@ -60,7 +62,7 @@ GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT:
 GGML_GEMMINI_OPTION_DEFAULT=${GGML_GEMMINI_OPTION_DEFAULT:-WS}
 GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-OFF}
 GGML_OPENMP_DEFAULT=${GGML_OPENMP_DEFAULT:-OFF}
-GGML_GEMMINI_ENABLE_OPENMP_DEFAULT=${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT:-ON}
+GGML_GEMMINI_ENABLE_OPENMP_DEFAULT=${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT:-OFF}
 LLAMA_BUILD_TESTS_DEFAULT=${LLAMA_BUILD_TESTS_DEFAULT:-ON}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF}
 CMAKE_TOOLCHAIN_FILE_DEFAULT=${CMAKE_TOOLCHAIN_FILE_DEFAULT:-"$SCRIPT_ROOT/cmake/$target.cmake"}
@@ -95,19 +97,21 @@ GGML_GEMMINI_ENABLE_STRIPE_PIPELINE_DEFAULT=${GGML_GEMMINI_ENABLE_STRIPE_PIPELIN
 GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT=${GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT:-FULL}
 GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT:-2}
 GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT=${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT:-ON}
-GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-ON}
-GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-WS}
+# Error compensation is a selectable path; the HP1 validation runs it OFF.
+# PoTal executes the CPU (cpu_direct) residual backend only.
+GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-OFF}
+GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-CPU}
 
 # ExSIA activation staging.
-GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-TENSOR} # PoTal implements TENSOR only
+GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-TENSOR} # HP1 validation setting; all five are supported
 GGML_GEMMINI_EXSIA_SIGMA_DEFAULT=${GGML_GEMMINI_EXSIA_SIGMA_DEFAULT:-2}
 GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT=${GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT:-SEQUENTIAL}
 GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT:-4}
 GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT:-OFF}
 
 # Logs and independent metrics. CPU logging follows final LOG_CYCLE unless overridden.
-LOG_DEBUG_DEFAULT=${LOG_DEBUG_DEFAULT:-0}
-LOG_CYCLE_DEFAULT=${LOG_CYCLE_DEFAULT:-0}
+LOG_DEBUG_DEFAULT=${LOG_DEBUG_DEFAULT:-1}
+LOG_CYCLE_DEFAULT=${LOG_CYCLE_DEFAULT:-1}
 LOG_DUMP_DEFAULT=${LOG_DUMP_DEFAULT:-0}
 LOG_DUMP_SCALE_DEFAULT=${LOG_DUMP_SCALE_DEFAULT:-0}
 CYCLE_DETAIL_DEFAULT=${CYCLE_DETAIL_DEFAULT:-0}
@@ -140,7 +144,7 @@ elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
   # PoTal tests first, so they exist even if llama-cli does not link.
   cmake --build "$BUILD_DIR" --target potal-api-test potal-api-smoke potal-multicore-smoke \
     potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke -j"${BUILD_JOBS_DEFAULT}"
-  cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"${BUILD_JOBS_DEFAULT}"
+  cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
 else
   cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
 fi

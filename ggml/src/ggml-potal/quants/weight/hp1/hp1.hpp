@@ -1,12 +1,12 @@
 #pragma once
 
-// Q8_HP1 weights -> PoTal operands, on the weight reader copied from Gemmini
-// (quants/common/weight_reader, hp1_scu).
+// Q8_HP1 weights -> PoTal operands, through the Gemmini weight reader
+// (ggml-gemmini/quants/common/weight_reader + weight_route, HP1 SCU domain).
 //
 //   block_q8_hp1 (ggml-common.h, QK8_HP = 32): qs[32] int8, m int16, padding[2], channel_scale f32
 //   value = qs * channel_scale * 2^m          (dequantize_row_q8_hp1; m = INT16_MIN -> 0)
 //
-//   qs             -> B[k][n] int8 payload           (wreader::read_code_validated)
+//   qs             -> B[k][n] int8 payload           (per validated block, as wreader::read_code_tile_validated)
 //   m              -> SCU carrier                     (wreader::read_hp1_carrier_validated)
 //   channel_scale  -> F32 reconstruction, per column  (wreader::read_column_scale_validated)
 //
@@ -16,20 +16,23 @@
 // rmd-compose enforces), the scale must not be negative, and a row with scale
 // 0 may only hold zero blocks. Nothing is dequantized and requantized.
 
-#include "../../common/weight_reader.hpp"
+#include "quants/common/weight_reader.hpp"
 
 #include <cstddef>
 #include <cstdint>
 
-struct ggml_potal_args_t;
+struct ggml_gemmini_args_t;
 
 namespace ggml::potal::quants::weight::hp1 {
+
+namespace wreader = ggml::gemmini::quants::wreader;
 
 constexpr uint32_t block_k = 32; // QK8_HP, the K extent of one scale block
 
 enum class status {
     ok,
     invalid,        // null output, stride too small
+    route,          // resolve_weight_route_plan() is not the HP1 SCU route
     metadata,       // wreader::validate() failed (see the reader status)
     channel_scale,  // negative, or 0 in a row with a non-zero block
     scale_mismatch, // blocks of one row carry different channel_scale bits
@@ -40,6 +43,7 @@ const char * status_name(status s);
 struct stats {
     uint64_t blocks       = 0;
     uint64_t zero_blocks  = 0; // m = INT16_MIN (zero carrier)
+    uint64_t shift_blocks = 0; // carrier > 0: the SCU shifts (not x1)
     uint64_t zero_rows    = 0; // channel_scale == 0
     int32_t  min_m        = 0; // over non-zero blocks
     int32_t  max_m        = 0;
@@ -53,7 +57,7 @@ struct stats {
 //   carriers[(k / block_k) * cstride + n]  = carrier(m)
 //   channel_scale[n]                       = the row's channel_scale
 // Outputs are partially written when the status is not ok.
-status unpack(const ggml_potal_args_t & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
+status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
               float * channel_scale, stats * st, wreader::WeightReaderStatus * reader = nullptr);
 
 } // namespace ggml::potal::quants::weight::hp1

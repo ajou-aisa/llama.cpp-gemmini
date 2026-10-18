@@ -12,9 +12,12 @@ The following sections describe how to build with different backends and options
 ## Gemmini developer builds
 
 This fork provides `build-x86.sh`, `build-arm64.sh`, `build-arm64-cpu.sh`, and
-`build-riscv.sh`. FPGA support and its dedicated wrapper are retired. The x86
-wrapper visibly defaults to `IM2P_SIM` / `GEMMINI_HP1`, WS, A8/W8/D16, ExSIA,
-`STRIPE_PIPELINE`, and RMD enabled with WS residuals. Developer builds are distinct
+`build-riscv.sh`. FPGA support and its dedicated wrapper are retired. The x86 and
+RISC-V wrappers default to the PoTal backend (`GGML_POTAL=ON`, `GGML_GEMMINI=OFF`,
+TENSOR A8/W8/D16). On x86 no accelerator exists: it builds the host PoTal unit tests
+and `llama-quantize` (Q8_HP1 conversion). The Gemmini `IM2P_SIM` lane needs
+`-DGGML_POTAL=OFF -DGGML_GEMMINI=ON -DGEMMINI_SW_PATH=...`, an ExSIA activation
+mode and an existing `IM2P_SIM_ROOT`. Developer builds are distinct
 from the receipt-verified [measurement builds](../scripts/eval/README.md).
 
 Each wrapper visibly declares applicable defaults from the managed CMake
