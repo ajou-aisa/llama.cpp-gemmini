@@ -31,12 +31,41 @@ if (NOT POTAL_API_ONLY)
         C_VISIBILITY_PRESET hidden)
 endif()
 
+# Planned-GEMM API of potal.h (potal_stripe_session, potal_tiled_matmul_stripe)
+# on the Gemmini-compatible tiler: C++ inside, no ggml/Gemmini dependency. The
+# one owner of matmul/tiling.cpp: the GGML backend and its tests link it.
+add_library(potal-tiled-api STATIC
+    matmul/tiling.cpp
+    matmul/tiling.hpp
+    matmul/stripe-api.cpp
+    matmul/stripe-api.hpp)
+target_link_libraries(potal-tiled-api PUBLIC potal-api)
+target_compile_features(potal-tiled-api PUBLIC cxx_std_17)
+if (NOT POTAL_API_ONLY)
+    # Linked into the (shared) ggml-potal backend: private to it, as potal-api.
+    set_target_properties(potal-tiled-api PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+endif()
+
 # Field packing and validation; runs on the host and on the target.
 add_executable(potal-api-test tests/potal-api-test.c)
 target_link_libraries(potal-api-test PRIVATE potal-api)
 set_target_properties(potal-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-api-test COMMAND potal-api-test)
+endif()
+
+# potal_tiled_matmul_stripe from a C11 caller (header and link) and, on an
+# RTL-semantics emulator, frozen plans, tails, K chunks, descriptor rejection
+# without commands, generation wrap. Host and target; no hardware.
+add_executable(potal-stripe-api-test tests/potal-stripe-api-test.cpp tests/potal-stripe-api-c.c)
+target_include_directories(potal-stripe-api-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-stripe-api-test PRIVATE potal-tiled-api)
+set_target_properties(potal-stripe-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-stripe-api-test COMMAND potal-stripe-api-test)
 endif()
 
 # Hardware smoke test: RISC-V only, and only for the validated DIM16 GEMM path.
@@ -94,15 +123,31 @@ endif()
 if (NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL "32")
     message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_BLOCK_SIZE must be 32, the Q8_HP1 scale block (got ${GGML_GEMMINI_BLOCK_SIZE})")
 endif()
-if (GGML_GEMMINI_ENABLE_RMD AND NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "CPU")
-    # The WS residual executor (rmd-executor.cpp) drives Gemmini through gemmini.h/IM2P;
-    # PoTal has no compact-RMD executor yet. CPU = the existing cpu_direct route.
-    message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_DEFAULT_RMD_BACKEND=${GGML_GEMMINI_DEFAULT_RMD_BACKEND} needs the Gemmini WS "
-                        "residual executor, which PoTal does not have; use CPU (cpu_direct) or GGML_GEMMINI_ENABLE_RMD=OFF")
+# Execution modes (matmul/options.hpp): FULL runs every activation algorithm
+# and, under RMD, the CPU (cpu_direct) residual; STRIPE_PIPELINE runs EXSIA
+# and, under RMD, the WS residual as a PoTal Residual GEMM (potal_ws). The
+# Gemmini WS executor (rmd-executor.cpp, gemmini.h/IM2P) is not linked. Build
+# defaults outside that are refused here; runtime overrides
+# (GEMMINI_MATMUL_MODE, GEMMINI_RMD_BACKEND, GEMMINI_STRIPE_JOB_CAPACITY) are
+# refused per node, never replaced by another path.
+string(TOUPPER "${GGML_GEMMINI_ACTIVATION_QUANT}" _POTAL_ACTIVATION_QUANT)
+if (GGML_GEMMINI_DEFAULT_MATMUL_MODE STREQUAL "STRIPE_PIPELINE")
+    if (NOT _POTAL_ACTIVATION_QUANT STREQUAL "EXSIA")
+        message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE needs "
+                            "GGML_GEMMINI_ACTIVATION_QUANT=EXSIA (got ${GGML_GEMMINI_ACTIVATION_QUANT})")
+    endif()
+    if (GGML_GEMMINI_ENABLE_RMD AND NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "WS")
+        message(FATAL_ERROR "GGML_POTAL: STRIPE_PIPELINE with GGML_GEMMINI_ENABLE_RMD=ON runs the WS residual on PoTal; "
+                            "GGML_GEMMINI_DEFAULT_RMD_BACKEND=${GGML_GEMMINI_DEFAULT_RMD_BACKEND} (cpu_direct) is FULL-only")
+    endif()
+elseif (GGML_GEMMINI_ENABLE_RMD AND NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "CPU")
+    message(FATAL_ERROR "GGML_POTAL: FULL with GGML_GEMMINI_ENABLE_RMD=ON runs the CPU (cpu_direct) residual; "
+                        "GGML_GEMMINI_DEFAULT_RMD_BACKEND=${GGML_GEMMINI_DEFAULT_RMD_BACKEND} (the PoTal WS residual) "
+                        "runs in GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE")
 endif()
-if (NOT GGML_GEMMINI_DEFAULT_MATMUL_MODE STREQUAL "FULL")
-    message(FATAL_ERROR "GGML_POTAL executes FULL matmul invocations only (GGML_GEMMINI_DEFAULT_MATMUL_MODE=${GGML_GEMMINI_DEFAULT_MATMUL_MODE}); "
-                        "the stripe pipeline is not part of this backend")
+if (NOT GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY MATCHES "^[12]$")
+    message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY must be 1 or 2 "
+                        "(got ${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY})")
 endif()
 
 find_package(Threads REQUIRED)
@@ -154,12 +199,14 @@ set(POTAL_BACKEND_SOURCES
     matmul/options.hpp
     matmul/pack.cpp
     matmul/pack.hpp
-    matmul/tiling.cpp
-    matmul/tiling.hpp
+    matmul/stripe.cpp
+    matmul/stripe.hpp
     matmul/weight_cache.cpp
     matmul/weight_cache.hpp
     quants/weight/hp1/hp1.cpp
     quants/weight/hp1/hp1.hpp
+    residual/stripe-residual.cpp
+    residual/stripe-residual.hpp
     ${POTAL_GEMMINI_SHARED_SOURCES})
 
 # Compile definitions of the Gemmini backend (cmake/ggml-gemmini-config.cmake)
@@ -190,7 +237,7 @@ function(potal_add_backend_settings target)
     target_include_directories(${target} PRIVATE ${POTAL_PRIVATE_INCLUDES})
     target_compile_definitions(${target} PRIVATE ${POTAL_LOG_DEFINITIONS})
     target_compile_features(${target} PRIVATE cxx_std_17)
-    target_link_libraries(${target} PRIVATE potal-api ggml-gemmini-utils Threads::Threads)
+    target_link_libraries(${target} PRIVATE potal-tiled-api potal-api ggml-gemmini-utils Threads::Threads)
     if (GGML_GEMMINI_ENABLE_OPENMP)
         target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
         target_compile_definitions(${target} PRIVATE GGML_GEMMINI_HAS_OPENMP)
@@ -234,6 +281,30 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-tiling-unit-test COMMAND potal-tiling-unit-test)
 endif()
 
+# Hardware-free checks (host and target): the PoTal WS residual of one packet
+# (run-aware rows/runs, K32 padded lowering, gather from the prepared weight)
+# against an independent compact-run SCU/Sat32 golden, radix INT64
+# reconstruction, checked merge, failures.
+add_executable(potal-residual-unit-test tests/potal-residual-unit-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-residual-unit-test)
+target_include_directories(potal-residual-unit-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-residual-unit-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-residual-unit-test COMMAND potal-residual-unit-test)
+endif()
+
+# Hardware-free checks (host and target): the stripe pipeline with real ExSIA
+# stripe-ready events, the production queue/consumer on an emulator thread:
+# overlap and backpressure gates, semantic capacity, serialized == pipelined,
+# immutability of accepted stripes, failure wake-up, no partial commit.
+add_executable(potal-stripe-pipeline-test tests/potal-stripe-pipeline-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-stripe-pipeline-test)
+target_include_directories(potal-stripe-pipeline-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-stripe-pipeline-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-stripe-pipeline-test COMMAND potal-stripe-pipeline-test)
+endif()
+
 # Benchmark (host and target, not a test): Q8_HP1 weight preparation cost per
 # stage and with the backend's weight cache, synthetic or from a GGUF (--gguf).
 # GGML_GEMMINI_TESTING enables the Gemmini reader's call counters in this target only.
@@ -253,4 +324,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     add_executable(potal-hp1-smoke tests/potal-hp1-smoke.cpp ${POTAL_BACKEND_SOURCES})
     potal_add_backend_settings(potal-hp1-smoke)
     target_link_libraries(potal-hp1-smoke PRIVATE ggml)
+
+    # FireSim: STRIPE_PIPELINE MUL_MAT graphs (ExSIA, Main and Residual GEMMs on
+    # the hart-0 issuer), checked element-exactly against a CPU golden built
+    # from the same ExSIA codes, theta and packets.
+    add_executable(potal-stripe-smoke tests/potal-stripe-smoke.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-stripe-smoke)
+    target_include_directories(potal-stripe-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-stripe-smoke PRIVATE ggml)
 endif()

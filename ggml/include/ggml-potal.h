@@ -19,7 +19,11 @@ extern "C" {
 //     TENSOR, TOKEN, BLOCK or STRIPE), HP1 exponents as SCU carriers,
 //     Gemmini-compatible tiling (potal_tiled_matmul_auto) on the route of the
 //     activation metadata ("<activation>+block"), F32 reconstruction and, with
-//     GGML_GEMMINI_ENABLE_RMD, the cpu_direct residual correction.
+//     GGML_GEMMINI_ENABLE_RMD, the cpu_direct residual correction (FULL mode).
+//     STRIPE_PIPELINE mode (EXSIA only): each ExSIA stripe goes to the
+//     hardware as soon as its folding commits; with GGML_GEMMINI_ENABLE_RMD
+//     its residual runs as a PoTal Residual GEMM (rmd_backend WS), then the
+//     CPU reconstructs and merges it.
 // Metadata-only view ops are accepted; every other op is rejected by
 // supports_op, so ggml_backend_sched places it on another backend.
 // graph_compute never computes on the CPU: a request it cannot run in hardware
@@ -136,6 +140,34 @@ struct ggml_backend_potal_stats {
     uint64_t weight_pack_bytes;      // B + carrier + channel_scale bytes those unpackings wrote
     double   weight_alloc_s;         // zeroed weight buffer allocation of those preparations
     double   weight_lookup_s;        // cache hits: lookup only
+
+    // STRIPE_PIPELINE nodes (GGML_GEMMINI_DEFAULT_MATMUL_MODE / GEMMINI_MATMUL_MODE):
+    // ExSIA stripes handed to the issuer as soon as their folding commits, Main
+    // and Residual GEMMs on PoTal, reconstruction and merge on the CPU. Their
+    // GEMMs are also in hw_requests, tiled_*, scale_*, tlb_flushes above;
+    // hp1_completed still counts nodes. Merged per node after its run ended.
+    uint64_t stripe_pipeline_nodes;       // HP1 nodes run as a stripe pipeline
+    uint64_t stripe_pipeline_failed;      // of which failed (dst set to NaN)
+    uint64_t stripes_accepted;            // stripes submitted and accepted
+    uint64_t stripes_semantic_completed;  // Main + Residual + reconstruction/merge done
+    uint64_t max_outstanding_semantic;    // most stripes accepted and not yet semantically done
+    uint64_t producer_capacity_waits;     // submits that found the pipeline full and waited
+    uint64_t main_logical_gemms;          // Main stripe GEMMs completed
+    uint64_t main_loop_ws;                // their LOOP_WS invocations
+    uint64_t main_fences;                 // their POTAL_FENCE == POTAL_OK
+    uint64_t residual_nonempty_packets;   // stripes whose residual was merged
+    uint64_t residual_logical_gemms;      // Residual GEMMs completed
+    uint64_t residual_loop_ws;
+    uint64_t residual_fences;
+    uint64_t residual_compact_k;          // sum of the residual GEMMs' compact K
+    uint64_t residual_execution_k;        // sum of their K32-padded execution K
+    uint64_t residual_active_lane_rows;   // sum of their rows (active (lane, row) pairs)
+    uint64_t radix_reconstructions;
+    uint64_t merges_completed;
+    uint64_t corrections_nonzero;         // nonzero INT64 correction entries merged
+    uint64_t last_stripe_count;           // stripes of the last pipelined node
+    double   pipeline_wall_s;             // caller wall time of pipelined nodes: quantization,
+                                          // the overlapped issuer work and the drain
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);

@@ -209,4 +209,30 @@ compensation_result apply_compensation(const ggml_gemmini_args_t & args);
 void reference_gemm_i32(const int8_t * a, size_t lda, const int8_t * b, size_t ldb, const uint32_t * carriers,
                         size_t cstride, size_t block_k, size_t M, size_t N, size_t K, int32_t * c, size_t ldc);
 
+// ---- shared by the FULL route and the stripe pipeline (matmul/stripe.hpp) -----
+
+size_t align_up(size_t v, size_t to);
+
+// A DMA buffer: `bytes` rounded up to POTAL_HW_MAX_BYTES, aligned to it and
+// zeroed; nullptr if out of memory. Free with std::free, except after a fatal
+// hardware failure: then leak it (the accelerator may still reach it).
+void * dma_alloc(size_t bytes);
+
+// Main reconstruction of one output row (FULL routes with a constant-along-K
+// scale and every stripe of the pipeline):
+//   out[n * col_stride] = float(double(c[n]) * activation_scale * double(channel_scale[n]))
+void reconstruct_row(const int32_t * c, size_t n, double activation_scale, const float * channel_scale, float * out,
+                     size_t col_stride);
+
+// Rows [row_begin, row_begin + rows) of the A8 codes in args.A -> dst rows of
+// stride lda (K codes each). false if args.A is not the dense A8 I x K buffer
+// or the rows are outside it.
+bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda);
+
+// The fields of args a residual merge reads, and nothing the activation
+// quantizer writes: I/J/K, the Q8_HP1 weight view, the layer identity, the
+// tile geometry and the residual route; f_out = out (row stride out_stride,
+// column stride 1). No activation buffer, no metadata, no stripe sink.
+void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_t out_stride, ggml_gemmini_args_t & merge);
+
 } // namespace ggml::potal

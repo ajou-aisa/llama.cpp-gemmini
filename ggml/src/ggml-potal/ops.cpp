@@ -7,6 +7,7 @@
 #include "matmul/execution.hpp"
 #include "matmul/options.hpp"
 #include "matmul/pack.hpp"
+#include "matmul/stripe.hpp"
 #include "potal.h"
 #include "potal_hw_params.h"
 
@@ -19,6 +20,7 @@
 #include <gemmini/performance.hpp>
 #include <gemmini/trace-context.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -62,27 +64,7 @@ void cycle_stage(const std::string & layer, const char * op, uint64_t start, uin
 #endif
 }
 
-// Inference identity of the running node, as the Gemmini backend's records
-// carry it: phase/decode from the performance context, ids from the operator
-// trace context bound by potal_graph_compute. phase=none outside an inference.
-std::string trace_fields() {
-    namespace perf                = ggml::gemmini::performance;
-    const gemmini_trace_context t = gemmini_trace_capture();
-    const perf::Context         p = ggml::gemmini::trace::inference_context(t);
-    // The trace context has no decode ordinal; the published context has it
-    // while the same operation is current.
-    const perf::Context g      = perf::capture_context();
-    const bool          decode = p.request_id && p.phase == perf::Phase::decode;
-    const bool          known  = decode && g.request_id == p.request_id && g.operation_id == p.operation_id;
-    const std::string   decode_ordinal = known ? std::to_string(g.decode_ordinal) : "null"; // prefill: null
-    char                buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "phase=%s decode_ordinal=%s request_id=%" PRIu64 " operation_id=%" PRIu64 " graph_id=%" PRIu64
-                  " operator_id=%" PRIu64 " node_ordinal=%" PRIu64,
-                  p.request_id ? perf::phase_name(p.phase) : "none", decode_ordinal.c_str(), p.request_id,
-                  p.operation_id, t.graph_id, t.operator_id, t.node_id);
-    return buf;
-}
+using log::trace_fields;
 
 // The work ran on PoTal, which exposes no cycle counter: the operation gets an
 // NPU record that says so (the summary then reports POTAL/... cycles=n/a with
@@ -161,8 +143,112 @@ ggml_status hp1_fail(ggml_backend_potal_stats & st, ggml_tensor * node, const st
     return GGML_STATUS_FAILED;
 }
 
-const char * rmd_backend_name(ggml::gemmini::RmdBackend b) {
-    return b == ggml::gemmini::RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+// STRIPE_PIPELINE (matmul/stripe.hpp): ExSIA hands every folding-committed
+// stripe to the hart-0 issuer at once; Main and Residual GEMMs on PoTal,
+// reconstruction and merge on the CPU, dst written once on success.
+ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, const std::string & layer,
+                                 ggml_gemmini_args_t & args, weight_lookup & wl, const potal_tile_plan & plan,
+                                 size_t job_capacity) {
+    ggml_backend_potal_stats & st     = state.stats;
+    const hp1_weight &         weight = *wl.weight;
+    st.stripe_pipeline_nodes++;
+
+    pipeline_config cfg;
+    cfg.job_capacity = job_capacity;
+    cfg.residual     = options::compensation;
+    cfg.layer        = layer;
+    issuer_owner owner;
+    const uint64_t c0 = gcycle::read();
+    const auto     t  = clock_type::now();
+    const pipeline_report r = run_stripe_pipeline(node->src[1], args, weight, plan, cfg, owner);
+    // Caller-side interval: quantization, the overlapped issuer work and the
+    // final drain; not SCU or array time.
+    st.pipeline_wall_s += seconds_since(t);
+    cycle_stage(layer, "potal.stripe_pipeline", c0, gcycle::read());
+
+    // The run's counters, merged once on this thread after the run ended.
+    const pipeline_counts & c = r.counts;
+    st.hw_requests += c.main_logical_gemms + c.residual_logical_gemms;
+    st.tiled_jobs += c.main_logical_gemms + c.residual_logical_gemms;
+    st.tiled_invocations += c.main_loop_ws + c.residual_loop_ws;
+    st.tiled_validated += c.main_validated + c.residual_validated;
+    st.tiled_fences += c.main_fences + c.residual_fences;
+    st.scale_writes += c.scale_writes;
+    st.scale_releases += c.scale_releases;
+    st.tlb_flushes += c.tlb_flushes;
+    st.scale_s += c.scale_s;
+    st.issue_s += c.issue_s;
+    st.fence_s += c.fence_s;
+    st.last_status     = r.status;
+    st.last_generation = c.last_generation != 0 ? c.last_generation : st.last_generation;
+    st.residual_payloads += c.residual_nonempty_packets;
+    st.compensation_executed += c.merges_completed;
+    st.stripes_accepted += c.stripes_accepted;
+    st.stripes_semantic_completed += c.stripes_semantic_completed;
+    st.max_outstanding_semantic = std::max(st.max_outstanding_semantic, c.max_outstanding_semantic);
+    st.producer_capacity_waits += c.producer_capacity_waits;
+    st.main_logical_gemms += c.main_logical_gemms;
+    st.main_loop_ws += c.main_loop_ws;
+    st.main_fences += c.main_fences;
+    st.residual_nonempty_packets += c.residual_nonempty_packets;
+    st.residual_logical_gemms += c.residual_logical_gemms;
+    st.residual_loop_ws += c.residual_loop_ws;
+    st.residual_fences += c.residual_fences;
+    st.residual_compact_k += c.residual_compact_k;
+    st.residual_execution_k += c.residual_execution_k;
+    st.residual_active_lane_rows += c.residual_active_lane_rows;
+    st.radix_reconstructions += c.radix_reconstructions;
+    st.merges_completed += c.merges_completed;
+    st.corrections_nonzero += c.corrections_nonzero;
+    st.last_stripe_count = r.expected_stripes;
+#if LOG_DEBUG
+    log::debug(layer.c_str(),
+                "[POTAL] route=ExSIA+block matmul_mode=STRIPE_PIPELINE residual_executor=POTAL/%s node=%s "
+                "run_id=%s stripe_count=%zu job_capacity=%zu tile_I=%zu tile_J=%zu tile_K=%zu stripes_accepted=%llu "
+                "stripes_semantic_completed=%llu max_outstanding_semantic=%llu producer_capacity_waits=%llu "
+                "main_logical_gemms=%llu main_loop_ws=%llu main_fences=%llu residual_nonempty_packets=%llu "
+                "residual_logical_gemms=%llu residual_loop_ws=%llu residual_fences=%llu residual_compact_k=%llu "
+                "residual_execution_k=%llu active_lane_rows=%llu radix_reconstructions=%llu merges_completed=%llu "
+                "corrections_nonzero=%llu scale_writes=%llu scale_releases=%llu tlb_flushes=%llu generation=%u "
+                "status=%s",
+                options::residual_executor_name(options::MatmulInvocationMode::stripe_pipeline), node->name,
+                r.run_bound ? std::to_string(r.run_id).c_str() : "-", r.expected_stripes, job_capacity,
+                plan.tile_I, plan.tile_J, plan.tile_K, (unsigned long long) c.stripes_accepted,
+                (unsigned long long) c.stripes_semantic_completed, (unsigned long long) c.max_outstanding_semantic,
+                (unsigned long long) c.producer_capacity_waits, (unsigned long long) c.main_logical_gemms,
+                (unsigned long long) c.main_loop_ws, (unsigned long long) c.main_fences,
+                (unsigned long long) c.residual_nonempty_packets, (unsigned long long) c.residual_logical_gemms,
+                (unsigned long long) c.residual_loop_ws, (unsigned long long) c.residual_fences,
+                (unsigned long long) c.residual_compact_k, (unsigned long long) c.residual_execution_k,
+                (unsigned long long) c.residual_active_lane_rows, (unsigned long long) c.radix_reconstructions,
+                (unsigned long long) c.merges_completed, (unsigned long long) c.corrections_nonzero,
+                (unsigned long long) c.scale_writes, (unsigned long long) c.scale_releases,
+                (unsigned long long) c.tlb_flushes, c.last_generation, r.ok ? "committed" : "failed");
+#endif
+    if (!r.ok) {
+        st.stripe_pipeline_failed++;
+        if (r.fatal) {
+            // The accelerator may still reach the weight: leak it, the cached entry included.
+            if (wl.transient) {
+                wl.transient->abandon();
+            } else {
+                state.weights.abandon(&weight);
+            }
+        }
+        const std::string detail = std::string("route=ExSIA+block matmul_mode=STRIPE_PIPELINE status=POTAL_") +
+                                   potal_status_name(r.status) + (r.fatal ? " fatal=1" : " fatal=0") +
+                                   " detail=" + (r.detail.empty() ? std::string("-") : r.detail);
+        return hp1_fail(st, node, layer, r.stage != nullptr ? r.stage : "stripe_pipeline", detail.c_str());
+    }
+    st.route_completed[static_cast<int>(act_route::exsia)]++;
+    st.hp1_completed++;
+    record_unmeasured_npu();
+#if LOG_DEBUG
+    log::debug(layer.c_str(), "[POTAL] node=%s route=ExSIA+block dispatch=HARDWARE matmul_mode=STRIPE_PIPELINE "
+                              "fence=POTAL_OK completed=%llu",
+                node->name, (unsigned long long) st.hp1_completed);
+#endif
+    return GGML_STATUS_SUCCESS;
 }
 
 ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_index, const hp1_shape & s) {
@@ -179,32 +265,34 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     // 0. Matmul options as the Gemmini backend resolves them (build default, GEMMINI_* environment).
     const auto resolved = ggml::gemmini::resolve_matmul_options();
     if (!resolved.ok()) {
-        return hp1_fail(st, node, layer, "options", "invalid matmul options (GEMMINI_MATMUL_MODE / GEMMINI_RMD_BACKEND)");
-    }
-    if (resolved.options.mode != ggml::gemmini::MatmulInvocationMode::full) {
-        return hp1_fail(st, node, layer, "options", "stripe_pipeline is not executed by PoTal (FULL only)");
-    }
-    const ggml::gemmini::RmdBackend rmd_backend = resolved.options.rmd_backend;
-    if (options::compensation && rmd_backend != ggml::gemmini::RmdBackend::cpu_direct) {
         return hp1_fail(st, node, layer, "options",
-                        "compensation=ON with rmd_backend=gemmini_ws_compact: PoTal has no WS residual executor");
+                        "invalid matmul options (GEMMINI_MATMUL_MODE / GEMMINI_RMD_BACKEND / "
+                        "GEMMINI_STRIPE_JOB_CAPACITY)");
+    }
+    const options::MatmulInvocationMode mode        = resolved.options.mode;
+    const ggml::gemmini::RmdBackend     rmd_backend = resolved.options.rmd_backend;
+    if (const char * why = options::unsupported_combination(mode, rmd_backend, resolved.options.job_capacity)) {
+        return hp1_fail(st, node, layer, "options", why);
     }
 #if LOG_DEBUG
     log::debug(layer.c_str(),
                 "[POTAL] config backend=POTAL operation=MUL_MAT node=%s node_index=%d model_arch=%s layer=%s "
                 "weight=%s weight_type=%s weight_granularity=%s activation_quant=%s compensation=%s rmd_backend=%s "
+                "matmul_mode=%s residual_executor=POTAL/%s job_capacity=%zu "
                 "M=%lld N=%lld K=%lld rows=%s %s params_sha256=%s",
                 node->name, node_index, state.model_arch.empty() ? "unknown" : state.model_arch.c_str(),
                 layer.c_str(), w->name, options::weight_type,
                 options::weight_granularity, options::activation_quant_name(), options::compensation_name,
-                rmd_backend_name(rmd_backend), (long long) s.m, (long long) s.n, (long long) s.k,
-                s.m == 1 ? "decode_shaped(M=1)" : "prefill_shaped(M>1)", trace_fields().c_str(),
-                potal_hw_params_sha256());
+                options::rmd_backend_name(rmd_backend), options::matmul_mode_name(mode),
+                options::residual_executor_name(mode), resolved.options.job_capacity, (long long) s.m,
+                (long long) s.n, (long long) s.k, s.m == 1 ? "decode_shaped(M=1)" : "prefill_shaped(M>1)",
+                trace_fields().c_str(), potal_hw_params_sha256());
 #else
     (void) node_index;
 #endif
 
-    // Tile plan first: the quantizers read the stripe geometry from it.
+    // Tile plan first: the quantizers read the stripe geometry from it. In
+    // STRIPE_PIPELINE this is the frozen Main plan of every stripe.
     potal_tile_plan plan;
     const potal_status plan_status = potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k,
                                                        quants::weight::hp1::block_k / POTAL_HW_DIM, &plan);
@@ -267,6 +355,10 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
                 weight.bytes(), (unsigned long long) cache.entries, (unsigned long long) cache.bytes,
                 (unsigned long long) cache.budget);
 #endif
+
+    if (mode == options::MatmulInvocationMode::stripe_pipeline) {
+        return mul_mat_hp1_pipeline(state, node, layer, args, wl, plan, resolved.options.job_capacity);
+    }
 
     // Per-call operands: activation codes and the accumulator; B/carriers/scale point at `weight`.
     hp1_operands ops;
@@ -370,7 +462,7 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     log::debug(layer.c_str(),
                 "[POTAL] compensation=%s rmd_backend=%s residual_payloads=%zu corrections_merged=%zu "
                 "residual_events=%zu nonzero_corrections=%zu status=%s",
-                options::compensation_name, rmd_backend_name(rmd_backend), comp.payloads, comp.executed,
+                options::compensation_name, options::rmd_backend_name(rmd_backend), comp.payloads, comp.executed,
                 comp.residuals, comp.nonzero, comp.ok ? "ok" : "failed");
 #endif
     if (!comp.ok) {

@@ -12,11 +12,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' 'Default: GGML PoTal backend (GGML_GEMMINI=OFF, GGML_POTAL=ON, GGML_BACKEND_DL=OFF,'
   printf '%s\n' '  POTAL_EXPECTED_DIM=16, POTAL_HW_PARAMS=<potal>/software/gemmini-rocc-tests/include/gemmini_potal_params.h).'
   printf '%s\n' '  Builds potal-api-test, potal-api-smoke, potal-multicore-smoke, potal-ggml-unit-test,'
-  printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, then llama-cli and llama-perplexity.'
+  printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, potal-stripe-api-test,'
+  printf '%s\n' '  potal-residual-unit-test, potal-stripe-pipeline-test, potal-stripe-smoke,'
+  printf '%s\n' '  then llama-cli and llama-perplexity.'
   printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>] selects another header.'
   printf '%s\n' '  Defaults here: GGML_GEMMINI_ACTIVATION_QUANT=TENSOR, GGML_GEMMINI_ENABLE_RMD=OFF (compensation),'
   printf '%s\n' '  GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU. PoTal accepts EXSIA|TENSOR|TOKEN|BLOCK|STRIPE and RMD ON with'
-  printf '%s\n' '  the CPU (cpu_direct) backend; 8-bit activations/weights and block size 32 are required.'
+  printf '%s\n' '  the CPU (cpu_direct) backend in FULL mode; STRIPE_PIPELINE (stripe matmul pipeline) needs'
+  printf '%s\n' '  -DGGML_GEMMINI_ACTIVATION_QUANT=EXSIA -DGGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE and, with'
+  printf '%s\n' '  RMD ON, -DGGML_GEMMINI_DEFAULT_RMD_BACKEND=WS (residual GEMM on PoTal); use its own BUILD_DIR.'
+  printf '%s\n' '  8-bit activations/weights and block size 32 are required.'
   printf '%s\n' '  Q8_HP1 models: llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1 (host build).'
   printf '%s\n' 'PoTal API only: -DGGML_POTAL=OFF -DPOTAL_API_ONLY=ON [-DPOTAL_EXPECTED_DIM=16|32|64]'
   printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
@@ -143,7 +148,9 @@ if [[ "${POTAL_API_ONLY_DEFAULT:-OFF}" == ON ]]; then
 elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
   # PoTal tests first, so they exist even if llama-cli does not link.
   cmake --build "$BUILD_DIR" --target potal-api-test potal-api-smoke potal-multicore-smoke \
-    potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke -j"${BUILD_JOBS_DEFAULT}"
+    potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke \
+    potal-stripe-api-test potal-residual-unit-test potal-stripe-pipeline-test potal-stripe-smoke \
+    -j"${BUILD_JOBS_DEFAULT}"
   cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
 else
   cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"

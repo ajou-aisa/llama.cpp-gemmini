@@ -273,7 +273,8 @@ GGML DEBUG lines. Exit 0 pass, 1 fail, 2 usage/environment error.
 
 Not implemented in the I8 form: other shapes; those go through the Q8_HP1 form
 only. Not implemented in the backend: F16/other quantized MUL_MAT,
-Stripe/Paired execution, DIM32/64, dynamic backend loading, concurrent processes.
+Paired Main/Residual execution, DIM32/64, dynamic backend loading, concurrent
+processes. The stripe pipeline (STRIPE_PIPELINE) has its own section below.
 
 ## Q8_HP1 path: configured activation quantization, routes, compensation
 
@@ -285,7 +286,7 @@ column, `block`), the *weight format* (Q8_HP1 payload/scale contract) and the
 *hardware tile* (SPAD/ACC capacity, `potal_tile_select`).
 
 ```
-matmul options          ggml::gemmini::resolve_matmul_options() (FULL only; rmd backend)
+matmul options          ggml::gemmini::resolve_matmul_options() (mode, rmd backend, stripe capacity)
 tile plan               potal_tile_select() -> args.tile_I/J/K, activation_rows_per_stripe
 src1 F32 --ggml::gemmini::quants::quantize_activation--> A int8 [M][K] + act::Meta (+ residuals if RMD)
                          GGML_GEMMINI_ACTIVATION_QUANT: EXSIA | TENSOR | TOKEN | BLOCK | STRIPE
@@ -312,12 +313,13 @@ Compensation keeps the Gemmini meaning. OFF (`GGML_GEMMINI_ENABLE_RMD=OFF`) is
 the original OFF build: no outlier selection, no residual capture, the scale
 from all finite values, no correction work at all. ON captures outlier
 residuals in the quantizer and corrects dst on the CPU (`cpu_direct`, the
-`GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU` route). Not available on PoTal (blocked,
-never silently dropped): the WS residual route (`gemmini_ws_compact`, it needs
-the Gemmini WS executor `rmd-executor.cpp`, gemmini.h/IM2P): configure fails
-for `DEFAULT_RMD_BACKEND=WS`, and a node that gets a ws_packet payload (e.g.
-`GEMMINI_RMD_BACKEND=WS` at run time) fails. The stripe pipeline
-(`GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE`) is not part of PoTal.
+`GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU` route) in FULL mode. The WS residual
+route (`gemmini_ws_compact`) never uses the Gemmini WS executor
+(`rmd-executor.cpp`, gemmini.h/IM2P): in STRIPE_PIPELINE mode it runs as a
+PoTal Residual GEMM (`potal_ws`, next section); in FULL mode it is refused
+(configure fails for `DEFAULT_RMD_BACKEND=WS` with a FULL default, a FULL node
+with `GEMMINI_RMD_BACKEND=WS` at run time fails, a ws_packet payload reaching
+FULL compensation fails), never silently dropped.
 
 Tile selection is `tiled_matmul_auto`'s WS branch (start from the `db_` sizes,
 grow J, I, K while A+B fit half the SPAD and C half the ACC), plus the PoTal
@@ -362,6 +364,35 @@ schema): `log::debug` JSONL (`LOG_DEBUG=1`, `debug-log.jsonl` under
 | `[POTAL] compensation= residual_payloads= corrections_merged= residual_events=` | what the compensation step actually did (OFF: all 0) |
 | `[POTAL] node= route= dispatch=HARDWARE fence=POTAL_OK completed=` | completion |
 | `[POTAL] supports_op_reject op=MUL_MAT ...` | a `supports_op` answer, not a CPU execution |
+
+## Stripe pipeline (`STRIPE_PIPELINE`, ExSIA, `matmul/stripe.hpp`)
+
+`GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE` (or `GEMMINI_MATMUL_MODE`
+at run time) with `GGML_GEMMINI_ACTIVATION_QUANT=EXSIA`. The Main tile plan is
+selected once, before ExSIA starts (`potal_tile_select`; its `tile_I * DIM` is
+the stripe height). The calling thread quantizes; at every stripe's folding
+commit ExSIA calls the stripe sink, which copies the stripe's codes, post-fold
+theta and residual packet into one of 1..2 run-owned slots and hands it to the
+hart-0 issuer at once, then ExSIA goes on with the next stripe. The issuer
+runs, per stripe and in order, the Main GEMM (frozen plan), with a packet the
+Residual GEMM (WS residual on PoTal, `potal_ws`), then on its CPU the F32 Main
+reconstruction, the radix INT64 reconstruction and the checked merge; only then
+the slot is free again. dst is written once, from the run's private output,
+after every stripe completed. RMD OFF runs the same pipeline with Main GEMMs
+only (the control). Planned GEMMs use the C API `potal_tiled_matmul_stripe()`.
+
+```
+producer (graph_compute thread)          consumer (hart-0 issuer)
+ExSIA stripe s folding commit -> submit  Main(s) -> Residual(s) -> reconstruct + merge(s) -> slot free
+ExSIA stripe s+1 ... (waits if 2 held)   Main(s+1) ...
+finish -> commit private output to dst
+```
+
+Supported: STRIPE_PIPELINE + EXSIA + RMD ON + WS, and STRIPE_PIPELINE + EXSIA +
+RMD OFF; job capacity 1 or 2. Refused (configure or per node, never replaced):
+STRIPE_PIPELINE with another activation algorithm or with the CPU residual,
+other capacities. Details, numerics, logs and commands:
+[docs/potal-stripe-api.md](docs/potal-stripe-api.md).
 
 ### Prepared weights (`matmul/weight_cache.hpp`)
 
@@ -412,6 +443,10 @@ MUL_MAT, so an HP1 GEMM is never silently computed on the CPU.
 | `potal-tiling-unit-test` | host and target (emulator, no accelerator) | tile choice vs gemmini.h, tiled execution on an RTL-semantics emulator == integer golden (multi-tile, K chunks, padding, zero carriers, Sat32), scale release, fail-stop, HP1 validation, the configured dispatcher (metadata kind, route, never TENSOR in its place), all five algorithms through their own quantizer and route vs a golden from the raw metadata and vs their own dequantization, compensation as configured, generation wrap, GGML contract | `POTAL_TILING_UNIT_TEST PASS` |
 | `potal-tiling-unit-test` (W) | host and target | prepared-weight cache: MISS then HIT, operands == the reader's per-element values, cached dst == per-call dst bitwise for all five algorithms, distinct weights and views, uncached/bypass/budget, invalid weights never cached, mutation only after clear(), concurrent first use, fatal abandon through the backend | (same) |
 | `potal-hp1-smoke` | FireSim (RISC-V Linux) | F32 x Q8_HP1 graphs on the POTAL backend (configured route), every element == CPU golden of the same route, invocations fenced, scales released, one TLB flush per job, compensation counters; GPT-2 qkv/lm_head shapes; 2-layer chain; DMA reallocation; generation wrap asserted from the totals | `POTAL_HP1_SMOKE PASS` |
+| `potal-stripe-api-test` | host and target (emulator) | C11 caller of `potal_tiled_matmul_stripe` (header, link, layout), frozen plans (tail lowers tile_i only, N tail, K chunks) == integer reference, no tile search while executing, refused descriptors issue nothing, generation wrap, fatal session, shared generations with the legacy API | `POTAL_STRIPE_API_TEST PASS` |
+| `potal-residual-unit-test` | host and target (emulator) | PoTal WS residual: run-aware request, K32 padded lowering == compact-run golden (INT32 bit-exact) for run lengths 1/15/16/17/31/32, multi-run, carry lanes, zero/large carriers, saturation, Sat32 cancellation order; INT64 reconstruction and checked merge == golden; failure cases | `POTAL_RESIDUAL_UNIT_TEST PASS` |
+| `potal-stripe-pipeline-test` | host and target (emulator thread) | real ExSIA events through the production run/driver: overlap and backpressure gates, semantic capacity, serialized == pipelined == golden, immutable accepted stripes, failure wake-up, no partial commit, repeated runs, producer placement | `POTAL_STRIPE_PIPELINE_TEST PASS` |
+| `potal-stripe-smoke` | FireSim (RISC-V Linux) | STRIPE_PIPELINE graphs on the POTAL backend (Main and Residual GEMMs on the hart-0 issuer) == CPU golden from the same ExSIA codes/theta/packets; stripes, packets, merges, fences, TLB flushes; generation wrap | `POTAL_STRIPE_PIPELINE_SMOKE PASS` |
 
 ## Commands
 
@@ -457,6 +492,8 @@ build-potal-ggml-host/bin/potal-tiling-unit-test   # expects "POTAL_TILING_UNIT_
 # Other selections build and test the same way (one build directory each), e.g.
 #   -DGGML_GEMMINI_ACTIVATION_QUANT=BLOCK            (Block+block route)
 #   -DGGML_GEMMINI_ENABLE_RMD=ON                     (compensation ON, cpu_direct)
+
+# Stripe pipeline: its own build directories (commands in docs/potal-stripe-api.md).
 
 # GGML backend, RISC-V Linux cross build (build-riscv.sh defaults to the same
 # selection; the options are spelled out anyway)

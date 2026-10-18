@@ -1,8 +1,7 @@
 #include "tiling.hpp"
 
-#include "options.hpp"
-
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 
@@ -43,7 +42,32 @@ constexpr size_t max_acc_rows() {
 // gemmini.h fits plus the PoTal limits a single LOOP_WS must respect.
 bool fits(size_t I, size_t J, size_t K, uint32_t passes_per_block) {
     return total_spad_rows(I, J, K) <= max_spad_rows() && total_acc_rows(I, J) <= max_acc_rows() &&
-           I * J <= POTAL_WORK_IDS_PER_LOOP && (K / passes_per_block) * J <= options::scale_window_slots;
+           I * J <= POTAL_WORK_IDS_PER_LOOP && (K / passes_per_block) * J <= scale_window_slots;
+}
+
+std::atomic<uint64_t> g_tile_selects{ 0 };
+
+// The plan of tile counts that fit (I0..K0, padding, rows, slots).
+void fill_plan(size_t dim_I, size_t dim_J, size_t dim_K, size_t tile_I, size_t tile_J, size_t tile_K,
+               uint32_t passes_per_block, potal_tile_plan * plan) {
+    const size_t dim_I_padded = padded(dim_I);
+    const size_t dim_J_padded = padded(dim_J);
+    const size_t dim_K_padded = padded(dim_K);
+    plan->tile_I           = tile_I;
+    plan->tile_J           = tile_J;
+    plan->tile_K           = tile_K;
+    plan->I0               = dim_I_padded / (tile_I * DIM) + (dim_I_padded % (tile_I * DIM) != 0);
+    plan->J0               = dim_J_padded / (tile_J * DIM) + (dim_J_padded % (tile_J * DIM) != 0);
+    plan->K0               = dim_K_padded / (tile_K * DIM) + (dim_K_padded % (tile_K * DIM) != 0);
+    plan->pad_I            = dim_I_padded - dim_I;
+    plan->pad_J            = dim_J_padded - dim_J;
+    plan->pad_K            = dim_K_padded - dim_K;
+    plan->spad_rows        = total_spad_rows(tile_I, tile_J, tile_K);
+    plan->max_spad_rows    = max_spad_rows();
+    plan->acc_rows         = total_acc_rows(tile_I, tile_J);
+    plan->max_acc_rows     = max_acc_rows();
+    plan->passes_per_block = passes_per_block;
+    plan->scale_slots      = (uint32_t) ((tile_K / passes_per_block) * tile_J);
 }
 
 // The requests the PoTal LOOP_WS path implements (see tiling.hpp).
@@ -106,8 +130,48 @@ const potal_ws_ops & potal_hw_ops() {
     return ops;
 }
 
+potal_ws_report work_since(const potal_ws_report & now, const potal_ws_report & before) {
+    potal_ws_report d = now;
+    d.invocations     = now.invocations - before.invocations;
+    d.validated_gemms = now.validated_gemms - before.validated_gemms;
+    d.fences          = now.fences - before.fences;
+    d.scale_writes    = now.scale_writes - before.scale_writes;
+    d.scale_releases  = now.scale_releases - before.scale_releases;
+    d.tlb_flushes     = now.tlb_flushes - before.tlb_flushes;
+    d.generations     = now.generations - before.generations;
+    d.scale_s         = now.scale_s - before.scale_s;
+    d.issue_s         = now.issue_s - before.issue_s;
+    d.fence_s         = now.fence_s - before.fence_s;
+    return d;
+}
+
+uint64_t potal_tile_select_count() {
+    return g_tile_selects.load(std::memory_order_relaxed);
+}
+
+potal_status potal_frozen_plan(size_t dim_I, size_t dim_J, size_t dim_K, size_t tile_I, size_t tile_J,
+                               size_t tile_K, uint32_t passes_per_block, potal_tile_plan * plan) {
+    if (plan == nullptr || dim_I == 0 || dim_J == 0 || dim_K == 0 || passes_per_block == 0 || tile_I == 0 ||
+        tile_J == 0 || tile_K == 0 || tile_I > 65535 || tile_J > 65535 || tile_K > 65535) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    // The rows present decide only how many I tiles are needed (tail stripe).
+    const size_t i_tiles = padded(dim_I) / DIM;
+    const size_t tile_I_run = tile_I < i_tiles ? tile_I : i_tiles;
+    if (tile_J * DIM > padded(dim_J) || tile_K * DIM > padded(dim_K) || tile_K % passes_per_block != 0 ||
+        (padded(dim_K) / DIM) % passes_per_block != 0) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    if (!fits(tile_I_run, tile_J, tile_K, passes_per_block)) {
+        return POTAL_ERR_CAPACITY;
+    }
+    fill_plan(dim_I, dim_J, dim_K, tile_I_run, tile_J, tile_K, passes_per_block, plan);
+    return POTAL_OK;
+}
+
 potal_status potal_tile_select(size_t dim_I, size_t dim_J, size_t dim_K, uint32_t passes_per_block,
                                potal_tile_plan * plan) {
+    g_tile_selects.fetch_add(1, std::memory_order_relaxed);
     if (plan == nullptr || dim_I == 0 || dim_J == 0 || dim_K == 0 || passes_per_block == 0) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
@@ -170,21 +234,7 @@ potal_status potal_tile_select(size_t dim_I, size_t dim_J, size_t dim_K, uint32_
         }
     }
 
-    plan->tile_I           = tile_I;
-    plan->tile_J           = tile_J;
-    plan->tile_K           = tile_K;
-    plan->I0               = dim_I_padded / (tile_I * DIM) + (dim_I_padded % (tile_I * DIM) != 0);
-    plan->J0               = dim_J_padded / (tile_J * DIM) + (dim_J_padded % (tile_J * DIM) != 0);
-    plan->K0               = dim_K_padded / (tile_K * DIM) + (dim_K_padded % (tile_K * DIM) != 0);
-    plan->pad_I            = dim_I_padded - dim_I;
-    plan->pad_J            = dim_J_padded - dim_J;
-    plan->pad_K            = dim_K_padded - dim_K;
-    plan->spad_rows        = total_spad_rows(tile_I, tile_J, tile_K);
-    plan->max_spad_rows    = max_spad_rows();
-    plan->acc_rows         = total_acc_rows(tile_I, tile_J);
-    plan->max_acc_rows     = max_acc_rows();
-    plan->passes_per_block = passes_per_block;
-    plan->scale_slots      = (uint32_t) ((tile_K / ppb) * tile_J);
+    fill_plan(dim_I, dim_J, dim_K, tile_I, tile_J, tile_K, passes_per_block, plan);
     return POTAL_OK;
 }
 
@@ -426,7 +476,7 @@ potal_status potal_sp_tiled_matmul_ws(const int8_t * A, const int8_t * B,
     const bool     accumulate = !no_bias || D == nullptr;
     const uint32_t blocks     = (uint32_t) (K / passes_per_block);
     const uint32_t slots      = blocks * (uint32_t) J;
-    const uint32_t base       = options::scale_window_base;
+    const uint32_t base       = scale_window_base;
     const uint32_t generation = session.generation % POTAL_GENERATION_MAX + 1; // 1..255
 
     potal_loop_ws loop = {};
@@ -449,7 +499,7 @@ potal_status potal_sp_tiled_matmul_ws(const int8_t * A, const int8_t * B,
 
     // Software checks first: nothing reaches the accelerator when they fail.
     potal_status status = potal_loop_ws_check(&loop);
-    if (status == POTAL_OK && slots > options::scale_window_slots) {
+    if (status == POTAL_OK && slots > scale_window_slots) {
         status = POTAL_ERR_CAPACITY;
     }
     const auto valid_columns = [&](size_t j) { return (uint32_t) (DIM - (j == J - 1 ? pad_J : 0)); };
@@ -487,6 +537,7 @@ potal_status potal_sp_tiled_matmul_ws(const int8_t * A, const int8_t * B,
 
     session.generation = generation;
     r.last_generation  = generation;
+    r.generations++;
     r.max_scale_slots  = std::max(r.max_scale_slots, slots);
     const potal_ws_ops & ops = *session.ops;
 

@@ -64,7 +64,12 @@ void potal_free(ggml_backend_t backend) {
         "issue_s=%.3f fence_s=%.3f route_wall_s=%.3f compensation_s=%.3f weight_cache_hits=%llu "
         "weight_cache_misses=%llu weight_cache_bypasses=%llu weight_cache_uncached=%llu "
         "weight_cache_entries=%llu weight_cache_bytes=%llu weight_validations=%llu weight_packs=%llu "
-        "weight_pack_bytes=%llu weight_alloc_s=%.3f weight_lookup_s=%.6f",
+        "weight_pack_bytes=%llu weight_alloc_s=%.3f weight_lookup_s=%.6f stripe_pipeline_nodes=%llu "
+        "stripe_pipeline_failed=%llu stripes_accepted=%llu stripes_semantic_completed=%llu "
+        "max_outstanding_semantic=%llu producer_capacity_waits=%llu main_logical_gemms=%llu main_loop_ws=%llu "
+        "main_fences=%llu residual_nonempty_packets=%llu residual_logical_gemms=%llu residual_loop_ws=%llu "
+        "residual_fences=%llu residual_compact_k=%llu residual_execution_k=%llu active_lane_rows=%llu "
+        "radix_reconstructions=%llu merges_completed=%llu corrections_nonzero=%llu pipeline_wall_s=%.3f",
         (unsigned long long) st.gemm_completed, (unsigned long long) st.gemm_failed,
         (unsigned long long) st.hp1_nodes, (unsigned long long) st.hp1_completed,
         (unsigned long long) st.hp1_failed, (unsigned long long) st.prefill_shaped_nodes,
@@ -87,7 +92,17 @@ void potal_free(ggml_backend_t backend) {
         (unsigned long long) st.weight_cache_bypasses, (unsigned long long) st.weight_cache_uncached,
         (unsigned long long) cache.entries, (unsigned long long) cache.bytes,
         (unsigned long long) st.weight_validations, (unsigned long long) st.weight_packs,
-        (unsigned long long) st.weight_pack_bytes, st.weight_alloc_s, st.weight_lookup_s);
+        (unsigned long long) st.weight_pack_bytes, st.weight_alloc_s, st.weight_lookup_s,
+        (unsigned long long) st.stripe_pipeline_nodes, (unsigned long long) st.stripe_pipeline_failed,
+        (unsigned long long) st.stripes_accepted, (unsigned long long) st.stripes_semantic_completed,
+        (unsigned long long) st.max_outstanding_semantic, (unsigned long long) st.producer_capacity_waits,
+        (unsigned long long) st.main_logical_gemms, (unsigned long long) st.main_loop_ws,
+        (unsigned long long) st.main_fences, (unsigned long long) st.residual_nonempty_packets,
+        (unsigned long long) st.residual_logical_gemms, (unsigned long long) st.residual_loop_ws,
+        (unsigned long long) st.residual_fences, (unsigned long long) st.residual_compact_k,
+        (unsigned long long) st.residual_execution_k, (unsigned long long) st.residual_active_lane_rows,
+        (unsigned long long) st.radix_reconstructions, (unsigned long long) st.merges_completed,
+        (unsigned long long) st.corrections_nonzero, st.pipeline_wall_s);
     // Debug records are flushed per record; drain the buffered cycle log too.
     (void) ggml::gemmini::log::cycle.flush();
     delete static_cast<potal_context *>(backend->context);

@@ -2,6 +2,7 @@
 
 #include "ggml-impl.h"
 #include "log.hpp"
+#include "stripe-api.hpp"
 
 #include "potal_hw_params.h"
 
@@ -10,12 +11,15 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(__linux__)
+#    include <pthread.h>
+#    include <sched.h>
+#endif
+
 #if defined(__riscv)
 #    if !defined(__linux__)
 #        error "ggml-potal needs RISC-V Linux: its issuer thread pins itself to the hart-0 CPU"
 #    endif
-#    include <pthread.h>
-#    include <sched.h>
 #    include <sys/syscall.h>
 #    include <unistd.h>
 
@@ -66,21 +70,6 @@ potal_gemm_ws make_request(uint32_t k, uint32_t generation) {
     g.passes_per_block = k / DIM; // one scale block: the x1 carriers cover all of K
     g.flags            = 0;
     return g;
-}
-
-// Work counters of a session between two snapshots; status/stage/fatal are the current ones.
-potal_ws_report work_since(const potal_ws_report & now, const potal_ws_report & before) {
-    potal_ws_report d = now;
-    d.invocations     = now.invocations - before.invocations;
-    d.validated_gemms = now.validated_gemms - before.validated_gemms;
-    d.fences          = now.fences - before.fences;
-    d.scale_writes    = now.scale_writes - before.scale_writes;
-    d.scale_releases  = now.scale_releases - before.scale_releases;
-    d.tlb_flushes     = now.tlb_flushes - before.tlb_flushes;
-    d.scale_s         = now.scale_s - before.scale_s;
-    d.issue_s         = now.issue_s - before.issue_s;
-    d.fence_s         = now.fence_s - before.fence_s;
-    return d;
 }
 
 // potal_tiled_matmul_auto() with the only request the PoTal path implements:
@@ -204,9 +193,19 @@ class issuer {
     issuer_info  info();
     const char * failure_text(potal_status * status); // stable once the issuer is disabled
 
+    // One request at a time: run() and a stripe stream hold this lock from
+    // post() until wait_done() returned.
+    std::unique_lock<std::mutex> acquire() { return std::unique_lock<std::mutex>(submit_mutex); }
+    // With acquire() held: waits for the bring-up, then hands `task` over and
+    // returns; the issuer keeps it alive until it ran. false: disabled.
+    bool post(std::shared_ptr<const issuer_task> task);
+    // With acquire() held, after a successful post(): waits until the task returned.
+    void wait_done();
+
     // Issuer thread only (called from tasks).
-    gemm_report  execute(const gemm_job & job);
-    tiled_report execute_tiled(const tiled_job & job);
+    gemm_report    execute(const gemm_job & job);
+    tiled_report   execute_tiled(const tiled_job & job);
+    planned_result execute_planned(const potal_stripe_gemm_desc & desc);
 
   private:
     void main_loop();
@@ -217,17 +216,18 @@ class issuer {
     std::condition_variable cv;
 
     enum class state { starting, ready, failed };
-    state               st      = state::starting;
-    const issuer_task * pending = nullptr;
-    bool                done    = false;
-    std::string         failure; // set once, when st becomes failed
-    potal_status        failure_status = POTAL_OK;
+    state                              st      = state::starting;
+    std::shared_ptr<const issuer_task> pending; // the request being run, owned
+    bool                               done    = false;
+    std::string                        failure; // set once, when st becomes failed
+    potal_status                       failure_status = POTAL_OK;
 
     // Owned by the issuer thread; published when st leaves `starting`.
     int cpu = -1;
     long tid = -1;
-    // Scale generations and work counters of every PoTal command of the process.
-    potal_ws_session session = { &potal_hw_ops(), 0, {} };
+    // Scale generations and work counters of every PoTal command of the
+    // process: the I8 GEMM, the FULL tiled jobs and the planned stripe GEMMs.
+    potal_stripe_session session = { { &potal_hw_ops(), 0, {} } };
 };
 
 void issuer::start() {
@@ -243,18 +243,30 @@ void issuer::start() {
 }
 
 bool issuer::run(const issuer_task & task) {
-    std::lock_guard<std::mutex>  one_request(submit_mutex);
+    std::unique_lock<std::mutex> one_request = acquire();
+    if (!post(std::make_shared<const issuer_task>(task))) {
+        return false;
+    }
+    wait_done();
+    return true;
+}
+
+bool issuer::post(std::shared_ptr<const issuer_task> task) {
     std::unique_lock<std::mutex> lock(mutex);
     cv.wait(lock, [this] { return st != state::starting; });
     if (st == state::failed) {
         return false;
     }
-    pending = &task;
+    pending = std::move(task);
     done    = false;
     cv.notify_all();
-    cv.wait(lock, [this] { return done; });
-    pending = nullptr;
     return true;
+}
+
+void issuer::wait_done() {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [this] { return done; });
+    pending.reset();
 }
 
 const char * issuer::failure_text(potal_status * status) {
@@ -282,7 +294,7 @@ void issuer::main_loop() {
     cv.notify_all();
     while (st == state::ready) {
         cv.wait(lock, [this] { return pending != nullptr && !done; });
-        const issuer_task * task = pending;
+        const std::shared_ptr<const issuer_task> task = pending; // strong reference while it runs
         lock.unlock();
         std::string  why;
         potal_status status = POTAL_OK;
@@ -340,8 +352,8 @@ bool issuer::bring_up() {
 // Identity-carrier GEMM: Scale WRITE -> LOOP_WS -> FENCE -> C readback -> Scale RELEASE.
 gemm_report issuer::execute(const gemm_job & job) {
     gemm_report r;
-    r.generation          = session.generation % POTAL_GENERATION_MAX + 1; // 1..255
-    session.generation    = r.generation;
+    r.generation          = session.ws.generation % POTAL_GENERATION_MAX + 1; // 1..255
+    session.ws.generation = r.generation;
     const potal_gemm_ws g = make_request(job.k, r.generation);
 
     // Software checks first: nothing reaches the accelerator when they fail.
@@ -460,9 +472,39 @@ tiled_report issuer::execute_tiled(const tiled_job & job) {
         r.fatal = true;
         return r;
     }
-    session.report.tlb_flushes++;
-    r = tiled_matmul(job, session);
+    session.ws.report.tlb_flushes++;
+    r = tiled_matmul(job, session.ws);
     r.work.tlb_flushes = 1;
+    return r;
+}
+
+// One planned stripe GEMM on the issuer: affinity, TLB FLUSH + FENCE, then
+// potal_tiled_matmul_stripe() on the issuer's session.
+planned_result issuer::execute_planned(const potal_stripe_gemm_desc & desc) {
+    planned_result r;
+    if (sched_getcpu() != cpu) {
+        r.stage = "affinity"; // custom-3 would trap off hart 0
+        r.fatal = true;
+        return r;
+    }
+    // A stripe GEMM may read buffers allocated since the previous GEMM (the
+    // run's slots, a residual's operands): drop every accelerator translation
+    // before its first DMA. The previous GEMM ended with a FENCE.
+    r.status = potal_tlb_flush();
+    if (r.status == POTAL_OK) {
+        r.status = potal_fence();
+    }
+    if (r.status != POTAL_OK) {
+        r.stage = "tlb_flush";
+        r.fatal = true;
+        return r;
+    }
+    session.ws.report.tlb_flushes++;
+    r.tlb_flushes = 1;
+    r.status      = potal_tiled_matmul_stripe(&session, &desc, &r.report);
+    r.stage       = r.report.stage;
+    r.fatal       = r.report.fatal != 0;
+    r.ok          = r.status == POTAL_OK;
     return r;
 }
 
@@ -556,6 +598,195 @@ issuer_info get_issuer_info() {
 #else
     return {};
 #endif
+}
+
+// ---- stripe pipeline consumer ------------------------------------------------
+
+bool stripe_owner::pin_producer(bool one_cpu, std::string & why) {
+    (void) one_cpu;
+    (void) why;
+    return true;
+}
+
+void stripe_owner::unpin_producer() {}
+
+struct producer_affinity::saved {
+#if defined(__linux__)
+    cpu_set_t mask; // the caller's mask before pin()
+#endif
+    bool pinned = false;
+    int  cpu    = -1;
+};
+
+producer_affinity::producer_affinity() : saved_(std::make_unique<saved>()) {}
+
+producer_affinity::~producer_affinity() {
+    std::string why;
+    if (!restore(why)) {
+        log::failure("potal.issuer", "[POTAL_STRIPE] producer affinity not restored: %s", why.c_str());
+    }
+}
+
+bool producer_affinity::pin(int exclude_cpu, bool one_cpu, std::string & why) {
+#if defined(__linux__)
+    if (saved_->pinned) {
+        why = "producer already pinned";
+        return false;
+    }
+    cpu_set_t current;
+    CPU_ZERO(&current);
+    int rc = pthread_getaffinity_np(pthread_self(), sizeof(current), &current);
+    if (rc != 0) {
+        why = std::string("reading the producer affinity failed: ") + std::strerror(rc);
+        return false;
+    }
+    cpu_set_t narrowed;
+    CPU_ZERO(&narrowed);
+    int chosen = -1;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &current) && c != exclude_cpu && (!one_cpu || chosen < 0)) {
+            CPU_SET(c, &narrowed);
+            chosen = chosen < 0 ? c : chosen;
+        }
+    }
+    if (chosen < 0) {
+        why = "the caller's affinity mask has no CPU besides the issuer's cpu " + std::to_string(exclude_cpu) +
+              ": producer and issuer cannot run side by side";
+        return false;
+    }
+    rc = pthread_setaffinity_np(pthread_self(), sizeof(narrowed), &narrowed);
+    if (rc != 0) {
+        why = "narrowing the producer affinity failed: " + std::string(std::strerror(rc));
+        return false;
+    }
+    saved_->mask   = current;
+    saved_->pinned = true;
+    saved_->cpu    = one_cpu ? chosen : -1;
+    cpu_set_t got;
+    CPU_ZERO(&got);
+    rc = pthread_getaffinity_np(pthread_self(), sizeof(got), &got);
+    if (rc != 0 || !CPU_EQUAL(&got, &narrowed)) {
+        std::string ignored;
+        (void) restore(ignored);
+        why = "producer affinity differs from the requested mask after narrowing";
+        return false;
+    }
+    return true;
+#else
+    (void) exclude_cpu;
+    (void) one_cpu;
+    why = "producer placement needs Linux thread affinity";
+    return false;
+#endif
+}
+
+bool producer_affinity::restore(std::string & why) {
+#if defined(__linux__)
+    if (!saved_->pinned) {
+        return true;
+    }
+    saved_->pinned = false;
+    saved_->cpu    = -1;
+    const int rc   = pthread_setaffinity_np(pthread_self(), sizeof(saved_->mask), &saved_->mask);
+    if (rc != 0) {
+        why = std::string("restoring the producer affinity failed: ") + std::strerror(rc);
+        return false;
+    }
+#else
+    (void) why;
+#endif
+    return true;
+}
+
+int producer_affinity::cpu() const {
+    return saved_->cpu;
+}
+
+struct issuer_owner::state {
+#if defined(__riscv)
+    issuer *                     iss    = nullptr;
+    std::unique_lock<std::mutex> hold;          // the issuer's one-request lock, start() .. join()
+    bool                         posted = false; // a consumer was handed over and not joined
+#endif
+    producer_affinity            producer;
+};
+
+issuer_owner::issuer_owner() : st_(std::make_unique<state>()) {}
+
+issuer_owner::~issuer_owner() {
+    unpin_producer();
+    join();
+}
+
+bool issuer_owner::start(stripe_consumer consume, std::string & why, potal_status & status) {
+#if defined(__riscv)
+    if (st_->hold.owns_lock()) {
+        why    = "stripe stream already started";
+        status = POTAL_ERR_BUSY;
+        return false;
+    }
+    issuer & iss = get_issuer();
+    st_->iss     = &iss;
+    st_->hold    = iss.acquire();
+    // The issuer owns the consumer (and through it the run) until it returns.
+    auto task = std::make_shared<const issuer_task>(
+        [&iss, consume = std::move(consume)](std::string & task_why, potal_status & task_status) {
+            const consume_outcome o =
+                consume([&iss](const potal_stripe_gemm_desc & desc) { return iss.execute_planned(desc); });
+            if (o.fatal) {
+                task_why    = failure_of(o.stage != nullptr ? o.stage : "stripe_pipeline", o.status);
+                task_status = o.status;
+            }
+            return o.fatal;
+        });
+    if (!iss.post(std::move(task))) {
+        const char * text = iss.failure_text(&status);
+        why               = std::string("issuer disabled: ") + (text != nullptr ? text : "-");
+        st_->hold.unlock();
+        return false;
+    }
+    st_->posted = true;
+    return true;
+#else
+    (void) consume;
+    why    = "no PoTal hardware: this build is not for RISC-V";
+    status = POTAL_ERR_NO_HARDWARE;
+    return false;
+#endif
+}
+
+void issuer_owner::join() {
+#if defined(__riscv)
+    if (st_->posted) {
+        st_->iss->wait_done();
+        st_->posted = false;
+    }
+    if (st_->hold.owns_lock()) {
+        st_->hold.unlock();
+    }
+#endif
+}
+
+bool issuer_owner::pin_producer(bool one_cpu, std::string & why) {
+#if defined(__riscv)
+    const issuer_info i = st_->posted ? st_->iss->info() : issuer_info{};
+    if (!i.ready || i.cpu < 0) {
+        why = "the issuer is not running a stripe stream";
+        return false;
+    }
+    return st_->producer.pin(i.cpu, one_cpu, why);
+#else
+    (void) one_cpu;
+    why = "no issuer: this build is not for RISC-V";
+    return false;
+#endif
+}
+
+void issuer_owner::unpin_producer() {
+    std::string why;
+    if (!st_->producer.restore(why)) {
+        log::failure("potal.issuer", "[POTAL_STRIPE] producer affinity not restored: %s", why.c_str());
+    }
 }
 
 } // namespace ggml::potal

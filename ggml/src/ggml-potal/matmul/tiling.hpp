@@ -41,6 +41,11 @@ using potal_acc_scale_t = float;
 constexpr potal_scale_t     POTAL_MVIN_SCALE_IDENTITY = 0;
 constexpr potal_acc_scale_t POTAL_ACC_SCALE_IDENTITY  = 0;
 
+// Scale slots the tiled path may use; every invocation releases its slots
+// before the next one writes, so the whole ScaleMemory is one window.
+constexpr uint32_t scale_window_base  = 0;
+constexpr uint32_t scale_window_slots = POTAL_SCALE_ENTRIES;
+
 // carriers[b * stride + n]: SCU carrier of K scale block b (K elements
 // [b*block_k, (b+1)*block_k)) for output column n. block_k = scaleBlockK.
 struct potal_scale_operand {
@@ -74,12 +79,16 @@ struct potal_ws_report {
     uint64_t scale_writes    = 0;
     uint64_t scale_releases  = 0;
     uint64_t tlb_flushes     = 0; // TLB FLUSH + FENCE before a job's first DMA (issuer)
+    uint64_t generations     = 0; // scale generations assigned: one per invocation that passed its checks
     uint32_t last_generation = 0;
     uint32_t max_scale_slots = 0; // largest slot window of one invocation
     double   scale_s         = 0; // guest seconds in SCALE_WRITE/RELEASE
     double   issue_s         = 0;
     double   fence_s         = 0;
 };
+
+// Work counters of a session between two snapshots; status/stage/fatal are the current ones.
+potal_ws_report work_since(const potal_ws_report & now, const potal_ws_report & before);
 
 // Issuer-owned state: one session per accelerator owner thread.
 struct potal_ws_session {
@@ -107,6 +116,19 @@ struct potal_tile_plan {
 // one block-sized tile does not fit.
 potal_status potal_tile_select(size_t dim_I, size_t dim_J, size_t dim_K, uint32_t passes_per_block,
                                potal_tile_plan * plan);
+
+// potal_tile_select() calls of this process. Diagnostic: executing a frozen
+// plan (potal_frozen_plan, potal_tiled_matmul_stripe) never adds one.
+uint64_t potal_tile_select_count();
+
+// A frozen plan applied to one logical GEMM, without a tile search: the given
+// tile counts, except that tile_I is limited to the I tiles dim_I needs (the
+// tail stripe of a plan selected for more rows). tile_J/tile_K must fit
+// dim_J/dim_K. Same per-invocation limits as potal_tile_select (SPAD/ACC
+// halves, WorkIdsPerLoop, scale window, whole scale blocks); fills the plan
+// fields as it does. POTAL_ERR_INVALID_ARGUMENT / POTAL_ERR_CAPACITY otherwise.
+potal_status potal_frozen_plan(size_t dim_I, size_t dim_J, size_t dim_K, size_t tile_I, size_t tile_J,
+                               size_t tile_K, uint32_t passes_per_block, potal_tile_plan * plan);
 
 potal_status potal_tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K,
                                      const int8_t * A, const int8_t * B,

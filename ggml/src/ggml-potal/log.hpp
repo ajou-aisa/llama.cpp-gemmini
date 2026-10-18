@@ -10,6 +10,8 @@
 
 #include "ggml.h"
 
+#include <string>
+
 namespace ggml::potal::log {
 
 // Default outputs of the shared logger (setup_default_outputs, once per process;
@@ -25,5 +27,13 @@ void debug(const char * layer, const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(2, 3
 // to the GGML error log instead, so a failure is never silent. The caller still
 // returns its failure status.
 void failure(const char * layer, const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(2, 3);
+
+// Inference identity of the running node, as the Gemmini backend's records
+// carry it: "phase=... decode_ordinal=... request_id=... operation_id=...
+// graph_id=... operator_id=... node_ordinal=...". Phase/decode come from the
+// performance context, ids from the operator trace context bound on the
+// calling thread (potal_graph_compute; the issuer binds a job's own context).
+// phase=none outside an inference.
+std::string trace_fields();
 
 } // namespace ggml::potal::log

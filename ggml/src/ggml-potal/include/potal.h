@@ -247,6 +247,112 @@ potal_status potal_gemm_ws_issue(const potal_gemm_ws *gemm);
  */
 potal_status potal_loop_ws_issue(const potal_loop_ws *loop);
 
+/* ---- Planned stripe GEMM (library potal-tiled-api, C++ inside) ----------- */
+
+/*
+ * One logical GEMM of a stripe pipeline (a Main stripe GEMM or the Residual
+ * GEMM of a stripe), executed with a tile plan its caller froze earlier:
+ *
+ *   C[m][n] = Sat32 sum over DIM-wide K passes p of
+ *             SCU(sum_{k in p} A[m][k] * B[k][n], carriers[p*DIM/scale_block_k][n])
+ *
+ * on the Gemmini-compatible WS tiler (tiled_matmul -> sp_tiled_matmul_ws ->
+ * potal_loop_ws_issue / potal_gemm_ws_issue). The K accumulation of an output
+ * tile stays in the PoTal ACC across K chunks; C is written once, after the
+ * last chunk. No tile search runs: tile_i/tile_j/tile_k are used as given,
+ * except that tile_i is limited to the I tiles m needs (a tail stripe).
+ *
+ * Synchronous: POTAL_OK means every LOOP_WS invocation of this GEMM was
+ * issued, fenced (POTAL_FENCE == POTAL_OK) and its scale entries released, so
+ * C is complete. This differs from the issue functions above, whose POTAL_OK
+ * only means "issued". A rejected descriptor issues no command at all.
+ *
+ * Not thread-safe, like the rest of this API: one thread, pinned to the CPU of
+ * the hart the PoTal RoCC is attached to, owns a session and calls this.
+ * TLB maintenance (potal_tlb_flush + potal_fence before fresh DMA buffers) is
+ * the caller's job, as for every other GEMM.
+ */
+typedef struct potal_stripe_session potal_stripe_session; /* opaque */
+
+typedef enum potal_stripe_work_kind {
+    POTAL_STRIPE_WORK_MAIN     = 0,
+    POTAL_STRIPE_WORK_RESIDUAL = 1,
+} potal_stripe_work_kind;
+
+typedef struct potal_stripe_gemm_desc {
+    /* Identity, recorded only: never changes the arithmetic. */
+    uint64_t        run_id;
+    uint64_t        stripe_id;
+    uint64_t        row_begin;      /* first original activation row of the stripe */
+    uint32_t        work_kind;      /* potal_stripe_work_kind */
+
+    uint32_t        m;              /* rows of A and C */
+    uint32_t        n;              /* columns of B and C */
+    uint32_t        k;              /* reduction extent of the A/B handed over */
+
+    const int8_t   *a;              /* [m][lda], already at the stripe's first row */
+    const int8_t   *b;              /* [k][ldb] */
+    int32_t        *c;              /* [m][ldc], overwritten */
+    size_t          lda;            /* element strides */
+    size_t          ldb;
+    size_t          ldc;
+
+    const uint32_t *carriers;       /* [k / scale_block_k][carrier_stride] SCU carriers */
+    size_t          carrier_stride; /* uint32 elements, >= n */
+    uint32_t        scale_block_k;  /* K extent of one carrier: a multiple of DIM dividing k */
+
+    uint32_t        tile_i;         /* frozen plan: DIM tiles per LOOP_WS, not elements */
+    uint32_t        tile_j;
+    uint32_t        tile_k;         /* a multiple of scale_block_k / DIM */
+} potal_stripe_gemm_desc;
+
+typedef struct potal_stripe_gemm_report {
+    potal_status status;            /* POTAL_OK or the first failure */
+    const char  *stage;             /* failing step (static string), NULL when ok */
+    int          fatal;             /* 1: hardware state unknown; the session refuses later work */
+
+    /* Commands this call completed with POTAL_OK; nothing refused is counted. */
+    uint64_t     loop_ws;           /* LOOP_WS invocations issued */
+    uint64_t     validated_gemms;   /* of which through potal_gemm_ws_issue */
+    uint64_t     fences;
+    uint64_t     scale_writes;
+    uint64_t     scale_releases;
+    uint32_t     last_generation;   /* 8-bit scale generation of the last invocation this call
+                                       started, 0 if it started none */
+
+    /* Geometry executed (tile_i after the tail limit). */
+    uint32_t     tile_i, tile_j, tile_k;
+    uint32_t     i0, j0, k0;        /* LOOP_WS invocations per dimension */
+    uint32_t     pad_i, pad_j, pad_k;
+
+    double       scale_s;           /* SCALE_WRITE/RELEASE, issue, fence: guest seconds */
+    double       issue_s;
+    double       fence_s;
+} potal_stripe_gemm_report;
+
+/*
+ * Allocates a session (scale generation counter and work counters) bound to
+ * the hardware. Starts no thread and issues no command. On failure *out is
+ * NULL (when out is not NULL). One session serves one accelerator owner for
+ * its whole life; destroy it only when no call on it is running. Destroying
+ * frees the session alone: buffers of a GEMM that reported fatal must still
+ * never be freed. potal_stripe_session_destroy(NULL) does nothing.
+ */
+potal_status potal_stripe_session_create(potal_stripe_session **out);
+void         potal_stripe_session_destroy(potal_stripe_session *session);
+
+/*
+ * Run one planned logical GEMM to completion (see above). Checks before the
+ * first command: session/desc/report non-NULL, the session not disabled,
+ * work_kind, m/n/k > 0, strides, scale_block_k, tiles against the shape and
+ * the per-invocation capacity, A/B DIM-byte and C DIM*4-byte alignment, every
+ * operand extent within the 32-bit DRAM offset, C disjoint from A and B, and
+ * every carrier a valid PoTal carrier. Not supported (rejected as everywhere
+ * in this API): bias/D, transposes, activation functions, scale factors.
+ */
+potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const potal_stripe_gemm_desc *desc,
+                                       potal_stripe_gemm_report *report);
+
 #ifdef __cplusplus
 }
 #endif

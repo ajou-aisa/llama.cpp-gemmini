@@ -27,10 +27,6 @@ namespace act = ggml::gemmini::quants::act;
 constexpr size_t HW_DIM = POTAL_HW_DIM; // not DIM: <gemmini_params.h> defines that macro
 constexpr size_t ALIGN  = POTAL_HW_MAX_BYTES;
 
-size_t round_up(size_t v, size_t to) {
-    return (v + to - 1) / to * to;
-}
-
 bool is_2d(const ggml_tensor * t) {
     return t->ne[2] == 1 && t->ne[3] == 1;
 }
@@ -38,14 +34,6 @@ bool is_2d(const ggml_tensor * t) {
 bool in_host_memory(const ggml_tensor * t) {
     const ggml_tensor * base = t->view_src ? t->view_src : t;
     return base->buffer == nullptr || ggml_backend_buffer_is_host(base->buffer);
-}
-
-void * zeroed(size_t bytes) {
-    void * p = std::aligned_alloc(ALIGN, round_up(bytes, ALIGN));
-    if (p != nullptr) {
-        std::memset(p, 0, round_up(bytes, ALIGN));
-    }
-    return p;
 }
 
 void add_work(potal_ws_report & sum, const potal_ws_report & w) {
@@ -74,6 +62,63 @@ tiled_job job_of(const ggml_gemmini_args_t & args, const hp1_operands & ops, siz
 }
 
 } // namespace
+
+size_t align_up(size_t v, size_t to) {
+    return (v + to - 1) / to * to;
+}
+
+void * dma_alloc(size_t bytes) {
+    void * p = std::aligned_alloc(ALIGN, align_up(bytes, ALIGN));
+    if (p != nullptr) {
+        std::memset(p, 0, align_up(bytes, ALIGN));
+    }
+    return p;
+}
+
+void reconstruct_row(const int32_t * c, size_t n, double activation_scale, const float * channel_scale, float * out,
+                     size_t col_stride) {
+    for (size_t j = 0; j < n; ++j) {
+        out[j * col_stride] =
+            static_cast<float>(static_cast<double>(c[j]) * activation_scale * static_cast<double>(channel_scale[j]));
+    }
+}
+
+bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda) {
+    const auto &    A     = args.A;
+    const uint8_t * codes = A.raw_data();
+    if (codes == nullptr || A.bits != 8 || A.cols != args.K || A.row_stride_bytes != args.K || lda < args.K ||
+        row_begin > A.rows || rows > A.rows - row_begin || (row_begin + rows) * A.row_stride_bytes > A.raw_size()) {
+        return false;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        std::memcpy(dst + r * lda, codes + (row_begin + r) * A.row_stride_bytes, args.K);
+    }
+    return true;
+}
+
+void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_t out_stride, ggml_gemmini_args_t & merge) {
+    merge.I                          = args.I;
+    merge.J                          = args.J;
+    merge.K                          = args.K;
+    merge.sA                         = args.sA;
+    merge.sC                         = args.sC;
+    merge.residual_route             = args.residual_route;
+    merge.weight_format              = args.weight_format;
+    merge.q8_hp1_blocks              = args.q8_hp1_blocks;
+    merge.q8_hp1_blocks_per_row      = args.q8_hp1_blocks_per_row;
+    merge.q8_hp1_block_count         = args.q8_hp1_block_count;
+    merge.native_weight_bytes        = args.native_weight_bytes;
+    merge.block_size_k               = args.block_size_k;
+    merge.f_out                      = out;
+    merge.col_stride_f_out           = 1;
+    merge.stride_f_out               = out_stride;
+    merge.model_arch                 = args.model_arch;
+    merge.matmul_layer               = args.matmul_layer;
+    merge.tile_I                     = args.tile_I;
+    merge.tile_J                     = args.tile_J;
+    merge.tile_K                     = args.tile_K;
+    merge.activation_rows_per_stripe = args.activation_rows_per_stripe;
+}
 
 ggml_potal_reject check_mul_mat_hp1(const ggml_tensor * op, bool require_data, hp1_shape * shape) {
     const ggml_tensor * w = op->src[0];
@@ -125,20 +170,20 @@ void hp1_weight::abandon() {
 bool hp1_weight::allocate(int64_t n_, int64_t k_) {
     n       = (size_t) n_;
     k       = (size_t) k_;
-    n_pad   = round_up(n, HW_DIM);
-    ldb     = round_up(n_pad, ALIGN);
+    n_pad   = align_up(n, HW_DIM);
+    ldb     = align_up(n_pad, ALIGN);
     cstride = n_pad;
     const size_t k_blocks = k / quants::weight::hp1::block_k;
 
-    b        = static_cast<int8_t *>(blocks[0] = zeroed(k * ldb));
-    carriers = static_cast<uint32_t *>(blocks[1] = zeroed(k_blocks * cstride * sizeof(uint32_t)));
-    scale    = static_cast<float *>(blocks[2] = zeroed(n_pad * sizeof(float)));
+    b        = static_cast<int8_t *>(blocks[0] = dma_alloc(k * ldb));
+    carriers = static_cast<uint32_t *>(blocks[1] = dma_alloc(k_blocks * cstride * sizeof(uint32_t)));
+    scale    = static_cast<float *>(blocks[2] = dma_alloc(n_pad * sizeof(float)));
     return b && carriers && scale;
 }
 
 size_t hp1_weight::bytes() const {
-    return round_up(k * ldb, ALIGN) + round_up(k / quants::weight::hp1::block_k * cstride * sizeof(uint32_t), ALIGN) +
-           round_up(n_pad * sizeof(float), ALIGN);
+    return align_up(k * ldb, ALIGN) + align_up(k / quants::weight::hp1::block_k * cstride * sizeof(uint32_t), ALIGN) +
+           align_up(n_pad * sizeof(float), ALIGN);
 }
 
 hp1_operands::~hp1_operands() {
@@ -155,12 +200,12 @@ void hp1_operands::abandon() {
 }
 
 bool hp1_operands::allocate_dynamic(const hp1_shape & s) {
-    m_pad = round_up((size_t) s.m, HW_DIM);
-    n_pad = round_up((size_t) s.n, HW_DIM);
-    lda   = round_up((size_t) s.k, ALIGN);
+    m_pad = align_up((size_t) s.m, HW_DIM);
+    n_pad = align_up((size_t) s.n, HW_DIM);
+    lda   = align_up((size_t) s.k, ALIGN);
     ldc   = n_pad;
-    a     = static_cast<int8_t *>(blocks[0] = zeroed(m_pad * lda));
-    c     = static_cast<int32_t *>(blocks[1] = zeroed(m_pad * ldc * sizeof(int32_t)));
+    a     = static_cast<int8_t *>(blocks[0] = dma_alloc(m_pad * lda));
+    c     = static_cast<int32_t *>(blocks[1] = dma_alloc(m_pad * ldc * sizeof(int32_t)));
     return a && c;
 }
 
@@ -293,13 +338,8 @@ route_result execute_route(const route_plan & route, const ggml_gemmini_args_t &
             return fail("potal_gemm");
         }
         for (size_t m = 0; m < args.I; ++m) {
-            float *         out = args.f_out + m * args.stride_f_out;
-            const int32_t * c   = ops.c + m * ops.ldc;
-            const double    s_m = static_cast<double>(row_scale[m]);
-            for (size_t n = 0; n < args.J; ++n) {
-                out[n * args.col_stride_f_out] =
-                    static_cast<float>(static_cast<double>(c[n]) * s_m * static_cast<double>(ops.scale[n]));
-            }
+            reconstruct_row(ops.c + m * ops.ldc, args.J, static_cast<double>(row_scale[m]), ops.scale,
+                            args.f_out + m * args.stride_f_out, args.col_stride_f_out);
         }
         r.ok = true;
         return r;
