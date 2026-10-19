@@ -9,6 +9,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
   printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*, POTAL_*.'
+  printf '%s\n' '  RISCV_LIBGOMP=/target/libgomp.so.1 overrides automatic OpenMP runtime discovery (ELF/ABI validated).'
   printf '%s\n' 'Default: GGML PoTal backend (GGML_GEMMINI=OFF, GGML_POTAL=ON, GGML_BACKEND_DL=OFF,'
   printf '%s\n' '  POTAL_EXPECTED_DIM=16, POTAL_HW_PARAMS=<potal>/software/gemmini-rocc-tests/include/gemmini_potal_params.h).'
   printf '%s\n' '  Builds potal-api-test, potal-api-smoke, potal-multicore-smoke, potal-ggml-unit-test,'
@@ -155,3 +156,7 @@ elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
 else
   cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
 fi
+
+# shellcheck source=scripts/stage-riscv-runtime.sh
+source "$SCRIPT_ROOT/scripts/stage-riscv-runtime.sh"
+stage_riscv_openmp_runtime "$BUILD_DIR"
