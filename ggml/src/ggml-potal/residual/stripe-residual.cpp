@@ -97,8 +97,8 @@ bool request::allocate(size_t m_rows, size_t n_cols, size_t k_exec, size_t runs_
     return a && b && carriers && c;
 }
 
-rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight & w, request & out) try {
-    out.reset();
+rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight & w, decoded_packet & out) try {
+    out = decoded_packet{};
     if (rmd::validate_packet(packet) != rmd::RmdStatus::success) {
         return rmd::RmdStatus::invalid_packet;
     }
@@ -111,7 +111,8 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
     const rmd::BalancedRadixContract radix = rmd::balanced_radix_contract(packet.digit_bits);
 
     // Runs: the packet's blocks (validated: block id ascending), their compact K.
-    const size_t runs = packet.blocks.size();
+    const size_t        runs = packet.blocks.size();
+    std::vector<size_t> offset; // compact offset of each run
     out.runs.reserve(runs);
     for (const rmd::BlockDescriptor & block : packet.blocks) {
         if ((size_t) block.block_id > (w.k - RUN_K) / RUN_K ||
@@ -127,15 +128,13 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
             }
             r.local_k.push_back(local_k);
         }
+        offset.push_back(out.k_compact);
         out.k_compact += r.local_k.size();
         out.runs.push_back(std::move(r));
     }
-    out.k_execution = RUN_K * runs;
-    out.n           = w.n;
 
-    // Rows: lane-major, then source row; one digit row of K_execution each.
-    std::vector<int8_t> digits; // [rows][k_execution], before the DMA buffer is sized
-    std::vector<int8_t> row(out.k_execution);
+    // Rows: lane-major, then source row; one compact digit row each.
+    std::vector<int8_t> row(out.k_compact);
     for (uint8_t lane = 0; lane < packet.lane_capacity; ++lane) {
         for (size_t src = 0; src < packet.row_count; ++src) {
             std::fill(row.begin(), row.end(), int8_t{ 0 });
@@ -155,26 +154,51 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
                     if (digit < radix.digit_min || digit > radix.digit_max) {
                         return rmd::RmdStatus::overflow;
                     }
-                    row[r * RUN_K + k] = (int8_t) digit;
+                    row[offset[r] + k] = (int8_t) digit;
                     active             = active || digit != 0;
                 }
             }
             if (active) {
                 out.rows.push_back({ lane, (uint32_t) src });
-                digits.insert(digits.end(), row.begin(), row.end());
+                out.digits.insert(out.digits.end(), row.begin(), row.end());
             }
         }
     }
-    out.m = out.rows.size();
-    if (out.m == 0) {
+    if (out.rows.empty()) {
         return rmd::RmdStatus::invalid_packet; // a sealed packet carries at least one nonzero digit
     }
+    return rmd::RmdStatus::success;
+} catch (const std::bad_alloc &) {
+    return rmd::RmdStatus::allocation_failure;
+} catch (const std::length_error &) {
+    return rmd::RmdStatus::overflow;
+}
+
+rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight & w, request & out) try {
+    out.reset();
+    decoded_packet       decoded;
+    const rmd::RmdStatus status = decode_packet(packet, w, decoded);
+    if (status != rmd::RmdStatus::success) {
+        return status;
+    }
+    const size_t runs = decoded.runs.size();
+    out.runs          = std::move(decoded.runs);
+    out.rows          = std::move(decoded.rows);
+    out.k_compact     = decoded.k_compact;
+    out.k_execution   = RUN_K * runs;
+    out.n             = w.n;
+    out.m             = out.rows.size();
 
     if (!out.allocate(out.m, out.n, out.k_execution, runs, w.ldb, w.cstride)) {
         return rmd::RmdStatus::allocation_failure;
     }
+    // K32 padded lowering: run r's compact digits first, then zero K.
     for (size_t i = 0; i < out.m; ++i) {
-        std::memcpy(out.a + i * out.lda, digits.data() + i * out.k_execution, out.k_execution);
+        const int8_t * src = decoded.digits.data() + i * out.k_compact;
+        for (size_t r = 0; r < runs; ++r) {
+            std::memcpy(out.a + i * out.lda + r * RUN_K, src, out.runs[r].local_k.size());
+            src += out.runs[r].local_k.size();
+        }
     }
     // Gather from the prepared weight: run r's compact K first, then zero K.
     for (size_t r = 0; r < runs; ++r) {
@@ -199,19 +223,28 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
 }
 
 rmd::RmdStatus reconstruct(const rmd::StripePacket & packet, const request & req,
-                           rmd::BlockScaledInt64Correction & out) try {
+                           rmd::BlockScaledInt64Correction & out) {
+    if (req.m != req.rows.size()) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+    return reconstruct_rows(packet, req.rows, req.c, req.ldc, req.n, out);
+}
+
+rmd::RmdStatus reconstruct_rows(const rmd::StripePacket & packet, const std::vector<lane_row> & rows,
+                                const int32_t * c_rows, size_t ldc, size_t n,
+                                rmd::BlockScaledInt64Correction & out) try {
     const rmd::BalancedRadixContract radix = rmd::balanced_radix_contract(packet.digit_bits);
     size_t                           value_count = 0;
-    if (radix.radix == 0 || req.c == nullptr || req.n != packet.logical_j || req.m != req.rows.size() ||
-        __builtin_mul_overflow(packet.row_count, req.n, &value_count)) {
+    if (radix.radix == 0 || c_rows == nullptr || n != packet.logical_j ||
+        __builtin_mul_overflow(packet.row_count, n, &value_count)) {
         return rmd::RmdStatus::invalid_arguments;
     }
     std::vector<wide_t> wide(value_count, 0);
-    for (size_t i = 0; i < req.m; ++i) {
-        const lane_row & row = req.rows[i];
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const lane_row & row = rows[i];
         if (row.lane >= radix.lane_capacity || row.source_row >= packet.row_count ||
-            (i > 0 && (row.lane < req.rows[i - 1].lane ||
-                       (row.lane == req.rows[i - 1].lane && row.source_row <= req.rows[i - 1].source_row)))) {
+            (i > 0 && (row.lane < rows[i - 1].lane ||
+                       (row.lane == rows[i - 1].lane && row.source_row <= rows[i - 1].source_row)))) {
             return rmd::RmdStatus::invalid_packet;
         }
         wide_t place = 1;
@@ -220,9 +253,9 @@ rmd::RmdStatus reconstruct(const rmd::StripePacket & packet, const request & req
                 return rmd::RmdStatus::overflow;
             }
         }
-        const int32_t * c   = req.c + i * req.ldc;
-        wide_t *        dst = wide.data() + (size_t) row.source_row * req.n;
-        for (size_t col = 0; col < req.n; ++col) {
+        const int32_t * c   = c_rows + i * ldc;
+        wide_t *        dst = wide.data() + (size_t) row.source_row * n;
+        for (size_t col = 0; col < n; ++col) {
             wide_t term = c[col];
             if (__builtin_mul_overflow(term, place, &term) || __builtin_add_overflow(dst[col], term, &dst[col])) {
                 return rmd::RmdStatus::overflow;

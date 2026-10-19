@@ -199,6 +199,11 @@ set(POTAL_BACKEND_SOURCES
     matmul/options.hpp
     matmul/pack.cpp
     matmul/pack.hpp
+    matmul/paired.cpp
+    matmul/paired.hpp
+    matmul/paired-emulator.cpp
+    matmul/paired-plan.cpp
+    matmul/paired-schedule.cpp
     matmul/stripe.cpp
     matmul/stripe.hpp
     matmul/weight_cache.cpp
@@ -310,6 +315,25 @@ target_link_libraries(potal-stripe-pipeline-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-stripe-pipeline-test COMMAND potal-stripe-pipeline-test)
 endif()
+
+# Hardware-free checks (host and target) of the paired Main/Residual GEMM
+# software model (matmul/paired.hpp): no RoCC command, PAIRED_EMULATED only.
+#   plan      paired SP/ACC partition, frozen t_I/t_J, K32 common windows, the
+#             shared indexed-weight Residual descriptor, capacity failures
+#   schedule  the micro-tile trace: 1:1 alternation, tails, K order, group
+#             reversal, save/restore, determinism
+#   unit      Main / Residual INT32 and radix INT64: independent golden ==
+#             serialized reference == paired emulator; both merge modes,
+#             failures with no partial commit, real ExSIA packets
+foreach(_paired_test plan schedule unit)
+    add_executable(potal-paired-${_paired_test}-test tests/potal-paired-${_paired_test}-test.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-paired-${_paired_test}-test)
+    target_include_directories(potal-paired-${_paired_test}-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-paired-${_paired_test}-test PRIVATE ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-paired-${_paired_test}-test COMMAND potal-paired-${_paired_test}-test)
+    endif()
+endforeach()
 
 # Benchmark (host and target, not a test): Q8_HP1 weight preparation cost per
 # stage and with the backend's weight cache, synthetic or from a GGUF (--gguf).

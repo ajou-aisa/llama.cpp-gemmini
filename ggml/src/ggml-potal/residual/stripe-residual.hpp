@@ -112,6 +112,23 @@ class request {
     void * blocks[4] = {};
 };
 
+// The run-aware view of one sealed packet, before any lowering: the runs, the
+// active (lane, source row) rows and their compact digits
+//   digits int8 [rows][k_compact]   run r's compact K at the run's compact offset
+// (validate_packet, A8 radix range, shape against the prepared weight w).
+// Shared by build_request (K32 padded lowering) and the paired executor
+// (matmul/paired.hpp, indexed weight): both see the same rows, runs and order.
+struct decoded_packet {
+    std::vector<run>      runs;
+    std::vector<lane_row> rows;
+    size_t                k_compact = 0;
+    std::vector<int8_t>   digits;
+};
+
+// RmdStatus::success only with at least one active row; a packet without any
+// nonzero digit is invalid_packet; unsupported_route: not an A8 packet.
+rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight & w, decoded_packet & out);
+
 // validate_packet, the run-aware rows/runs, the padded operands gathered from
 // the prepared weight and the residual plan, into `out` (reset first).
 // RmdStatus::success only with a complete request; a packet without any
@@ -124,6 +141,10 @@ rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight 
 // Transactional: out is unchanged on failure.
 rmd::RmdStatus reconstruct(const rmd::StripePacket & packet, const request & req,
                            rmd::BlockScaledInt64Correction & out);
+
+// reconstruct() on any Residual C: c[i * ldc + col] is the INT32 of rows[i].
+rmd::RmdStatus reconstruct_rows(const rmd::StripePacket & packet, const std::vector<lane_row> & rows,
+                                const int32_t * c, size_t ldc, size_t n, rmd::BlockScaledInt64Correction & out);
 
 // Adds `correction` (stripe-local rows x weight.n, row-major) to rows
 // [row_begin, row_end) of the F32 output out[row * row_stride + col *
