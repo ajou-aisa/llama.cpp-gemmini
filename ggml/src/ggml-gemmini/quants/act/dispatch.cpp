@@ -206,7 +206,8 @@ bool quantize(const ggml_tensor * src, ggml_gemmini_args_t & args) {
         }
         return true;
     }
-    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK: {
+    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK:
+    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK_POT: {
         args.act_quant.storage().emplace<block::Meta>();
         if (!block::quantize(src, args)) {
             reset_quantize_failure(args);
@@ -244,6 +245,7 @@ bool dequantize_activation(float *                     dst,
         }
         return token::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     case ggml::gemmini::config::ActivationQuantAlgo::BLOCK:
+    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK_POT:
         return block::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     case ggml::gemmini::config::ActivationQuantAlgo::STRIPE:
         return stripe::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);

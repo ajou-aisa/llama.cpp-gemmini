@@ -21,6 +21,9 @@
 namespace ggml::gemmini::quants::act::block {
 namespace {
 
+constexpr bool use_pot_scale =
+    config::CURRENT_ACTIVATION_QUANT == config::ActivationQuantAlgo::BLOCK_POT;
+
 uint64_t next_block_run_id() {
     static std::atomic<uint64_t> next{0};
     return next.fetch_add(1, std::memory_order_relaxed);
@@ -98,9 +101,14 @@ bool quantize_block(const float *                                   data,
 
     scale = 1.0f;
     if (scale_max_abs != 0.0) {
-        scale = static_cast<float>(
-            scale_max_abs /
-            static_cast<double>(ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX));
+        if constexpr (use_pot_scale) {
+            scale = std::scalbn(1.0f, std::ilogb(finite_max_abs) -
+                                          (GGML_GEMMINI_ACTIVATION_BITS - 2));
+        } else {
+            scale = static_cast<float>(
+                scale_max_abs /
+                static_cast<double>(ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX));
+        }
         if (!std::isfinite(scale) || scale <= 0.0f)
             return false;
     }

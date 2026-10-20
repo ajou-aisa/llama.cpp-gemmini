@@ -71,6 +71,7 @@ enum class ActivationQuantAlgo : uint8_t {
     TOKEN  = 2,
     BLOCK  = 3,
     STRIPE = 4,
+    BLOCK_POT = 5,
 };
 
 // Macro → enum mapping (compile-time) ---------------------------------------
@@ -97,15 +98,22 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
         ActivationQuantAlgo::BLOCK;
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 4
         ActivationQuantAlgo::STRIPE;
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 5
+        ActivationQuantAlgo::BLOCK_POT;
 #else
 #error "Invalid GGML_GEMMINI_ACTIVATION_QUANT value"
 #endif
+
+inline constexpr bool IS_BLOCK_ACTIVATION =
+    CURRENT_ACTIVATION_QUANT == ActivationQuantAlgo::BLOCK ||
+    CURRENT_ACTIVATION_QUANT == ActivationQuantAlgo::BLOCK_POT;
 
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA "exsia"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR "tensor"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN "token"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK "block"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMESTRIPE "stripe"
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK_POT "block_pot"
 
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA
@@ -117,14 +125,18 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 4
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMESTRIPE
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 5
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK_POT
 #endif
 
 inline constexpr bool DEQUANT_FP_TEST = GGML_GEMMINI_DEQUANT_FP_TEST != 0;
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1,
               "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
-static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 4,
-              "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, BLOCK, or STRIPE");
+static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 5,
+              "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, BLOCK, STRIPE, or BLOCK_POT");
+static_assert(CURRENT_ACTIVATION_QUANT != ActivationQuantAlgo::BLOCK_POT || !GGML_GEMMINI_ENABLE_RMD,
+              "BLOCK_POT requires GGML_GEMMINI_ENABLE_RMD=OFF");
 static_assert(GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS == 8 ||
                   GGML_GEMMINI_ACTIVATION_BITS == 16,
               "GGML_GEMMINI_ACTIVATION_BITS must be 4, 8, or 16");

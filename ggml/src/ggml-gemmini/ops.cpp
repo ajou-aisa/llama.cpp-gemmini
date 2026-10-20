@@ -475,7 +475,7 @@ bool gemmini_q4_0_q8_0_layout_contract(const ggml_tensor * weight) {
            reinterpret_cast<uintptr_t>(weight->data) % block_alignment == 0;
 }
 
-// Q4_0/Q8_0 never convert to H1. BLOCK activation runs int x int (block x
+// Q4_0/Q8_0 never convert to H1. BLOCK/BLOCK_POT activation runs int x int (block x
 // block, then dequantize) on the CPU route at the build's matched width;
 // every other mode computes FP32 from the dequantized weight.
 bool gemmini_q4_0_q8_0_supported(const ggml_tensor * weight) {
@@ -484,8 +484,7 @@ bool gemmini_q4_0_q8_0_supported(const ggml_tensor * weight) {
     }
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
                       ggml::gemmini::config::ComputeType::INT &&
-                  ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                      ggml::gemmini::config::ActivationQuantAlgo::BLOCK) {
+                  ggml::gemmini::config::IS_BLOCK_ACTIVATION) {
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
         return false;
 #else
@@ -528,8 +527,7 @@ gemmini_q8_channel_int_route_for(const ggml_tensor * weight, bool validate_paylo
                           ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
                       ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                           ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
-                      ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                          ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
+                      ggml::gemmini::config::IS_BLOCK_ACTIVATION ||
                       ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                           ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
             return gemmini_q8_channel_int_route_t::cpu_direct_read;
@@ -539,8 +537,7 @@ gemmini_q8_channel_int_route_for(const ggml_tensor * weight, bool validate_paylo
                           ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
                       ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                           ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
-                      ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                          ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
+                      ggml::gemmini::config::IS_BLOCK_ACTIVATION ||
                       ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                           ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
             return gemmini_q8_channel_int_route_t::hw_dense_sidecar;
@@ -1134,12 +1131,11 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
         }
     }
 
-    // Q4_0/Q8_0 outside BLOCK activation: no activation quantization, FP32 from
+    // Q4_0/Q8_0 outside BLOCK/BLOCK_POT activation: no activation quantization, FP32 from
     // the GGUF-dequantized weight (any build width).
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
                       ggml::gemmini::config::ComputeType::INT &&
-                  ggml::gemmini::config::CURRENT_ACTIVATION_QUANT !=
-                      ggml::gemmini::config::ActivationQuantAlgo::BLOCK) {
+                  !ggml::gemmini::config::IS_BLOCK_ACTIVATION) {
         if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) {
             static thread_local std::vector<float> src0_f32;
             src0_f32.resize(jk_count);
@@ -1187,8 +1183,7 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     constexpr bool im2p_exsia     = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                                     ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
-    constexpr bool im2p_block     = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                                    ggml::gemmini::config::ActivationQuantAlgo::BLOCK;
+    constexpr bool im2p_block     = ggml::gemmini::config::IS_BLOCK_ACTIVATION;
     constexpr bool im2p_non_exsia = !im2p_exsia;
     const auto     route_gate =
         ggml::gemmini::config::DEQUANT_FP_TEST && gemmini_exsia_weight_family(src0->type) ==

@@ -581,7 +581,8 @@ add_executable(test-gemmini-act-quant-i32-saturation
 target_link_libraries(test-gemmini-act-quant-i32-saturation PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-act-quant-i32-saturation PRIVATE cxx_std_17)
 set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT ${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE})
-if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
+if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK" OR
+    _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK_POT")
     # Keep the existing ExSIA merge fixture; BLOCK saturation is covered by test-gemmini-block-quant.
     set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT 0)
 endif()
