@@ -21,6 +21,8 @@
 #include <gemmini/trace-context.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -134,6 +136,50 @@ ggml_status mul_mat_i8(backend_state & state, ggml_tensor * node, const mul_mat_
 
 // ---- F32 x Q8_HP1 routed, tiled GEMM ---------------------------------------
 
+} // namespace
+
+bool options::paired_fences_conservative(bool * invalid) {
+    *invalid           = false;
+    const char * value = std::getenv("GGML_POTAL_PAIRED_FENCES");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string v(value);
+    for (char & ch : v) {
+        ch = (char) std::toupper((unsigned char) ch);
+    }
+    if (v == "RTL") {
+        return false;
+    }
+    if (v == "CONSERVATIVE") {
+        return true;
+    }
+    *invalid = true;
+    return false;
+}
+
+bool options::paired_auto_requested(bool * invalid) {
+    *invalid           = false;
+    const char * value = std::getenv("GGML_POTAL_PAIRED_AUTO");
+    if (value == nullptr || *value == '\0') {
+        return paired_auto_default;
+    }
+    std::string v(value);
+    for (char & ch : v) {
+        ch = (char) std::toupper((unsigned char) ch);
+    }
+    if (v == "ON" || v == "1") {
+        return true;
+    }
+    if (v == "OFF" || v == "0") {
+        return false;
+    }
+    *invalid = true;
+    return false;
+}
+
+namespace {
+
 ggml_status hp1_fail(ggml_backend_potal_stats & st, ggml_tensor * node, const std::string & layer, const char * stage,
                      const char * detail) {
     st.hp1_failed++;
@@ -151,11 +197,27 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
                                  size_t job_capacity) {
     ggml_backend_potal_stats & st     = state.stats;
     const hp1_weight &         weight = *wl.weight;
+
+    // Paired route: requested (build default / GGML_POTAL_PAIRED_AUTO) and eligible
+    // (compensation ON: the ws_packet residual exists). Compensation OFF keeps the
+    // serial route; an invalid request fails the node (an options failure, like the
+    // matmul options: before the node counts as a pipelined node), never picks a route.
+    bool       paired_invalid = false, fences_invalid = false;
+    const bool paired_request = options::paired_auto_requested(&paired_invalid);
+    const bool conservative   = options::paired_fences_conservative(&fences_invalid);
+    if (paired_invalid) {
+        return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_AUTO must be ON, OFF, 1 or 0");
+    }
+    if (fences_invalid) {
+        return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_FENCES must be RTL or CONSERVATIVE");
+    }
     st.stripe_pipeline_nodes++;
 
     pipeline_config cfg;
     cfg.job_capacity = job_capacity;
     cfg.residual     = options::compensation;
+    cfg.paired       = paired_request && options::compensation;
+    cfg.paired_conservative_fences = cfg.paired && conservative;
     cfg.layer        = layer;
     issuer_owner owner;
     const uint64_t c0 = gcycle::read();
@@ -176,6 +238,16 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.scale_writes += c.scale_writes;
     st.scale_releases += c.scale_releases;
     st.tlb_flushes += c.tlb_flushes;
+    st.paired_stripes += c.paired_stripes;
+    st.paired_fallback_stripes += c.paired_fallback_stripes;
+    st.paired_main_loop_ws += c.paired_main_loop_ws;
+    st.paired_residual_loop_ws += c.paired_residual_loop_ws;
+    st.paired_index_configs += c.paired_index_configs;
+    st.paired_index_writes += c.paired_index_writes;
+    st.paired_readbacks += c.paired_readbacks;
+    st.paired_readback_tiles += c.paired_readback_tiles;
+    st.paired_fences += c.paired_fences;
+    st.paired_drains += c.paired_drains;
     st.scale_s += c.scale_s;
     st.issue_s += c.issue_s;
     st.fence_s += c.fence_s;
@@ -210,7 +282,9 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
                 "residual_logical_gemms=%llu residual_loop_ws=%llu residual_fences=%llu residual_compact_k=%llu "
                 "residual_execution_k=%llu active_lane_rows=%llu radix_reconstructions=%llu merges_completed=%llu "
                 "corrections_nonzero=%llu scale_writes=%llu scale_releases=%llu tlb_flushes=%llu generation=%u "
-                "status=%s",
+                "paired=%s paired_fences=%s paired_stripes=%llu paired_fallback_stripes=%llu paired_main_loop_ws=%llu "
+                "paired_residual_loop_ws=%llu paired_index_configs=%llu paired_index_writes=%llu "
+                "paired_readbacks=%llu paired_readback_tiles=%llu paired_fences=%llu paired_drains=%llu status=%s",
                 options::residual_executor_name(options::MatmulInvocationMode::stripe_pipeline), node->name,
                 r.run_bound ? std::to_string(r.run_id).c_str() : "-", r.expected_stripes, job_capacity,
                 plan.tile_I, plan.tile_J, plan.tile_K, (unsigned long long) c.stripes_accepted,
@@ -223,7 +297,14 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
                 (unsigned long long) c.residual_active_lane_rows, (unsigned long long) c.radix_reconstructions,
                 (unsigned long long) c.merges_completed, (unsigned long long) c.corrections_nonzero,
                 (unsigned long long) c.scale_writes, (unsigned long long) c.scale_releases,
-                (unsigned long long) c.tlb_flushes, c.last_generation, r.ok ? "committed" : "failed");
+                (unsigned long long) c.tlb_flushes, c.last_generation, cfg.paired ? "ON" : "OFF",
+                cfg.paired_conservative_fences ? "CONSERVATIVE" : "RTL",
+                (unsigned long long) c.paired_stripes, (unsigned long long) c.paired_fallback_stripes,
+                (unsigned long long) c.paired_main_loop_ws, (unsigned long long) c.paired_residual_loop_ws,
+                (unsigned long long) c.paired_index_configs, (unsigned long long) c.paired_index_writes,
+                (unsigned long long) c.paired_readbacks, (unsigned long long) c.paired_readback_tiles,
+                (unsigned long long) c.paired_fences, (unsigned long long) c.paired_drains,
+                r.ok ? "committed" : "failed");
 #endif
     if (!r.ok) {
         st.stripe_pipeline_failed++;

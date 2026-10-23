@@ -83,6 +83,23 @@ constexpr const char * residual_executor_name(MatmulInvocationMode mode) {
     return !compensation ? "none" : mode == MatmulInvocationMode::full ? "cpu_direct" : "potal_ws";
 }
 
+// GGML_POTAL_PAIRED_AUTO: build default of the paired route (CMake option);
+// the environment variable of the same name (ON / OFF / 1 / 0) overrides it.
+#ifndef GGML_POTAL_PAIRED_AUTO
+#    error "GGML_POTAL_PAIRED_AUTO must come from ggml-potal/CMakeLists.txt"
+#endif
+constexpr bool paired_auto_default = GGML_POTAL_PAIRED_AUTO != 0;
+
+// The requested paired route: the build default, or the environment override.
+// false with *invalid set when the environment value is not ON / OFF / 1 / 0.
+bool paired_auto_requested(bool * invalid);
+
+// GGML_POTAL_PAIRED_FENCES=RTL (default) | CONSERVATIVE: CONSERVATIVE adds a POTAL_FENCE
+// before every Indexed LOOP_WS, ACC readback and scale release of a paired stripe (the
+// H2-validated fence placement) instead of relying on the RTL's ordering of the stream.
+// false with *invalid set when the value is neither.
+bool paired_fences_conservative(bool * invalid);
+
 // nullptr when PoTal executes the resolved mode, residual backend and stripe
 // job capacity with the configured activation algorithm, else why not.
 constexpr const char * unsupported_combination(MatmulInvocationMode mode, RmdBackend backend,

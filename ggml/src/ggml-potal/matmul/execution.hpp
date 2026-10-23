@@ -21,6 +21,11 @@
 
 namespace ggml::potal {
 
+// matmul/paired-auto.hpp (not included here: it includes this header through dense.hpp).
+struct potal_paired_request;
+struct potal_paired_report;
+enum class potal_paired_status : uint8_t;
+
 // One DIM16 GEMM with every scale carrier x1:
 // C[16][16] = A[16][k] * B[k][16], k = 16 or 32.
 struct gemm_job {
@@ -104,6 +109,25 @@ issuer_info get_issuer_info();
 // preflight, TLB FLUSH + FENCE, the GEMM; see stripe-api.hpp).
 using planned_runner = std::function<planned_result(const potal_stripe_gemm_desc &)>;
 
+// One paired stripe (matmul/paired-auto.hpp, potal_paired_run_session) on the
+// accelerator owner thread, inside the owner's safety policy (issuer: hart-0
+// affinity check; the owner's scale generation counter): its own paired session,
+// opened before the first command and closed after the drain.
+using paired_runner = std::function<potal_paired_status(const potal_paired_request &, potal_paired_report &)>;
+
+// The paired step of an owner (defined in paired-auto.cpp): on_owner_cpu false
+// refuses with a fatal "affinity" report; else potal_paired_run_session on the
+// hardware with the owner's scale generation counter.
+potal_paired_status run_paired_on_owner(const potal_paired_request & req, uint32_t * generation, bool on_owner_cpu,
+                                        potal_paired_report & report);
+
+// What an accelerator owner offers its consumer. `paired` empty: the owner cannot
+// run paired stripes (a run configured for them fails instead of falling back).
+struct owner_runners {
+    planned_runner planned;
+    paired_runner  paired;
+};
+
 // How a consumer ended. fatal: the accelerator state is unknown; the issuer
 // disables itself and the run's buffers must never be freed.
 struct consume_outcome {
@@ -112,7 +136,7 @@ struct consume_outcome {
     const char * stage  = nullptr;
 };
 
-using stripe_consumer = std::function<consume_outcome(const planned_runner &)>;
+using stripe_consumer = std::function<consume_outcome(const owner_runners &)>;
 
 // The thread that owns the accelerator while one stripe run is consumed: the
 // issuer in the backend, a test thread with an emulator session in host tests.
@@ -158,7 +182,9 @@ class producer_affinity {
 // waits for the issuer's bring-up (affinity, TLB flush) under the caller's
 // unchanged affinity, then hands it the consumer and returns; the consumer
 // runs planned GEMMs on the issuer's session (the I8 and FULL session) and
-// the issuer keeps a strong reference to it until it returns. From start()
+// paired stripes on per-stripe paired sessions sharing that session's scale
+// generation counter, and the issuer keeps a strong reference to it until it
+// returns. From start()
 // until join() every other PoTal request of the process waits. pin_producer()
 // moves the caller to a CPU other than the issuer's (producer_affinity).
 // Off RISC-V start() fails with POTAL_ERR_NO_HARDWARE.

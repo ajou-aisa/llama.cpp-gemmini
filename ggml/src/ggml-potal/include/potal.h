@@ -353,6 +353,256 @@ void         potal_stripe_session_destroy(potal_stripe_session *session);
 potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const potal_stripe_gemm_desc *desc,
                                        potal_stripe_gemm_report *report);
 
+/* ---- Command funct7 values (GemminiISA.scala); the raw issue layer and the
+ * paired session's command records use them. ---------------------------------- */
+#define POTAL_FUNCT_CONFIG                    0
+#define POTAL_FUNCT_MVOUT                     3
+#define POTAL_FUNCT_FLUSH                     7
+#define POTAL_FUNCT_LOOP_WS                   8
+#define POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS     9
+#define POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB   10
+#define POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC   11
+#define POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB 12
+#define POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC 13
+#define POTAL_FUNCT_SCALE_WRITE               23
+#define POTAL_FUNCT_SCALE_RELEASE             24
+#define POTAL_FUNCT_FENCE                     25
+#define POTAL_FUNCT_INDEX_WRITE               26
+#define POTAL_FUNCT_INDEX_CONFIG              27
+
+/* ---- H2 paired / indexed execution (potal_paired_*) ---------------------- */
+
+/*
+ * The paired Main/Residual GEMM of the H2 hardware (generators/potal, branch
+ * potal; validated by potal_shared_weight_*.c, potal_h2b1_a_cohabit.c,
+ * potal_h2c_*.c, potal_h2d_cycle_bench.c): two physical bank pairs, each one
+ * activation bank + one weight bank + one Index Table, ACC0 (Main) and ACC1
+ * (Residual) halves of the accumulator, INDEX_CONFIG / INDEX_WRITE and the
+ * paired LOOP_WS bits. Planning (which pair, which sp rows, which scale window,
+ * when a pair may be reused) is the job of matmul/paired-auto.hpp; this layer
+ * checks fields and geometry, encodes the commands and issues them inside an
+ * explicitly owned paired session.
+ *
+ * Address units: sp row = one row of POTAL_HW_DIM int8 (0 .. BANK_NUM*BANK_ROWS-1);
+ * tile = POTAL_HW_DIM rows; resident_k = original K - the resident panel's first K.
+ * Pair p: activation bank 2p, weight bank 2p+1, Index buffer p, LOOP_WS A/B
+ * scratchpad selector p + 1 (LoopMatmul a/b_ex_spad_id: 1 = half 0, 2 = half 1).
+ */
+#define POTAL_PAIRS 2u
+
+/*
+ * INDEX_CONFIG (funct7 27, xd): rs1 = {jTiles[63:32], bBase[31:0]},
+ * rs2 = {activeRows[63:32], sourceKRows[31:0]}. The hardware derives the
+ * Index buffer from bBase (bank 1 -> buffer 0, bank 3 -> buffer 1) and
+ * requires bBase + ceil(sourceKRows/DIM) * jTiles * DIM inside that weight bank.
+ */
+typedef struct potal_index_config {
+    uint32_t pair;          /* physical bank pair 0..POTAL_PAIRS-1 = Index buffer */
+    uint32_t b_sp_base;     /* first sp row of the resident B panel, inside the pair's weight bank */
+    uint32_t j_tiles;       /* N tiles of the resident panel (its row-tile stride) */
+    uint32_t source_k_rows; /* K rows of the resident panel: original_k - k_begin < source_k_rows */
+    uint32_t active_rows;   /* Index Table slots of this window, 1..POTAL_HW_INDEX_ENTRIES */
+} potal_index_config;
+
+/* INDEX_WRITE (funct7 26, xd): rs1 = slot, rs2 = resident_k; targets the last configured buffer. */
+typedef struct potal_index_write {
+    uint32_t slot;       /* window-local, < active_rows */
+    uint32_t resident_k; /* < source_k_rows: never a model-global K of a partitioned B */
+} potal_index_write;
+
+potal_status potal_index_config_check(const potal_index_config *cfg);
+potal_status potal_index_config_encode(const potal_index_config *cfg, potal_rocc_cmd *cmd);
+potal_status potal_index_write_check(const potal_index_config *cfg, const potal_index_write *w);
+potal_status potal_index_write_encode(const potal_index_config *cfg, const potal_index_write *w,
+                                      potal_rocc_cmd *cmd);
+
+typedef enum potal_paired_path {
+    POTAL_PAIRED_MAIN     = 0, /* A x B -> ACC0; loads A and the original B panel (LdA + LdB) */
+    POTAL_PAIRED_RESIDUAL = 1, /* packed digits x resident B through the Index Table -> ACC1 */
+} potal_paired_path;
+
+/*
+ * One paired LOOP_WS. `loop` carries the geometry, pointers, strides and scale
+ * fields of the regular invocation (potal_loop_ws); the paired fields select
+ * the path, the pair and the scratchpad placement. Rules (potal_paired_loop_ws_check):
+ *   Main      resident_b 0, indexed 0, a_offset_tiles 0, loop.b the original B
+ *             panel (k rows x n cols), (i_tiles*k_tiles) * DIM <= BANK_ROWS,
+ *             k_tiles * j_tiles * DIM <= BANK_ROWS (one activation / weight bank)
+ *   Residual  resident_b 1, indexed 1, loop.b NULL (B DRAM address 0: no LdB,
+ *             LoopMatmul asserts it), loop.a the packed window digits
+ *             [i_tiles*DIM - pad_i][k_tiles*DIM - pad_k] = the Index slots in order,
+ *             a_offset_tiles the bank-local A offset (tile_I * tile_K of the plan),
+ *             (a_offset_tiles + i_tiles*k_tiles) * DIM <= BANK_ROWS
+ *   both      loop.c NULL (results leave the ACC through potal_acc_readback),
+ *             i_tiles * j_tiles * DIM <= ACC_ROWS / 2 (one ACC bank), work IDs,
+ *             scale window, pads < DIM, k_tiles a multiple of passes_per_block,
+ *             loop.flags 0 or POTAL_GEMM_ACCUMULATE
+ * The check validates fields and geometry only; whether B is resident, the
+ * Index window programmed and Main A not overwritten is the paired session's
+ * runtime check (potal_paired_loop_ws_issue).
+ *
+ * Encoding: the regular 10-command program with LOOP_WS rs1 bit 61 (paired),
+ * bit 62 (residual), bit 63 (indexed weight), a_ex_spad_id = b_ex_spad_id =
+ * pair + 1 at [19:18] / [17:16], and rs2[31:3] = a_offset_tiles.
+ */
+typedef struct potal_paired_loop_ws {
+    potal_loop_ws loop;
+    uint32_t      path;           /* potal_paired_path */
+    uint32_t      pair;           /* 0..POTAL_PAIRS-1 */
+    uint32_t      a_offset_tiles; /* bank-local A offset, DIM-row tiles */
+    uint32_t      resident_b;     /* 1: reuse the pair's resident B, no B DMA */
+    uint32_t      indexed;        /* 1: Indexed Weight PRELOAD through the pair's Index Table */
+} potal_paired_loop_ws;
+
+potal_status potal_paired_loop_ws_check(const potal_paired_loop_ws *l);
+potal_status potal_paired_loop_ws_encode(const potal_paired_loop_ws *l, potal_gemm_ws_program *program);
+
+/*
+ * Full-width INT32 readback of one ACC bank's result tiles: CONFIG_ST(ldc
+ * bytes) then one MVOUT (funct7 3) per DIM x DIM tile, rows (i, j) at ACC row
+ * bank * ACC_ROWS/2 + (i * j_tiles + j) * DIM (the LoopMatmul tile layout),
+ * last tiles shortened by pad_i / pad_j. c must be DIM*4-byte aligned with
+ * ldc >= the valid columns. The readback is a DMA store: it is complete only
+ * after a POTAL_OK fence, and only then may the CPU read c.
+ */
+typedef struct potal_acc_readback {
+    uint32_t acc_bank; /* 0 Main (ACC0), 1 Residual (ACC1) */
+    uint32_t i_tiles;
+    uint32_t j_tiles;
+    uint32_t pad_i;    /* rows missing from the last I tile, < DIM */
+    uint32_t pad_j;    /* columns missing from the last J tile, < DIM */
+    int32_t *c;        /* [i_tiles*DIM - pad_i][ldc] */
+    size_t   ldc;      /* elements */
+} potal_acc_readback;
+
+potal_status potal_acc_readback_check(const potal_acc_readback *r);
+/* config_st and up to `capacity` MVOUT commands (i_tiles * j_tiles needed; *count says how many). */
+potal_status potal_acc_readback_encode(const potal_acc_readback *r, potal_rocc_cmd *config_st,
+                                       potal_rocc_cmd *mvouts, uint32_t capacity, uint32_t *count);
+
+/*
+ * Paired session: the single owner of the accelerator while open. Opening
+ * refuses (POTAL_ERR_BUSY) while a regular GEMM is unfenced or another session
+ * is open; while open, potal_gemm_ws_issue / potal_loop_ws_issue / potal_fence /
+ * potal_tlb_flush refuse with POTAL_ERR_BUSY. Inside it several paired LOOP_WS
+ * may be outstanding; only potal_paired_fence() == POTAL_OK means they (and
+ * every readback DMA) completed. Not thread-safe; same hart-0 rule as the rest.
+ *
+ * Commands go to the hardware (RISC-V) or, when `sink` is given, to the sink in
+ * issue order (host tests: a record of the command stream, never a model of the
+ * RTL's concurrency). Without hardware and without a sink every issue returns
+ * POTAL_ERR_NO_HARDWARE after its checks and changes nothing.
+ *
+ * Runtime rules of the session (beyond the field checks):
+ *   Main LOOP_WS       its pair must have no outstanding paired work (a fence
+ *                      retired every reader of the pair's previous B / A);
+ *                      records the pair's resident B (base, j tiles, K rows) and
+ *                      Main A footprint
+ *   INDEX_CONFIG       starts one transaction on its pair; refused while another
+ *                      transaction is unfinished (writes < active_rows). Any pair
+ *                      may be configured while the other pair executes
+ *                      (cross-buffer, H2-2C); a same-buffer update is stalled by
+ *                      the hardware until that buffer is idle
+ *   INDEX_WRITE        inside the open transaction, slot / resident_k checked
+ *                      against it; the transaction completes with its last slot
+ *   Residual LOOP_WS   its pair must hold a resident B whose base, j tiles and K
+ *                      rows equal the pair's completed Index window, the window's
+ *                      active rows must equal k_tiles*DIM - pad_k, and the A offset
+ *                      must lie behind the pair's Main A footprint
+ *   scale write        refused (POTAL_ERR_CAPACITY) while the slot holds live
+ *                      columns of another generation, or the column itself is
+ *                      live (written, not released): generations never alias;
+ *                      liveness is per (slot, column), so a padded last J tile
+ *                      that writes fewer than DIM columns frees its slot when
+ *                      its last written column is released; release needs the
+ *                      live generation and column (POTAL_ERR_INVALID_ARGUMENT).
+ *                      The hardware accepts a RELEASE only after every older
+ *                      command drained (Controller.scala releaseSafe :=
+ *                      allDrained, the FENCE condition): an accepted release
+ *                      is a drain point and clears the outstanding work like
+ *                      potal_paired_fence() does
+ *   readback           outstanding until the next POTAL_OK fence
+ *   failure            a hardware status other than POTAL_OK, or a bad response,
+ *                      makes the session failed: the error and stage are kept,
+ *                      every further issue returns that error, outstanding work
+ *                      is never forgotten; potal_paired_fence() may still drain it
+ *   close              POTAL_ERR_BUSY while work is outstanding or scale entries
+ *                      are live and the session is not failed; a failed session
+ *                      with outstanding work or live scale entries closes, but the
+ *                      accelerator stays owned (every later open and regular issue
+ *                      returns POTAL_ERR_BUSY): its state is unknown
+ */
+typedef struct potal_paired_session potal_paired_session; /* opaque */
+
+typedef struct potal_paired_cmd_record {
+    uint32_t funct;  /* potal_rocc.h POTAL_FUNCT_* */
+    uint32_t xd;     /* 1: the hardware answers with a status */
+    uint64_t rs1;
+    uint64_t rs2;
+} potal_paired_cmd_record;
+
+/* Returns the (simulated) hardware status of an xd command; POTAL_OK for the others. */
+typedef potal_status (*potal_paired_sink_fn)(void *ctx, const potal_paired_cmd_record *record);
+
+typedef struct potal_paired_sink {
+    potal_paired_sink_fn cmd;
+    void                *ctx;
+} potal_paired_sink;
+
+typedef struct potal_paired_pair_status {
+    uint32_t resident_b;    /* a Main LOOP_WS loaded the panel below */
+    uint32_t b_sp_base;
+    uint32_t b_j_tiles;
+    uint32_t b_k_rows;
+    uint32_t main_a_tiles;  /* Main A footprint, tiles from the bank start */
+    uint32_t index_valid;   /* a complete Index window is programmed on this buffer */
+    uint32_t index_active_rows;
+    uint32_t outstanding;   /* paired LOOP_WS issued on this pair since the last POTAL_OK fence */
+} potal_paired_pair_status;
+
+typedef struct potal_paired_session_status {
+    uint32_t     failed;
+    potal_status error;
+    const char  *error_stage;         /* NULL when not failed */
+    uint32_t     outstanding_loops;
+    uint32_t     outstanding_readbacks;
+    uint32_t     index_transaction_open; /* a CONFIG whose writes are not complete */
+    uint32_t     index_transaction_pair;
+    uint32_t     index_transaction_written;
+    uint32_t     live_scale_slots;
+    uint64_t     commands;            /* raw commands handed to the hardware / sink */
+    uint64_t     drains;              /* accepted POTAL_FENCE and SCALE_RELEASE commands: drain points */
+    potal_paired_pair_status pair[POTAL_PAIRS];
+} potal_paired_session_status;
+
+potal_status potal_paired_session_open(const potal_paired_sink *sink, potal_paired_session **out);
+potal_status potal_paired_session_close(potal_paired_session *session);
+potal_paired_session_status potal_paired_session_query(const potal_paired_session *session);
+
+potal_status potal_paired_tlb_flush(potal_paired_session *session); /* POTAL_ERR_BUSY while work is outstanding */
+potal_status potal_paired_scale_write(potal_paired_session *session, uint32_t slot, uint32_t generation,
+                                      uint32_t column, uint32_t carrier);
+potal_status potal_paired_scale_release(potal_paired_session *session, uint32_t slot, uint32_t generation,
+                                        uint32_t column);
+potal_status potal_paired_index_config(potal_paired_session *session, const potal_index_config *cfg);
+potal_status potal_paired_index_write(potal_paired_session *session, const potal_index_write *w);
+potal_status potal_paired_loop_ws_issue(potal_paired_session *session, const potal_paired_loop_ws *loop);
+potal_status potal_paired_acc_readback_issue(potal_paired_session *session, const potal_acc_readback *r);
+/* POTAL_FENCE: POTAL_OK means every outstanding paired LOOP_WS and readback drained. */
+potal_status potal_paired_fence(potal_paired_session *session);
+
+/*
+ * Restores a known accelerator state after a failure the hardware answered
+ * (an error status of an xd command): POTAL_FENCE if work is outstanding,
+ * then SCALE_RELEASE of every live (slot, column) this session wrote. The
+ * session stays failed (later issues return its error; close returns it).
+ * POTAL_OK: nothing outstanding, no live scale entry, close releases the
+ * accelerator. Any other status: the state is unknown (the accelerator stays
+ * owned after close). Never call it after a failed POTAL_FENCE: a fence that
+ * did not answer OK is not retried by this API.
+ */
+potal_status potal_paired_session_cleanup(potal_paired_session *session);
+
 #ifdef __cplusplus
 }
 #endif

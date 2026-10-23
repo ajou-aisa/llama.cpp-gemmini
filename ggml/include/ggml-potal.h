@@ -159,15 +159,32 @@ struct ggml_backend_potal_stats {
     uint64_t residual_logical_gemms;      // Residual GEMMs completed
     uint64_t residual_loop_ws;
     uint64_t residual_fences;
-    uint64_t residual_compact_k;          // sum of the residual GEMMs' compact K
-    uint64_t residual_execution_k;        // sum of their K32-padded execution K
-    uint64_t residual_active_lane_rows;   // sum of their rows (active (lane, row) pairs)
+    uint64_t residual_compact_k;          // sum of the residual packets' compact K (serial and paired stripes)
+    uint64_t residual_execution_k;        // sum of the serial Residual GEMMs' K32-padded execution K
+    uint64_t residual_active_lane_rows;   // sum of their rows (active (lane, row) pairs; serial and paired stripes)
     uint64_t radix_reconstructions;
     uint64_t merges_completed;
     uint64_t corrections_nonzero;         // nonzero INT64 correction entries merged
     uint64_t last_stripe_count;           // stripes of the last pipelined node
     double   pipeline_wall_s;             // caller wall time of pipelined nodes: quantization,
                                           // the overlapped issuer work and the drain
+
+    // Paired stripes (GGML_POTAL_PAIRED_AUTO, STRIPE_PIPELINE with compensation ON):
+    // Main and Residual GEMMs of a stripe as one paired execution on the H2
+    // indexed-weight hardware (potal_paired_matmul_auto). Their scale commands, TLB
+    // flushes and scale_s / issue_s / fence_s are also in the fields above; the
+    // planned-GEMM fields (hw_requests, tiled_*, main_* / residual_* GEMMs, loop_ws
+    // and fences) count the serial route only.
+    uint64_t paired_stripes;              // stripes run as one paired execution
+    uint64_t paired_fallback_stripes;     // paired plan refused (capacity): run by the serial route
+    uint64_t paired_main_loop_ws;         // Main paired LOOP_WS submissions
+    uint64_t paired_residual_loop_ws;     // Indexed Residual LOOP_WS submissions
+    uint64_t paired_index_configs;        // INDEX_CONFIG commands
+    uint64_t paired_index_writes;         // INDEX_WRITE commands
+    uint64_t paired_readbacks;            // ACC readbacks (CONFIG_ST + MVOUTs of one ACC epoch)
+    uint64_t paired_readback_tiles;       // MVOUT commands
+    uint64_t paired_fences;               // POTAL_FENCE of paired sessions
+    uint64_t paired_drains;               // drain points: fences + released scale windows
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);

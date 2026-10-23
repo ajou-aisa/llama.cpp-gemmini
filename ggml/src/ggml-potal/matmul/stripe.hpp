@@ -64,6 +64,7 @@
 
 #include "dense.hpp"
 #include "execution.hpp"
+#include "paired-auto.hpp"
 #include "tiling.hpp"
 
 #include "quants/act/exsia/exsia-event.hpp"
@@ -96,6 +97,12 @@ enum class slot_state : uint8_t {
     residual_done,
     reconstruct_merge,
     semantic_done,
+    // Paired route (pipeline_config::paired): MAIN_RUNNING -> PAIRED_PREPARE ->
+    // PAIRED_RUNNING -> PAIRED_DONE -> RECONSTRUCT_MERGE, or back to MAIN_RUNNING
+    // for a stripe whose paired plan was refused (the serial route runs it).
+    paired_prepare,
+    paired_running,
+    paired_done,
 };
 
 const char * slot_state_name(slot_state s);
@@ -122,6 +129,16 @@ enum class stripe_event_kind : uint8_t {
     quant_end,
     run_commit,
     run_failed,
+    // Paired route only. paired_prepare_*: decode of the packet and the paired
+    // plans (CPU, before any command); its end says the route (paired, or
+    // serial_fallback with the refusal). paired_begin / paired_end: the one
+    // hardware stream in which Main and Residual GEMMs interleave; no
+    // main_end / residual_* events are emitted for a paired stripe (their
+    // order on the accelerator is not sequential).
+    paired_prepare_begin,
+    paired_prepare_end,
+    paired_begin,
+    paired_end,
 };
 
 const char * stripe_event_name(stripe_event_kind k);
@@ -154,7 +171,12 @@ struct stripe_event {
     const float *                    out         = nullptr; // merge_end, semantic_complete: first stripe row
     size_t                           out_stride  = 0;
     size_t                           nonzero     = 0;       // merge_end: nonzero correction entries
-    const char *                     detail      = nullptr; // run_failed: the first error
+    const char *                     detail      = nullptr; // run_failed: the first error; paired_prepare_end: the refusal
+    const char *                     route       = nullptr; // paired_prepare_end: "paired" | "serial_fallback"
+    const potal_paired_report *      paired      = nullptr; // paired_end: the executor's report
+    const int32_t *                  residual_c  = nullptr; // paired_end: Residual C (residual_rows lane rows)
+    size_t                           residual_ldc  = 0;
+    size_t                           residual_rows = 0;
     // submit_accepted: ExSIA's quantization interval and folding commit of the stripe (ns, CPU).
     uint64_t                         quantization_start_ns = 0;
     uint64_t                         quantization_end_ns   = 0;
@@ -169,6 +191,14 @@ struct pipeline_config {
     bool            residual     = false;      // compensation ON: ws_packet packets may arrive
     std::string     layer;                     // log layer of the node
     const char *    backend      = "HARDWARE"; // records' owner label: HARDWARE (issuer), EMULATED (host tests)
+    // GGML_POTAL_PAIRED_AUTO (options.hpp): each stripe's Main and Residual GEMMs as
+    // one paired execution (matmul/paired-auto.hpp) through owner_runners::paired;
+    // a stripe whose paired plan is refused for capacity runs the serial route,
+    // reported as serial_fallback. Needs residual (compensation ON).
+    bool            paired       = false;
+    // GGML_POTAL_PAIRED_FENCES=CONSERVATIVE: the paired executor fences before every
+    // Indexed LOOP_WS, ACC readback and scale release (potal_paired_request).
+    bool            paired_conservative_fences = false;
     // Optional; called on the thread of each step after its record, holding no
     // lock of the run (it may query or abort the run). Order across threads:
     // stripe_event::sequence.
@@ -183,6 +213,7 @@ struct stripe_completion {
     size_t   slot                = 0; // pool slot index
     uint64_t slot_generation     = 0; // reuse count of that slot before this stripe
     bool     residual            = false; // a packet was executed and merged
+    bool     paired              = false; // Main and Residual ran as one paired execution
     size_t   residual_rows       = 0;     // active (lane, row) pairs of its Residual GEMM
     size_t   k_compact           = 0;
     size_t   k_execution         = 0;
@@ -218,6 +249,17 @@ struct pipeline_counts {
     uint64_t scale_releases             = 0;
     uint64_t tlb_flushes                = 0;
     uint32_t last_generation            = 0;
+    // Paired route (pipeline_config::paired); scale_writes / releases / tlb_flushes above include it.
+    uint64_t paired_stripes             = 0; // stripes run as one paired execution
+    uint64_t paired_fallback_stripes    = 0; // paired plan refused (capacity): the serial route ran them
+    uint64_t paired_main_loop_ws        = 0;
+    uint64_t paired_residual_loop_ws    = 0;
+    uint64_t paired_index_configs       = 0;
+    uint64_t paired_index_writes        = 0;
+    uint64_t paired_readbacks           = 0;
+    uint64_t paired_readback_tiles      = 0; // MVOUT commands
+    uint64_t paired_fences              = 0;
+    uint64_t paired_drains              = 0; // fences + released scale windows (each is a drain point)
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;
     double   fence_s                    = 0;
@@ -264,7 +306,8 @@ class stripe_run {
     void abort(const char * stage, const std::string & detail);
 
     // ---- consumer: on the accelerator owner thread -----------------------------
-    consume_outcome consume(const planned_runner & exec);
+    consume_outcome consume(const owner_runners & runners);
+    consume_outcome consume(const planned_runner & exec); // an owner without a paired runner
 
     // Completion records added since the last call (any thread).
     std::vector<stripe_completion> poll_completed();
@@ -280,7 +323,7 @@ class stripe_run {
     struct slot;
     struct stripe_result;
 
-    stripe_result execute(slot & s, const stripe_event & main_begin, const planned_runner & exec);
+    stripe_result execute(slot & s, const stripe_event & main_begin, const owner_runners & runners);
     std::string   check_event(const exsia::StripeReadyEvent & e, size_t rows) const;
     std::string   check_order_locked(const exsia::StripeReadyEvent & e, size_t rows) const;
     void          fail_locked(const char * stage, potal_status status, bool fatal, std::string detail);

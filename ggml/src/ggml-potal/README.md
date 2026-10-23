@@ -14,7 +14,7 @@ backend by default (`GGML_GEMMINI=OFF`, `GGML_POTAL=ON`).
 
 | File | Role |
 |---|---|
-| `include/potal.h` | Public API: status codes, encoders, scale control, WS GEMM |
+| `include/potal.h` | Public API: status codes, encoders, scale control, WS GEMM; H2 paired / indexed commands and the paired session (`potal_paired_*`, `docs/potal-paired-matmul-auto.md`) |
 | `include/potal_rocc.h` | Unchecked raw custom-3 issue layer (RISC-V only) |
 | `potal.c` | Validation, encoding, hardware calls; cross-checks the original header |
 | `tests/potal-api-test.c` | Host/target packing and validation test (`potal-api-test`) |
@@ -25,6 +25,10 @@ backend by default (`GGML_GEMMINI=OFF`, `GGML_POTAL=ON`).
 | `matmul/options.hpp` | The configured options (activation algorithm, compensation ON/OFF) for logs and checks; no fixed policy |
 | `matmul/dense.{hpp,cpp}` | F32 x Q8_HP1 contract, DMA staging operands, args as Gemmini sets them, route selection and execution, compensation step, integer golden |
 | `matmul/tiling.{hpp,cpp}` | `potal_tiled_matmul_auto/_tiled_matmul/_outer/_sp_tiled_matmul_ws` (gemmini.h layering) |
+| `matmul/paired-auto.{hpp,cpp}` | `potal_paired_matmul_auto` planner (H3-0 tile plan, H3-1 execution plan + validator): Main-derived I/J, final common K, H2 bank-pair / ACC0-ACC1 / Index Window capacities, ordered ops with dependencies (`docs/potal-paired-matmul-auto.md`) |
+| `tests/potal-paired-auto-test.cpp` | Hardware-free planner test (`potal-paired-auto-test`) |
+| `tests/potal-paired-execution-test.cpp` | Hardware-free executor + stripe-route test on the H2 command emulator (`potal-paired-execution-test`) |
+| `tests/potal-paired-smoke.cpp` | FireSim paired-route test (`potal-paired-smoke`; `GGML_POTAL_PAIRED_AUTO`) |
 | `matmul/pack.{hpp,cpp}` | I8 MUL_MAT <-> validated PoTal GEMM contract, A/B packing, C -> F32 |
 | `matmul/execution.{hpp,cpp}` | hart-0 issuer thread: TLB flush, then validated GEMMs and tiled jobs (TLB flush per job, caller trace context) |
 | `quants/weight/hp1/hp1.{hpp,cpp}` | Q8_HP1 -> B / carriers / channel scales on the Gemmini weight reader (HP1 SCU route), PoTal row checks |
@@ -49,10 +53,13 @@ no default, no correction) unless:
   absolute path and its realpath are recorded in the manifest;
 - `POTAL_EXPECTED_DIM` is 16, 32 or 64 and equals the header `DIM`;
 - `XCUSTOM_ACC`, `DIM`, `ADDR_LEN`, `BANK_NUM`, `BANK_ROWS`, `ACC_ROWS`,
-  `MAX_BYTES` are each defined exactly once as decimal literals;
+  `MAX_BYTES`, `POTAL_SCALE_ENTRIES`, `POTAL_INDEX_ENTRIES` are each defined
+  exactly once as decimal literals;
 - `XCUSTOM_ACC == 3`, `ADDR_LEN == 32`, `BANK_NUM`/`BANK_ROWS`/`ACC_ROWS` are
-  powers of two, `MAX_BYTES` is a multiple of `DIM`, and half of SPAD/ACC holds
-  one A/B tile pair and one C tile;
+  powers of two, `MAX_BYTES` is a multiple of `DIM`, half of SPAD/ACC holds
+  one A/B tile pair and one C tile, `POTAL_SCALE_ENTRIES == 256` (the scale-key
+  encoding of `potal.h`) and `POTAL_INDEX_ENTRIES >= DIM` (one Index Window
+  holds at least one DIM-wide K pass);
 - `typedef int8_t elem_t;` and `typedef int32_t acc_t;` (A8W8, INT32 ACC).
 
 Configure writes `<build>/generated/`:

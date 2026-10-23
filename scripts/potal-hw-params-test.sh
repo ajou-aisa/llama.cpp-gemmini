@@ -111,6 +111,12 @@ expect_fail missing-bank-rows 'does not define required parameter BANK_ROWS' -DP
   "-DPOTAL_HW_PARAMS=$(mutant no-bank-rows '/^#define BANK_ROWS /d')"
 expect_fail missing-max-bytes 'does not define required parameter MAX_BYTES' -DPOTAL_EXPECTED_DIM=16 \
   "-DPOTAL_HW_PARAMS=$(mutant no-max-bytes '/^#define MAX_BYTES /d')"
+expect_fail missing-index-entries 'does not define required parameter POTAL_INDEX_ENTRIES' -DPOTAL_EXPECTED_DIM=16 \
+  "-DPOTAL_HW_PARAMS=$(mutant no-index-entries '/^#define POTAL_INDEX_ENTRIES /d')"
+expect_fail index-entries-below-dim 'POTAL_INDEX_ENTRIES=8 must hold at least one DIM=16 K pass' -DPOTAL_EXPECTED_DIM=16 \
+  "-DPOTAL_HW_PARAMS=$(mutant index8 's/^#define POTAL_INDEX_ENTRIES 32$/#define POTAL_INDEX_ENTRIES 8/')"
+expect_fail scale-entries 'POTAL_SCALE_ENTRIES=512; potal.h supports 256' -DPOTAL_EXPECTED_DIM=16 \
+  "-DPOTAL_HW_PARAMS=$(mutant scale512 's/^#define POTAL_SCALE_ENTRIES 256$/#define POTAL_SCALE_ENTRIES 512/')"
 expect_fail duplicate-dim 'defines DIM 2 times' -DPOTAL_EXPECTED_DIM=16 \
   "-DPOTAL_HW_PARAMS=$(mutant dup-dim 's/^#define DIM 16$/#define DIM 16\n#define DIM 32/')"
 expect_fail non-numeric-acc-rows 'ACC_ROWS must be a plain decimal integer' -DPOTAL_EXPECTED_DIM=16 \

@@ -367,6 +367,584 @@ static void test_host_has_no_hardware(void) {
 }
 #endif
 
+/* ---- H2 paired / indexed API ----------------------------------------------- */
+
+/* Geometry names of the H2 firmware (potal_shared_weight_indexed.c): K = 3 tiles, N = 2 tiles. */
+#define H2_KTILES 3u
+#define H2_JTILES 2u
+#define SP_ROWS   ((uint64_t)POTAL_HW_BANK_NUM * POTAL_HW_BANK_ROWS)
+
+static potal_index_config h2_index_config(uint32_t pair) {
+    const uint64_t rows = (uint64_t)H2_KTILES * H2_JTILES * POTAL_HW_DIM; /* B_SP_ROWS */
+    potal_index_config c = {
+        .pair = pair,
+        .b_sp_base = (uint32_t)((pair + 1) * (SP_ROWS / 2) - rows), /* B_BASE of the H2 tests */
+        .j_tiles = H2_JTILES,
+        .source_k_rows = H2_KTILES * POTAL_HW_DIM,
+        .active_rows = 3 * POTAL_HW_DIM / 2, /* ACTIVE_R */
+    };
+    return c;
+}
+
+static void test_index_encoding(void) {
+    potal_rocc_cmd c = { 1, 1 };
+    potal_index_config cfg = h2_index_config(1);
+    check_status("index config pair 1 (H2 geometry)", potal_index_config_encode(&cfg, &c), POTAL_OK);
+    /* rs1 = {JTILES[63:32], B_BASE[31:0]}, rs2 = {ACTIVE_R[63:32], KROWS[31:0]} of configure_indices(). */
+    check_u64("index config rs1", c.rs1, ((uint64_t)H2_JTILES << 32) | (SP_ROWS - H2_KTILES * H2_JTILES * POTAL_HW_DIM));
+    check_u64("index config rs2", c.rs2, ((uint64_t)(3 * POTAL_HW_DIM / 2) << 32) | (H2_KTILES * POTAL_HW_DIM));
+    cfg = h2_index_config(0);
+    check_status("index config pair 0 (bank 1)", potal_index_config_encode(&cfg, &c), POTAL_OK);
+    check_u64("index config pair 0 base below SP/2", c.rs1 & 0xFFFFFFFFull, SP_ROWS / 2 - H2_KTILES * H2_JTILES * POTAL_HW_DIM);
+
+    /* Capacity: the whole table fits, one more slot does not (DIM16: 32, DIM32: 64, DIM64: 128). */
+    cfg = h2_index_config(0); cfg.active_rows = POTAL_HW_INDEX_ENTRIES;
+    check_status("index config full table", potal_index_config_check(&cfg), POTAL_OK);
+    cfg.active_rows = POTAL_HW_INDEX_ENTRIES + 1;
+    check_status("index config table + 1", potal_index_config_check(&cfg), POTAL_ERR_CAPACITY);
+    check_u64("index entries are a whole number of DIM passes", POTAL_HW_INDEX_ENTRIES % POTAL_HW_DIM, 0);
+
+    /* Region inside the pair's weight bank (ingress cfgAddressValid). */
+    cfg = h2_index_config(0); cfg.b_sp_base = (uint32_t)(SP_ROWS / 4 - 1);
+    check_status("index config base below bank 1", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    cfg = h2_index_config(0); cfg.b_sp_base = (uint32_t)(SP_ROWS / 2 - 1);
+    check_status("index config region past bank 1 end", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    cfg = h2_index_config(1); cfg.b_sp_base = (uint32_t)(SP_ROWS / 2); /* bank 2: an activation bank */
+    check_status("index config base in the activation bank of pair 1", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    cfg = h2_index_config(0); cfg.pair = 2;
+    check_status("index config pair 2", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    cfg = h2_index_config(0); cfg.source_k_rows = 0;
+    check_status("index config sourceKRows 0", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    cfg = h2_index_config(0); cfg.active_rows = 0;
+    check_status("index config activeRows 0", potal_index_config_check(&cfg), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("index config null", potal_index_config_check(NULL), POTAL_ERR_INVALID_ARGUMENT);
+    /* A panel whose K is not a whole number of tiles still occupies whole tiles. */
+    cfg = h2_index_config(0); cfg.source_k_rows = H2_KTILES * POTAL_HW_DIM - 1;
+    check_status("index config partial K tile rounds up", potal_index_config_check(&cfg), POTAL_OK);
+    cfg.source_k_rows = (H2_KTILES - 1) * POTAL_HW_DIM; cfg.b_sp_base += POTAL_HW_DIM * H2_JTILES; /* one K tile less resident */
+    check_status("index config smaller panel at a higher base", potal_index_config_check(&cfg), POTAL_OK);
+
+    /* INDEX_WRITE: rs1 = slot, rs2 = resident_k (both window / panel local). */
+    cfg = h2_index_config(1);
+    potal_index_write w = { .slot = 5, .resident_k = 2 * ((5 * 5) % (3 * POTAL_HW_DIM / 2)) + 1 }; /* active_k[5] of the H2 test */
+    check_status("index write encode", potal_index_write_encode(&cfg, &w, &c), POTAL_OK);
+    check_u64("index write rs1 slot", c.rs1, 5);
+    check_u64("index write rs2 resident k", c.rs2, w.resident_k);
+    w.slot = cfg.active_rows;
+    check_status("index write slot == activeRows", potal_index_write_check(&cfg, &w), POTAL_ERR_INVALID_ARGUMENT);
+    w.slot = 0; w.resident_k = cfg.source_k_rows;
+    check_status("index write resident k == sourceKRows", potal_index_write_check(&cfg, &w), POTAL_ERR_INVALID_ARGUMENT);
+    /* A K panel starting at original K 480 (DIM16): original K 500 is resident K 20, not 500. */
+    cfg.source_k_rows = 2 * POTAL_HW_DIM;
+    w.resident_k = 500 - 480;
+    check_status("index write resident K of a later panel", potal_index_write_check(&cfg, &w), POTAL_HW_DIM >= 11 ? POTAL_OK : POTAL_ERR_INVALID_ARGUMENT);
+    w.resident_k = 500;
+    check_status("index write global K rejected for a partitioned B", potal_index_write_check(&cfg, &w), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("index write null", potal_index_write_check(&cfg, NULL), POTAL_ERR_INVALID_ARGUMENT);
+}
+
+/* The H2 Main LOOP_WS of pair `pair`: A [DIM][3*DIM], B [3*DIM][2*DIM], scale phase 0, gen 7, ppb = K tiles. */
+static potal_paired_loop_ws h2_main(uint32_t pair) {
+    const uint32_t d = POTAL_HW_DIM;
+    potal_paired_loop_ws l = {
+        .loop = {
+            .a = FAKE_A, .b = FAKE_B, .c = NULL,
+            .lda = H2_KTILES * d, .ldb = H2_JTILES * d, .ldc = 0,
+            .i_tiles = 1, .j_tiles = H2_JTILES, .k_tiles = H2_KTILES,
+            .pad_i = 0, .pad_j = 0, .pad_k = 0,
+            .scale_base = 0, .scale_generation = 7, .passes_per_block = H2_KTILES,
+            .flags = 0,
+        },
+        .path = POTAL_PAIRED_MAIN, .pair = pair, .a_offset_tiles = 0, .resident_b = 0, .indexed = 0,
+    };
+    return l;
+}
+
+/* The H2 Residual window: packed A [DIM][2 tiles], ACTIVE_R rows, resident B, A behind Main A. */
+static potal_paired_loop_ws h2_residual(uint32_t pair, uint32_t phase) {
+    const uint32_t d = POTAL_HW_DIM;
+    const uint32_t active = 3 * d / 2;
+    potal_paired_loop_ws l = {
+        .loop = {
+            .a = FAKE_A, .b = NULL, .c = NULL,
+            .lda = H2_KTILES * d, .ldb = 0, .ldc = 0,
+            .i_tiles = 1, .j_tiles = H2_JTILES, .k_tiles = 2,
+            .pad_i = 0, .pad_j = 0, .pad_k = 2 * d - active,
+            .scale_base = phase * H2_JTILES, .scale_generation = 7 + phase, .passes_per_block = 2,
+            .flags = phase > 1 ? POTAL_GEMM_ACCUMULATE : 0,
+        },
+        .path = POTAL_PAIRED_RESIDUAL, .pair = pair, .a_offset_tiles = H2_KTILES, .resident_b = 1, .indexed = 1,
+    };
+    return l;
+}
+
+static void test_paired_loop_ws(void) {
+    potal_gemm_ws_program p;
+    const uint32_t d = POTAL_HW_DIM;
+    potal_paired_loop_ws l = h2_main(0);
+
+    /* Main, pair 0: submit_main() flags of potal_h2d_cycle_bench.c (accumulate 0, phase 0). */
+    check_status("paired main pair 0 encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    const uint64_t h2_main_rs1 = (1ull << 61) | (1ull << 1) | (1ull << 20) | (1ull << 18) | (1ull << 16) |
+                                 (0ull << 21) | (7ull << 37) | ((uint64_t)H2_KTILES << 45);
+    check_u64("paired main rs1 == H2 submit_main flags", p.loop_ws.rs1, h2_main_rs1);
+    check_u64("paired main rs2 (A offset 0)", p.loop_ws.rs2, 0);
+    check_u64("paired main bounds", p.bounds.rs2, ((uint64_t)H2_KTILES << 32) | ((uint64_t)H2_JTILES << 16) | 1ull);
+    check_u64("paired main addrs_ab A", p.addrs_ab.rs1, 0x10000);
+    check_u64("paired main addrs_ab B (original B loaded)", p.addrs_ab.rs2, 0x20000);
+    check_u64("paired main addrs_dc (no D, no C store)", p.addrs_dc.rs1 | p.addrs_dc.rs2, 0);
+    check_u64("paired main strides_ab", p.strides_ab.rs1 | (p.strides_ab.rs2 << 32),
+              (uint64_t)(H2_KTILES * d) | ((uint64_t)(H2_JTILES * d) << 32));
+    check_u64("paired bits: paired 1, residual 0, indexed 0", p.loop_ws.rs1 >> 61, 1);
+    l = h2_main(1);
+    check_status("paired main pair 1 encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("paired main pair 1 selectors 2/2", (p.loop_ws.rs1 >> 16) & 0xF, 0xA);
+    l = h2_main(0); l.loop.flags = POTAL_GEMM_ACCUMULATE;
+    check_status("paired main accumulate encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("paired main accumulate bit 0", p.loop_ws.rs1 & 1, 1);
+
+    /* Residual, pair 0, phase 1: issue_loop(1) flags of potal_shared_weight_indexed.c plus the pair selectors. */
+    l = h2_residual(0, 1);
+    check_status("paired residual pair 0 encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    const uint64_t h2_res_rs1 = (1ull << 61) | (1ull << 62) | (1ull << 63) | (1ull << 1) | (1ull << 20) |
+                                (1ull << 18) | (1ull << 16) | ((uint64_t)(1 * H2_JTILES) << 21) | (8ull << 37) | (2ull << 45);
+    check_u64("paired residual rs1 == H2 residual flags", p.loop_ws.rs1, h2_res_rs1);
+    check_u64("paired bits: paired 1, residual 1, indexed 1", p.loop_ws.rs1 >> 61, 7);
+    check_u64("paired residual rs2[31:3] = A offset tiles", p.loop_ws.rs2, (uint64_t)H2_KTILES << 3);
+    check_u64("paired residual rs2[2:0] clear", p.loop_ws.rs2 & 7, 0);
+    check_u64("paired residual B DRAM address 0 (resident B)", p.addrs_ab.rs2, 0);
+    check_u64("paired residual bounds pad_k", p.bounds.rs1, ((uint64_t)(2 * d - 3 * d / 2) << 32));
+    check_u64("paired residual bounds tiles", p.bounds.rs2, (2ull << 32) | ((uint64_t)H2_JTILES << 16) | 1ull);
+    l = h2_residual(1, 2);
+    check_status("paired residual pair 1 accumulate encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("paired residual pair 1 selectors + accumulate", (p.loop_ws.rs1 >> 16) & 0xF, 0xA);
+    check_u64("paired residual phase 2 accumulate", p.loop_ws.rs1 & 1, 1);
+    /* A large A offset: rs2[31:3] carries 29 bits. */
+    l = h2_residual(0, 1); l.a_offset_tiles = POTAL_HW_BANK_ROWS / d - 2;
+    check_status("paired residual A offset at the bank end", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("paired residual A offset rs2", p.loop_ws.rs2 >> 3, POTAL_HW_BANK_ROWS / d - 2);
+
+    /* Field rules. */
+    l = h2_main(0); l.loop.b = NULL;
+    check_status("paired main needs the original B", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_main(0); l.resident_b = 1;
+    check_status("paired main cannot reuse B", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_main(0); l.a_offset_tiles = 1;
+    check_status("paired main A offset must be 0", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_residual(0, 1); l.loop.b = FAKE_B; l.loop.ldb = H2_JTILES * d;
+    check_status("paired residual must not reload B", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_residual(0, 1); l.indexed = 0;
+    check_status("paired residual must be indexed", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_residual(0, 1); l.resident_b = 0;
+    check_status("paired residual must reuse the resident B", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_main(0); l.loop.c = FAKE_C; l.loop.ldc = H2_JTILES * d;
+    check_status("paired LOOP_WS C store unsupported (readback instead)", potal_paired_loop_ws_check(&l), POTAL_ERR_UNSUPPORTED);
+    l = h2_main(0); l.pair = 2;
+    check_status("paired pair 2", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_main(0); l.path = 2;
+    check_status("paired path 2", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = h2_main(0); l.loop.flags = POTAL_GEMM_BIAS;
+    check_status("paired bias unsupported", potal_paired_loop_ws_check(&l), POTAL_ERR_UNSUPPORTED);
+    l = h2_main(0); l.loop.pad_k = d;
+    check_status("paired pad_k == DIM", potal_paired_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    /* Last-tile padding of a Main panel: pad_i / pad_j go to BOUNDS rs1. */
+    l = h2_main(0); l.loop.pad_i = 3; l.loop.pad_j = d - 1; l.loop.ldb = H2_JTILES * d - (d - 1);
+    check_status("paired main padded encode", potal_paired_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("paired main pads", p.bounds.rs1, ((uint64_t)(d - 1) << 16) | 3ull);
+
+    /* Physical capacity: one activation bank for A (behind its offset), one weight bank for B, one ACC bank. */
+    const uint32_t bank_tiles = POTAL_HW_BANK_ROWS / d;
+    l = h2_main(0); l.loop.i_tiles = 1; l.loop.k_tiles = bank_tiles; l.loop.passes_per_block = 1; l.loop.lda = bank_tiles * d;
+    l.loop.j_tiles = 1; l.loop.ldb = d; l.loop.b = (const int8_t *)(uintptr_t)0x80000; /* a long K: B away from A's extent */
+    check_status("paired main A fills the activation bank", potal_paired_loop_ws_check(&l), POTAL_OK);
+    l.loop.k_tiles = bank_tiles + 1; l.loop.lda = (bank_tiles + 1) * d;
+    check_status("paired main A beyond the activation bank", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l = h2_main(0); l.loop.j_tiles = bank_tiles / H2_KTILES + 1; l.loop.ldb = l.loop.j_tiles * d; l.loop.i_tiles = 1;
+    check_status("paired main B beyond the weight bank", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l = h2_residual(0, 1); l.a_offset_tiles = bank_tiles - 1; /* 2 tiles do not fit behind it */
+    check_status("paired residual A offset + footprint beyond the bank", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l = h2_residual(0, 1); l.a_offset_tiles = bank_tiles;
+    check_status("paired residual A offset == bank tiles", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l = h2_main(0); l.loop.i_tiles = (POTAL_HW_ACC_ROWS / 2) / d / H2_JTILES + 1;
+    check_status("paired ACC bank exceeded", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l = h2_main(0); l.loop.scale_base = 255;
+    check_status("paired scale window", potal_paired_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    check_status("paired null", potal_paired_loop_ws_check(NULL), POTAL_ERR_INVALID_ARGUMENT);
+}
+
+static void test_acc_readback(void) {
+    const uint32_t d = POTAL_HW_DIM;
+    potal_rocc_cmd st, mv[8];
+    uint32_t count = 0;
+    potal_acc_readback r = { .acc_bank = 1, .i_tiles = 1, .j_tiles = H2_JTILES, .pad_i = 0, .pad_j = 0,
+                             .c = FAKE_C, .ldc = H2_JTILES * d };
+    check_status("readback ACC1 1x2 encode", potal_acc_readback_encode(&r, &st, mv, 8, &count), POTAL_OK);
+    check_u64("readback count", count, H2_JTILES);
+    check_u64("readback config_st rs1", st.rs1, 2);
+    check_u64("readback config_st rs2 (row bytes)", st.rs2, (uint64_t)H2_JTILES * d * 4);
+    /* acc_desc(bank 1, j): {DIM[63:48], DIM[47:32], ACC1_FULL_ADDR + j*DIM} of the H2 tests, ACC1 = 5 << 29 + ACC_ROWS/2. */
+    const uint64_t acc1 = (5ull << 29) + POTAL_HW_ACC_ROWS / 2;
+    check_u64("readback mvout 0 rs2 == H2 acc_desc(1, 0)", mv[0].rs2, ((uint64_t)d << 48) | ((uint64_t)d << 32) | acc1);
+    check_u64("readback mvout 1 rs2 == H2 acc_desc(1, 1)", mv[1].rs2, ((uint64_t)d << 48) | ((uint64_t)d << 32) | (acc1 + d));
+    check_u64("readback mvout 0 rs1 (C)", mv[0].rs1, 0x30000);
+    check_u64("readback mvout 1 rs1 (C + DIM columns)", mv[1].rs1, 0x30000 + (uint64_t)d * 4);
+    r.acc_bank = 0;
+    check_status("readback ACC0 encode", potal_acc_readback_encode(&r, &st, mv, 8, &count), POTAL_OK);
+    check_u64("readback ACC0 base = 5 << 29", mv[0].rs2 & 0xFFFFFFFFull, 5ull << 29);
+    check_u64("readback ACC0 / ACC1 never alias", (mv[0].rs2 & 0xFFFFFFFFull) != acc1, 1);
+    /* Two row tiles with padding: tile (i, j) at ACC row (i * j_tiles + j) * DIM, shortened last tiles. */
+    r.acc_bank = 1; r.i_tiles = 2; r.pad_i = 3; r.pad_j = 5; r.ldc = 2 * d;
+    check_status("readback 2x2 padded encode", potal_acc_readback_encode(&r, &st, mv, 8, &count), POTAL_OK);
+    check_u64("readback padded count", count, 4);
+    check_u64("readback tile (1,1) rows/cols", mv[3].rs2 >> 32, ((uint64_t)(d - 3) << 16) | (d - 5));
+    check_u64("readback tile (1,1) acc row", mv[3].rs2 & 0xFFFFFFFFull, acc1 + 3 * d);
+    check_u64("readback tile (1,1) dram", mv[3].rs1, 0x30000 + ((uint64_t)d * 2 * d + d) * 4);
+    check_u64("readback tile (0,1) full rows", mv[1].rs2 >> 48, d);
+    check_status("readback capacity 3 of 4", potal_acc_readback_encode(&r, &st, mv, 3, &count), POTAL_ERR_CAPACITY);
+    r.ldc = 2 * d - 6;
+    check_status("readback ldc < columns", potal_acc_readback_check(&r), POTAL_ERR_INVALID_ARGUMENT);
+    r.ldc = 2 * d; r.c = (int32_t *)(uintptr_t)(0x30000 + 4);
+    check_status("readback C misaligned", potal_acc_readback_check(&r), POTAL_ERR_INVALID_ARGUMENT);
+    r.c = FAKE_C; r.acc_bank = 2;
+    check_status("readback bank 2", potal_acc_readback_check(&r), POTAL_ERR_INVALID_ARGUMENT);
+    r.acc_bank = 0; r.i_tiles = (POTAL_HW_ACC_ROWS / 2) / d / 2 + 1; r.pad_i = 0;
+    check_status("readback beyond one ACC bank", potal_acc_readback_check(&r), POTAL_ERR_CAPACITY);
+    check_status("readback null", potal_acc_readback_check(NULL), POTAL_ERR_INVALID_ARGUMENT);
+}
+
+/* Command sink: records the stream, answers xd commands with a programmable status. */
+#define SINK_CAPACITY 512
+typedef struct sink_state {
+    potal_paired_cmd_record records[SINK_CAPACITY];
+    uint32_t count;
+    uint32_t fail_funct;    /* an xd command of this funct answers fail_status (once) */
+    potal_status fail_status;
+} sink_state;
+
+static potal_status sink_cmd(void *ctx, const potal_paired_cmd_record *rec) {
+    sink_state *st = ctx;
+    if (st->count < SINK_CAPACITY) {
+        st->records[st->count] = *rec;
+    }
+    st->count++;
+    if (st->fail_funct != 0 && rec->funct == st->fail_funct) {
+        st->fail_funct = 0;
+        return st->fail_status;
+    }
+    return POTAL_OK;
+}
+
+static uint32_t sink_funct_at(const sink_state *st, uint32_t i) {
+    return i < st->count && i < SINK_CAPACITY ? st->records[i].funct : 0xFFFFFFFFu;
+}
+
+static int sink_has(const sink_state *st, uint32_t funct) {
+    for (uint32_t i = 0; i < st->count && i < SINK_CAPACITY; ++i) {
+        if (st->records[i].funct == funct) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int sink_order_is(const sink_state *st, const uint32_t *functs, uint32_t n) {
+    if (st->count != n) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (sink_funct_at(st, i) != functs[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Index window programming of the H2 residual: config + ACTIVE_R writes (resident K = active_k[t]). */
+static potal_status program_h2_window(potal_paired_session *s, uint32_t pair) {
+    const potal_index_config cfg = h2_index_config(pair);
+    potal_status status = potal_paired_index_config(s, &cfg);
+    for (uint32_t t = 0; status == POTAL_OK && t < cfg.active_rows; ++t) {
+        const potal_index_write w = { .slot = t, .resident_k = 2 * ((t * 5) % cfg.active_rows) + 1 };
+        status = potal_paired_index_write(s, &w);
+    }
+    return status;
+}
+
+static void test_paired_session(void) {
+    const uint32_t d = POTAL_HW_DIM;
+    sink_state sink_st;
+    memset(&sink_st, 0, sizeof(sink_st));
+    const potal_paired_sink sink = { sink_cmd, &sink_st };
+    potal_paired_session *s = NULL;
+    potal_paired_session_status q;
+
+    /* Ownership: one session; the regular API refuses while it is open. */
+    check_status("session open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_u64("session handle", s != NULL, 1);
+    potal_paired_session *other = NULL;
+    check_status("second session refused", potal_paired_session_open(&sink, &other), POTAL_ERR_BUSY);
+    {
+        potal_loop_ws l = two_by_three_loop();
+        check_status("regular loop issue refused during a paired session", potal_loop_ws_issue(&l), POTAL_ERR_BUSY);
+        check_status("regular fence refused during a paired session", potal_fence(), POTAL_ERR_BUSY);
+        check_status("regular tlb flush refused during a paired session", potal_tlb_flush(), POTAL_ERR_BUSY);
+    }
+
+    /* The H2 sequence: TLB flush, scales, Main(pair 0), Index window, Residual, readback, fence. */
+    check_status("session tlb flush (nothing outstanding)", potal_paired_tlb_flush(s), POTAL_OK);
+    check_u64("flush recorded", sink_funct_at(&sink_st, 0), POTAL_FUNCT_FLUSH);
+    potal_status st = POTAL_OK;
+    for (uint32_t j = 0; j < H2_JTILES && st == POTAL_OK; ++j) {
+        for (uint32_t col = 0; col < d && st == POTAL_OK; ++col) {
+            st = potal_paired_scale_write(s, j, 7, col, 0);
+        }
+    }
+    check_status("scale phase 0 written (2 slots x DIM columns)", st, POTAL_OK);
+    check_status("scale write of a live slot with another generation", potal_paired_scale_write(s, 0, 8, 0, 0), POTAL_ERR_CAPACITY);
+    check_status("scale write invalid carrier", potal_paired_scale_write(s, 3, 7, 0, 32768), POTAL_ERR_INVALID_ARGUMENT);
+    potal_paired_loop_ws m0 = h2_main(0);
+    const uint32_t before_main = sink_st.count;
+    check_status("residual before any Main refused (no resident B)", potal_paired_loop_ws_issue(s, &(potal_paired_loop_ws){ 0 }), POTAL_ERR_INVALID_ARGUMENT);
+    {
+        potal_paired_loop_ws r = h2_residual(0, 1);
+        check_status("residual on a pair without resident B refused", potal_paired_loop_ws_issue(s, &r), POTAL_ERR_INVALID_ARGUMENT);
+    }
+    check_u64("refused issues send nothing", sink_st.count, before_main);
+    check_status("main pair 0 issued", potal_paired_loop_ws_issue(s, &m0), POTAL_OK);
+    check_u64("main = 4 CONFIG + 5 LOOP_WS_CONFIG + LOOP_WS", sink_st.count - before_main, 10);
+    check_u64("main last command is LOOP_WS", sink_funct_at(&sink_st, sink_st.count - 1), POTAL_FUNCT_LOOP_WS);
+    q = potal_paired_session_query(s);
+    check_u64("pair 0 resident B recorded", q.pair[0].resident_b, 1);
+    check_u64("pair 0 resident B base = H2 B_BASE", q.pair[0].b_sp_base, SP_ROWS / 2 - H2_KTILES * H2_JTILES * d);
+    check_u64("pair 0 resident K rows", q.pair[0].b_k_rows, H2_KTILES * d);
+    check_u64("pair 0 Main A tiles", q.pair[0].main_a_tiles, H2_KTILES);
+    check_u64("one loop outstanding", q.outstanding_loops, 1);
+
+    /* Index transaction on pair 0 (no fence before it: a same-buffer update is the hardware's stall). */
+    {
+        const potal_index_write w = { 0, 1 };
+        check_status("index write without a transaction", potal_paired_index_write(s, &w), POTAL_ERR_BUSY);
+    }
+    potal_index_config cfg0 = h2_index_config(0);
+    check_status("index config pair 0", potal_paired_index_config(s, &cfg0), POTAL_OK);
+    {
+        potal_index_config cfg1 = h2_index_config(1);
+        check_status("another config inside an unfinished transaction refused", potal_paired_index_config(s, &cfg1), POTAL_ERR_BUSY);
+        potal_paired_loop_ws r = h2_residual(0, 1);
+        check_status("residual on a half-programmed window refused", potal_paired_loop_ws_issue(s, &r), POTAL_ERR_INVALID_ARGUMENT);
+        const potal_index_write w = { .slot = 1, .resident_k = 1 };
+        check_status("index write out of slot order", potal_paired_index_write(s, &w), POTAL_ERR_INVALID_ARGUMENT);
+        const potal_index_write bad = { .slot = 0, .resident_k = cfg0.source_k_rows };
+        check_status("index write resident K beyond the panel", potal_paired_index_write(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    }
+    const uint32_t before_writes = sink_st.count;
+    for (uint32_t t = 0; t < cfg0.active_rows; ++t) {
+        const potal_index_write w = { .slot = t, .resident_k = 2 * ((t * 5) % cfg0.active_rows) + 1 };
+        st = potal_paired_index_write(s, &w);
+        if (st != POTAL_OK) {
+            break;
+        }
+    }
+    check_status("index writes of the window", st, POTAL_OK);
+    check_u64("one INDEX_WRITE per active slot", sink_st.count - before_writes, cfg0.active_rows);
+    check_u64("index write rs1/rs2 = slot / resident K", sink_st.records[before_writes + 5].rs1 | (sink_st.records[before_writes + 5].rs2 << 32),
+              5ull | ((uint64_t)(2 * ((5 * 5) % cfg0.active_rows) + 1) << 32));
+    q = potal_paired_session_query(s);
+    check_u64("transaction complete", q.index_transaction_open, 0);
+    check_u64("pair 0 window valid", q.pair[0].index_valid, 1);
+
+    /* Residual scales (phase 1), Residual on the resident B of pair 0, then a second Main on pair 1 outstanding together. */
+    for (uint32_t j = 0; j < H2_JTILES && st == POTAL_OK; ++j) {
+        for (uint32_t col = 0; col < d && st == POTAL_OK; ++col) {
+            st = potal_paired_scale_write(s, H2_JTILES + j, 8, col, 0);
+        }
+    }
+    check_status("scale phase 1 written", st, POTAL_OK);
+    potal_paired_loop_ws r0 = h2_residual(0, 1);
+    {
+        potal_paired_loop_ws overlap = r0; overlap.a_offset_tiles = H2_KTILES - 1;
+        check_status("residual A overlapping Main A refused", potal_paired_loop_ws_issue(s, &overlap), POTAL_ERR_INVALID_ARGUMENT);
+        potal_paired_loop_ws wrong = r0; wrong.loop.pad_k = 0; /* active rows 32 != the window's */
+        check_status("residual whose K rows differ from the window refused", potal_paired_loop_ws_issue(s, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+        potal_paired_loop_ws p1 = r0; p1.pair = 1;
+        check_status("residual on the other pair (no B there) refused", potal_paired_loop_ws_issue(s, &p1), POTAL_ERR_INVALID_ARGUMENT);
+    }
+    check_status("residual pair 0 issued without a fence after Main", potal_paired_loop_ws_issue(s, &r0), POTAL_OK);
+    potal_paired_loop_ws m1 = h2_main(1);
+    check_status("main pair 1 issued with pair 0 work outstanding", potal_paired_loop_ws_issue(s, &m1), POTAL_OK);
+    check_status("main pair 0 again while pair 0 outstanding refused", potal_paired_loop_ws_issue(s, &m0), POTAL_ERR_BUSY);
+    q = potal_paired_session_query(s);
+    check_u64("three loops outstanding, no fence between them", q.outstanding_loops, 3);
+    check_u64("pair outstanding 2 / 1", q.pair[0].outstanding * 10 + q.pair[1].outstanding, 21);
+    /* Cross-buffer: pair 1's window may be programmed while pair 0 executes (no refusal, no fence). */
+    check_status("index window of pair 1 programmed while pair 0 is busy", program_h2_window(s, 1), POTAL_OK);
+    q = potal_paired_session_query(s);
+    check_u64("pair 1 window valid, pair 0 window kept", q.pair[0].index_valid * 10 + q.pair[1].index_valid, 11);
+    check_u64("no FENCE in the stream so far", sink_has(&sink_st, POTAL_FUNCT_FENCE), 0);
+    {
+        /* The whole stream up to here, in order: flush, 2*DIM writes, Main(10), config, ACTIVE_R writes,
+         * 2*DIM writes, Residual(10), Main(10), config, ACTIVE_R writes. */
+        uint32_t expect[SINK_CAPACITY];
+        uint32_t n = 0;
+        expect[n++] = POTAL_FUNCT_FLUSH;
+        for (uint32_t i = 0; i < 2 * d; ++i) expect[n++] = POTAL_FUNCT_SCALE_WRITE;
+        const uint32_t loop[10] = { POTAL_FUNCT_CONFIG, POTAL_FUNCT_CONFIG, POTAL_FUNCT_CONFIG, POTAL_FUNCT_CONFIG,
+                                    POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB,
+                                    POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB,
+                                    POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC, POTAL_FUNCT_LOOP_WS };
+        for (uint32_t i = 0; i < 10; ++i) expect[n++] = loop[i];
+        expect[n++] = POTAL_FUNCT_INDEX_CONFIG;
+        for (uint32_t i = 0; i < cfg0.active_rows; ++i) expect[n++] = POTAL_FUNCT_INDEX_WRITE;
+        for (uint32_t i = 0; i < 2 * d; ++i) expect[n++] = POTAL_FUNCT_SCALE_WRITE;
+        for (uint32_t i = 0; i < 10; ++i) expect[n++] = loop[i];
+        for (uint32_t i = 0; i < 10; ++i) expect[n++] = loop[i];
+        expect[n++] = POTAL_FUNCT_INDEX_CONFIG;
+        for (uint32_t i = 0; i < cfg0.active_rows; ++i) expect[n++] = POTAL_FUNCT_INDEX_WRITE;
+        check_u64("command stream order (flush, scales, Main 0, window 0, scales, Residual 0, Main 1, window 1)",
+                  sink_order_is(&sink_st, expect, n), 1);
+    }
+
+    /* Readback of ACC1, then the fence that completes everything; readback before the fence stays outstanding. */
+    potal_acc_readback rb = { .acc_bank = 1, .i_tiles = 1, .j_tiles = H2_JTILES, .pad_i = 0, .pad_j = 0, .c = FAKE_C, .ldc = H2_JTILES * d };
+    check_status("ACC1 readback issued", potal_paired_acc_readback_issue(s, &rb), POTAL_OK);
+    check_u64("readback = CONFIG_ST + 2 MVOUT", sink_funct_at(&sink_st, sink_st.count - 3) == POTAL_FUNCT_CONFIG &&
+              sink_funct_at(&sink_st, sink_st.count - 2) == POTAL_FUNCT_MVOUT && sink_funct_at(&sink_st, sink_st.count - 1) == POTAL_FUNCT_MVOUT, 1);
+    check_status("close with outstanding work refused", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_status("tlb flush with outstanding work refused", potal_paired_tlb_flush(s), POTAL_ERR_BUSY);
+    check_status("fence drains", potal_paired_fence(s), POTAL_OK);
+    q = potal_paired_session_query(s);
+    check_u64("nothing outstanding after the fence", q.outstanding_loops + q.outstanding_readbacks + q.pair[0].outstanding + q.pair[1].outstanding, 0);
+    check_u64("resident B and windows survive the fence", q.pair[0].resident_b + q.pair[1].resident_b + q.pair[0].index_valid + q.pair[1].index_valid, 4);
+    /* Releases: the live generation, in write order; a wrong generation is refused before issue. */
+    check_status("release with the wrong generation", potal_paired_scale_release(s, 0, 9, 0), POTAL_ERR_INVALID_ARGUMENT);
+    for (uint32_t j = 0; j < 2 * H2_JTILES && st == POTAL_OK; ++j) {
+        for (uint32_t col = 0; col < d && st == POTAL_OK; ++col) {
+            st = potal_paired_scale_release(s, j, j < H2_JTILES ? 7 : 8, col);
+        }
+    }
+    check_status("releases of both windows", st, POTAL_OK);
+    check_u64("no live scale slot", potal_paired_session_query(s).live_scale_slots, 0);
+    check_status("release of a free slot", potal_paired_scale_release(s, 0, 7, 0), POTAL_ERR_INVALID_ARGUMENT);
+    /* Main on pair 0 again after the fence: the pair's readers drained. */
+    check_status("main pair 0 after the fence", potal_paired_loop_ws_issue(s, &m0), POTAL_OK);
+    check_u64("new panel invalidates pair 0's window", potal_paired_session_query(s).pair[0].index_valid, 0);
+    /* An accepted SCALE_RELEASE is a drain point (releaseSafe == fenceDrained): outstanding work is gone. */
+    for (uint32_t col = 0; col < d && st == POTAL_OK; ++col) {
+        st = potal_paired_scale_write(s, 9, 3, col, 0);
+    }
+    check_status("scale slot 9 written", st, POTAL_OK);
+    check_u64("one loop outstanding before the release", potal_paired_session_query(s).outstanding_loops, 1);
+    check_status("release slot 9 column 0", potal_paired_scale_release(s, 9, 3, 0), POTAL_OK);
+    q = potal_paired_session_query(s);
+    check_u64("accepted release drained the outstanding loop", q.outstanding_loops + q.pair[0].outstanding, 0);
+    check_u64("slot 9 still live until its last column", q.live_scale_slots, 1);
+    check_status("main pair 0 again right after the release (drained)", potal_paired_loop_ws_issue(s, &m0), POTAL_OK);
+    for (uint32_t col = 1; col < d && st == POTAL_OK; ++col) {
+        st = potal_paired_scale_release(s, 9, 3, col);
+    }
+    check_status("release slot 9 remaining columns", st, POTAL_OK);
+    check_u64("slot 9 free", potal_paired_session_query(s).live_scale_slots, 0);
+    /* A padded last J tile writes fewer than DIM columns: its slot is free once those columns are released. */
+    for (uint32_t col = 0; col + 4 < d && st == POTAL_OK; ++col) {
+        st = potal_paired_scale_write(s, 10, 4, col, 0);
+    }
+    check_status("slot 10 written for DIM-4 columns", st, POTAL_OK);
+    check_status("slot 10 column rewrite (same generation) refused", potal_paired_scale_write(s, 10, 4, 0, 0), POTAL_ERR_CAPACITY);
+    check_status("slot 10 unwritten column of the live generation accepted", potal_paired_scale_write(s, 10, 4, d - 1, 0), POTAL_OK);
+    check_status("release slot 10 never-written column refused", potal_paired_scale_release(s, 10, 4, d - 2), POTAL_ERR_INVALID_ARGUMENT);
+    for (uint32_t col = 0; col + 4 < d && st == POTAL_OK; ++col) {
+        st = potal_paired_scale_release(s, 10, 4, col);
+    }
+    check_status("release slot 10 written columns", st, POTAL_OK);
+    check_status("release slot 10 last live column", potal_paired_scale_release(s, 10, 4, d - 1), POTAL_OK);
+    check_u64("slot 10 free after its written columns", potal_paired_session_query(s).live_scale_slots, 0);
+    check_status("slot 10 rewritten with a new generation", potal_paired_scale_write(s, 10, 5, 0, 0), POTAL_OK);
+    check_status("slot 10 released again", potal_paired_scale_release(s, 10, 5, 0), POTAL_OK);
+    check_status("fence again", potal_paired_fence(s), POTAL_OK);
+    /* Live scale entries keep a healthy session from closing: the hardware cache would hold them. */
+    check_status("scale write slot 3 before close", potal_paired_scale_write(s, 3, 9, 0, 0), POTAL_OK);
+    check_status("close with a live scale entry refused", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_status("release slot 3", potal_paired_scale_release(s, 3, 9, 0), POTAL_OK);
+    check_status("session close", potal_paired_session_close(s), POTAL_OK);
+#if !defined(__riscv)
+    {
+        /* Host only: on the target this would issue a real GEMM on fake addresses. */
+        potal_loop_ws l = two_by_three_loop();
+        check_status("regular loop issue after close (host: no hardware)", potal_loop_ws_issue(&l), POTAL_ERR_NO_HARDWARE);
+    }
+#endif
+
+    /* Failure: a hardware status on INDEX_CONFIG makes the session failed; outstanding work is kept until a fence. */
+    memset(&sink_st, 0, sizeof(sink_st));
+    check_status("session open (failure case)", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_status("main pair 0 (failure case)", potal_paired_loop_ws_issue(s, &m0), POTAL_OK);
+    sink_st.fail_funct = POTAL_FUNCT_INDEX_CONFIG;
+    sink_st.fail_status = POTAL_HW_INVALID_ADDRESS;
+    check_status("index config answered INVALID_ADDRESS", potal_paired_index_config(s, &cfg0), POTAL_HW_INVALID_ADDRESS);
+    q = potal_paired_session_query(s);
+    check_u64("session failed with the error and stage", q.failed && q.error == POTAL_HW_INVALID_ADDRESS && q.error_stage != NULL &&
+              strcmp(q.error_stage, "index_config") == 0, 1);
+    check_u64("outstanding loop kept after the failure", q.outstanding_loops, 1);
+    check_u64("no transaction opened by the refused config", q.index_transaction_open, 0);
+    check_status("further issue returns the sticky error", potal_paired_loop_ws_issue(s, &m1), POTAL_HW_INVALID_ADDRESS);
+    check_status("scale write of a failed session refused", potal_paired_scale_write(s, 0, 1, 0, 0), POTAL_HW_INVALID_ADDRESS);
+    sink_st.count = 0;
+    check_status("cleanup drains a failed session", potal_paired_session_cleanup(s), POTAL_OK);
+    check_u64("cleanup issued one FENCE", sink_st.count == 1 && sink_st.records[0].funct == POTAL_FUNCT_FENCE, 1);
+    check_u64("drained", potal_paired_session_query(s).outstanding_loops, 0);
+    check_status("close returns the sticky error, accelerator released", potal_paired_session_close(s), POTAL_HW_INVALID_ADDRESS);
+    /* Cleanup releases the scale entries a failed session left live. */
+    memset(&sink_st, 0, sizeof(sink_st));
+    check_status("session open (scale cleanup case)", potal_paired_session_open(&sink, &s), POTAL_OK);
+    for (uint32_t col = 0; col < 3; ++col) {
+        check_status("scale write before the failure", potal_paired_scale_write(s, 4, 6, col, 0), POTAL_OK);
+    }
+    sink_st.fail_funct = POTAL_FUNCT_SCALE_WRITE;
+    sink_st.fail_status = POTAL_HW_SCALE_CONFLICT;
+    check_status("scale write answered SCALE_CONFLICT", potal_paired_scale_write(s, 4, 6, 3, 0), POTAL_HW_SCALE_CONFLICT);
+    sink_st.count = 0;
+    check_status("cleanup releases the three live columns", potal_paired_session_cleanup(s), POTAL_OK);
+    check_u64("three releases, no fence (nothing outstanding)", sink_st.count == 3 && sink_st.records[0].funct == POTAL_FUNCT_SCALE_RELEASE &&
+              sink_st.records[2].rs1 == ((2ull << 16) | (6ull << 8) | 4ull), 1);
+    check_u64("no live slot after cleanup", potal_paired_session_query(s).live_scale_slots, 0);
+    check_status("close after cleanup returns the error", potal_paired_session_close(s), POTAL_HW_SCALE_CONFLICT);
+    check_status("session open after a drained failure", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_status("session close", potal_paired_session_close(s), POTAL_OK);
+    /* A failed fence (bad response) with outstanding work: close keeps the accelerator owned. */
+    memset(&sink_st, 0, sizeof(sink_st));
+    check_status("session open (bad fence case)", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_status("main pair 0 (bad fence case)", potal_paired_loop_ws_issue(s, &m0), POTAL_OK);
+    sink_st.fail_funct = POTAL_FUNCT_FENCE;
+    sink_st.fail_status = POTAL_ERR_BAD_RESPONSE;
+    check_status("fence answered badly", potal_paired_fence(s), POTAL_ERR_BAD_RESPONSE);
+    check_u64("work still outstanding", potal_paired_session_query(s).outstanding_loops, 1);
+    check_status("cleanup refuses to retry a failed fence", potal_paired_session_cleanup(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("close of a failed session with outstanding work", potal_paired_session_close(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("accelerator stays owned: open refused", potal_paired_session_open(&sink, &s), POTAL_ERR_BUSY);
+    (void)other;
+}
+
+/* Without a sink the host issues nothing: every issue validates, returns POTAL_ERR_NO_HARDWARE and changes no state. */
+static void test_paired_host_no_hardware_before_sessions(void) {
+#if !defined(__riscv)
+    potal_paired_session *s = NULL;
+    check_status("host session open without a sink", potal_paired_session_open(NULL, &s), POTAL_OK);
+    potal_paired_loop_ws m0 = h2_main(0);
+    check_status("host main issue: no hardware", potal_paired_loop_ws_issue(s, &m0), POTAL_ERR_NO_HARDWARE);
+    m0.pair = 2;
+    check_status("host main issue: invalid first", potal_paired_loop_ws_issue(s, &m0), POTAL_ERR_INVALID_ARGUMENT);
+    const potal_index_config cfg = h2_index_config(0);
+    check_status("host index config: no hardware", potal_paired_index_config(s, &cfg), POTAL_ERR_NO_HARDWARE);
+    check_status("host scale write: no hardware", potal_paired_scale_write(s, 0, 1, 0, 0), POTAL_ERR_NO_HARDWARE);
+    check_status("host tlb flush: no hardware", potal_paired_tlb_flush(s), POTAL_ERR_NO_HARDWARE);
+    check_status("host fence: no hardware", potal_paired_fence(s), POTAL_ERR_NO_HARDWARE);
+    const potal_paired_session_status q = potal_paired_session_query(s);
+    check_u64("host: nothing issued, nothing outstanding, not failed",
+              q.commands == 0 && q.outstanding_loops == 0 && q.index_transaction_open == 0 && q.failed == 0 && q.pair[0].resident_b == 0, 1);
+    check_status("host session close", potal_paired_session_close(s), POTAL_OK);
+#endif
+}
+
 int main(void) {
     printf("POTAL_API_TEST DIM=%u params_sha256=%s\n", (unsigned)potal_hw_dim(), potal_hw_params_sha256());
     check_u64("hw dim matches adapter", potal_hw_dim(), POTAL_HW_DIM);
@@ -380,6 +958,11 @@ int main(void) {
 #if !defined(__riscv)
     test_host_has_no_hardware();
 #endif
+    test_index_encoding();
+    test_paired_loop_ws();
+    test_acc_readback();
+    test_paired_host_no_hardware_before_sessions();
+    test_paired_session();
 
     if (failures != 0) {
         printf("POTAL_API_TEST FAIL (%d)\n", failures);

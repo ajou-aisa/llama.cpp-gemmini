@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 
+#include "potal.h" /* POTAL_FUNCT_* */
 #include "potal_hw_params.h"
 
 #if !defined(__riscv)
@@ -26,18 +27,7 @@
 #error "PoTal hardware decodes custom-3 only"
 #endif
 
-/* funct7 values (GemminiISA.scala). */
-#define POTAL_FUNCT_CONFIG                    0
-#define POTAL_FUNCT_FLUSH                     7
-#define POTAL_FUNCT_LOOP_WS                   8
-#define POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS     9
-#define POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB   10
-#define POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC   11
-#define POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB 12
-#define POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC 13
-#define POTAL_FUNCT_SCALE_WRITE               23
-#define POTAL_FUNCT_SCALE_RELEASE             24
-#define POTAL_FUNCT_FENCE                     25
+/* funct7 values: POTAL_FUNCT_* in potal.h. */
 
 #define POTAL_ROCC_STR_(x) #x
 #define POTAL_ROCC_STR(x)  POTAL_ROCC_STR_(x)
@@ -113,6 +103,24 @@ static inline void potal_rocc_loop_ws_strides_dc(uint64_t rs1, uint64_t rs2) {
 
 static inline void potal_rocc_loop_ws(uint64_t rs1, uint64_t rs2) {
     POTAL_ROCC_0_R_R(POTAL_FUNCT_LOOP_WS, rs1, rs2);
+}
+
+/* INDEX_CONFIG / INDEX_WRITE (PoTalScaleCommandIngress): xd, return the status. */
+static inline uint64_t potal_rocc_index_config(uint64_t rs1, uint64_t rs2) {
+    uint64_t rd;
+    POTAL_ROCC_R_R_R(POTAL_FUNCT_INDEX_CONFIG, rd, rs1, rs2);
+    return rd;
+}
+
+static inline uint64_t potal_rocc_index_write(uint64_t rs1, uint64_t rs2) {
+    uint64_t rd;
+    POTAL_ROCC_R_R_R(POTAL_FUNCT_INDEX_WRITE, rd, rs1, rs2);
+    return rd;
+}
+
+/* MVOUT (STORE_CMD): rs1 DRAM address, rs2 {rows[63:48], cols[47:32], local addr[31:0]}; no response. */
+static inline void potal_rocc_mvout(uint64_t rs1, uint64_t rs2) {
+    POTAL_ROCC_0_R_R(POTAL_FUNCT_MVOUT, rs1, rs2);
 }
 
 /* CPU ordering of normal loads/stores around DMA hand-off; not completion. */

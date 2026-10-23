@@ -69,7 +69,10 @@ void potal_free(ggml_backend_t backend) {
         "max_outstanding_semantic=%llu producer_capacity_waits=%llu main_logical_gemms=%llu main_loop_ws=%llu "
         "main_fences=%llu residual_nonempty_packets=%llu residual_logical_gemms=%llu residual_loop_ws=%llu "
         "residual_fences=%llu residual_compact_k=%llu residual_execution_k=%llu active_lane_rows=%llu "
-        "radix_reconstructions=%llu merges_completed=%llu corrections_nonzero=%llu pipeline_wall_s=%.3f",
+        "radix_reconstructions=%llu merges_completed=%llu corrections_nonzero=%llu pipeline_wall_s=%.3f "
+        "paired_stripes=%llu paired_fallback_stripes=%llu paired_main_loop_ws=%llu paired_residual_loop_ws=%llu "
+        "paired_index_configs=%llu paired_index_writes=%llu paired_readbacks=%llu paired_readback_tiles=%llu "
+        "paired_fences=%llu paired_drains=%llu",
         (unsigned long long) st.gemm_completed, (unsigned long long) st.gemm_failed,
         (unsigned long long) st.hp1_nodes, (unsigned long long) st.hp1_completed,
         (unsigned long long) st.hp1_failed, (unsigned long long) st.prefill_shaped_nodes,
@@ -102,7 +105,12 @@ void potal_free(ggml_backend_t backend) {
         (unsigned long long) st.residual_fences, (unsigned long long) st.residual_compact_k,
         (unsigned long long) st.residual_execution_k, (unsigned long long) st.residual_active_lane_rows,
         (unsigned long long) st.radix_reconstructions, (unsigned long long) st.merges_completed,
-        (unsigned long long) st.corrections_nonzero, st.pipeline_wall_s);
+        (unsigned long long) st.corrections_nonzero, st.pipeline_wall_s,
+        (unsigned long long) st.paired_stripes, (unsigned long long) st.paired_fallback_stripes,
+        (unsigned long long) st.paired_main_loop_ws, (unsigned long long) st.paired_residual_loop_ws,
+        (unsigned long long) st.paired_index_configs, (unsigned long long) st.paired_index_writes,
+        (unsigned long long) st.paired_readbacks, (unsigned long long) st.paired_readback_tiles,
+        (unsigned long long) st.paired_fences, (unsigned long long) st.paired_drains);
     // Debug records are flushed per record; drain the buffered cycle log too.
     (void) ggml::gemmini::log::cycle.flush();
     delete static_cast<potal_context *>(backend->context);

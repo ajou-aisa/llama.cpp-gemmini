@@ -145,6 +145,17 @@ elseif (GGML_GEMMINI_ENABLE_RMD AND NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUA
                         "GGML_GEMMINI_DEFAULT_RMD_BACKEND=${GGML_GEMMINI_DEFAULT_RMD_BACKEND} (the PoTal WS residual) "
                         "runs in GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE")
 endif()
+# Paired Main/Residual stripes (matmul/paired-auto.hpp, H2 indexed weight): the
+# build default of the route; GGML_POTAL_PAIRED_AUTO=ON|OFF in the environment
+# overrides it per process (matmul/options.hpp). Takes effect only in
+# STRIPE_PIPELINE with compensation=ON; OFF keeps the serial Main then Residual GEMMs.
+option(GGML_POTAL_PAIRED_AUTO "STRIPE_PIPELINE: run each stripe's Main and Residual GEMMs as one paired execution" OFF)
+if (GGML_POTAL_PAIRED_AUTO)
+    set(_POTAL_PAIRED_AUTO_VALUE 1)
+else()
+    set(_POTAL_PAIRED_AUTO_VALUE 0)
+endif()
+
 if (NOT GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY MATCHES "^[12]$")
     message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY must be 1 or 2 "
                         "(got ${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY})")
@@ -201,6 +212,8 @@ set(POTAL_BACKEND_SOURCES
     matmul/pack.hpp
     matmul/paired.cpp
     matmul/paired.hpp
+    matmul/paired-auto.cpp
+    matmul/paired-auto.hpp
     matmul/paired-emulator.cpp
     matmul/paired-plan.cpp
     matmul/paired-schedule.cpp
@@ -222,6 +235,7 @@ set(POTAL_LOG_DEFINITIONS
     GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_CONFIGURED_DIM=${POTAL_HW_DIM}
+    GGML_POTAL_PAIRED_AUTO=${_POTAL_PAIRED_AUTO_VALUE}
     GGML_GEMMINI_EXECUTION_BACKEND_HARDWARE=1
     EXSIA_VALIDATION=0
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
@@ -325,7 +339,17 @@ endif()
 #   unit      Main / Residual INT32 and radix INT64: independent golden ==
 #             serialized reference == paired emulator; both merge modes,
 #             failures with no partial commit, real ExSIA packets
-foreach(_paired_test plan schedule unit)
+#   auto      H3-0 / H3-1 planner of potal_paired_matmul_auto (matmul/paired-auto.hpp)
+#             on the H2 contract: Main I/J kept, final K = the most restrictive
+#             limit, bank / ACC / Index / scale occupancy, K panels and Index
+#             Windows, resident K coordinates, refusals with diagnostics; the
+#             execution plan (ops, dependencies, pair residency, Index entries,
+#             scale lifetimes, ACC first/last) and its validator
+#   execution H3-2B.1 potal_paired_matmul_auto on the command-level H2 emulator:
+#             translation (LOOP_WS / INDEX / scale / readback counts and order),
+#             residual staging, Main / Residual INT32, radix INT64 and merged
+#             F32 == the serialized reference, pairs and generations, failures
+foreach(_paired_test plan schedule unit auto execution)
     add_executable(potal-paired-${_paired_test}-test tests/potal-paired-${_paired_test}-test.cpp ${POTAL_BACKEND_SOURCES})
     potal_add_backend_settings(potal-paired-${_paired_test}-test)
     target_include_directories(potal-paired-${_paired_test}-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -372,4 +396,11 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     potal_add_backend_settings(potal-stripe-smoke)
     target_include_directories(potal-stripe-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(potal-stripe-smoke PRIVATE ggml)
+
+    # FireSim: the paired route (GGML_POTAL_PAIRED_AUTO) on the H2 hardware, same
+    # golden as potal-stripe-smoke, each case paired and serial (measured timing).
+    add_executable(potal-paired-smoke tests/potal-paired-smoke.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-paired-smoke)
+    target_include_directories(potal-paired-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-paired-smoke PRIVATE ggml)
 endif()

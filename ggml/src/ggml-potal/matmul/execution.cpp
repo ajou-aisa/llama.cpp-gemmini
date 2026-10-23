@@ -206,6 +206,7 @@ class issuer {
     gemm_report    execute(const gemm_job & job);
     tiled_report   execute_tiled(const tiled_job & job);
     planned_result execute_planned(const potal_stripe_gemm_desc & desc);
+    potal_paired_status execute_paired(const potal_paired_request & req, potal_paired_report & report);
 
   private:
     void main_loop();
@@ -493,6 +494,16 @@ planned_result issuer::execute_planned(const potal_stripe_gemm_desc & desc) {
     return run_planned_stripe_gemm(session, desc);
 }
 
+// One paired stripe on the issuer: the hart-0 affinity check, then its own paired
+// session (potal_paired_run_session) with the issuer's scale generation counter, so
+// the planned GEMMs and the paired stripes of the process share one generation
+// sequence. Every earlier GEMM of the issuer ended with a FENCE, so the paired
+// session opens drained; it flushes the TLB before its first DMA.
+potal_paired_status issuer::execute_paired(const potal_paired_request & req, potal_paired_report & report) {
+    // custom-3 would trap off hart 0: refused (fatal) inside the owner step.
+    return run_paired_on_owner(req, &session.ws.generation, sched_getcpu() == cpu, report);
+}
+
 std::mutex g_issuer_mutex;
 issuer *   g_issuer = nullptr; // created by the first request; leaked because its thread is detached
 
@@ -716,8 +727,12 @@ bool issuer_owner::start(stripe_consumer consume, std::string & why, potal_statu
     // The issuer owns the consumer (and through it the run) until it returns.
     auto task = std::make_shared<const issuer_task>(
         [&iss, consume = std::move(consume)](std::string & task_why, potal_status & task_status) {
-            const consume_outcome o =
-                consume([&iss](const potal_stripe_gemm_desc & desc) { return iss.execute_planned(desc); });
+            owner_runners runners;
+            runners.planned = [&iss](const potal_stripe_gemm_desc & desc) { return iss.execute_planned(desc); };
+            runners.paired  = [&iss](const potal_paired_request & r, potal_paired_report & rep) {
+                return iss.execute_paired(r, rep);
+            };
+            const consume_outcome o = consume(runners);
             if (o.fatal) {
                 task_why    = failure_of(o.stage != nullptr ? o.stage : "stripe_pipeline", o.status);
                 task_status = o.status;

@@ -106,7 +106,8 @@ function(potal_configure_hw_params out_dir)
         message(FATAL_ERROR "PoTal: ${source} is not a generated Gemmini/PoTal parameter header (GEMMINI_PARAMS_H guard missing)")
     endif()
 
-    foreach(name IN ITEMS XCUSTOM_ACC DIM ADDR_LEN BANK_NUM BANK_ROWS ACC_ROWS MAX_BYTES)
+    foreach(name IN ITEMS XCUSTOM_ACC DIM ADDR_LEN BANK_NUM BANK_ROWS ACC_ROWS MAX_BYTES
+            POTAL_SCALE_ENTRIES POTAL_INDEX_ENTRIES)
         _potal_hw_int("${content}" ${name} ${name})
     endforeach()
     _potal_hw_typedef("${content}" elem_t int8_t)
@@ -141,6 +142,15 @@ function(potal_configure_hw_params out_dir)
     if(spad_half LESS ab_tile_rows OR acc_half LESS DIM)
         message(FATAL_ERROR "PoTal: SPAD/ACC capacity too small for DIM=${DIM}")
     endif()
+    # potal.h encodes scale keys with an 8-bit slot (POTAL_SCALE_ENTRIES 256);
+    # the H2 Index Table holds whole DIM-wide K passes (ExecuteController
+    # requires at least one).
+    if(NOT POTAL_SCALE_ENTRIES EQUAL 256)
+        message(FATAL_ERROR "PoTal: POTAL_SCALE_ENTRIES=${POTAL_SCALE_ENTRIES}; potal.h supports 256 scale entries")
+    endif()
+    if(POTAL_INDEX_ENTRIES LESS DIM)
+        message(FATAL_ERROR "PoTal: POTAL_INDEX_ENTRIES=${POTAL_INDEX_ENTRIES} must hold at least one DIM=${DIM} K pass")
+    endif()
 
     file(MAKE_DIRECTORY "${out_dir}")
     # configure_file records the source as a configure dependency: editing the
@@ -160,6 +170,8 @@ function(potal_configure_hw_params out_dir)
 #define POTAL_HW_BANK_ROWS ${BANK_ROWS}
 #define POTAL_HW_ACC_ROWS  ${ACC_ROWS}
 #define POTAL_HW_MAX_BYTES ${MAX_BYTES}
+#define POTAL_HW_SCALE_ENTRIES ${POTAL_SCALE_ENTRIES}
+#define POTAL_HW_INDEX_ENTRIES ${POTAL_INDEX_ENTRIES}
 #define POTAL_HW_PARAMS_SHA256 \"${sha256}\"
 
 #endif /* POTAL_HW_PARAMS_H */
@@ -191,6 +203,8 @@ bank_num=${BANK_NUM}
 bank_rows=${BANK_ROWS}
 acc_rows=${ACC_ROWS}
 max_bytes=${MAX_BYTES}
+scale_entries=${POTAL_SCALE_ENTRIES}
+index_entries=${POTAL_INDEX_ENTRIES}
 precision=A8W8 elem_t=int8_t acc_t=int32_t
 hw_config=${hw_config}
 hw_params_repo_head=${hardware_head}
@@ -203,7 +217,8 @@ potal_api_only=${POTAL_API_ONLY}
 ")
 
     message(STATUS "PoTal hardware parameters: DIM=${DIM} XCUSTOM=${XCUSTOM_ACC} "
-        "BANK_NUM=${BANK_NUM} BANK_ROWS=${BANK_ROWS} ACC_ROWS=${ACC_ROWS} MAX_BYTES=${MAX_BYTES}")
+        "BANK_NUM=${BANK_NUM} BANK_ROWS=${BANK_ROWS} ACC_ROWS=${ACC_ROWS} MAX_BYTES=${MAX_BYTES} "
+        "SCALE_ENTRIES=${POTAL_SCALE_ENTRIES} INDEX_ENTRIES=${POTAL_INDEX_ENTRIES}")
     message(STATUS "PoTal hardware header: ${source} sha256=${sha256}")
     message(STATUS "PoTal build manifest: ${out_dir}/potal_build_manifest.txt")
 

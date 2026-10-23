@@ -67,6 +67,9 @@ const char * slot_state_name(slot_state s) {
         case slot_state::residual_done:     return "RESIDUAL_DONE";
         case slot_state::reconstruct_merge: return "RECONSTRUCT_MERGE";
         case slot_state::semantic_done:     return "SEMANTIC_DONE";
+        case slot_state::paired_prepare:    return "PAIRED_PREPARE";
+        case slot_state::paired_running:    return "PAIRED_RUNNING";
+        case slot_state::paired_done:       return "PAIRED_DONE";
     }
     return "UNKNOWN";
 }
@@ -92,6 +95,10 @@ const char * stripe_event_name(stripe_event_kind k) {
         case stripe_event_kind::quant_end:               return "quant_end";
         case stripe_event_kind::run_commit:              return "run_commit";
         case stripe_event_kind::run_failed:              return "run_failed";
+        case stripe_event_kind::paired_prepare_begin:    return "paired_prepare_begin";
+        case stripe_event_kind::paired_prepare_end:      return "paired_prepare_end";
+        case stripe_event_kind::paired_begin:            return "paired_begin";
+        case stripe_event_kind::paired_end:              return "paired_end";
     }
     return "unknown";
 }
@@ -296,7 +303,7 @@ void stripe_run::emit(const stripe_event & ev) {
             }
         } written{ *this, ev.sequence }; // also when the record fails
 
-        char run[32] = "-", stripe[32] = "-", slot[32] = "-", extra[384] = "";
+        char run[32] = "-", stripe[32] = "-", slot[32] = "-", extra[768] = "";
         if (ev.run_bound) {
             std::snprintf(run, sizeof(run), "%llu", (unsigned long long) ev.run_id);
         }
@@ -317,6 +324,28 @@ void stripe_run::emit(const stripe_event & ev) {
                           (unsigned long long) g.scale_releases, g.last_generation, g.tile_i, g.tile_j, g.tile_k,
                           g.i0, g.j0, g.k0, ev.k_compact, ev.k_execution, ev.runs, potal_status_name(g.status),
                           g.stage ? " step=" : "", g.stage ? g.stage : "");
+        } else if (ev.paired != nullptr) {
+            const potal_paired_report & p = *ev.paired;
+            const potal_paired_counts & c = p.counts;
+            std::snprintf(extra, sizeof(extra),
+                          " paired_status=%s step=%s hw_status=POTAL_%s issued=%d fatal=%d cleaned=%d main_loop_ws=%llu "
+                          "residual_loop_ws=%llu index_configs=%llu index_writes=%llu scale_writes=%llu "
+                          "scale_releases=%llu readbacks=%llu readback_tiles=%llu fences=%llu drains=%llu "
+                          "tlb_flushes=%llu generation=%u tile_I=%zu tile_J=%zu tile_K=%zu k_panels=%zu j_groups=%zu "
+                          "windows=%zu lane_rows=%zu",
+                          potal_paired_status_name(p.status), p.stage ? p.stage : "-", potal_status_name(p.hw_status),
+                          (int) p.issued, (int) p.fatal, (int) p.cleaned, (unsigned long long) c.main_loop_ws,
+                          (unsigned long long) c.residual_loop_ws, (unsigned long long) c.index_configs,
+                          (unsigned long long) c.index_writes, (unsigned long long) c.scale_writes,
+                          (unsigned long long) c.scale_releases, (unsigned long long) c.readbacks,
+                          (unsigned long long) c.readback_tiles, (unsigned long long) c.fences,
+                          (unsigned long long) c.drains, (unsigned long long) c.tlb_flushes, p.last_generation,
+                          p.tile.tile_I, p.tile.tile_J, p.tile.tile_K, p.tile.k_panels, p.tile.j_groups,
+                          p.tile.residual_windows, p.tile.residual_lane_rows);
+        } else if (ev.kind == stripe_event_kind::paired_prepare_end) {
+            std::snprintf(extra, sizeof(extra), " route=%s active_lane_rows=%zu k_compact=%zu k_execution=%zu runs=%zu%s%s",
+                          ev.route ? ev.route : "-", ev.rows, ev.k_compact, ev.k_execution, ev.runs,
+                          ev.detail ? " refusal=" : "", ev.detail ? ev.detail : "");
         } else if (ev.kind == stripe_event_kind::residual_prepare_end) {
             std::snprintf(extra, sizeof(extra), " active_lane_rows=%zu k_compact=%zu k_execution=%zu runs=%zu",
                           ev.rows, ev.k_compact, ev.k_execution, ev.runs);
@@ -501,6 +530,12 @@ void stripe_run::abort(const char * stage, const std::string & detail) {
 }
 
 consume_outcome stripe_run::consume(const planned_runner & exec) {
+    owner_runners runners;
+    runners.planned = exec;
+    return consume(runners);
+}
+
+consume_outcome stripe_run::consume(const owner_runners & runners) {
     consume_outcome out;
     for (;;) {
         slot *       s = nullptr;
@@ -518,7 +553,7 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
         }
         stripe_result r;
         try {
-            r = execute(*s, begin, exec);
+            r = execute(*s, begin, runners);
         } catch (...) {
             // Only a failure while reporting a failure gets here (no memory for
             // its text): the accelerator state is not known for sure, fail-stop.
@@ -537,7 +572,8 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
     return out;
 }
 
-stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const planned_runner & exec) {
+stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const owner_runners & runners) {
+    const planned_runner & exec = runners.planned;
     ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
     stripe_result                       res;
     bool                                gemm_fatal = false; // a planned GEMM left the accelerator state unknown
@@ -571,6 +607,16 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         counts_.scale_releases += n.scale_releases;
         counts_.tlb_flushes += n.tlb_flushes;
         counts_.last_generation = n.last_generation != 0 ? n.last_generation : counts_.last_generation;
+        counts_.paired_stripes += n.paired_stripes;
+        counts_.paired_fallback_stripes += n.paired_fallback_stripes;
+        counts_.paired_main_loop_ws += n.paired_main_loop_ws;
+        counts_.paired_residual_loop_ws += n.paired_residual_loop_ws;
+        counts_.paired_index_configs += n.paired_index_configs;
+        counts_.paired_index_writes += n.paired_index_writes;
+        counts_.paired_readbacks += n.paired_readbacks;
+        counts_.paired_readback_tiles += n.paired_readback_tiles;
+        counts_.paired_fences += n.paired_fences;
+        counts_.paired_drains += n.paired_drains;
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
@@ -608,115 +654,252 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
     };
 
     try {
-        // 1. Main GEMM with the frozen Main plan (main_begin was stamped when
-        //    the stripe left the queue).
+        // main_begin was stamped when the stripe left the queue.
         emit(main_begin);
         done.main_begin_ns   = main_begin.t_ns;
         done.slot_generation = main_begin.slot_generation;
-        potal_stripe_gemm_desc d = {};
-        d.run_id                 = s.run_id;
-        d.stripe_id              = s.stripe_id;
-        d.row_begin              = s.row_begin;
-        d.work_kind              = POTAL_STRIPE_WORK_MAIN;
-        d.m                      = (uint32_t) rows;
-        d.n                      = (uint32_t) n_;
-        d.k                      = (uint32_t) k_;
-        d.a                      = s.a;
-        d.b                      = w_.b;
-        d.c                      = s.c;
-        d.lda                    = lda_;
-        d.ldb                    = w_.ldb;
-        d.ldc                    = ldc_;
-        d.carriers               = w_.carriers;
-        d.carrier_stride         = w_.cstride;
-        d.scale_block_k          = SCALE_BLOCK_K;
-        d.tile_i                 = (uint32_t) plan_.tile_I;
-        d.tile_j                 = (uint32_t) plan_.tile_J;
-        d.tile_k                 = (uint32_t) plan_.tile_K;
-        const planned_result main = exec(d);
-        gemm_fatal                = main.fatal;
-        account(main, true);
-        {
-            stripe_event ev = main.ok ? advance(s, slot_state::main_done, stripe_event_kind::main_end)
-                                      : event_of(stripe_event_kind::main_end, s);
-            ev.gemm         = &main.report;
-            ev.rows         = rows;
-            ev.cols         = n_;
-            if (main.ok) {
-                ev.c   = s.c;
-                ev.ldc = ldc_;
+
+        residual::request               req;        // serial route: the Residual GEMM's operands and C
+        rmd::BlockScaledInt64Correction correction;
+        residual::decoded_packet        decoded;    // paired route: the packet, decoded once
+        potal_paired_execution_plan     routing;    // paired route: the plan that chose the route, executed as is
+        potal_paired_report             paired;     // paired route: the executor's report (residual rows)
+        struct dma_block {
+            void * p = nullptr;
+            ~dma_block() { std::free(p); }
+            void abandon() { p = nullptr; } // the accelerator may still reach it
+        } paired_rc;                                // paired route: Residual C, lane rows x ldc_
+
+        // 0. Paired route (cfg_.paired): decode the packet, plan Main + Residual
+        //    (potal_paired_plan_stripe, CPU, before any command) and choose the
+        //    route. A capacity refusal runs the serial route below and is
+        //    reported as serial_fallback; any other refusal fails the stripe.
+        bool paired_route = false;
+        if (cfg_.paired) {
+            emit(advance(s, slot_state::paired_prepare, stripe_event_kind::paired_prepare_begin));
+            if (!runners.paired) {
+                return failed("paired", POTAL_ERR_UNSUPPORTED, false,
+                              "paired route configured, but the accelerator owner runs no paired stripes");
             }
+            if (s.packet) {
+                const rmd::RmdStatus dec = residual::decode_packet(*s.packet, w_, decoded);
+                if (dec != rmd::RmdStatus::success) {
+                    return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(dec));
+                }
+            }
+            potal_paired_tile_plan    tile;
+            std::string               why;
+            const potal_paired_status ps = potal_paired_plan_stripe(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                                                    tile, routing, &why);
+            if (ps != potal_paired_status::ok && !potal_paired_capacity_refusal(ps)) {
+                return failed("paired_plan", POTAL_OK, false,
+                              std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
+            }
+            paired_route = ps == potal_paired_status::ok;
+            const std::string refusal =
+                paired_route ? std::string() : std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why;
+            if (paired_route && !decoded.rows.empty()) {
+                paired_rc.p = dma_alloc(align_up(decoded.rows.size(), HW_DIM) * ldc_ * sizeof(int32_t));
+                if (paired_rc.p == nullptr) {
+                    return failed("alloc", POTAL_OK, false, "out of memory for the paired Residual C");
+                }
+            }
+            stripe_event ev = paired_route ? event_of(stripe_event_kind::paired_prepare_end, s)
+                                           : advance(s, slot_state::main_running, stripe_event_kind::paired_prepare_end);
+            ev.route       = paired_route ? "paired" : "serial_fallback";
+            ev.detail      = paired_route ? nullptr : refusal.c_str();
+            ev.rows        = decoded.rows.size();
+            ev.cols        = n_;
+            ev.k_compact   = decoded.k_compact;
+            ev.k_execution = paired_route ? tile.fragments.size() * HW_DIM : 0;
+            ev.runs        = decoded.runs.size();
             emit(ev);
-        }
-        if (!main.ok) {
-            return failed("main", main.status, main.fatal, "Main GEMM " + gemm_detail(main));
+            n.paired_fallback_stripes += paired_route ? 0 : 1;
         }
 
-        // 2. Residual GEMM of the sealed packet, on the same accelerator.
-        residual::request               req;
-        rmd::BlockScaledInt64Correction correction;
-        if (s.packet) {
-            emit(advance(s, slot_state::residual_prepare, stripe_event_kind::residual_prepare_begin));
-            const rmd::RmdStatus built = residual::build_request(*s.packet, w_, req);
-            if (built != rmd::RmdStatus::success) {
-                return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(built));
+        if (paired_route) {
+            // 1+2. Main and Residual GEMMs as one paired execution on the owner thread:
+            //      planned again (deterministic), staged, issued, read back, drained.
+            potal_paired_request pq;
+            pq.run_id       = s.run_id;
+            pq.stripe_id    = s.stripe_id;
+            pq.row_begin    = s.row_begin;
+            pq.rows         = rows;
+            pq.n            = n_;
+            pq.k            = k_;
+            pq.main_plan    = &plan_;
+            pq.a            = s.a;
+            pq.lda          = lda_;
+            pq.weight       = &w_;
+            pq.residual     = decoded.rows.empty() ? nullptr : &decoded;
+            pq.c_main       = s.c;
+            pq.ldc_main     = ldc_;
+            pq.c_residual   = static_cast<int32_t *>(paired_rc.p);
+            pq.ldc_residual = ldc_;
+            pq.tlb_flush    = true;
+            pq.plan         = &routing; // validated again by the executor, never re-planned
+            pq.conservative_fences = cfg_.paired_conservative_fences;
+            emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
+            const potal_paired_status pst = runners.paired(pq, paired);
+            gemm_fatal                    = gemm_fatal || paired.fatal;
+            if (paired.fatal) {
+                paired_rc.abandon();
             }
+            const potal_paired_counts & pc = paired.counts;
+            n.paired_main_loop_ws += pc.main_loop_ws;
+            n.paired_residual_loop_ws += pc.residual_loop_ws;
+            n.paired_index_configs += pc.index_configs;
+            n.paired_index_writes += pc.index_writes;
+            n.paired_readbacks += pc.readbacks;
+            n.paired_readback_tiles += pc.readback_tiles;
+            n.paired_fences += pc.fences;
+            n.paired_drains += pc.drains;
+            n.scale_writes += pc.scale_writes;
+            n.scale_releases += pc.scale_releases;
+            n.tlb_flushes += pc.tlb_flushes;
+            n.scale_s += pc.scale_s;
+            n.issue_s += pc.issue_s;
+            n.fence_s += pc.fence_s;
+            n.last_generation = paired.last_generation != 0 ? paired.last_generation : n.last_generation;
             {
-                stripe_event ev = event_of(stripe_event_kind::residual_prepare_end, s);
-                ev.rows         = req.m;
-                ev.cols         = n_;
-                ev.k_compact    = req.k_compact;
-                ev.k_execution  = req.k_execution;
-                ev.runs         = req.runs.size();
-                emit(ev);
-            }
-            emit(advance(s, slot_state::residual_running, stripe_event_kind::residual_begin));
-            potal_stripe_gemm_desc r = d;
-            r.work_kind              = POTAL_STRIPE_WORK_RESIDUAL;
-            r.m                      = (uint32_t) req.m;
-            r.k                      = (uint32_t) req.k_execution;
-            r.a                      = req.a;
-            r.b                      = req.b;
-            r.c                      = req.c;
-            r.lda                    = req.lda;
-            r.ldb                    = req.ldb;
-            r.ldc                    = req.ldc;
-            r.carriers               = req.carriers;
-            r.carrier_stride         = req.cstride;
-            r.tile_i                 = (uint32_t) req.plan.tile_I;
-            r.tile_j                 = (uint32_t) req.plan.tile_J;
-            r.tile_k                 = (uint32_t) req.plan.tile_K;
-            const planned_result residual_gemm = exec(r);
-            gemm_fatal                         = gemm_fatal || residual_gemm.fatal;
-            if (residual_gemm.fatal) {
-                req.abandon(); // the accelerator may still reach them
-            }
-            account(residual_gemm, false);
-            n.residual_compact_k += req.k_compact;
-            n.residual_execution_k += req.k_execution;
-            n.residual_active_lane_rows += req.m;
-            done.residual_rows = req.m;
-            done.k_compact     = req.k_compact;
-            done.k_execution   = req.k_execution;
-            {
-                stripe_event ev = residual_gemm.ok
-                                      ? advance(s, slot_state::residual_done, stripe_event_kind::residual_end)
-                                      : event_of(stripe_event_kind::residual_end, s);
-                ev.gemm         = &residual_gemm.report;
-                ev.rows         = req.m;
-                ev.cols         = n_;
-                ev.k_compact    = req.k_compact;
-                ev.k_execution  = req.k_execution;
-                ev.runs         = req.runs.size();
-                if (residual_gemm.ok) {
-                    ev.c   = req.c;
-                    ev.ldc = req.ldc;
+                stripe_event ev = pst == potal_paired_status::ok
+                                      ? advance(s, slot_state::paired_done, stripe_event_kind::paired_end)
+                                      : event_of(stripe_event_kind::paired_end, s);
+                ev.paired      = &paired;
+                ev.rows        = rows;
+                ev.cols        = n_;
+                ev.k_compact   = decoded.k_compact;
+                ev.k_execution = paired.tile.fragments.size() * HW_DIM;
+                ev.runs        = decoded.runs.size();
+                if (pst == potal_paired_status::ok) {
+                    ev.c             = s.c;
+                    ev.ldc           = ldc_;
+                    ev.residual_c    = static_cast<const int32_t *>(paired_rc.p);
+                    ev.residual_ldc  = ldc_;
+                    ev.residual_rows = paired.plan.residual_rows.size();
                 }
                 emit(ev);
             }
-            if (!residual_gemm.ok) {
-                return failed("residual", residual_gemm.status, residual_gemm.fatal,
-                              "Residual GEMM " + gemm_detail(residual_gemm));
+            if (pst != potal_paired_status::ok) {
+                return failed("paired", paired.hw_status, paired.fatal,
+                              std::string("paired status=POTAL_PAIRED_") + potal_paired_status_name(pst) + " step=" +
+                                  (paired.stage != nullptr ? paired.stage : "-") + " hw=POTAL_" +
+                                  potal_status_name(paired.hw_status) + (paired.fatal ? " fatal=1 " : " fatal=0 ") +
+                                  paired.detail);
+            }
+            n.paired_stripes++;
+            // Packet properties, route-independent; residual_execution_k stays the serial
+            // route's K32-padded K (a paired stripe executes fragments x DIM, see paired_end).
+            n.residual_compact_k += decoded.k_compact;
+            n.residual_active_lane_rows += decoded.rows.size();
+            done.paired        = true;
+            done.residual_rows = decoded.rows.size();
+            done.k_compact     = decoded.k_compact;
+            done.k_execution   = paired.tile.fragments.size() * HW_DIM;
+        } else {
+            potal_stripe_gemm_desc d = {};
+            d.run_id                 = s.run_id;
+            d.stripe_id              = s.stripe_id;
+            d.row_begin              = s.row_begin;
+            d.work_kind              = POTAL_STRIPE_WORK_MAIN;
+            d.m                      = (uint32_t) rows;
+            d.n                      = (uint32_t) n_;
+            d.k                      = (uint32_t) k_;
+            d.a                      = s.a;
+            d.b                      = w_.b;
+            d.c                      = s.c;
+            d.lda                    = lda_;
+            d.ldb                    = w_.ldb;
+            d.ldc                    = ldc_;
+            d.carriers               = w_.carriers;
+            d.carrier_stride         = w_.cstride;
+            d.scale_block_k          = SCALE_BLOCK_K;
+            d.tile_i                 = (uint32_t) plan_.tile_I;
+            d.tile_j                 = (uint32_t) plan_.tile_J;
+            d.tile_k                 = (uint32_t) plan_.tile_K;
+            const planned_result main = exec(d);
+            gemm_fatal                = main.fatal;
+            account(main, true);
+            {
+                stripe_event ev = main.ok ? advance(s, slot_state::main_done, stripe_event_kind::main_end)
+                                          : event_of(stripe_event_kind::main_end, s);
+                ev.gemm         = &main.report;
+                ev.rows         = rows;
+                ev.cols         = n_;
+                if (main.ok) {
+                    ev.c   = s.c;
+                    ev.ldc = ldc_;
+                }
+                emit(ev);
+            }
+            if (!main.ok) {
+                return failed("main", main.status, main.fatal, "Main GEMM " + gemm_detail(main));
+            }
+
+            // 2. Residual GEMM of the sealed packet, on the same accelerator.
+            if (s.packet) {
+                emit(advance(s, slot_state::residual_prepare, stripe_event_kind::residual_prepare_begin));
+                const rmd::RmdStatus built = residual::build_request(*s.packet, w_, req);
+                if (built != rmd::RmdStatus::success) {
+                    return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(built));
+                }
+                {
+                    stripe_event ev = event_of(stripe_event_kind::residual_prepare_end, s);
+                    ev.rows         = req.m;
+                    ev.cols         = n_;
+                    ev.k_compact    = req.k_compact;
+                    ev.k_execution  = req.k_execution;
+                    ev.runs         = req.runs.size();
+                    emit(ev);
+                }
+                emit(advance(s, slot_state::residual_running, stripe_event_kind::residual_begin));
+                potal_stripe_gemm_desc r = d;
+                r.work_kind              = POTAL_STRIPE_WORK_RESIDUAL;
+                r.m                      = (uint32_t) req.m;
+                r.k                      = (uint32_t) req.k_execution;
+                r.a                      = req.a;
+                r.b                      = req.b;
+                r.c                      = req.c;
+                r.lda                    = req.lda;
+                r.ldb                    = req.ldb;
+                r.ldc                    = req.ldc;
+                r.carriers               = req.carriers;
+                r.carrier_stride         = req.cstride;
+                r.tile_i                 = (uint32_t) req.plan.tile_I;
+                r.tile_j                 = (uint32_t) req.plan.tile_J;
+                r.tile_k                 = (uint32_t) req.plan.tile_K;
+                const planned_result residual_gemm = exec(r);
+                gemm_fatal                         = gemm_fatal || residual_gemm.fatal;
+                if (residual_gemm.fatal) {
+                    req.abandon(); // the accelerator may still reach them
+                }
+                account(residual_gemm, false);
+                n.residual_compact_k += req.k_compact;
+                n.residual_execution_k += req.k_execution;
+                n.residual_active_lane_rows += req.m;
+                done.residual_rows = req.m;
+                done.k_compact     = req.k_compact;
+                done.k_execution   = req.k_execution;
+                {
+                    stripe_event ev = residual_gemm.ok
+                                          ? advance(s, slot_state::residual_done, stripe_event_kind::residual_end)
+                                          : event_of(stripe_event_kind::residual_end, s);
+                    ev.gemm         = &residual_gemm.report;
+                    ev.rows         = req.m;
+                    ev.cols         = n_;
+                    ev.k_compact    = req.k_compact;
+                    ev.k_execution  = req.k_execution;
+                    ev.runs         = req.runs.size();
+                    if (residual_gemm.ok) {
+                        ev.c   = req.c;
+                        ev.ldc = req.ldc;
+                    }
+                    emit(ev);
+                }
+                if (!residual_gemm.ok) {
+                    return failed("residual", residual_gemm.status, residual_gemm.fatal,
+                                  "Residual GEMM " + gemm_detail(residual_gemm));
+                }
             }
         }
 
@@ -729,7 +912,10 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         }
         if (s.packet) {
             emit(event_of(stripe_event_kind::radix_reconstruct_begin, s));
-            const rmd::RmdStatus composed = residual::reconstruct(*s.packet, req, correction);
+            const rmd::RmdStatus composed =
+                paired_route ? residual::reconstruct_rows(*s.packet, paired.plan.residual_rows,
+                                                          static_cast<const int32_t *>(paired_rc.p), ldc_, n_, correction)
+                             : residual::reconstruct(*s.packet, req, correction);
             if (composed != rmd::RmdStatus::success) {
                 return failed("radix_reconstruct", POTAL_OK, false, rmd::rmd_status_message(composed));
             }
@@ -859,6 +1045,9 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     if (args.exsia_stripe_ready_sink != nullptr) {
         return refuse("options", "a stripe-ready sink is already attached");
     }
+    if (cfg.paired && !cfg.residual) {
+        return refuse("options", "the paired route needs compensation=ON (the ws_packet residual)");
+    }
 
     std::shared_ptr<stripe_run> run;
     std::string                 why;
@@ -875,7 +1064,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     // Consumer first, under the caller's unchanged affinity: the owner keeps
     // a strong reference to the run until its consumer returns.
     potal_status status = POTAL_OK;
-    if (!owner.start([run](const planned_runner & exec) { return run->consume(exec); }, why, status)) {
+    if (!owner.start([run](const owner_runners & runners) { return run->consume(runners); }, why, status)) {
         r.status = status;
         return refuse("issuer", why); // nothing was issued
     }

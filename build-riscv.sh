@@ -15,6 +15,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' '  Builds potal-api-test, potal-api-smoke, potal-multicore-smoke, potal-ggml-unit-test,'
   printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, potal-stripe-api-test,'
   printf '%s\n' '  potal-residual-unit-test, potal-stripe-pipeline-test, potal-stripe-smoke,'
+  printf '%s\n' '  potal-paired-auto-test, potal-paired-execution-test, potal-paired-smoke,'
   printf '%s\n' '  then llama-cli and llama-perplexity.'
   printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>] selects another header.'
   printf '%s\n' '  Defaults here: GGML_GEMMINI_ACTIVATION_QUANT=TENSOR, GGML_GEMMINI_ENABLE_RMD=OFF (compensation),'
@@ -151,6 +152,7 @@ elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
   cmake --build "$BUILD_DIR" --target potal-api-test potal-api-smoke potal-multicore-smoke \
     potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke \
     potal-stripe-api-test potal-residual-unit-test potal-stripe-pipeline-test potal-stripe-smoke \
+    potal-paired-auto-test potal-paired-execution-test potal-paired-smoke \
     -j"${BUILD_JOBS_DEFAULT}"
   cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
 else

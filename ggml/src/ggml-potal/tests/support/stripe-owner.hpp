@@ -34,13 +34,20 @@ struct emu_session {
 
 class thread_owner final : public ggml::potal::stripe_owner {
   public:
-    explicit thread_owner(ggml::potal::planned_runner exec) : exec_(std::move(exec)) {}
+    explicit thread_owner(ggml::potal::planned_runner exec, ggml::potal::paired_runner paired = {}) :
+        exec_(std::move(exec)),
+        paired_(std::move(paired)) {}
     ~thread_owner() override { join(); }
 
     bool start(ggml::potal::stripe_consumer consume, std::string & why, potal_status & status) override {
         (void) why;
         (void) status;
-        thread_ = std::thread([this, consume = std::move(consume)] { outcome = consume(exec_); });
+        thread_ = std::thread([this, consume = std::move(consume)] {
+            ggml::potal::owner_runners runners;
+            runners.planned = exec_;
+            runners.paired  = paired_;
+            outcome         = consume(runners);
+        });
         started = true;
         return true;
     }
@@ -56,6 +63,7 @@ class thread_owner final : public ggml::potal::stripe_owner {
 
   private:
     ggml::potal::planned_runner exec_;
+    ggml::potal::paired_runner  paired_;
     std::thread                 thread_;
 };
 
