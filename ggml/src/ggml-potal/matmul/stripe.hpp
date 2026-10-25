@@ -260,6 +260,7 @@ struct pipeline_counts {
     uint64_t paired_readback_tiles      = 0; // MVOUT commands
     uint64_t paired_fences              = 0;
     uint64_t paired_drains              = 0; // fences + released scale windows (each is a drain point)
+    double   act_quant_s                = 0; // ExSIA quantize_activation call, including producer capacity waits
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;
     double   fence_s                    = 0;

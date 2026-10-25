@@ -7,6 +7,7 @@
 #include "potal_hw_params.h"
 
 #include "quants/act/quantize.hpp"
+#include "quants/common/hp1_scu.hpp"
 
 #include <gemmini/trace-context.hpp>
 
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <new>
@@ -664,6 +666,10 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         residual::decoded_packet        decoded;    // paired route: the packet, decoded once
         potal_paired_execution_plan     routing;    // paired route: the plan that chose the route, executed as is
         potal_paired_report             paired;     // paired route: the executor's report (residual rows)
+        potal_paired_geometry           diagnostic_hw;
+        potal_tile_plan                 diagnostic_main;
+        const potal_tile_plan *         paired_main = &plan_;
+        bool                            diagnostic_index = false;
         struct dma_block {
             void * p = nullptr;
             ~dma_block() { std::free(p); }
@@ -676,11 +682,25 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         //    reported as serial_fallback; any other refusal fails the stripe.
         bool paired_route = false;
         if (cfg_.paired) {
+            const char * profile_env = std::getenv("POTAL_PAIRED_PROFILE");
+            const bool profile = profile_env != nullptr && std::strcmp(profile_env, "1") == 0;
             emit(advance(s, slot_state::paired_prepare, stripe_event_kind::paired_prepare_begin));
             if (!runners.paired) {
                 return failed("paired", POTAL_ERR_UNSUPPORTED, false,
                               "paired route configured, but the accelerator owner runs no paired stripes");
             }
+            const char * index_entries = std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+            if (index_entries != nullptr) {
+                const char * window_diag = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
+                diagnostic_hw = potal_paired_hw_geometry();
+                if (std::strcmp(index_entries, "16") != 0 || window_diag == nullptr ||
+                    std::strcmp(window_diag, "1") != 0 || diagnostic_hw.dim != 16 || diagnostic_hw.index_entries < 16) {
+                    return failed("paired_plan", POTAL_ERR_INVALID_ARGUMENT, false,
+                                  "POTAL_PAIRED_DIAG_INDEX_ENTRIES requires value 16, POTAL_PAIRED_WINDOW_DIAG=1 and DIM16");
+                }
+                diagnostic_index = true;
+            }
+            const auto decode_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (s.packet) {
                 const rmd::RmdStatus dec = residual::decode_packet(*s.packet, w_, decoded);
                 if (dec != rmd::RmdStatus::success) {
@@ -689,13 +709,30 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             }
             potal_paired_tile_plan    tile;
             std::string               why;
-            const potal_paired_status ps = potal_paired_plan_stripe(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
-                                                                    tile, routing, &why);
+            const auto plan_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const double decode_ms = profile ? std::chrono::duration<double, std::milli>(plan_start - decode_start).count() : 0;
+            potal_paired_status ps = potal_paired_plan_stripe(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                                             tile, routing, &why);
+            if (ps == potal_paired_status::ok && diagnostic_index) {
+                // Smaller Index Windows must not enlarge the normal paired Main K panel.
+                diagnostic_main = tile.main;
+                paired_main = &diagnostic_main;
+                diagnostic_hw.index_entries = 16;
+                ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                              tile, routing, &why, diagnostic_hw);
+            }
             if (ps != potal_paired_status::ok && !potal_paired_capacity_refusal(ps)) {
                 return failed("paired_plan", POTAL_OK, false,
                               std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
             }
             paired_route = ps == potal_paired_status::ok;
+            if (profile) {
+                const double plan_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - plan_start).count();
+                std::fprintf(stderr, "[POTAL_PLAN_PROFILE] run_id=%llu stripe=%zu fallback=%d status=%s decode_ms=%.6f plan_ms=%.6f\n",
+                             (unsigned long long) s.run_id, s.stripe_id, paired_route ? 0 : 1,
+                             potal_paired_status_name(ps), decode_ms, plan_ms);
+            }
             const std::string refusal =
                 paired_route ? std::string() : std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why;
             if (paired_route && !decoded.rows.empty()) {
@@ -727,7 +764,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             pq.rows         = rows;
             pq.n            = n_;
             pq.k            = k_;
-            pq.main_plan    = &plan_;
+            pq.main_plan    = paired_main;
             pq.a            = s.a;
             pq.lda          = lda_;
             pq.weight       = &w_;
@@ -738,6 +775,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             pq.ldc_residual = ldc_;
             pq.tlb_flush    = true;
             pq.plan         = &routing; // validated again by the executor, never re-planned
+            pq.hw           = diagnostic_index ? &diagnostic_hw : nullptr;
             pq.conservative_fences = cfg_.paired_conservative_fences;
             emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
             const potal_paired_status pst = runners.paired(pq, paired);
@@ -787,6 +825,101 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                                   potal_status_name(paired.hw_status) + (paired.fatal ? " fatal=1 " : " fatal=0 ") +
                                   paired.detail);
             }
+
+            // Temporary FireSim numeric probe. Readbacks have already been fenced.
+            const char * numeric_probe = std::getenv("POTAL_PAIRED_STAGE_DIAG");
+            if (numeric_probe != nullptr && numeric_probe[0] == '1') {
+                auto compare = [&](const char * stage,
+                                   const int32_t * got,
+                                   const std::vector<int32_t> & want,
+                                   size_t count_rows) {
+                    size_t bad = 0;
+                    for (size_t rr = 0; rr < count_rows; ++rr) {
+                        for (size_t col = 0; col < n_; ++col) {
+                            const int32_t actual = got[rr * ldc_ + col];
+                            const int32_t expected = want[rr * ldc_ + col];
+                            if (actual != expected) {
+                                if (bad < 8) {
+                                    std::fprintf(stderr,
+                                        "[POTAL_STAGE_DIAG] stage=%s row=%zu col=%zu "
+                                        "got=%d want=%d\n",
+                                        stage, rr, col, actual, expected);
+                                }
+                                ++bad;
+                            }
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "[POTAL_STAGE_DIAG] stage=%s bad=%zu total=%zu\n",
+                        stage, bad, count_rows * n_);
+                    std::fflush(stderr);
+                };
+
+                std::vector<int32_t> main_ref(rows * ldc_, 0);
+                reference_gemm_i32(
+                    s.a, lda_,
+                    w_.b, w_.ldb,
+                    w_.carriers, w_.cstride,
+                    SCALE_BLOCK_K,
+                    rows, n_, k_,
+                    main_ref.data(), ldc_);
+                compare("MAIN_INT32", s.c, main_ref, rows);
+
+                if (s.packet && !decoded.rows.empty()) {
+                    namespace hp1ref = ggml::gemmini::quants::hp1;
+
+                    std::vector<int32_t> residual_ref(
+                        decoded.rows.size() * ldc_, 0);
+
+                    for (size_t rr = 0; rr < decoded.rows.size(); ++rr) {
+                        for (size_t col = 0; col < n_; ++col) {
+                            int32_t acc = 0;
+                            bool first = true;
+                            size_t compact_base = 0;
+
+                            for (const auto & run : decoded.runs) {
+                                const uint32_t carrier =
+                                    w_.carriers[run.block_id * w_.cstride + col];
+
+                                for (size_t f = 0; f < run.local_k.size();
+                                     f += HW_DIM) {
+                                    int32_t partial = 0;
+                                    const size_t end =
+                                        std::min(f + HW_DIM, run.local_k.size());
+
+                                    for (size_t x = f; x < end; ++x) {
+                                        const size_t original_k =
+                                            (size_t) run.block_id * SCALE_BLOCK_K +
+                                            run.local_k[x];
+                                        const int32_t digit =
+                                            decoded.digits[
+                                                rr * decoded.k_compact +
+                                                compact_base + x];
+                                        const int32_t weight =
+                                            w_.b[original_k * w_.ldb + col];
+                                        partial += digit * weight;
+                                    }
+
+                                    const int32_t value =
+                                        hp1ref::apply_validated(partial, carrier);
+
+                                    acc = first ? value :
+                                        hp1ref::accumulate(acc, value);
+                                    first = false;
+                                }
+                                compact_base += run.local_k.size();
+                            }
+                            residual_ref[rr * ldc_ + col] = acc;
+                        }
+                    }
+
+                    compare(
+                        "RESIDUAL_INT32",
+                        static_cast<const int32_t *>(paired_rc.p),
+                        residual_ref, decoded.rows.size());
+                }
+            }
+
             n.paired_stripes++;
             // Packet properties, route-independent; residual_execution_k stays the serial
             // route's K32-padded K (a paired stripe executes fragments x DIM, see paired_end).
@@ -839,7 +972,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             // 2. Residual GEMM of the sealed packet, on the same accelerator.
             if (s.packet) {
                 emit(advance(s, slot_state::residual_prepare, stripe_event_kind::residual_prepare_begin));
-                const rmd::RmdStatus built = residual::build_request(*s.packet, w_, req);
+                // In this Serial branch, cfg_.paired means a recognized capacity
+                // refusal after a successful decode of this same immutable packet.
+                const rmd::RmdStatus built = cfg_.paired
+                    ? residual::build_request_from_decoded(std::move(decoded), w_, req)
+                    : residual::build_request(*s.packet, w_, req);
                 if (built != rmd::RmdStatus::success) {
                     return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(built));
                 }
@@ -1068,6 +1205,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         r.status = status;
         return refuse("issuer", why); // nothing was issued
     }
+    double act_quant_s = 0;
     try {
         struct unpin {
             stripe_owner & owner;
@@ -1080,7 +1218,9 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
             exsia::StripeReadySink sink{ &binding, &sink_binding::on_ready };
             args.exsia_stripe_ready_sink = &sink;
             run->emit_run(stripe_event_kind::quant_begin);
+            const auto quant_start = std::chrono::steady_clock::now();
             const bool quantized = ggml::gemmini::quants::quantize_activation(src1, args);
+            act_quant_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - quant_start).count();
             args.exsia_stripe_ready_sink = nullptr;
             run->emit_run(stripe_event_kind::quant_end);
             if (quantized) {
@@ -1096,6 +1236,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     owner.join();
 
     r             = run->report();
+    r.counts.act_quant_s = act_quant_s;
     r.completions = run->poll_completed();
     if (r.ok) {
         const float * out = run->output();

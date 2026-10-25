@@ -171,8 +171,7 @@ struct residual_run {
     potal_stripe_gemm_report report{};
 };
 
-void execute(const fixture & f, const grmd::StripePacket & p, potal_test::emu_session & es, residual_run & r) {
-    r.built = residual::build_request(p, f.weight, r.req);
+void execute_request(const grmd::StripePacket & p, potal_test::emu_session & es, residual_run & r) {
     if (r.built != grmd::RmdStatus::success) {
         return;
     }
@@ -196,6 +195,11 @@ void execute(const fixture & f, const grmd::StripePacket & p, potal_test::emu_se
     d.tile_j                 = (uint32_t) r.req.plan.tile_J;
     d.tile_k                 = (uint32_t) r.req.plan.tile_K;
     r.gemm                   = potal_tiled_matmul_stripe(&es.session, &d, &r.report);
+}
+
+void execute(const fixture & f, const grmd::StripePacket & p, potal_test::emu_session & es, residual_run & r) {
+    r.built = residual::build_request(p, f.weight, r.req);
+    execute_request(p, es, r);
 }
 
 bool golden_of(const fixture & f, const grmd::StripePacket & p, std::vector<potal_test::golden_lane_row> & g) {
@@ -346,6 +350,74 @@ bool padded_operands_ok(const fixture & f, const residual::request & req) {
     return true;
 }
 
+bool same_request(const residual::request & a, const residual::request & b) {
+    if (a.m != b.m || a.n != b.n || a.k_compact != b.k_compact || a.k_execution != b.k_execution ||
+        a.lda != b.lda || a.ldb != b.ldb || a.ldc != b.ldc || a.cstride != b.cstride ||
+        a.runs.size() != b.runs.size() || a.rows.size() != b.rows.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.runs.size(); ++i) {
+        if (a.runs[i].block_id != b.runs[i].block_id || a.runs[i].local_k != b.runs[i].local_k) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.rows.size(); ++i) {
+        if (a.rows[i].lane != b.rows[i].lane || a.rows[i].source_row != b.rows[i].source_row) {
+            return false;
+        }
+    }
+    const auto & x = a.plan;
+    const auto & y = b.plan;
+    const bool plan = std::tie(x.tile_I, x.tile_J, x.tile_K, x.I0, x.J0, x.K0, x.pad_I, x.pad_J, x.pad_K,
+                              x.spad_rows, x.max_spad_rows, x.acc_rows, x.max_acc_rows, x.passes_per_block, x.scale_slots) ==
+                      std::tie(y.tile_I, y.tile_J, y.tile_K, y.I0, y.J0, y.K0, y.pad_I, y.pad_J, y.pad_K,
+                              y.spad_rows, y.max_spad_rows, y.acc_rows, y.max_acc_rows, y.passes_per_block, y.scale_slots);
+    const size_t m_pad = align_up(a.m, D);
+    return plan && std::memcmp(a.a, b.a, m_pad * a.lda) == 0 &&
+           std::memcmp(a.b, b.b, a.k_execution * a.ldb) == 0 &&
+           std::memcmp(a.carriers, b.carriers, a.runs.size() * a.cstride * sizeof(uint32_t)) == 0 &&
+           std::memcmp(a.c, b.c, m_pad * a.ldc * sizeof(int32_t)) == 0;
+}
+
+bool buffer_padding_ok(const residual::request & req) {
+    if (!req.a || !req.b || !req.carriers || !req.c ||
+        reinterpret_cast<uintptr_t>(req.a) % POTAL_HW_MAX_BYTES != 0 ||
+        reinterpret_cast<uintptr_t>(req.b) % POTAL_HW_MAX_BYTES != 0 ||
+        reinterpret_cast<uintptr_t>(req.carriers) % POTAL_HW_MAX_BYTES != 0 ||
+        reinterpret_cast<uintptr_t>(req.c) % POTAL_HW_MAX_BYTES != 0 ||
+        req.lda != align_up(req.k_execution, POTAL_HW_MAX_BYTES) || req.ldb < req.n ||
+        req.cstride < req.n || req.ldc != align_up(req.n, D)) {
+        return false;
+    }
+    for (size_t i = 0; i < align_up(req.m, D); ++i) {
+        for (size_t k = i < req.m ? req.k_execution : 0; k < req.lda; ++k) {
+            if (req.a[i * req.lda + k] != 0) {
+                return false;
+            }
+        }
+        for (size_t n = 0; n < req.ldc; ++n) {
+            if (req.c[i * req.ldc + n] != 0) {
+                return false;
+            }
+        }
+    }
+    for (size_t k = 0; k < req.k_execution; ++k) {
+        for (size_t n = req.n; n < req.ldb; ++n) {
+            if (req.b[k * req.ldb + n] != 0) {
+                return false;
+            }
+        }
+    }
+    for (size_t r = 0; r < req.runs.size(); ++r) {
+        for (size_t n = req.n; n < req.cstride; ++n) {
+            if (req.carriers[r * req.cstride + n] != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // One complete case: A shape, B transport == golden, D reconstruction + merge.
 void run_case(const std::string & name, const fixture & f, size_t row_begin, size_t rows,
               const std::vector<entry> & entries, int16_t theta) {
@@ -357,11 +429,35 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
     }
     potal_test::emu_session es;
     residual_run            run;
-    execute(f, *packet, es, run);
+    run.built = residual::build_request(*packet, f.weight, run.req);
+    residual::decoded_packet decoded;
+    const grmd::RmdStatus decoded_status = residual::decode_packet(*packet, f.weight, decoded);
+    potal_test::emu_session decoded_es;
+    residual_run            decoded_run;
+    // Reuse a populated destination: lowering must reset buffers and metadata,
+    // not retain old C values or append runs/rows.
+    const grmd::RmdStatus seeded = residual::build_request(*packet, f.weight, decoded_run.req);
+    if (seeded == grmd::RmdStatus::success) {
+        std::fill(decoded_run.req.c, decoded_run.req.c + align_up(decoded_run.req.m, D) * decoded_run.req.ldc, 123);
+        decoded_run.req.runs.push_back({});
+        decoded_run.req.rows.push_back({});
+    }
+    if (decoded_status == grmd::RmdStatus::success) {
+        decoded_run.built = residual::build_request_from_decoded(std::move(decoded), f.weight, decoded_run.req);
+    }
+    const bool both_built = run.built == grmd::RmdStatus::success &&
+                            decoded_run.built == grmd::RmdStatus::success;
+    check(tag + ": public and decoded-move lowering match all metadata, plan fields and full padded buffers",
+          both_built && seeded == grmd::RmdStatus::success && same_request(run.req, decoded_run.req));
+    check(tag + ": both requests have aligned buffers and zero DMA padding and initial C",
+          both_built && buffer_padding_ok(run.req) && buffer_padding_ok(decoded_run.req));
+    execute_request(*packet, es, run);
+    execute_request(*packet, decoded_es, decoded_run);
     check(tag + ": request = runs in block order, compact K, lane-major rows",
-          run.built == grmd::RmdStatus::success && shape_matches(run.req, expect(entries, rows)));
+          both_built && shape_matches(run.req, expect(entries, rows)) &&
+              shape_matches(decoded_run.req, expect(entries, rows)));
     check(tag + ": K32 padded operands gathered from the prepared weight",
-          run.built == grmd::RmdStatus::success && padded_operands_ok(f, run.req));
+          both_built && padded_operands_ok(f, run.req) && padded_operands_ok(f, decoded_run.req));
 
     std::vector<potal_test::golden_lane_row> g;
     const bool golden = golden_of(f, *packet, g);
@@ -370,6 +466,10 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
               std::to_string(run.req.k_execution),
           run.gemm == POTAL_OK && golden && same_as_golden(run.req, g, f.N) &&
               run.report.fences == run.report.loop_ws && es.emu.scales.empty() && !es.emu.scale_miss);
+    check(tag + ": decoded-move Residual GEMM == independent compact-run golden (INT32 bit-exact)",
+          decoded_run.gemm == POTAL_OK && golden && same_as_golden(decoded_run.req, g, f.N) &&
+              decoded_run.report.fences == decoded_run.report.loop_ws &&
+              decoded_es.emu.scales.empty() && !decoded_es.emu.scale_miss);
 
     grmd::BlockScaledInt64Correction corr;
     std::vector<int64_t>             want_r;
@@ -378,6 +478,11 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
     const bool golden_r = golden && potal_test::compose_golden(g, rows, f.N, want_r);
     check(tag + ": radix INT64 reconstruction == golden (row/lane mapping)",
           composed && golden_r && corr.values == want_r);
+    grmd::BlockScaledInt64Correction decoded_corr;
+    const bool decoded_composed = decoded_run.gemm == POTAL_OK &&
+        residual::reconstruct(*packet, decoded_run.req, decoded_corr) == grmd::RmdStatus::success;
+    check(tag + ": decoded-move radix INT64 reconstruction == independent golden",
+          decoded_composed && golden_r && decoded_corr.values == want_r);
 
     std::vector<float> before(f.M * f.N);
     for (size_t i = 0; i < before.size(); ++i) {
@@ -388,7 +493,11 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
     const size_t             nonzero = m.prepared_nonzero;
     const bool               merged  = composed && m.ok();
     check(tag + ": prepared merge == Gemmini checked merge (status, nonzero, every output bit)", composed && m.same());
+    const merge_outcome decoded_m = merge_both(f, row_begin, row_begin + rows, theta, decoded_corr, before);
+    check(tag + ": decoded-move prepared merge == Gemmini checked merge (status, nonzero, every output bit)",
+          decoded_composed && decoded_m.ok() && decoded_m.same());
     bool   exact    = merged && golden_r;
+    bool decoded_exact = decoded_composed && decoded_m.ok() && golden_r;
     size_t want_nz  = 0;
     for (size_t m = 0; exact && m < f.M; ++m) {
         for (size_t n = 0; exact && n < f.N; ++n) {
@@ -399,10 +508,14 @@ void run_case(const std::string & name, const fixture & f, size_t row_begin, siz
                                     : before[i];
             want_nz += in && want_r[(m - row_begin) * f.N + n] != 0;
             exact = std::memcmp(&out[i], &wantv, sizeof(float)) == 0;
+            decoded_exact = decoded_exact &&
+                std::memcmp(&decoded_m.prepared_out[i], &wantv, sizeof(float)) == 0;
         }
     }
     check(tag + ": checked merge == golden F32, only the stripe's rows, nonzero correction merged",
           exact && nonzero == want_nz && want_nz > 0);
+    check(tag + ": decoded-move checked merge == independent golden F32, only the stripe's rows",
+          exact && decoded_exact && decoded_m.prepared_nonzero == want_nz && want_nz > 0);
 }
 
 // One nonzero residual per local K of `block` in one row: |base| .. |base| + 4
@@ -457,6 +570,14 @@ void test_runs() {
         { 4, 6 * 32 + 1, 100 },
     };
     run_case("A/B/D non-consecutive K and rows, lanes 0..4", f, 24, 12, lanes, -20);
+
+    std::vector<entry> dense;
+    for (size_t row = 0; row < 12; ++row) {
+        for (size_t k = 0; k < 64; ++k) {
+            dense.push_back({ row, k, (row + k) % 2 ? -300 : 255 });
+        }
+    }
+    run_case("A/B/D dense two-run multi-lane rows", f, 24, 12, dense, -12);
 }
 
 void test_carriers() {

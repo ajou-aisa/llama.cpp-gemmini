@@ -33,6 +33,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "ggml-potal.h"
 #include "ggml-quants.h"
 #include "log.hpp"
@@ -44,8 +45,11 @@
 
 #include "ggml-gemmini/matmul/options.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -147,6 +151,7 @@ struct route_run {
     double   compute_ms = 0; // steady clock around ggml_backend_graph_compute
     double   wall_ms = 0;    // the backend's pipeline wall time of the node
     uint64_t paired = 0, fallback = 0, fences = 0;
+    ggml_backend_potal_stats before = {}, after = {};
 };
 
 enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL };
@@ -161,7 +166,7 @@ void select_route(route_kind k) {
 }
 
 route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, ggml_cgraph * g, ggml_tensor * y,
-                    const ggml_tensor * expected, const golden_result & gold) {
+                    const ggml_tensor * expected, const golden_result & gold, bool print_case = true) {
     route_run  r;
     const bool paired = kind != ROUTE_SERIAL;
     select_route(kind);
@@ -171,6 +176,8 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
     const ggml_status              status = ggml_backend_graph_compute(potal, g);
     const auto                     t1     = std::chrono::steady_clock::now();
     const ggml_backend_potal_stats a      = stats_of(potal);
+    r.before = b;
+    r.after = a;
     r.compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     r.wall_ms    = (a.pipeline_wall_s - b.pipeline_wall_s) * 1e3;
 
@@ -208,18 +215,20 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
     r.paired   = pstripes;
     r.fallback = fallback;
     r.fences   = p_fence;
-    std::printf("POTAL_PAIRED_CASE %s case=%s route=%s stripes=%llu golden_stripes=%zu paired_stripes=%llu "
-                "fallback_stripes=%llu serial_main_gemms=%llu serial_residual_gemms=%llu paired_main_loop_ws=%llu "
-                "paired_residual_loop_ws=%llu index_configs=%llu index_writes=%llu readbacks=%llu readback_tiles=%llu "
-                "paired_fences=%llu paired_drains=%llu scale_writes=%llu scale_releases=%llu merges=%llu "
-                "golden_packets=%zu compute_ms=%.3f pipeline_wall_ms=%.3f\n",
-                ok ? "PASS" : "FAIL", name, route_name(kind), (unsigned long long) stripes, gold.stripes,
-                (unsigned long long) pstripes, (unsigned long long) fallback, (unsigned long long) main_gemm,
-                (unsigned long long) res_gemm, (unsigned long long) p_main, (unsigned long long) p_res,
-                (unsigned long long) p_cfg, (unsigned long long) p_wr, (unsigned long long) p_rb,
-                (unsigned long long) p_tiles, (unsigned long long) p_fence, (unsigned long long) p_drain,
-                (unsigned long long) writes, (unsigned long long) releases, (unsigned long long) merges,
-                gold.counts.packets, r.compute_ms, r.wall_ms);
+    if (print_case) {
+        std::printf("POTAL_PAIRED_CASE %s case=%s route=%s stripes=%llu golden_stripes=%zu paired_stripes=%llu "
+                    "fallback_stripes=%llu serial_main_gemms=%llu serial_residual_gemms=%llu paired_main_loop_ws=%llu "
+                    "paired_residual_loop_ws=%llu index_configs=%llu index_writes=%llu readbacks=%llu readback_tiles=%llu "
+                    "paired_fences=%llu paired_drains=%llu scale_writes=%llu scale_releases=%llu merges=%llu "
+                    "golden_packets=%zu compute_ms=%.3f pipeline_wall_ms=%.3f\n",
+                    ok ? "PASS" : "FAIL", name, route_name(kind), (unsigned long long) stripes, gold.stripes,
+                    (unsigned long long) pstripes, (unsigned long long) fallback, (unsigned long long) main_gemm,
+                    (unsigned long long) res_gemm, (unsigned long long) p_main, (unsigned long long) p_res,
+                    (unsigned long long) p_cfg, (unsigned long long) p_wr, (unsigned long long) p_rb,
+                    (unsigned long long) p_tiles, (unsigned long long) p_fence, (unsigned long long) p_drain,
+                    (unsigned long long) writes, (unsigned long long) releases, (unsigned long long) merges,
+                    gold.counts.packets, r.compute_ms, r.wall_ms);
+    }
     failures += ok ? 0 : 1;
     return r;
 }
@@ -256,6 +265,154 @@ void run_case(ggml_backend_t potal, const char * name, int64_t M, int64_t N, int
                 (unsigned long long) p.fences, (unsigned long long) c.fences,
                 p.compute_ms > 0 ? s.compute_ms / p.compute_ms : 0.0);
 }
+struct bench_case {
+    const char * name;
+    int64_t m, n, k;
+    float outlier;
+    int blocks;
+    int64_t step;
+};
+
+constexpr bench_case bench_cases[] = {
+    { "small_48x96x256", 48, 96, 256, 60.0f, 1, 4 },
+    { "decode_1x768x768", 1, 768, 768, 400.0f, 2, 1 },
+    { "decode_carry_lanes_1x768x768", 1, 768, 768, 30000.0f, 6, 1 },
+    { "two_stripes_sparse_150x320x128", 150, 320, 128, 60.0f, 1, 8 },
+    { "k_panels_100x160x2048", 100, 160, 2048, 60.0f, 2, 8 },
+    { "gpt2_ffn_up_16x3072x768", 16, 3072, 768, 400.0f, 2, 2 },
+    { "dense_fallback_160x320x512", 160, 320, 512, 30000.0f, 6, 1 },
+    { "repeat_48x96x256", 48, 96, 256, 60.0f, 1, 4 },
+};
+
+double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+}
+
+void summary(const char * name, const char * phase, route_kind kind, const std::vector<route_run> & runs) {
+    std::vector<double> compute, wall, deviation;
+    for (const route_run & r : runs) {
+        compute.push_back(r.compute_ms);
+        wall.push_back(r.wall_ms);
+    }
+    const double med = median(compute);
+    for (double value : compute) deviation.push_back(std::abs(value - med));
+    const auto mm = std::minmax_element(compute.begin(), compute.end());
+    const double wall_med = median(wall);
+    std::vector<double> wall_deviation;
+    for (double value : wall) wall_deviation.push_back(std::abs(value - wall_med));
+    const auto wm = std::minmax_element(wall.begin(), wall.end());
+    std::printf("POTAL_BENCH_SUMMARY case=%s phase=%s route=%s repeats=%zu compute_median_ms=%.6f "
+                "compute_min_ms=%.6f compute_max_ms=%.6f compute_mad_ms=%.6f pipeline_wall_median_ms=%.6f "
+                "pipeline_wall_min_ms=%.6f pipeline_wall_max_ms=%.6f pipeline_wall_mad_ms=%.6f\n",
+                name, phase, route_name(kind), runs.size(), med, *mm.first, *mm.second,
+                median(deviation), wall_med, *wm.first, *wm.second, median(wall_deviation));
+}
+
+void print_stats(const char * name, const char * phase, route_kind route, int iteration, const route_run & r) {
+    const auto & b = r.before;
+    const auto & a = r.after;
+#define TIME_FIELD(field) std::printf(" %s_ms=%.6f", #field, (a.field - b.field) * 1e3)
+#define COUNT_FIELD(field) std::printf(" %s=%llu", #field, (unsigned long long) (a.field - b.field))
+    std::printf("POTAL_BENCH_STATS case=%s phase=%s route=%s iteration=%d", name, phase, route_name(route), iteration);
+    TIME_FIELD(scale_s); TIME_FIELD(issue_s); TIME_FIELD(fence_s); TIME_FIELD(act_quant_s);
+    TIME_FIELD(weight_pack_s); TIME_FIELD(weight_alloc_s); TIME_FIELD(weight_lookup_s); TIME_FIELD(pipeline_wall_s);
+    COUNT_FIELD(producer_capacity_waits); COUNT_FIELD(main_loop_ws); COUNT_FIELD(residual_loop_ws);
+    COUNT_FIELD(main_fences); COUNT_FIELD(residual_fences);
+    COUNT_FIELD(paired_main_loop_ws); COUNT_FIELD(paired_residual_loop_ws);
+    COUNT_FIELD(paired_index_configs); COUNT_FIELD(paired_index_writes);
+    COUNT_FIELD(scale_writes); COUNT_FIELD(scale_releases);
+    COUNT_FIELD(paired_readbacks); COUNT_FIELD(paired_readback_tiles);
+    COUNT_FIELD(paired_fences); COUNT_FIELD(paired_drains); COUNT_FIELD(paired_fallback_stripes);
+    COUNT_FIELD(stripes_semantic_completed);
+    std::printf("\n");
+#undef TIME_FIELD
+#undef COUNT_FIELD
+}
+
+void bench_one(ggml_backend_t potal, const bench_case & c, int repeat) {
+    std::mt19937 rng(20261023); // one fixed tensor pair for every route and repeat
+    ggml_init_params ip = { (size_t) (4 * (c.n * c.k + 2 * c.m * c.n + c.m * c.k) + 64 * 1024 * 1024), nullptr, false };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * w = hp1_weight_tensor(ctx.get(), c.k, c.n, rng);
+    ggml_tensor * x = activations(ctx.get(), c.k, c.m, rng, c.outlier, c.blocks, c.step);
+    ggml_tensor * expected = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n, c.m);
+    const golden_result gold = golden(w, x, expected);
+    if (!gold.ok) {
+        std::fprintf(stderr, "POTAL_BENCH_FAIL case=%s stage=golden\n", c.name);
+        ++failures;
+        return;
+    }
+    // Model weights need a tensor without arena data before backend allocation.
+    ggml_init_params wip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr weights_ctx(ggml_init(wip));
+    ggml_tensor * cached_w = ggml_new_tensor_2d(weights_ctx.get(), GGML_TYPE_Q8_HP1, c.k, c.n);
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_ptr weight_buffer(ggml_backend_buft_alloc_buffer(
+        buft, ggml_backend_buft_get_alloc_size(buft, cached_w)));
+    if (!weight_buffer || ggml_backend_buffer_get_base(weight_buffer.get()) == nullptr ||
+        ggml_backend_tensor_alloc(weight_buffer.get(), cached_w, ggml_backend_buffer_get_base(weight_buffer.get())) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "POTAL_BENCH_FAIL case=%s stage=weight_buffer\n", c.name);
+        ++failures;
+        return;
+    }
+    ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(cached_w, w->data, 0, ggml_nbytes(w));
+    ggml_tensor * y = ggml_mul_mat(ctx.get(), cached_w, x);
+    ggml_cgraph * g = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(g, y);
+    const route_kind routes[] = { ROUTE_SERIAL, ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE };
+    std::array<std::vector<route_run>, 3> cold, steady;
+    // Untimed route warmups initialize the issuer and route code; each output is checked.
+    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false);
+    for (int i = 0; i < repeat; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const route_kind route = routes[(i + (i % 2 ? 2 - j : j)) % 3];
+            ggml_backend_potal_clear_weight_cache(potal);
+            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false);
+            cold[(int) route].push_back(r);
+            const auto & b = r.before;
+            const auto & a = r.after;
+            if (a.weight_cache_misses - b.weight_cache_misses != 1) ++failures;
+            std::printf("POTAL_BENCH_SAMPLE case=%s phase=cold route=%s iteration=%d compute_ms=%.6f pipeline_wall_ms=%.6f "
+                        "cache_hits=%llu cache_misses=%llu weight_prep_ms=%.6f act_quant_ms=%.6f ok=%d\n",
+                        c.name, route_name(route), i + 1, r.compute_ms, r.wall_ms,
+                        (unsigned long long) (a.weight_cache_hits - b.weight_cache_hits),
+                        (unsigned long long) (a.weight_cache_misses - b.weight_cache_misses),
+                        (a.weight_pack_s - b.weight_pack_s) * 1e3, (a.act_quant_s - b.act_quant_s) * 1e3, r.ok);
+            print_stats(c.name, "cold", route, i + 1, r);
+        }
+    }
+    // All steady samples reuse the same prepared weight. Order rotates and reverses.
+    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false);
+    for (int i = 0; i < repeat; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const route_kind route = routes[(i + (i % 2 ? 2 - j : j)) % 3];
+            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false);
+            steady[(int) route].push_back(r);
+            const auto & b = r.before;
+            const auto & a = r.after;
+            if (a.weight_cache_hits - b.weight_cache_hits != 1) ++failures;
+            std::printf("POTAL_BENCH_SAMPLE case=%s phase=steady route=%s iteration=%d compute_ms=%.6f pipeline_wall_ms=%.6f "
+                        "cache_hits=%llu cache_misses=%llu weight_prep_ms=%.6f act_quant_ms=%.6f ok=%d\n",
+                        c.name, route_name(route), i + 1, r.compute_ms, r.wall_ms,
+                        (unsigned long long) (a.weight_cache_hits - b.weight_cache_hits),
+                        (unsigned long long) (a.weight_cache_misses - b.weight_cache_misses),
+                        (a.weight_pack_s - b.weight_pack_s) * 1e3, (a.act_quant_s - b.act_quant_s) * 1e3, r.ok);
+            print_stats(c.name, "steady", route, i + 1, r);
+        }
+    }
+    for (route_kind route : routes) {
+        summary(c.name, "cold", route, cold[(int) route]);
+        summary(c.name, "steady", route, steady[(int) route]);
+    }
+    const double serial = median([&] { std::vector<double> v; for (const auto & r : steady[ROUTE_SERIAL]) v.push_back(r.compute_ms); return v; }());
+    for (route_kind route : { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE }) {
+        std::vector<double> v; for (const auto & r : steady[(int) route]) v.push_back(r.compute_ms);
+        std::printf("POTAL_BENCH_RATIO case=%s route=%s serial_over_route=%.6f\n", c.name, route_name(route), serial / median(v));
+    }
+    ggml_backend_potal_clear_weight_cache(potal); // buffer will be freed next
+}
 
 // Untimed: issuer bring-up (thread, hart-0 pinning, TLB flush) and the first weight
 // preparation happen here, outside every measurement.
@@ -267,9 +424,32 @@ void warm_up(ggml_backend_t potal, std::mt19937 & rng) {
     ggml_tensor *    y = ggml_mul_mat(ctx.get(), w, x);
     ggml_cgraph *    g = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(g, y);
-    for (route_kind k : { ROUTE_SERIAL, ROUTE_PAIRED }) {
+    auto run_one = [&](route_kind k) {
         select_route(k);
-        (void) ggml_backend_graph_compute(potal, g);
+        std::fprintf(stderr, "[POTAL_PROBE] BEGIN route=%s\n", route_name(k));
+        std::fflush(stderr);
+        const ggml_status status = ggml_backend_graph_compute(potal, g);
+        std::fprintf(stderr, "[POTAL_PROBE] END route=%s status=%d\n",
+                     route_name(k), (int) status);
+        std::fflush(stderr);
+        if (status != GGML_STATUS_SUCCESS) ++failures;
+    };
+
+    const char * probe = std::getenv("POTAL_PAIRED_PROBE");
+    if (probe != nullptr) {
+        if (std::strcmp(probe, "serial") == 0)
+            run_one(ROUTE_SERIAL);
+        else if (std::strcmp(probe, "conservative") == 0)
+            run_one(ROUTE_PAIRED_CONSERVATIVE);
+        else if (std::strcmp(probe, "rtl") == 0)
+            run_one(ROUTE_PAIRED);
+        else {
+            std::fprintf(stderr, "[POTAL_PROBE] invalid mode: %s\n", probe);
+            ++failures;
+        }
+    } else {
+        run_one(ROUTE_SERIAL);
+        run_one(ROUTE_PAIRED);
     }
     std::printf("POTAL_PAIRED_WARMUP done\n");
 }
@@ -308,6 +488,25 @@ bool select_pipeline_mode() {
 
 int main(int argc, char ** argv) {
     const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
+    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    const char * case_name = nullptr;
+    int repeat = 7;
+    if (bench) {
+        for (int i = 2; i < argc; i += 2) {
+            if (i + 1 >= argc) { std::fprintf(stderr, "usage: %s --bench --case NAME [--repeat N]\n", argv[0]); return 2; }
+            if (std::strcmp(argv[i], "--case") == 0) case_name = argv[i + 1];
+            else if (std::strcmp(argv[i], "--repeat") == 0) {
+                char * end = nullptr;
+                errno = 0;
+                const long value = std::strtol(argv[i + 1], &end, 10);
+                if (errno || end == argv[i + 1] || *end || value < 1 || value > 1000) {
+                    std::fprintf(stderr, "repeat must be 1..1000\n"); return 2;
+                }
+                repeat = (int) value;
+            } else { std::fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
+        }
+        if (case_name == nullptr) { std::fprintf(stderr, "--bench requires --case NAME\n"); return 2; }
+    }
     log::ensure_outputs();
     if (!select_pipeline_mode()) {
         std::printf("POTAL_PAIRED_SMOKE FAIL configuration\n");
@@ -320,8 +519,37 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (bench) {
+        // Diagnostic modes inject fences, readbacks, or tracing into measured work.
+        if (std::getenv("POTAL_PAIRED_PROBE") || std::getenv("POTAL_PAIRED_WINDOW_DIAG") ||
+            std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES") || std::getenv("POTAL_PAIRED_STAGE_DIAG") ||
+            std::getenv("POTAL_RAW_TRACE")) {
+            std::fprintf(stderr, "POTAL_BENCH_FAIL diagnostics enabled\n"); return 2;
+        }
+        for (const bench_case & c : bench_cases) {
+            if (std::strcmp(c.name, case_name) == 0) {
+                bench_one(potal.get(), c, repeat);
+                std::printf("POTAL_BENCH %s case=%s failures=%d\n", failures ? "FAIL" : "PASS", case_name, failures);
+                return failures ? 1 : 0;
+            }
+        }
+        std::fprintf(stderr, "unknown case: %s\n", case_name);
+        return 2;
+    }
     warm_up(potal.get(), rng);
     const ggml_backend_potal_stats warm = stats_of(potal.get());
+
+    if (std::getenv("POTAL_PAIRED_PROBE") != nullptr) {
+        const bool ok = failures == 0 &&
+                        warm.hp1_failed == 0 &&
+                        warm.stripe_pipeline_failed == 0;
+        std::fprintf(stderr,
+                     "[POTAL_PROBE] %s hp1_failed=%llu pipeline_failed=%llu\n",
+                     ok ? "PASS" : "FAIL",
+                     (unsigned long long) warm.hp1_failed,
+                     (unsigned long long) warm.stripe_pipeline_failed);
+        return ok ? 0 : 1;
+    }
 
     // Quick: one stripe with a few residual rows (fits ACC1).
     run_case(potal.get(), "small_48x96x256", 48, 96, 256, 60.0f, 1, 4, rng);

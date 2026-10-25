@@ -57,6 +57,33 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-api-test COMMAND potal-api-test)
 endif()
 
+# Standalone Linux Indexed Weight diagnostic; --self-test checks C11 encoders on the host.
+if (POTAL_HW_DIM EQUAL 16 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Exercise the RISC-V trace wrapper on the host, keeping real RoCC dispatch
+    # disabled there. This private test definition adds no runtime control API.
+    add_executable(potal-trace-test tests/potal-trace-test.c potal.c)
+    target_include_directories(potal-trace-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${POTAL_HW_GENERATED_DIR})
+    target_compile_definitions(potal-trace-test PRIVATE POTAL_TEST_RAW_TRACE)
+    set_target_properties(potal-trace-test PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-trace-test COMMAND potal-trace-test)
+    endif()
+    add_executable(potal-scale-path-bench tests/potal-scale-path-bench.c tests/potal-scale-clock.cpp)
+    target_link_libraries(potal-scale-path-bench PRIVATE potal-api)
+    target_compile_features(potal-scale-path-bench PRIVATE cxx_std_11)
+    set_target_properties(potal-scale-path-bench PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_executable(potal-paired-index-hw-probe tests/potal-paired-index-hw-probe.c)
+    target_link_libraries(potal-paired-index-hw-probe PRIVATE potal-api)
+    set_target_properties(potal-paired-index-hw-probe PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-paired-index-encoder-test COMMAND potal-paired-index-hw-probe --self-test)
+    endif()
+endif()
+
 # potal_tiled_matmul_stripe from a C11 caller (header and link) and, on an
 # RTL-semantics emulator, frozen plans, tails, K chunks, descriptor rejection
 # without commands, generation wrap. Host and target; no hardware.
@@ -358,6 +385,9 @@ foreach(_paired_test plan schedule unit auto execution)
         add_test(NAME potal-paired-${_paired_test}-test COMMAND potal-paired-${_paired_test}-test)
     endif()
 endforeach()
+
+# Counts real Residual decode calls in the fallback regression, not elapsed time.
+target_compile_definitions(potal-paired-execution-test PRIVATE GGML_GEMMINI_TESTING)
 
 # Benchmark (host and target, not a test): Q8_HP1 weight preparation cost per
 # stage and with the backend's weight cache, synthetic or from a GGUF (--gguf).

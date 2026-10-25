@@ -4,10 +4,15 @@
 
 #include "paired-auto.hpp"
 
+#include "quants/common/hp1_scu.hpp"
+
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 
 namespace ggml::potal {
@@ -1528,6 +1533,28 @@ struct executor {
     size_t                        drained_upto = 0; // every op with id < drained_upto completed
     size_t                        last_op      = 0; // ops [0, last_op) were handled
     size_t                        pending_readback[2] = { potal_paired_no_index, potal_paired_no_index };
+    bool                          window_diag = false;
+    std::vector<int32_t>           window_expected; // original lane rows x N, separate J-group prefixes
+    std::unique_ptr<int32_t, decltype(&std::free)> window_snapshot{ nullptr, &std::free };
+    size_t                        window_ldc = 0;
+    size_t                        window_fences = 0, window_readbacks = 0, window_readback_tiles = 0;
+
+    bool profile = false;
+    exec_clock::time_point plan_start;
+    double plan_s = 0, pack_s = 0, scale_write_s = 0, scale_release_s = 0;
+    double index_s = 0, main_issue_s = 0, residual_issue_s = 0, readback_s = 0;
+
+    ~executor() {
+        if (!profile) return;
+        if (plan_start != exec_clock::time_point{}) plan_s += seconds_since(plan_start);
+        std::fprintf(stderr,
+                     "[POTAL_PROFILE] run_id=%" PRIu64 " stripe=%zu status=%s plan_ms=%.6f pack_ms=%.6f "
+                     "scale_write_ms=%.6f scale_release_ms=%.6f index_ms=%.6f main_issue_ms=%.6f "
+                     "residual_issue_ms=%.6f readback_ms=%.6f fence_ms=%.6f\n",
+                     req.run_id, req.stripe_id, potal_paired_status_name(report.status), plan_s * 1e3, pack_s * 1e3,
+                     scale_write_s * 1e3, scale_release_s * 1e3, index_s * 1e3, main_issue_s * 1e3,
+                     residual_issue_s * 1e3, readback_s * 1e3, report.counts.fence_s * 1e3);
+    }
 
     executor(const potal_paired_request & r, potal_paired_session * s, potal_paired_report & rep,
              const potal_paired_geometry & g) :
@@ -1555,6 +1582,7 @@ struct executor {
         }
         if (report.fatal) {
             staging.abandon();
+            (void) window_snapshot.release(); // outstanding diagnostic DMA must keep its destination alive
         }
     }
 
@@ -1619,6 +1647,156 @@ struct executor {
     // Conservative fences: everything issued so far completes first.
     potal_status drain_all() { return req.conservative_fences && drained_upto < last_op ? fence_now() : POTAL_OK; }
 
+    potal_paired_status prepare_window_diag() {
+        const char * enabled = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
+        window_diag = enabled != nullptr && std::strcmp(enabled, "1") == 0 && report.plan.residual_gemms != 0;
+        if (!window_diag) {
+            return potal_paired_status::ok;
+        }
+        const potal_paired_tile_plan & t = report.tile;
+        size_t elements = 0, bytes = 0, rounded = 0;
+        window_ldc = t.tile_J * hw.dim;
+        if (!mul(t.residual_lane_rows, req.n, elements) || !mul(elements, sizeof(int32_t), bytes) ||
+            !mul(t.residual_row_tiles * hw.dim, window_ldc, bytes) || !mul(bytes, sizeof(int32_t), bytes) ||
+            !add(bytes, POTAL_HW_MAX_BYTES - 1, rounded)) {
+            return fail(potal_paired_status::invalid_argument, "window_diag", "diagnostic buffer size overflow", POTAL_OK);
+        }
+        window_expected.assign(elements, 0);
+        window_snapshot.reset(static_cast<int32_t *>(dma_alloc(bytes)));
+        if (!window_snapshot) {
+            return fail(potal_paired_status::allocation_failure, "window_diag", "diagnostic buffer allocation failed", POTAL_OK);
+        }
+        return potal_paired_status::ok;
+    }
+
+    potal_paired_status diagnose_window(const potal_paired_op & op) {
+        // Keep these commands out of performance counts and leave the plan's drain bookkeeping unchanged.
+        potal_status st = potal_paired_fence(session);
+        if (st != POTAL_OK) {
+            return hw_fail("fence", st, &op);
+        }
+        ++window_fences;
+        potal_acc_readback r = {};
+        r.acc_bank = 1;
+        r.i_tiles  = (uint32_t) op.i_tiles;
+        r.j_tiles  = (uint32_t) op.j_tiles;
+        r.pad_i    = (uint32_t) op.pad_i;
+        r.pad_j    = (uint32_t) op.pad_j;
+        r.c        = window_snapshot.get();
+        r.ldc      = window_ldc;
+        st = potal_paired_acc_readback_issue(session, &r);
+        if (st != POTAL_OK) {
+            return hw_fail("window_diag_readback", st, &op);
+        }
+        ++window_readbacks;
+        window_readback_tiles += (size_t) r.i_tiles * r.j_tiles;
+        st = potal_paired_fence(session);
+        if (st != POTAL_OK) {
+            return hw_fail("fence", st, &op);
+        }
+        ++window_fences;
+
+        namespace hp1ref = ggml::gemmini::quants::hp1;
+        const residual::decoded_packet & d = *req.residual;
+        const potal_paired_k_panel & pan = report.tile.panels[op.panel];
+        const potal_paired_index_window & win = pan.windows[op.window];
+        const size_t col_begin = op.j_group * report.tile.tile_J * hw.dim;
+        const size_t cols = op.j_tiles * hw.dim - op.pad_j;
+        // Never use staged A or Index entries here: either mapping may be the source of the mismatch.
+        for (size_t f = win.fragment_begin; f < win.fragment_end; ++f) {
+            const potal_paired_fragment & fr = report.tile.fragments[f];
+            const residual::run & run = d.runs[fr.run];
+            for (size_t row = 0; row < d.rows.size(); ++row) {
+                const int8_t * digits = d.digits.data() + row * d.k_compact + fr.compact_begin;
+                for (size_t c = 0; c < cols; ++c) {
+                    const size_t col = col_begin + c;
+                    int32_t partial = 0;
+                    for (size_t x = 0; x < fr.count; ++x) {
+                        const size_t k = (size_t) run.block_id * hw.block_k + run.local_k[fr.local_begin + x];
+                        partial += (int32_t) digits[x] * req.weight->b[k * req.weight->ldb + col];
+                    }
+                    const uint32_t carrier = req.weight->carriers[(size_t) run.block_id * req.weight->cstride + col];
+                    const int32_t value = hp1ref::apply_validated(partial, carrier);
+                    int32_t & acc = window_expected[row * req.n + col];
+                    acc = op.first && f == win.fragment_begin ? value : hp1ref::accumulate(acc, value);
+                }
+            }
+        }
+        size_t bad = 0;
+        size_t mismatch_row[4], mismatch_col[4];
+        for (size_t row = 0; row < d.rows.size(); ++row) {
+            for (size_t c = 0; c < cols; ++c) {
+                if (r.c[row * r.ldc + c] != window_expected[row * req.n + col_begin + c]) {
+                    if (bad < 4) {
+                        mismatch_row[bad] = row;
+                        mismatch_col[bad] = c;
+                    }
+                    ++bad;
+                }
+            }
+        }
+        std::fprintf(stderr,
+                     "[POTAL_WINDOW_DIAG] j_group=%zu panel=%zu window=%zu pair=%zu active_rows=%zu pad_k=%zu "
+                     "fragment_begin=%zu fragment_end=%zu prefix_bad=%zu prefix_total=%zu "
+                     "i_tiles=%zu j_tiles=%zu k_tiles=%zu pad_i=%zu pad_j=%zu col_begin=%zu "
+                     "fragments_per_window=%zu passes_per_block=1 index_entries=%zu "
+                     "run_id=%" PRIu64 " stripe_id=%zu row_begin=%zu "
+                     "diag_fences=%zu diag_readbacks=%zu diag_readback_tiles=%zu\n",
+                     op.j_group, op.panel, op.window, op.pair, win.active_rows, op.pad_k,
+                     win.fragment_begin, win.fragment_end, bad, d.rows.size() * cols,
+                     op.i_tiles, op.j_tiles, op.k_tiles, op.pad_i, op.pad_j, col_begin,
+                     report.tile.fragments_per_window, hw.index_entries,
+                     req.run_id, req.stripe_id, req.row_begin,
+                     window_fences, window_readbacks, window_readback_tiles);
+        std::fflush(stderr);
+        for (size_t i = 0; i < std::min<size_t>(bad, 4); ++i) {
+            const size_t row = mismatch_row[i], c = mismatch_col[i];
+            std::fprintf(stderr,
+                         "[POTAL_WINDOW_MISMATCH] j_group=%zu panel=%zu window=%zu lane_row=%zu "
+                         "source_row=%zu col=%zu got=%" PRId32 " expected=%" PRId32 " lane=%u\n",
+                         op.j_group, op.panel, op.window, row, (size_t) d.rows[row].source_row, col_begin + c,
+                         r.c[row * r.ldc + c], window_expected[row * req.n + col_begin + c],
+                         (unsigned) d.rows[row].lane);
+            std::fflush(stderr);
+        }
+        const potal_paired_op * index = nullptr;
+        for (const potal_paired_dep & dep : op.deps) {
+            if (report.plan.ops[dep.op].kind == potal_paired_op_kind::index_program) {
+                index = &report.plan.ops[dep.op];
+                break;
+            }
+        }
+        for (size_t f = win.fragment_begin; f < std::min(win.fragment_end, win.fragment_begin + 4); ++f) {
+            const potal_paired_fragment & fr = report.tile.fragments[f];
+            const residual::run & run = d.runs[fr.run];
+            const size_t slot = (f - win.fragment_begin) * hw.dim;
+            const size_t sample_k = std::min<size_t>(fr.count, hw.index_entries == 16 ? 16 : 8);
+            std::fprintf(stderr,
+                         "[POTAL_WINDOW_INPUT] j_group=%zu panel=%zu window=%zu pair=%zu fragment=%zu "
+                         "block=%u slot_begin=%zu count=%u original_k=",
+                         op.j_group, op.panel, op.window, op.pair, f, (unsigned) run.block_id, slot, (unsigned) fr.count);
+            for (size_t x = 0; x < sample_k; ++x) {
+                std::fprintf(stderr, "%s%zu", x == 0 ? "" : ",",
+                             (size_t) run.block_id * hw.block_k + run.local_k[fr.local_begin + x]);
+            }
+            std::fprintf(stderr, " resident_k=");
+            if (index != nullptr) {
+                for (size_t x = 0; x < sample_k; ++x) {
+                    std::fprintf(stderr, "%s%zu", x == 0 ? "" : ",",
+                                 report.plan.index_entries[index->entry_begin + slot + x].resident_k);
+                }
+            }
+            std::fprintf(stderr, " carriers_col_begin=%zu carriers=", col_begin);
+            for (size_t c = 0; c < std::min<size_t>(cols, 4); ++c) {
+                std::fprintf(stderr, "%s0x%08" PRIx32, c == 0 ? "" : ",",
+                             req.weight->carriers[(size_t) run.block_id * req.weight->cstride + col_begin + c]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        return potal_paired_status::ok;
+    }
+
     potal_paired_status scale_program(const potal_paired_op & op) {
         const potal_paired_scale_window & w   = report.plan.scale_windows[op.scale_window];
         const potal_paired_k_panel &      pan = report.tile.panels[op.panel];
@@ -1639,14 +1817,18 @@ struct executor {
                                                                       gen, (uint32_t) c, carrier);
                     report.issued = true;
                     if (st != POTAL_OK) {
-                        report.counts.scale_s += seconds_since(t);
+                        const double elapsed = seconds_since(t);
+                        report.counts.scale_s += elapsed;
+                        if (profile) scale_write_s += elapsed;
                         return hw_fail("scale_write", st, &op);
                     }
                     report.counts.scale_writes++;
                 }
             }
         }
-        report.counts.scale_s += seconds_since(t);
+        const double elapsed = seconds_since(t);
+        report.counts.scale_s += elapsed;
+        if (profile) scale_write_s += elapsed;
         return potal_paired_status::ok;
     }
 
@@ -1665,14 +1847,18 @@ struct executor {
                     const potal_status st = potal_paired_scale_release(session, (uint32_t) (w.slot_base + b * w.j_tiles + j),
                                                                        hw_generation[w.index], (uint32_t) c);
                     if (st != POTAL_OK) {
-                        report.counts.scale_s += seconds_since(t);
+                        const double elapsed = seconds_since(t);
+                        report.counts.scale_s += elapsed;
+                        if (profile) scale_release_s += elapsed;
                         return hw_fail("scale_release", st, &op);
                     }
                     report.counts.scale_releases++;
                 }
             }
         }
-        report.counts.scale_s += seconds_since(t);
+        const double elapsed = seconds_since(t);
+        report.counts.scale_s += elapsed;
+        if (profile) scale_release_s += elapsed;
         // The hardware accepted the releases only after every older command drained.
         report.counts.drains++;
         drained_upto = last_op;
@@ -1682,7 +1868,9 @@ struct executor {
     potal_paired_status issue_loop(const potal_paired_loop_ws & l, const char * stage, const potal_paired_op & op) {
         const auto         t  = exec_clock::now();
         const potal_status st = potal_paired_loop_ws_issue(session, &l);
-        report.counts.issue_s += seconds_since(t);
+        const double elapsed = seconds_since(t);
+        report.counts.issue_s += elapsed;
+        if (profile) (op.kind == potal_paired_op_kind::main_gemm ? main_issue_s : residual_issue_s) += elapsed;
         report.issued = true;
         return st == POTAL_OK ? potal_paired_status::ok : hw_fail(stage, st, &op);
     }
@@ -1736,7 +1924,9 @@ struct executor {
         potal_status st   = potal_paired_index_config(session, &cfg);
         report.issued     = true;
         if (st != POTAL_OK) {
-            report.counts.issue_s += seconds_since(t);
+            const double elapsed = seconds_since(t);
+            report.counts.issue_s += elapsed;
+            if (profile) index_s += elapsed;
             return hw_fail("index_config", st, &op);
         }
         report.counts.index_configs++;
@@ -1745,12 +1935,16 @@ struct executor {
             potal_index_write                w  = { (uint32_t) en.slot, (uint32_t) en.resident_k };
             st                                  = potal_paired_index_write(session, &w);
             if (st != POTAL_OK) {
-                report.counts.issue_s += seconds_since(t);
+                const double elapsed = seconds_since(t);
+                report.counts.issue_s += elapsed;
+                if (profile) index_s += elapsed;
                 return hw_fail("index_write", st, &op);
             }
             report.counts.index_writes++;
         }
-        report.counts.issue_s += seconds_since(t);
+        const double elapsed = seconds_since(t);
+        report.counts.issue_s += elapsed;
+        if (profile) index_s += elapsed;
         return potal_paired_status::ok;
     }
 
@@ -1797,6 +1991,9 @@ struct executor {
         const potal_paired_status st = issue_loop(l, "residual_loop_ws", op);
         if (st == potal_paired_status::ok) {
             report.counts.residual_loop_ws++;
+            if (window_diag) {
+                return diagnose_window(op);
+            }
         }
         return st;
     }
@@ -1818,7 +2015,9 @@ struct executor {
         r.ldc = op.acc_bank == 0 ? req.ldc_main : req.ldc_residual;
         const auto         tm = exec_clock::now();
         const potal_status st = potal_paired_acc_readback_issue(session, &r);
-        report.counts.issue_s += seconds_since(tm);
+        const double elapsed = seconds_since(tm);
+        report.counts.issue_s += elapsed;
+        if (profile) readback_s += elapsed;
         report.issued = true;
         if (st != POTAL_OK) {
             return hw_fail("acc_readback", st, &op);
@@ -1942,6 +2141,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     report = potal_paired_report{};
     const potal_paired_geometry hw = req.hw != nullptr ? *req.hw : potal_paired_hw_geometry();
     executor                    ex(req, session, report, hw); // outlives the try: the staging is settled on any exit
+    const char * profile = std::getenv("POTAL_PAIRED_PROFILE");
+    ex.profile = profile != nullptr && std::strcmp(profile, "1") == 0;
+    if (ex.profile) ex.plan_start = exec_clock::now();
     try {
         const hp1_weight * w = req.weight;
         // A packet with neither rows nor runs is no residual; an inconsistent one is the planner's refusal.
@@ -1998,6 +2200,11 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             }
         }
 
+        if (ex.profile) {
+            ex.plan_s = seconds_since(ex.plan_start);
+            ex.plan_start = exec_clock::time_point{};
+        }
+        const auto pack_start = ex.profile ? exec_clock::now() : exec_clock::time_point{};
         // 2. Residual staging (DMA-ready, slot order), before any command.
         if (report.tile.residual) {
             st = potal_paired_pack_residual(report.plan, *req.residual, ex.staging, &why, hw);
@@ -2006,10 +2213,17 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             }
         }
 
+        if (ex.profile) ex.pack_s = seconds_since(pack_start);
+
         // 3. The session must be idle: nothing outstanding, no open Index transaction, not failed.
         const potal_paired_session_status q = potal_paired_session_query(session);
         if (q.failed || q.outstanding_loops != 0 || q.outstanding_readbacks != 0 || q.index_transaction_open != 0) {
             return ex.fail(potal_paired_status::invalid_argument, "session", "paired session busy or failed", q.error);
+        }
+
+        st = ex.prepare_window_diag();
+        if (st != potal_paired_status::ok) {
+            return st;
         }
 
         // 4. TLB maintenance before the first DMA of this stripe (the session is drained).

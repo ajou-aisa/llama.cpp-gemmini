@@ -5,6 +5,9 @@
 #include "potal_hw_params.h"
 
 #include <string.h>
+#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+#include <stdio.h>
+#endif
 
 #if defined(__riscv)
 #include "potal_rocc.h"
@@ -732,6 +735,7 @@ typedef struct paired_pair_state {
 struct potal_paired_session {
     potal_paired_sink sink;
     int               failed;
+    int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
     const char       *error_stage;
     uint32_t          outstanding_loops, outstanding_readbacks;
@@ -771,7 +775,7 @@ static int paired_can_issue(const potal_paired_session *s) {
  * One raw command in issue order: to the sink when bound, else to the
  * hardware. xd commands return the hardware status; the others POTAL_OK.
  */
-static potal_status paired_raw(potal_paired_session *s, uint32_t funct, uint64_t rs1, uint64_t rs2, int xd) {
+static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct, uint64_t rs1, uint64_t rs2, int xd) {
     s->commands++;
     if (s->sink.cmd != NULL) {
         const potal_paired_cmd_record rec = { funct, (uint32_t)xd, rs1, rs2 };
@@ -799,6 +803,56 @@ static potal_status paired_raw(potal_paired_session *s, uint32_t funct, uint64_t
     (void)funct; (void)rs1; (void)rs2; (void)xd;
     return POTAL_ERR_NO_HARDWARE;
 #endif
+}
+
+
+#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, cold))
+#endif
+static potal_status paired_raw_traced(
+    potal_paired_session *s,
+    uint32_t funct,
+    uint64_t rs1,
+    uint64_t rs2,
+    int xd
+) {
+    const unsigned long long seq =
+        (unsigned long long)s->commands + 1;
+
+    fprintf(stderr,
+        "[POTAL_RAW] ENTER seq=%llu funct=%u xd=%d "
+        "rs1=0x%016llx rs2=0x%016llx\n",
+        seq, funct, xd,
+        (unsigned long long)rs1,
+        (unsigned long long)rs2);
+    fflush(stderr);
+
+    const potal_status status =
+        paired_raw_untraced(s, funct, rs1, rs2, xd);
+
+    fprintf(stderr,
+        "[POTAL_RAW] EXIT seq=%llu funct=%u status=%d\n",
+        seq, funct, (int)status);
+    fflush(stderr);
+
+    return status;
+}
+#endif
+
+static potal_status paired_raw(
+    potal_paired_session *s,
+    uint32_t funct,
+    uint64_t rs1,
+    uint64_t rs2,
+    int xd
+) {
+#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+    if (s->trace_enabled) {
+        return paired_raw_traced(s, funct, rs1, rs2, xd);
+    }
+#endif
+    return paired_raw_untraced(s, funct, rs1, rs2, xd);
 }
 
 #define PAIRED_RAW(session, funct, rs1, rs2, xd, stage)                                  \
@@ -849,6 +903,8 @@ potal_status potal_paired_session_open(const potal_paired_sink *sink, potal_pair
     if (sink != NULL) {
         s->sink = *sink;
     }
+    const char *env = getenv("POTAL_RAW_TRACE");
+    s->trace_enabled = env != NULL && env[0] == '1';
     paired_owner = 1;
     *out = s;
     return POTAL_OK;

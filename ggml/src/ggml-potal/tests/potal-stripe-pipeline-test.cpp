@@ -624,6 +624,7 @@ void test_overlap(node & nd, const golden_node & g) {
 
     check("A pipeline committed, every stripe semantically done",
           r.report.ok && r.report.counts.stripes_semantic_completed == nd.stripes() && !r.committed_untouched);
+    check("A pipeline counts activation quantization call time", r.report.counts.act_quant_s > 0);
     check("A first Main starts before the whole activation is quantized", main0 >= 0 && qend > main0);
     check("A Quantize(1) and submit(1) complete while stripe 0's last GEMM is held",
           gate >= 0 && fold1 >= 0 && acc1 >= 0 && acc1 < gate && end0 > gate);

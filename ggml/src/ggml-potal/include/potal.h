@@ -493,6 +493,10 @@ potal_status potal_acc_readback_encode(const potal_acc_readback *r, potal_rocc_c
  * RTL's concurrency). Without hardware and without a sink every issue returns
  * POTAL_ERR_NO_HARDWARE after its checks and changes nothing.
  *
+ * On RISC-V, POTAL_RAW_TRACE selects ENTER/EXIT command records when its value
+ * starts with '1'. Selection is a session-open snapshot: environment changes
+ * take effect at the next session, not during an active session.
+ *
  * Runtime rules of the session (beyond the field checks):
  *   Main LOOP_WS       its pair must have no outstanding paired work (a fence
  *                      retired every reader of the pair's previous B / A);

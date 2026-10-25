@@ -129,11 +129,24 @@ struct decoded_packet {
 // nonzero digit is invalid_packet; unsupported_route: not an A8 packet.
 rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight & w, decoded_packet & out);
 
+#if defined(GGML_GEMMINI_TESTING)
+// Test-only invocation counter; reset only while no decode is active.
+void reset_decode_packet_calls();
+uint64_t decode_packet_calls();
+#endif
+
 // validate_packet, the run-aware rows/runs, the padded operands gathered from
 // the prepared weight and the residual plan, into `out` (reset first).
 // RmdStatus::success only with a complete request; a packet without any
 // nonzero digit is invalid_packet; unsupported_route: not an A8 packet.
 rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight & w, request & out);
+
+// Module-private K32 lowering, without a second packet validation/decode.
+// `decoded` must come from a successful decode_packet of the same sealed,
+// immutable packet and prepared weight w. Consumes runs/rows; compact digits
+// remain alive through A staging. Resets out and retains build_request's
+// allocation, tile-selection and failure behavior.
+rmd::RmdStatus build_request_from_decoded(decoded_packet && decoded, const hp1_weight & w, request & out);
 
 // The Residual GEMM's C (req.c) -> the stripe's BlockScaledInt64Correction,
 // row_count x n values (stripe-local rows). Rows must be strictly increasing

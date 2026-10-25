@@ -248,6 +248,7 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.paired_readback_tiles += c.paired_readback_tiles;
     st.paired_fences += c.paired_fences;
     st.paired_drains += c.paired_drains;
+    st.act_quant_s += c.act_quant_s;
     st.scale_s += c.scale_s;
     st.issue_s += c.issue_s;
     st.fence_s += c.fence_s;

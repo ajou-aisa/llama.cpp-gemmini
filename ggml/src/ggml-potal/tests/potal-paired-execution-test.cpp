@@ -32,6 +32,8 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace ggml::potal;
 using namespace potal_test;
@@ -57,7 +59,8 @@ struct run_result {
 
 // One stripe (stripe 0, rows = min(stripe_rows, M)) of a fixture through the new executor.
 run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in, h2_emulator & emu,
-                      bool with_sink = true, uint32_t generation = 0, bool conservative = false) {
+                      bool with_sink = true, uint32_t generation = 0, bool conservative = false,
+                      const potal_paired_sink * override_sink = nullptr) {
     run_result   r;
     const size_t rows = std::min(main.tile_I * PD, f.M);
     residual::decoded_packet d;
@@ -67,7 +70,7 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
     r.c_main.reset(static_cast<int32_t *>(dma_alloc(align_up(rows, PD) * ldc * sizeof(int32_t))));
     r.c_res.reset(static_cast<int32_t *>(dma_alloc(align_up(std::max<size_t>(d.rows.size(), 1), PD) * ldc * sizeof(int32_t))));
     potal_paired_session * s    = nullptr;
-    potal_paired_sink      sink = emu.sink();
+    potal_paired_sink      sink = override_sink != nullptr ? *override_sink : emu.sink();
     if (potal_paired_session_open(with_sink ? &sink : nullptr, &s) != POTAL_OK) {
         return r;
     }
@@ -664,7 +667,8 @@ struct direct_run {
 };
 
 direct_run run_direct(const paired_fixture & f, const potal_tile_plan & main, size_t rows,
-                      const residual::decoded_packet * d, h2_emulator & emu, const potal_paired_execution_plan * plan = nullptr) {
+                      const residual::decoded_packet * d, h2_emulator & emu, const potal_paired_execution_plan * plan = nullptr,
+                      const potal_paired_geometry * hw = nullptr) {
     direct_run   r;
     const size_t ldc = align_up(f.N, PD);
     std::unique_ptr<int32_t, dma_deleter> cm(static_cast<int32_t *>(dma_alloc(align_up(rows, PD) * ldc * sizeof(int32_t))));
@@ -679,7 +683,7 @@ direct_run run_direct(const paired_fixture & f, const potal_tile_plan & main, si
     potal_paired_request q;
     q.rows = rows; q.n = f.N; q.k = f.K; q.main_plan = &main; q.a = f.a.get(); q.lda = f.lda; q.weight = &f.weight;
     q.residual = d; q.c_main = cm.get(); q.ldc_main = ldc; q.c_residual = cr.get(); q.ldc_residual = ldc;
-    q.generation = &gen; q.plan = plan;
+    q.generation = &gen; q.plan = plan; q.hw = hw;
     r.status = potal_paired_matmul_auto(q, s, r.report);
     (void) potal_paired_session_close(s);
     if (r.status == potal_paired_status::ok) {
@@ -811,6 +815,364 @@ void test_conservative() {
               cons.report.counts.residual_loop_ws == rtl.report.counts.residual_loop_ws);
 }
 
+std::string capture_window_diag(const char * value, const std::function<void()> & run) {
+    const char * previous = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
+    const bool had_previous = previous != nullptr;
+    const std::string saved_value = had_previous ? previous : "";
+    std::fflush(stderr);
+    FILE * capture = std::tmpfile();
+    const int saved_fd = dup(STDERR_FILENO);
+    const bool ready = capture != nullptr && saved_fd >= 0 && dup2(fileno(capture), STDERR_FILENO) >= 0;
+    check("D stderr capture", ready);
+    if (!ready) {
+        if (capture != nullptr) std::fclose(capture);
+        if (saved_fd >= 0) close(saved_fd);
+        return {};
+    }
+    if (value != nullptr) setenv("POTAL_PAIRED_WINDOW_DIAG", value, 1);
+    else unsetenv("POTAL_PAIRED_WINDOW_DIAG");
+    run();
+    std::fflush(stderr);
+    const bool restored = dup2(saved_fd, STDERR_FILENO) >= 0;
+    close(saved_fd);
+    if (had_previous) setenv("POTAL_PAIRED_WINDOW_DIAG", saved_value.c_str(), 1);
+    else unsetenv("POTAL_PAIRED_WINDOW_DIAG");
+    check("D stderr restored", restored);
+    std::rewind(capture);
+    std::string text;
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = std::fread(buffer, 1, sizeof(buffer), capture)) != 0) text.append(buffer, bytes);
+    std::fclose(capture);
+    return text;
+}
+
+size_t window_diag_field(const std::string & line, const char * name) {
+    const std::string key = std::string(" ") + name + "=";
+    const size_t p = line.find(key);
+    return p == std::string::npos ? SIZE_MAX : (size_t) std::strtoull(line.c_str() + p + key.size(), nullptr, 10);
+}
+
+std::string capture_index_diag(const char * entries, const char * window, const std::function<void()> & run) {
+    const char * previous = std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = had_previous ? previous : "";
+    if (entries != nullptr) setenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES", entries, 1);
+    else unsetenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    const std::string output = capture_window_diag(window, run);
+    if (had_previous) setenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES", saved.c_str(), 1);
+    else unsetenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    return output;
+}
+
+void test_index16_plan() {
+    paired_fixture f(16, 32, 128, 111, [](size_t block, size_t n) { return (int16_t) ((block + n) % 4); });
+    potal_tile_plan main;
+    if (!f.ok || !main_select_ok(f, main)) {
+        check("I16 fixture", false);
+        return;
+    }
+    residual::decoded_packet d;
+    d.rows = { { 0, 0 }, { 0, 3 }, { 1, 3 } };
+    residual::run r0, r2;
+    r0.block_id = 0;
+    for (uint16_t k = 0; k < 32; ++k) if (k != 16) r0.local_k.push_back(k);
+    r2.block_id = 2;
+    r2.local_k = { 1, 5, 9 };
+    d.runs = { r0, r2 };
+    d.k_compact = 34;
+    d.digits.resize(d.rows.size() * d.k_compact);
+    for (size_t i = 0; i < d.digits.size(); ++i) d.digits[i] = (int8_t) ((int) (i * 11 % 255) - 127);
+
+    const potal_paired_geometry physical = potal_paired_hw_geometry();
+    potal_paired_geometry single = physical;
+    single.index_entries = 16;
+    potal_paired_tile_plan default_tile, physical_tile, single_tile;
+    potal_paired_execution_plan default_plan, physical_plan, single_plan;
+    std::string why;
+    const bool planned =
+        potal_paired_plan_stripe(main, 16, f.N, f.K, &d, default_tile, default_plan, &why) == potal_paired_status::ok &&
+        potal_paired_plan_stripe(main, 16, f.N, f.K, &d, physical_tile, physical_plan, &why, physical) == potal_paired_status::ok &&
+        potal_paired_plan_stripe(main, 16, f.N, f.K, &d, single_tile, single_plan, &why, single) == potal_paired_status::ok;
+    check("I16 plans from unchanged physical geometry and a local Index16 copy (" + why + ")", planned &&
+          physical.index_entries == 32 && POTAL_HW_INDEX_ENTRIES == 32 && single.index_entries == 16);
+    if (!planned) return;
+
+    bool unchanged = default_plan.ops.size() == physical_plan.ops.size() &&
+                     default_plan.index_entries.size() == physical_plan.index_entries.size();
+    for (size_t i = 0; i < default_plan.ops.size() && unchanged; ++i)
+        unchanged = potal_paired_op_text(default_plan.ops[i]) == potal_paired_op_text(physical_plan.ops[i]);
+    for (size_t i = 0; i < default_plan.index_entries.size() && unchanged; ++i) {
+        const auto & a = default_plan.index_entries[i];
+        const auto & b = physical_plan.index_entries[i];
+        unchanged = a.slot == b.slot && a.fragment == b.fragment && a.original_k == b.original_k &&
+                    a.resident_k == b.resident_k && a.compact_k == b.compact_k && a.filler == b.filler;
+    }
+    check("I16 default Index32 plan stays unchanged; diagnostic preserves Main I/J/K", unchanged &&
+          default_tile.fragments_per_window == 2 && single_tile.fragments_per_window == 1 &&
+          default_tile.tile_I == single_tile.tile_I && default_tile.tile_J == single_tile.tile_J &&
+          default_tile.tile_K == single_tile.tile_K && single_tile.residual_windows == single_tile.fragments.size());
+
+    potal_paired_staging staging;
+    bool packed = potal_validate_execution_plan(single_plan, &d, &why, single) == potal_paired_status::ok &&
+                  potal_paired_pack_residual(single_plan, d, staging, &why, single) == potal_paired_status::ok;
+    size_t windows = 0;
+    for (const auto & op : single_plan.ops) {
+        if (op.kind != potal_paired_op_kind::index_program) continue;
+        const auto & panel = single_tile.panels[op.panel];
+        const auto & window = panel.windows[op.window];
+        const auto & fragment = single_tile.fragments[window.fragment_begin];
+        const auto & run = d.runs[fragment.run];
+        packed = packed && window.fragment_end == window.fragment_begin + 1 && window.k_tiles == 1 &&
+                 window.active_rows == fragment.count && window.active_rows <= 16 &&
+                 window.pad_k == 16 - window.active_rows && op.entry_end - op.entry_begin == fragment.count;
+        size_t sw = 0;
+        while (sw < staging.windows.size() &&
+               (staging.windows[sw].panel != op.panel || staging.windows[sw].index != op.window)) ++sw;
+        packed = packed && sw < staging.windows.size();
+        if (!packed) break;
+        for (size_t x = 0; x < fragment.count; ++x) {
+            const auto & entry = single_plan.index_entries[op.entry_begin + x];
+            const size_t original_k = (size_t) run.block_id * 32 + run.local_k[fragment.local_begin + x];
+            packed = packed && !entry.filler && entry.slot == x && entry.slot < physical.index_entries &&
+                     entry.original_k == original_k && entry.resident_k == original_k - panel.k_begin &&
+                     entry.compact_k == fragment.compact_begin + x;
+            for (size_t row = 0; row < d.rows.size(); ++row)
+                packed = packed && staging.a(sw)[row * staging.windows[sw].lda + x] ==
+                                   d.digits[row * d.k_compact + fragment.compact_begin + x];
+        }
+        for (size_t x = fragment.count; x < 16; ++x)
+            for (size_t row = 0; row < d.rows.size(); ++row)
+                packed = packed && staging.a(sw)[row * staging.windows[sw].lda + x] == 0;
+        ++windows;
+    }
+    check("I16 one-fragment windows, packed original digits, Index K mapping and zero tail", packed &&
+          windows == single_tile.j_groups * single_tile.fragments.size());
+
+    h2_emulator emu;
+    direct_run result;
+    const std::string log = capture_index_diag("16", "1", [&] {
+        result = run_direct(f, main, 16, &d, emu, &single_plan, &single);
+    });
+    const direct_golden golden = golden_direct(f, 16, d);
+    check("I16 H2 Main and Residual INT32 equal independent original-K golden; every prefix matches",
+          result.status == potal_paired_status::ok && emu.errors.empty() && result.main_c == golden.main_c &&
+          result.residual_c == golden.residual_c && log.find("[POTAL_WINDOW_DIAG]") != std::string::npos &&
+          log.find("[POTAL_WINDOW_MISMATCH]") == std::string::npos);
+
+    bool checked = true, scales = true;
+    size_t indexed_loops = 0, residual_scales = 0;
+    for (const auto & record : emu.records) {
+        if (record.funct == POTAL_FUNCT_INDEX_CONFIG)
+            checked = checked && (record.rs2 >> 32) <= 16;
+        if (record.funct == POTAL_FUNCT_INDEX_WRITE)
+            checked = checked && record.rs1 < 16 && record.rs1 < physical.index_entries;
+        if (record.funct == POTAL_FUNCT_LOOP_WS && ((record.rs1 >> 62) & 1) != 0) {
+            checked = checked && ((record.rs1 >> 45) & 0xFFFF) == 1;
+            ++indexed_loops;
+        }
+        if (record.funct == POTAL_FUNCT_SCALE_WRITE) {
+            const size_t generation = (record.rs1 >> 8) & 0xFF;
+            if (generation == 0 || generation > single_plan.scale_windows.size()) { scales = false; continue; }
+            const auto & scale = single_plan.scale_windows[generation - 1];
+            if (!scale.residual) continue;
+            const auto & residency = single_plan.residencies[scale.residency];
+            const auto & window = single_tile.panels[residency.panel].windows[scale.window];
+            const auto & fragment = single_tile.fragments[window.fragment_begin];
+            const size_t slot = record.rs1 & 0xFF, col = (record.rs1 >> 16) & 0x3F;
+            const size_t original_col = residency.j_group * single_tile.tile_J * PD +
+                                        (slot - scale.slot_base) * PD + col;
+            scales = scales && scale.blocks == 1 && slot >= scale.slot_base &&
+                     slot < scale.slot_base + scale.j_tiles && record.rs2 == f.carrier_at(fragment.block_id, original_col);
+            ++residual_scales;
+        }
+    }
+    check("I16 checked C11 commands stay within virtual16/physical32, ppb1, one original block carrier", checked &&
+          scales && residual_scales > 0 && indexed_loops == single_tile.residual_windows * single_tile.j_groups);
+
+    potal_paired_geometry wrong = single;
+    wrong.index_entries = 8;
+    h2_emulator rejected;
+    const direct_run mismatch = run_direct(f, main, 16, &d, rejected, &single_plan, &wrong);
+    check("I16 executor validates the given plan against request.hw before any hardware command",
+          mismatch.status == potal_paired_status::invalid_execution_plan && rejected.records.empty());
+}
+
+void test_window_diag() {
+    paired_fixture f(17, 140, 2048, 101, [](size_t block, size_t) {
+        const int16_t exponents[] = { 20, 0, 1, INT16_MIN };
+        return exponents[block % 4];
+    });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool ready = f.ok && main_select_ok(f, main) && make_inputs(f, main.tile_I * PD, [](size_t, size_t rows) {
+        std::vector<res_entry> entries;
+        const size_t counts[] = { 3, 19, 32 };
+        for (size_t row = 0; row < rows; row += 8) {
+            for (size_t block = 0; block < 64; ++block) {
+                for (size_t k = 0; k < counts[block % 3]; ++k) {
+                    entries.push_back({ row, block * 32 + k, (int32_t) (300 + (row + k * 17) % 127) });
+                }
+            }
+        }
+        return entries;
+    }, in);
+    check("D fixture: original K gaps, fragment tails, mixed carriers and radix lanes", ready);
+    if (!ready) return;
+
+    h2_emulator normal_emu, diag_emu;
+    run_result normal, diag;
+    const std::string normal_log = capture_window_diag(nullptr, [&] { normal = run_paired(f, main, in, normal_emu); });
+    const std::string diag_log = capture_window_diag("1", [&] { diag = run_paired(f, main, in, diag_emu); });
+    const size_t windows = diag.report.counts.residual_loop_ws;
+    const bool ran = normal.status == potal_paired_status::ok && diag.status == potal_paired_status::ok &&
+                     normal_emu.errors.empty() && diag_emu.errors.empty() && windows > 0;
+    check("D snapshots preserve Main and Residual hardware output", ran && normal.main_c == diag.main_c &&
+          normal.residual_c == diag.residual_c && normal_log.find("[POTAL_WINDOW_") == std::string::npos);
+    check("D diagnostic fences and readbacks stay outside production counters", ran &&
+          normal.report.counts.fences == diag.report.counts.fences &&
+          normal.report.counts.readbacks == diag.report.counts.readbacks &&
+          normal.report.counts.readback_tiles == diag.report.counts.readback_tiles &&
+          diag_emu.fences == normal_emu.fences + 2 * windows);
+
+    bool summaries = ran, many_windows = false;
+    size_t records = 0, pos = 0;
+    while ((pos = diag_log.find("[POTAL_WINDOW_DIAG]", pos)) != std::string::npos) {
+        const std::string line = diag_log.substr(pos, diag_log.find('\n', pos) - pos);
+        const size_t group = window_diag_field(line, "j_group");
+        const size_t cols = group < diag.report.tile.j_groups
+                                ? std::min(diag.report.tile.tile_J * PD, f.N - group * diag.report.tile.tile_J * PD) : 0;
+        summaries = summaries && cols != 0 && window_diag_field(line, "prefix_bad") == 0 &&
+                    window_diag_field(line, "prefix_total") == diag.rows.size() * cols &&
+                    window_diag_field(line, "pair") < 2 &&
+                    window_diag_field(line, "diag_fences") == 2 * (records + 1) &&
+                    window_diag_field(line, "diag_readbacks") == records + 1;
+        ++records;
+        ++pos;
+    }
+    for (const potal_paired_k_panel & panel : diag.report.tile.panels) many_windows |= panel.windows.size() > 1;
+    check("D every cumulative snapshot matches across J groups, panels, filler slots and tails", summaries &&
+          records == windows && many_windows && diag.report.tile.j_groups > 1 && diag.report.tile.k_panels > 1 &&
+          diag.report.tile.residual_filler_slots > 0 && diag.report.tile.pad_J != 0 &&
+          diag_log.find("[POTAL_WINDOW_MISMATCH]") == std::string::npos &&
+          diag_log.find("[POTAL_WINDOW_INPUT]") != std::string::npos &&
+          diag_log.find("original_k=") != std::string::npos && diag_log.find("resident_k=") != std::string::npos &&
+          diag_log.find("carriers=") != std::string::npos);
+
+    bool ordered = ran, separate = ran;
+    size_t snapshots = 0, extra_tiles = 0;
+    const uintptr_t main_begin = reinterpret_cast<uintptr_t>(diag.c_main.get());
+    const uintptr_t main_end = main_begin + align_up(f.M, PD) * align_up(f.N, PD) * sizeof(int32_t);
+    const uintptr_t residual_begin = reinterpret_cast<uintptr_t>(diag.c_res.get());
+    const uintptr_t residual_end = residual_begin + align_up(diag.rows.size(), PD) * align_up(f.N, PD) * sizeof(int32_t);
+    for (size_t i = 0; i < diag_emu.records.size(); ++i) {
+        const potal_paired_cmd_record & rec = diag_emu.records[i];
+        if (rec.funct != POTAL_FUNCT_LOOP_WS || ((rec.rs1 >> 62) & 1) == 0) continue;
+        size_t p = i + 1;
+        ordered = ordered && p < diag_emu.records.size() && diag_emu.records[p++].funct == POTAL_FUNCT_FENCE;
+        ordered = ordered && p < diag_emu.records.size() && diag_emu.records[p++].funct == POTAL_FUNCT_CONFIG;
+        size_t tiles = 0;
+        while (p < diag_emu.records.size() && diag_emu.records[p].funct == POTAL_FUNCT_MVOUT) {
+            const uintptr_t address = (uintptr_t) diag_emu.records[p].rs1;
+            separate = separate && !(address >= main_begin && address < main_end) &&
+                       !(address >= residual_begin && address < residual_end) && address % (PD * sizeof(int32_t)) == 0;
+            ++tiles;
+            ++p;
+        }
+        ordered = ordered && tiles != 0 && p < diag_emu.records.size() &&
+                  diag_emu.records[p].funct == POTAL_FUNCT_FENCE;
+        extra_tiles += tiles;
+        ++snapshots;
+    }
+    check("D every Indexed LOOP_WS immediately gets fence, separate aligned ACC1 readback, fence",
+          ordered && separate && snapshots == windows &&
+          diag_emu.mvouts == normal_emu.mvouts + extra_tiles);
+
+    struct corrupt_index {
+        h2_emulator emu;
+        static potal_status command(void * context, const potal_paired_cmd_record * record) {
+            auto & self = *static_cast<corrupt_index *>(context);
+            potal_paired_cmd_record changed = *record;
+            if (changed.funct == POTAL_FUNCT_INDEX_WRITE) {
+                const auto & table = self.emu.tables[self.emu.selected_table];
+                changed.rs2 = (changed.rs2 + 1) % table.source_k_rows;
+            }
+            return self.emu.command(changed);
+        }
+    } corrupted;
+    const potal_paired_sink sink = { &corrupt_index::command, &corrupted };
+    run_result bad;
+    const std::string bad_log = capture_window_diag("1", [&] {
+        bad = run_paired(f, main, in, corrupted.emu, true, 0, false, &sink);
+    });
+    const size_t first_record = bad_log.find("[POTAL_WINDOW_DIAG]");
+    const std::string first_line = first_record == std::string::npos ? "" :
+        bad_log.substr(first_record, bad_log.find('\n', first_record) - first_record);
+    check("D corrupted hardware Index lookup differs from independent original-K reference in first window",
+          bad.status == potal_paired_status::ok && corrupted.emu.errors.empty() && !first_line.empty() &&
+          window_diag_field(first_line, "prefix_bad") > 0 &&
+          window_diag_field(first_line, "prefix_bad") != SIZE_MAX &&
+          bad_log.find("[POTAL_WINDOW_MISMATCH]") != std::string::npos &&
+          bad_log.find("lane_row=") != std::string::npos && bad_log.find("source_row=") != std::string::npos &&
+          bad_log.find(" got=") != std::string::npos && bad_log.find(" expected=") != std::string::npos &&
+          bad.main_c == normal.main_c && bad.residual_c != normal.residual_c &&
+          bad.report.counts.ops == normal.report.counts.ops &&
+          bad.report.counts.residual_loop_ws == windows);
+
+    h2_emulator disabled_emu;
+    run_result disabled;
+    const std::string disabled_log = capture_window_diag("true", [&] {
+        disabled = run_paired(f, main, in, disabled_emu);
+    });
+    check("D only exact POTAL_PAIRED_WINDOW_DIAG=1 enables snapshots", disabled.status == potal_paired_status::ok &&
+          disabled_emu.records.size() == normal_emu.records.size() && disabled_log.find("[POTAL_WINDOW_") == std::string::npos);
+
+    struct fail_diagnostic_command {
+        h2_emulator emu;
+        uint32_t funct;
+        size_t ordinal, seen = 0;
+        static potal_status command(void * context, const potal_paired_cmd_record * record) {
+            auto & self = *static_cast<fail_diagnostic_command *>(context);
+            if (record->funct == self.funct && ++self.seen == self.ordinal) {
+                self.emu.fail_funct = self.funct;
+                self.emu.fail_status = POTAL_ERR_BAD_RESPONSE;
+            }
+            return self.emu.command(*record);
+        }
+    };
+    for (size_t fence = 1; fence <= 2; ++fence) {
+        // A fatal early fence intentionally keeps the accelerator owned; contain that state in a child.
+        const pid_t child = fork();
+        if (child == 0) {
+            fail_diagnostic_command failure = { {}, POTAL_FUNCT_FENCE, fence };
+            const potal_paired_sink failing_sink = { &fail_diagnostic_command::command, &failure };
+            run_result failed;
+            capture_window_diag("1", [&] {
+                failed = run_paired(f, main, in, failure.emu, true, 0, false, &failing_sink);
+            });
+            const bool correct = failed.status == potal_paired_status::execution_failed &&
+                failed.report.hw_status == POTAL_ERR_BAD_RESPONSE &&
+                std::string(failed.report.stage ? failed.report.stage : "") == "fence" && failed.report.fatal &&
+                !failed.report.cleaned && failed.main_c.empty() &&
+                count_funct(failure.emu, POTAL_FUNCT_FENCE) == fence + 1; // One test-housekeeping fence in run_paired.
+            _exit(correct ? 0 : 1);
+        }
+        int status = 0;
+        const bool correct = child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        check("D failed diagnostic fence " + std::to_string(fence) + " stays fatal and is never retried by executor", correct);
+    }
+    fail_diagnostic_command failure = { {}, POTAL_FUNCT_MVOUT, 1 };
+    const potal_paired_sink failing_sink = { &fail_diagnostic_command::command, &failure };
+    run_result failed;
+    capture_window_diag("1", [&] {
+        failed = run_paired(f, main, in, failure.emu, true, 0, false, &failing_sink);
+    });
+    check("D failed diagnostic readback propagates hardware status and releases live scales",
+          failed.status == potal_paired_status::execution_failed && failed.report.hw_status == POTAL_ERR_BAD_RESPONSE &&
+          std::string(failed.report.stage ? failed.report.stage : "") == "window_diag_readback" &&
+          failed.report.cleaned && !failed.report.fatal && failed.session.live_scale_slots == 0);
+}
+
 // Last in main(): leaves the accelerator owned on purpose (a failed cleanup keeps it).
 void test_close_keeps_owner_with_live_entries() {
     h2_emulator            emu;
@@ -903,6 +1265,7 @@ struct pipe_result {
     bool                      untouched = false;
     std::vector<event_record> events;
     size_t                    paired_calls = 0;
+    uint64_t                  decode_calls = 0; // only the actual pipeline execution, not fixture/golden work
     std::string               planned_commands; // emulator record of the serial (planned) GEMMs
     uint64_t                  h2_main = 0, h2_residual = 0, h2_index = 0;
     std::string               h2_errors;
@@ -913,7 +1276,8 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 
 // mode: 0 serial, 1 paired, 2 paired configured without a paired runner, 3 paired runner reporting fatal,
 // 4 paired with conservative fences.
-pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode) {
+pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
+                     const std::function<void(const potal_paired_request &)> & inspect = {}) {
     pipe_result         r;
     ggml_gemmini_args_t args;
     if (!nd.args_for(args)) {
@@ -943,6 +1307,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode) {
     if (mode == 1 || mode == 3 || mode == 4) {
         runner = [&](const potal_paired_request & req, potal_paired_report & rep) {
             r.paired_calls++;
+            if (inspect) inspect(req);
             if (mode == 3) {
                 rep        = potal_paired_report{};
                 rep.status = potal_paired_status::execution_failed;
@@ -959,8 +1324,11 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode) {
         };
     }
     potal_test::thread_owner owner([&es](const potal_stripe_gemm_desc & d) { return es.run(d); }, runner);
+    residual::reset_decode_packet_calls();
+    const uint64_t decode_before = residual::decode_packet_calls();
     r.report = run_stripe_pipeline(nd.x, args, nd.weight, nd.plan, cfg, owner);
     owner.join();
+    r.decode_calls = residual::decode_packet_calls() - decode_before;
     r.consumer         = owner.outcome;
     r.planned_commands = es.emu.commands;
     r.h2_main          = h2.main_loops;
@@ -1002,7 +1370,7 @@ void print_pipe(const char * name, const pipe_result & r) {
     const pipeline_counts & c = r.report.counts;
     std::printf("  %s: ok=%d stage=%s fatal=%d stripes=%llu paired=%llu fallback=%llu main_loop_ws(planned)=%llu "
                 "residual_loop_ws(planned)=%llu paired_main=%llu paired_residual=%llu index=%llu/%llu readbacks=%llu "
-                "fences=%llu drains=%llu runner_calls=%zu planned_cmds=%zu h2(main=%llu res=%llu idx=%llu) %s\n",
+                "fences=%llu drains=%llu runner_calls=%zu planned_cmds=%zu h2(main=%llu res=%llu idx=%llu) decodes=%llu %s\n",
                 name, (int) r.report.ok, r.report.stage ? r.report.stage : "-", (int) r.report.fatal,
                 (unsigned long long) c.stripes_semantic_completed, (unsigned long long) c.paired_stripes,
                 (unsigned long long) c.paired_fallback_stripes, (unsigned long long) c.main_loop_ws,
@@ -1011,7 +1379,7 @@ void print_pipe(const char * name, const pipe_result & r) {
                 (unsigned long long) c.paired_index_writes, (unsigned long long) c.paired_readbacks,
                 (unsigned long long) c.paired_fences, (unsigned long long) c.paired_drains, r.paired_calls,
                 r.planned_commands.size(), (unsigned long long) r.h2_main, (unsigned long long) r.h2_residual,
-                (unsigned long long) r.h2_index, r.report.detail.c_str());
+                (unsigned long long) r.h2_index, (unsigned long long) r.decode_calls, r.report.detail.c_str());
 }
 
 void test_pipeline() {
@@ -1050,6 +1418,11 @@ void test_pipeline() {
         check("S residual packets were merged once per packet stripe" + cap,
               c.merges_completed == c.residual_nonempty_packets && c.residual_nonempty_packets > 0 &&
                   c.radix_reconstructions == c.residual_nonempty_packets);
+        check("S Serial and successful Paired each decode exactly once per nonempty packet" + cap,
+              serial.report.ok && paired.report.ok && serial.report.counts.residual_nonempty_packets > 0 &&
+                  serial.report.counts.residual_nonempty_packets == c.residual_nonempty_packets &&
+                  serial.decode_calls == serial.report.counts.residual_nonempty_packets &&
+                  paired.decode_calls == c.residual_nonempty_packets);
         // Paired event order per stripe; no serial GEMM events for a paired stripe.
         bool order = true, no_serial_events = true;
         for (size_t st = 0; st < stripes; ++st) {
@@ -1110,6 +1483,12 @@ void test_pipeline() {
                   paired.paired_calls == c.paired_stripes && c.main_logical_gemms == c.paired_fallback_stripes);
         check("S dense run with fallback stripes: F32 output == serial, bitwise",
               serial.report.ok && std::memcmp(serial.out.data(), paired.out.data(), serial.out.size() * sizeof(float)) == 0);
+        check("S dense Serial decodes once per packet; capacity-rejected Paired stripes reuse that decode",
+              serial.report.ok && paired.report.ok && c.paired_fallback_stripes > 0 &&
+                  c.residual_nonempty_packets == dense.stripes() &&
+                  serial.report.counts.residual_nonempty_packets == c.residual_nonempty_packets &&
+                  serial.decode_calls == serial.report.counts.residual_nonempty_packets &&
+                  paired.decode_calls == c.residual_nonempty_packets);
     }
 
     // Failures: no paired runner; a paired runner reporting fatal.
@@ -1128,6 +1507,93 @@ void test_pipeline() {
     }
 }
 
+void test_index16_pipeline() {
+    if (!options::compensation || options::activation_quant != options::ActivationQuantAlgo::EXSIA) return;
+    pipe_node nd(16, 32, 64, 121, 60.0f, 1, 4);
+    check("I16 pipeline fixture", nd.ok);
+    if (!nd.ok) return;
+    pipe_result normal, diagnostic;
+    potal_paired_tile_plan normal_tile;
+    bool normal_geometry = true, same_geometry = true;
+    capture_index_diag(nullptr, nullptr, [&] {
+        normal = run_pipe(nd, 1, 4, [&](const potal_paired_request & req) {
+            normal_geometry = normal_geometry && req.hw == nullptr && req.main_plan != nullptr && req.plan != nullptr &&
+                req.main_plan->tile_I == nd.plan.tile_I && req.main_plan->tile_J == nd.plan.tile_J &&
+                req.main_plan->tile_K == nd.plan.tile_K;
+            if (req.plan != nullptr) normal_tile = req.plan->tile;
+        });
+    });
+    const std::string log = capture_index_diag("16", "1", [&] {
+        diagnostic = run_pipe(nd, 1, 4, [&](const potal_paired_request & req) {
+            same_geometry = same_geometry && req.hw != nullptr && req.hw->index_entries == 16 &&
+                            req.plan != nullptr && req.residual != nullptr;
+            if (!same_geometry) return;
+            potal_paired_geometry expected = potal_paired_hw_geometry();
+            expected.index_entries = 16;
+            const auto & hw = *req.hw;
+            same_geometry = same_geometry && hw.dim == expected.dim && hw.bank_num == expected.bank_num &&
+                hw.bank_rows == expected.bank_rows && hw.acc_rows == expected.acc_rows &&
+                hw.scale_entries == expected.scale_entries && hw.work_ids == expected.work_ids &&
+                hw.block_k == expected.block_k && req.plan->tile.fragments_per_window == 1 &&
+                req.plan->tile.tile_I == normal_tile.tile_I && req.plan->tile.tile_J == normal_tile.tile_J &&
+                req.plan->tile.tile_K == normal_tile.tile_K && req.main_plan->tile_K == normal_tile.tile_K;
+            std::string why;
+            potal_paired_staging staging;
+            same_geometry = same_geometry &&
+                potal_validate_execution_plan(*req.plan, req.residual, &why, hw) == potal_paired_status::ok &&
+                potal_paired_pack_residual(*req.plan, *req.residual, staging, &why, hw) == potal_paired_status::ok;
+        });
+    });
+    check("I16 pipeline uses the same local geometry for planning, request, validation and packing", normal_geometry &&
+          same_geometry && normal.report.ok && diagnostic.report.ok && diagnostic.paired_calls == 1 &&
+          diagnostic.h2_errors.empty() && diagnostic.out == normal.out &&
+          normal_tile.fragments_per_window == 2 && diagnostic.h2_residual > normal.h2_residual &&
+          log.find("[POTAL_WINDOW_DIAG]") != std::string::npos &&
+          log.find("[POTAL_WINDOW_MISMATCH]") == std::string::npos);
+
+    pipe_node bound(16, 16, 4096, 122, 3000.0f, 1, 6);
+    bool bound_geometry = true, binding_fixture = false;
+    potal_paired_tile_plan bound_normal;
+    pipe_result bound_default, bound_single;
+    capture_index_diag(nullptr, nullptr, [&] {
+        bound_default = run_pipe(bound, 1, 4, [&](const potal_paired_request & req) {
+            if (req.plan != nullptr) bound_normal = req.plan->tile;
+        });
+    });
+    capture_index_diag("16", "1", [&] {
+        bound_single = run_pipe(bound, 1, 4, [&](const potal_paired_request & req) {
+            bound_geometry = bound_geometry && req.hw != nullptr && req.plan != nullptr && req.residual != nullptr;
+            if (!bound_geometry) return;
+            potal_paired_tile_plan unfrozen;
+            potal_paired_execution_plan unfrozen_plan;
+            std::string why;
+            binding_fixture = potal_paired_plan_stripe(bound.plan, req.rows, req.n, req.k, req.residual,
+                unfrozen, unfrozen_plan, &why, *req.hw) == potal_paired_status::ok &&
+                unfrozen.tile_K > bound_normal.tile_K;
+            bound_geometry = bound_geometry && req.plan->tile.tile_I == bound_normal.tile_I &&
+                req.plan->tile.tile_J == bound_normal.tile_J && req.plan->tile.tile_K == bound_normal.tile_K &&
+                req.main_plan->tile_K == bound_normal.tile_K;
+        });
+    });
+    check("I16 preserves common Main I/J/K when smaller Residual reservation would otherwise increase K", bound.ok &&
+          bound_default.report.ok && bound_single.report.ok && binding_fixture && bound_geometry &&
+          bound_default.out == bound_single.out && bound_single.h2_errors.empty());
+
+    const std::pair<const char *, const char *> invalid[] = {
+        { "32", "1" }, { "16x", "1" }, { "", "1" }, { "16", nullptr }, { "16", "true" },
+    };
+    for (const auto & setting : invalid) {
+        pipe_result rejected;
+        capture_index_diag(setting.first, setting.second, [&] { rejected = run_pipe(nd, 1, 4); });
+        check(std::string("I16 unsupported setting rejected before hardware: entries='") + setting.first +
+              "' window='" + (setting.second ? setting.second : "unset") + "'",
+              !rejected.report.ok && rejected.report.stage != nullptr &&
+              std::string(rejected.report.stage) == "paired_plan" && !rejected.report.fatal &&
+              rejected.untouched && rejected.paired_calls == 0 && rejected.h2_main == 0 &&
+              rejected.h2_residual == 0 && rejected.planned_commands.empty());
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1138,7 +1604,10 @@ int main() {
     test_failures();
     test_review_followups();
     test_conservative();
+    test_window_diag();
+    test_index16_plan();
     test_pipeline();
+    test_index16_pipeline();
     test_close_keeps_owner_with_live_entries(); // last: leaves the accelerator owned
     std::printf("%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

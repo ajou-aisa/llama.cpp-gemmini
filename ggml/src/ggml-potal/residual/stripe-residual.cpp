@@ -5,13 +5,19 @@
 #include "residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <utility>
+
+#if defined(GGML_GEMMINI_TESTING)
+#include <atomic>
+#endif
 
 namespace ggml::potal::residual {
 
@@ -24,6 +30,32 @@ constexpr size_t RUN_K  = quants::weight::hp1::block_k; // execution K of one ru
 
 static_assert(rmd::kBlockSize == RUN_K, "a residual run is one original weight block = one HP1 scale block");
 static_assert(RUN_K % HW_DIM == 0, "a run is a whole number of DIM-wide passes");
+
+#if defined(GGML_GEMMINI_TESTING)
+std::atomic<uint64_t> decode_calls{ 0 };
+#endif
+
+struct decode_profile {
+    size_t stripe;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+
+    explicit decode_profile(size_t id) : stripe(id) {
+        const char * env = std::getenv("POTAL_PAIRED_PROFILE");
+        enabled = env != nullptr && std::strcmp(env, "1") == 0;
+        if (enabled) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~decode_profile() {
+        if (enabled) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "[POTAL_DECODE_PROFILE] stripe=%zu elapsed_ms=%.6f\n", stripe, ms);
+        }
+    }
+};
 
 __extension__ typedef __int128 wide_t; // checked radix composition (no INT64 narrowing in between)
 
@@ -54,6 +86,16 @@ bool finite_bits(double value) {
 }
 
 } // namespace
+
+#if defined(GGML_GEMMINI_TESTING)
+void reset_decode_packet_calls() {
+    decode_calls.store(0, std::memory_order_relaxed);
+}
+
+uint64_t decode_packet_calls() {
+    return decode_calls.load(std::memory_order_relaxed);
+}
+#endif
 
 request::~request() {
     for (void * p : blocks) {
@@ -98,6 +140,10 @@ bool request::allocate(size_t m_rows, size_t n_cols, size_t k_exec, size_t runs_
 }
 
 rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight & w, decoded_packet & out) try {
+#if defined(GGML_GEMMINI_TESTING)
+    decode_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+    const decode_profile profile(packet.stripe_id);
     out = decoded_packet{};
     if (rmd::validate_packet(packet) != rmd::RmdStatus::success) {
         return rmd::RmdStatus::invalid_packet;
@@ -174,13 +220,18 @@ rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight 
     return rmd::RmdStatus::overflow;
 }
 
-rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight & w, request & out) try {
+rmd::RmdStatus build_request(const rmd::StripePacket & packet, const hp1_weight & w, request & out) {
     out.reset();
     decoded_packet       decoded;
     const rmd::RmdStatus status = decode_packet(packet, w, decoded);
     if (status != rmd::RmdStatus::success) {
         return status;
     }
+    return build_request_from_decoded(std::move(decoded), w, out);
+}
+
+rmd::RmdStatus build_request_from_decoded(decoded_packet && decoded, const hp1_weight & w, request & out) try {
+    out.reset();
     const size_t runs = decoded.runs.size();
     out.runs          = std::move(decoded.runs);
     out.rows          = std::move(decoded.rows);
