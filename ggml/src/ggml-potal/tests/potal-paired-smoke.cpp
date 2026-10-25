@@ -43,6 +43,10 @@
 #include "potal.h"
 #include "support/stripe-golden.hpp"
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+#include "matmul/planning-profile.hpp"
+#endif
+
 #include "ggml-gemmini/matmul/options.hpp"
 
 #include <algorithm>
@@ -172,6 +176,9 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
     select_route(kind);
     std::memset(y->data, 0xff, ggml_nbytes(y)); // NaN pattern: a stale dst never matches
     const ggml_backend_potal_stats b      = stats_of(potal);
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::reset();
+#endif
     const auto                     t0     = std::chrono::steady_clock::now();
     const ggml_status              status = ggml_backend_graph_compute(potal, g);
     const auto                     t1     = std::chrono::steady_clock::now();
@@ -180,6 +187,10 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
     r.after = a;
     r.compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     r.wall_ms    = (a.pipeline_wall_s - b.pipeline_wall_s) * 1e3;
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    // Formatting is outside graph-compute and Planning timers.
+    planning_profile::dump(stdout, name, route_name(kind));
+#endif
 
     const uint64_t stripes   = a.stripes_semantic_completed - b.stripes_semantic_completed;
     const uint64_t pstripes  = a.paired_stripes - b.paired_stripes;

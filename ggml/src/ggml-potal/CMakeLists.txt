@@ -177,6 +177,15 @@ endif()
 # overrides it per process (matmul/options.hpp). Takes effect only in
 # STRIPE_PIPELINE with compensation=ON; OFF keeps the serial Main then Residual GEMMs.
 option(GGML_POTAL_PAIRED_AUTO "STRIPE_PIPELINE: run each stripe's Main and Residual GEMMs as one paired execution" OFF)
+option(POTAL_PLANNING_DIAGNOSTICS "Compile Planning timers and ordinary new/delete call accounting" OFF)
+if (POTAL_PLANNING_DIAGNOSTICS AND
+    (NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    message(FATAL_ERROR "POTAL_PLANNING_DIAGNOSTICS requires GNU C++ on Linux with linker --wrap")
+endif()
+set(POTAL_PLANNING_WRAP_OPTIONS
+    "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam"
+    "-Wl,--wrap=_ZdlPv" "-Wl,--wrap=_ZdaPv"
+    "-Wl,--wrap=_ZdlPvm" "-Wl,--wrap=_ZdaPvm")
 if (GGML_POTAL_PAIRED_AUTO)
     set(_POTAL_PAIRED_AUTO_VALUE 1)
 else()
@@ -253,6 +262,23 @@ set(POTAL_BACKEND_SOURCES
     residual/stripe-residual.cpp
     residual/stripe-residual.hpp
     ${POTAL_GEMMINI_SHARED_SOURCES})
+if (POTAL_PLANNING_DIAGNOSTICS)
+    # Smoke and regression executables also compile backend sources. One shared
+    # collector keeps their reset/dump calls and the registered backend's roots
+    # in the same accounting instance, without relying on ELF interposition.
+    add_library(potal-planning-profile SHARED
+        matmul/planning-profile.cpp matmul/planning-profile.hpp)
+    target_include_directories(potal-planning-profile PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(potal-planning-profile PRIVATE cxx_std_17)
+    target_link_libraries(potal-planning-profile PRIVATE Threads::Threads)
+    target_link_options(potal-planning-profile PRIVATE ${POTAL_PLANNING_WRAP_OPTIONS})
+    set_target_properties(potal-planning-profile PROPERTIES
+        CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF)
+    set_source_files_properties(
+        matmul/paired-auto.cpp matmul/planning-profile.cpp
+        tests/potal-paired-smoke.cpp tests/potal-planning-profile-test.cpp
+        PROPERTIES COMPILE_DEFINITIONS POTAL_PLANNING_DIAGNOSTICS)
+endif()
 
 # Compile definitions of the Gemmini backend (cmake/ggml-gemmini-config.cmake)
 # without its execution-mode settings, plus the PoTal DIM. LOG_* / CYCLE_DETAIL
@@ -284,6 +310,10 @@ function(potal_add_backend_settings target)
     target_compile_definitions(${target} PRIVATE ${POTAL_LOG_DEFINITIONS})
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_link_libraries(${target} PRIVATE potal-tiled-api potal-api ggml-gemmini-utils Threads::Threads)
+    if (POTAL_PLANNING_DIAGNOSTICS)
+        target_link_libraries(${target} PRIVATE potal-planning-profile)
+        target_link_options(${target} PRIVATE ${POTAL_PLANNING_WRAP_OPTIONS})
+    endif()
     if (GGML_GEMMINI_ENABLE_OPENMP)
         target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
         target_compile_definitions(${target} PRIVATE GGML_GEMMINI_HAS_OPENMP)
@@ -385,6 +415,15 @@ foreach(_paired_test plan schedule unit auto execution)
         add_test(NAME potal-paired-${_paired_test}-test COMMAND potal-paired-${_paired_test}-test)
     endif()
 endforeach()
+
+if (POTAL_PLANNING_DIAGNOSTICS)
+    add_executable(potal-planning-profile-test
+        tests/potal-planning-profile-test.cpp)
+    potal_add_backend_settings(potal-planning-profile-test)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-planning-profile-test COMMAND potal-planning-profile-test)
+    endif()
+endif()
 
 # Counts real Residual decode calls in the fallback regression, not elapsed time.
 target_compile_definitions(potal-paired-execution-test PRIVATE GGML_GEMMINI_TESTING)

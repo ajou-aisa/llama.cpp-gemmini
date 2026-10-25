@@ -4,6 +4,10 @@
 
 #include "paired-auto.hpp"
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+#include "planning-profile.hpp"
+#endif
+
 #include "quants/common/hp1_scu.hpp"
 
 #include <algorithm>
@@ -48,6 +52,49 @@ void explain(std::string * why, std::string text) {
 }
 
 constexpr size_t loop_ws_field_max = 65535; // 16-bit LOOP_WS tile counts
+
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+// Logical copied fields, not padding, vector headers, spare capacity or bus traffic.
+// Inventory runs after the copy under its own diagnostic-only timing bucket.
+struct planning_copy_extent {
+    uint64_t bytes;
+    uint64_t objects;
+};
+
+planning_copy_extent tile_copy_extent(const potal_paired_tile_plan & tile) {
+    planning_copy_extent out{ 47 * sizeof(size_t) + 5 * sizeof(uint32_t) + sizeof(bool), 1 };
+    out.bytes += tile.fragments.size() * 5 * sizeof(uint32_t);
+    out.objects += tile.fragments.size() + tile.panels.size();
+    out.bytes += tile.panels.size() * 12 * sizeof(size_t);
+    for (const potal_paired_k_panel & panel : tile.panels) {
+        out.bytes += panel.windows.size() * 8 * sizeof(size_t);
+        out.objects += panel.windows.size();
+    }
+    return out;
+}
+
+planning_copy_extent execution_copy_extent(const potal_paired_execution_plan & plan) {
+    planning_copy_extent out = tile_copy_extent(plan.tile);
+    out.bytes += 10 * sizeof(size_t) +
+                 potal_paired_pairs * (6 * sizeof(size_t) + sizeof(potal_paired_pair_phase) + 3 * sizeof(bool));
+    out.objects += 1 + potal_paired_pairs;
+    out.bytes += plan.residual_rows.size() * (sizeof(uint8_t) + sizeof(uint32_t));
+    out.objects += plan.residual_rows.size();
+    out.bytes += plan.ops.size() * (30 * sizeof(size_t) + sizeof(potal_paired_op_kind) + 3 * sizeof(bool));
+    out.objects += plan.ops.size();
+    for (const potal_paired_op & op : plan.ops) {
+        out.bytes += op.deps.size() * (sizeof(size_t) + sizeof(bool));
+        out.objects += op.deps.size();
+    }
+    out.bytes += plan.index_entries.size() * (5 * sizeof(size_t) + sizeof(bool));
+    out.bytes += plan.scale_windows.size() * (11 * sizeof(size_t) + sizeof(bool));
+    out.bytes += plan.residencies.size() * 13 * sizeof(size_t);
+    out.bytes += plan.transitions.size() * (3 * sizeof(size_t) + 2 * sizeof(potal_paired_pair_phase));
+    out.objects += plan.index_entries.size() + plan.scale_windows.size() +
+                   plan.residencies.size() + plan.transitions.size();
+    return out;
+}
+#endif
 
 } // namespace
 
@@ -98,6 +145,10 @@ const char * potal_paired_status_name(potal_paired_status s) {
 potal_paired_status potal_paired_fragments(const residual::decoded_packet & residual, size_t rows, size_t k,
                                            const potal_paired_geometry & hw, std::vector<potal_paired_fragment> & out,
                                            std::string * why, size_t * skipped) try {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_build(planning_profile::Site::fragment_build, planning_profile::Component::construction);
+    planning_profile::Scope planning_input(planning_profile::Site::fragment_input, planning_profile::Component::validation);
+#endif
     out.clear();
     if (skipped != nullptr) {
         *skipped = 0;
@@ -117,6 +168,9 @@ potal_paired_status potal_paired_fragments(const residual::decoded_packet & resi
         return potal_paired_status::invalid_argument;
     }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_input.finish();
+#endif
     // Runs: block ids ascending below K / block_k, block-local K ascending below block_k.
     std::vector<potal_paired_fragment> fragments;
     size_t                             compact = 0;
@@ -153,6 +207,9 @@ potal_paired_status potal_paired_fragments(const residual::decoded_packet & resi
         return potal_paired_status::invalid_argument;
     }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_rows(planning_profile::Site::fragment_rows, planning_profile::Component::validation);
+#endif
     // Rows: strictly ascending (lane, source row), source rows inside the stripe.
     for (size_t i = 0; i < residual.rows.size(); ++i) {
         const residual::lane_row & row = residual.rows[i];
@@ -174,6 +231,9 @@ potal_paired_status potal_paired_fragments(const residual::decoded_packet & resi
         explain(why, "residual geometry: digits do not cover rows x k_compact");
         return potal_paired_status::invalid_argument;
     }
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_rows.finish();
+#endif
     // With the digits known, a fragment that is zero in every lane row contributes nothing: leave it out.
     if (!residual.digits.empty()) {
         std::vector<potal_paired_fragment> kept;
@@ -221,6 +281,10 @@ bool potal_paired_resident_k(const potal_paired_k_panel & panel, size_t original
 potal_paired_status potal_make_tile_plan(const potal_tile_plan & main, size_t rows, size_t n, size_t k,
                                          const residual::decoded_packet * residual, potal_paired_tile_plan & plan,
                                          std::string * why, const potal_paired_geometry & hw) try {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_build(planning_profile::Site::tile_build, planning_profile::Component::construction);
+    planning_profile::Scope planning_input(planning_profile::Site::tile_input, planning_profile::Component::validation);
+#endif
     plan = potal_paired_tile_plan{};
     if (why != nullptr) {
         why->clear();
@@ -280,6 +344,9 @@ potal_paired_status potal_make_tile_plan(const potal_tile_plan & main, size_t ro
                           " rows, ACC0 " + num(hw.acc_rows / 2) + " rows, work IDs " + num(hw.work_ids));
     }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_input.finish();
+#endif
     // 2. Residual geometry: lane rows, fragments, the largest Index Window.
     const bool has_residual = residual != nullptr && !(residual->rows.empty() && residual->runs.empty());
     if (has_residual) {
@@ -370,7 +437,13 @@ potal_paired_status potal_make_tile_plan(const potal_tile_plan & main, size_t ro
 
     // 4. The Main execution plan with the final K (chunk counts, padding) through the
     //    existing frozen-plan path; its own limits are the built hardware's.
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_frozen(planning_profile::Site::tile_frozen, planning_profile::Component::validation);
+#endif
     const potal_status frozen = potal_frozen_plan(rows, n, k, tile_I, tile_J, plan.tile_K, ppb, &plan.main);
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_frozen.finish();
+#endif
     if (frozen != POTAL_OK) {
         return refuse(potal_paired_status::invalid_argument,
                       std::string("potal_frozen_plan refused tile_K ") + num(plan.tile_K) + ": POTAL_" +
@@ -610,6 +683,10 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
                                               const residual::decoded_packet * residual,
                                               potal_paired_execution_plan & out, std::string * why,
                                               const potal_paired_geometry & hw) try {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_build(planning_profile::Site::execution_build, planning_profile::Component::construction);
+    planning_profile::Scope planning_input(planning_profile::Site::execution_input, planning_profile::Component::validation);
+#endif
     if (why != nullptr) {
         why->clear();
     }
@@ -640,10 +717,33 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
         return refuse(potal_paired_status::invalid_argument, "tile plan without residual carries residual work");
     }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_input.finish();
+#endif
     plan_builder b(tile, residual, hw);
-    b.plan.tile = tile;
+    {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_profile::Scope planning_copy(planning_profile::Site::builder_tile_copy, planning_profile::Component::copy);
+#endif
+        b.plan.tile = tile;
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_copy.finish();
+        planning_profile::Scope inventory(planning_profile::Site::payload_inventory, planning_profile::Component::instrumentation);
+        const planning_copy_extent extent = tile_copy_extent(b.plan.tile);
+        planning_copy.add_bytes(extent.bytes, extent.objects);
+#endif
+    }
     if (tile.residual) {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_profile::Scope planning_copy(planning_profile::Site::builder_rows_copy, planning_profile::Component::copy);
+#endif
         b.plan.residual_rows = residual->rows;
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_copy.finish();
+        planning_profile::Scope inventory(planning_profile::Site::payload_inventory, planning_profile::Component::instrumentation);
+        planning_copy.add_bytes(b.plan.residual_rows.size() * (sizeof(uint8_t) + sizeof(uint32_t)),
+                                b.plan.residual_rows.size());
+#endif
     }
     for (size_t q = 0; q < potal_paired_pairs; ++q) {
         b.plan.pairs[q].pair = q;
@@ -1406,6 +1506,9 @@ struct validator {
 potal_paired_status potal_validate_execution_plan(const potal_paired_execution_plan & plan,
                                                   const residual::decoded_packet * residual, std::string * why,
                                                   const potal_paired_geometry & hw) try {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_validation(planning_profile::Site::execution_validate, planning_profile::Component::validation);
+#endif
     if (why != nullptr) {
         why->clear();
     }
@@ -2083,6 +2186,9 @@ potal_paired_status potal_paired_plan_stripe(const potal_tile_plan & main, size_
                                              const residual::decoded_packet * residual, potal_paired_tile_plan & tile,
                                              potal_paired_execution_plan & plan, std::string * why,
                                              const potal_paired_geometry & hw) {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Root planning_root(planning_profile::Phase::route, rows, n, k);
+#endif
     const potal_paired_status st = potal_make_tile_plan(main, rows, n, k, residual, tile, why, hw);
     if (st != potal_paired_status::ok) {
         return st;
@@ -2138,6 +2244,9 @@ potal_paired_status potal_paired_run_session(const potal_paired_request & req, c
 
 potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, potal_paired_session * session,
                                              potal_paired_report & report) {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Root planning_root(planning_profile::Phase::executor, req.rows, req.n, req.k);
+#endif
     report = potal_paired_report{};
     const potal_paired_geometry hw = req.hw != nullptr ? *req.hw : potal_paired_hw_geometry();
     executor                    ex(req, session, report, hw); // outlives the try: the staging is settled on any exit
@@ -2145,6 +2254,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     ex.profile = profile != nullptr && std::strcmp(profile, "1") == 0;
     if (ex.profile) ex.plan_start = exec_clock::now();
     try {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_profile::Scope planning_request(planning_profile::Site::executor_request, planning_profile::Component::validation);
+#endif
         const hp1_weight * w = req.weight;
         // A packet with neither rows nor runs is no residual; an inconsistent one is the planner's refusal.
         const bool has_residual =
@@ -2174,11 +2286,17 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             return ex.fail(potal_paired_status::invalid_argument, "request", "generation counter beyond 8 bits", POTAL_OK);
         }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_request.finish();
+#endif
         // 1. Plans: Main-derived I/J, the common K, the ordered validated ops; or the caller's
         //    plan, validated again and checked against this request.
         std::string         why;
         potal_paired_status st = potal_paired_status::ok;
         if (req.plan != nullptr) {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+            planning_profile::Scope planning_match(planning_profile::Site::supplied_match, planning_profile::Component::validation);
+#endif
             const potal_paired_tile_plan & t       = req.plan->tile;
             const size_t                   i_tiles = (req.rows + hw.dim - 1) / hw.dim;
             if (t.rows != req.rows || t.n != req.n || t.k != req.k || t.tile_J != req.main_plan->tile_J ||
@@ -2186,12 +2304,37 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
                 t.residual != has_residual) {
                 return ex.fail(potal_paired_status::invalid_argument, "plan", "the given plan describes another request", POTAL_OK);
             }
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+            planning_match.finish();
+#endif
             st = potal_validate_execution_plan(*req.plan, has_residual ? req.residual : nullptr, &why, hw);
             if (st != potal_paired_status::ok) {
                 return ex.fail(st, "plan", why, POTAL_OK);
             }
-            report.plan = *req.plan;
-            report.tile = req.plan->tile;
+            {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+                planning_profile::Scope planning_copy(planning_profile::Site::report_plan_copy, planning_profile::Component::copy);
+#endif
+                report.plan = *req.plan;
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+                planning_copy.finish();
+                planning_profile::Scope inventory(planning_profile::Site::payload_inventory, planning_profile::Component::instrumentation);
+                const planning_copy_extent extent = execution_copy_extent(report.plan);
+                planning_copy.add_bytes(extent.bytes, extent.objects);
+#endif
+            }
+            {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+                planning_profile::Scope planning_copy(planning_profile::Site::report_tile_copy, planning_profile::Component::copy);
+#endif
+                report.tile = req.plan->tile;
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+                planning_copy.finish();
+                planning_profile::Scope inventory(planning_profile::Site::payload_inventory, planning_profile::Component::instrumentation);
+                const planning_copy_extent extent = tile_copy_extent(report.tile);
+                planning_copy.add_bytes(extent.bytes, extent.objects);
+#endif
+            }
         } else {
             st = potal_paired_plan_stripe(*req.main_plan, req.rows, req.n, req.k, has_residual ? req.residual : nullptr,
                                           report.tile, report.plan, &why, hw);
@@ -2200,6 +2343,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             }
         }
 
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+        planning_root.finish(); // No staging allocation or hardware issue is included.
+#endif
         if (ex.profile) {
             ex.plan_s = seconds_since(ex.plan_start);
             ex.plan_start = exec_clock::time_point{};
