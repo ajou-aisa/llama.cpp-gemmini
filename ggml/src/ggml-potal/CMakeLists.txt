@@ -367,6 +367,35 @@ if (POTAL_B5_TESTS)
     endif()
 endif()
 
+option(POTAL_E4A_TESTS "Build isolated resident-B interface acceptance executables" OFF)
+if (POTAL_E4A_TESTS)
+    add_library(potal-resident-api STATIC tests/potal-resident.c)
+    target_include_directories(potal-resident-api PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${POTAL_HW_GENERATED_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    set_target_properties(potal-resident-api PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_executable(potal-resident-test tests/potal-resident-test.cpp)
+    target_compile_features(potal-resident-test PRIVATE cxx_std_17)
+    target_link_libraries(potal-resident-test PRIVATE potal-resident-api)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+        target_sources(potal-resident-test PRIVATE ${POTAL_BACKEND_SOURCES}
+            matmul/tiling.cpp matmul/stripe-api.cpp)
+        target_include_directories(potal-resident-test PRIVATE ${POTAL_PRIVATE_INCLUDES})
+        target_compile_definitions(potal-resident-test PRIVATE ${POTAL_LOG_DEFINITIONS})
+        target_link_libraries(potal-resident-test PRIVATE ggml ggml-gemmini-utils Threads::Threads)
+    else()
+        add_test(NAME potal-resident-test COMMAND potal-resident-test)
+    endif()
+    add_executable(potal-resident-model-test tests/potal-resident-model-test.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-resident-model-test)
+    target_include_directories(potal-resident-model-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-resident-model-test PRIVATE ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-resident-model-test COMMAND potal-resident-model-test)
+    endif()
+endif()
+
 add_executable(potal-full-inference tests/potal-full-inference.cpp)
 target_include_directories(potal-full-inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src ${CMAKE_CURRENT_SOURCE_DIR}/../../../common)
