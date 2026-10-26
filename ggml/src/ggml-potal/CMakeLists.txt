@@ -342,6 +342,16 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-attention-test COMMAND potal-attention-test)
 endif()
 
+add_executable(potal-paired-inventory tests/potal-paired-inventory.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-paired-inventory)
+target_include_directories(potal-paired-inventory PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-paired-inventory PRIVATE ggml)
+
+option(POTAL_E3_TESTS "Build isolated H3-6E3 acceptance executables" OFF)
+if (POTAL_E3_TESTS)
+    include(tests/e3/CMakeLists.txt)
+endif()
+
 add_executable(potal-full-inference tests/potal-full-inference.cpp)
 target_include_directories(potal-full-inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src ${CMAKE_CURRENT_SOURCE_DIR}/../../../common)
