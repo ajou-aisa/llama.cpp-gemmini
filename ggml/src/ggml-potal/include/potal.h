@@ -356,6 +356,7 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const pota
 /* ---- Command funct7 values (GemminiISA.scala); the raw issue layer and the
  * paired session's command records use them. ---------------------------------- */
 #define POTAL_FUNCT_CONFIG                    0
+#define POTAL_FUNCT_MVIN                      2
 #define POTAL_FUNCT_MVOUT                     3
 #define POTAL_FUNCT_FLUSH                     7
 #define POTAL_FUNCT_LOOP_WS                   8
@@ -481,6 +482,31 @@ potal_status potal_acc_readback_encode(const potal_acc_readback *r, potal_rocc_c
                                        potal_rocc_cmd *mvouts, uint32_t capacity, uint32_t *count);
 
 /*
+ * One final signed INT32 column-bias addition to an initialized ACC bank.
+ * The same values[j] row is repeated over every valid output row. Hardware
+ * performs Sat32(ACC + values[j]) once per lane, without another SCU shift.
+ * Values must already be exactly representable INT32; this interface neither
+ * clips a wider correction nor splits it into multiple saturating additions.
+ *
+ * Full-width LOAD_CMD with is_acc_addr=1, accumulate=1, shrink=0 and stride=0.
+ * The descriptor covers the same bank-local tile layout as ACC readback.
+ * values is DIM*4-byte aligned and spans j_tiles*DIM-pad_j signed32 elements.
+ * It must remain mapped and untouched until the following successful fence.
+ */
+typedef struct potal_acc_bias {
+    uint32_t acc_bank;
+    uint32_t i_tiles;
+    uint32_t j_tiles;
+    uint32_t pad_i;
+    uint32_t pad_j;
+    const int32_t *values;
+} potal_acc_bias;
+
+potal_status potal_acc_bias_check(const potal_acc_bias *bias);
+potal_status potal_acc_bias_encode(const potal_acc_bias *bias, potal_rocc_cmd *config_ld,
+                                   potal_rocc_cmd *mvins, uint32_t capacity, uint32_t *count);
+
+/*
  * Paired session: the single owner of the accelerator while open. Opening
  * refuses (POTAL_ERR_BUSY) while a regular GEMM is unfenced or another session
  * is open; while open, potal_gemm_ws_issue / potal_loop_ws_issue / potal_fence /
@@ -570,6 +596,7 @@ typedef struct potal_paired_session_status {
     const char  *error_stage;         /* NULL when not failed */
     uint32_t     outstanding_loops;
     uint32_t     outstanding_readbacks;
+    uint32_t     outstanding_acc_updates; /* INT32 MVIN bias DMA, cleared only by a successful drain */
     uint32_t     index_transaction_open; /* a CONFIG whose writes are not complete */
     uint32_t     index_transaction_pair;
     uint32_t     index_transaction_written;
@@ -592,6 +619,8 @@ potal_status potal_paired_index_config(potal_paired_session *session, const pota
 potal_status potal_paired_index_write(potal_paired_session *session, const potal_index_write *w);
 potal_status potal_paired_loop_ws_issue(potal_paired_session *session, const potal_paired_loop_ws *loop);
 potal_status potal_paired_acc_readback_issue(potal_paired_session *session, const potal_acc_readback *r);
+/* Requires drained prior work. Later LOOP_WS, readback, flush and close require its fence. */
+potal_status potal_paired_acc_bias_issue(potal_paired_session *session, const potal_acc_bias *bias);
 /* POTAL_FENCE: POTAL_OK means every outstanding paired LOOP_WS and readback drained. */
 potal_status potal_paired_fence(potal_paired_session *session);
 

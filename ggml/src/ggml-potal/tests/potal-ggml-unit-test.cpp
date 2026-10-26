@@ -264,7 +264,7 @@ void test_contract(ggml_backend_t potal) {
         { "strided src0 view (nb1=32)",
           ggml_mul_mat(c, ggml_view_2d(c, matrix(GGML_TYPE_I8, 32, 16), 16, 16, wide->nb[1], 0), x16),
           GGML_POTAL_REJECT_LAYOUT },
-        { "attention role tag in op_params[1]", tagged, GGML_POTAL_REJECT_OP_PARAMS },
+        { "attention role rejects I8 operand types", tagged, GGML_POTAL_REJECT_TYPE },
         { "bias ADD", ggml_add(c, matrix(GGML_TYPE_F32, 16, 16), matrix(GGML_TYPE_F32, 16, 1)),
           GGML_POTAL_REJECT_OP },
         { "SOFT_MAX", ggml_soft_max(c, matrix(GGML_TYPE_F32, 16, 16)), GGML_POTAL_REJECT_OP },

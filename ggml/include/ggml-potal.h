@@ -41,8 +41,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_potal_reg(void);
 enum ggml_potal_reject {
     GGML_POTAL_REJECT_NONE = 0,  // supported
     GGML_POTAL_REJECT_OP,        // neither MUL_MAT nor a metadata-only view op
-    GGML_POTAL_REJECT_OP_PARAMS, // MUL_MAT tagged beyond op_params[0] (e.g. an attention role)
-    GGML_POTAL_REJECT_TYPE,      // neither I8 x I8 nor Q8_HP1 weights x F32 activations, or dst not F32
+    GGML_POTAL_REJECT_OP_PARAMS, // unrecognized MUL_MAT precision/role parameters
+    GGML_POTAL_REJECT_TYPE,      // unsupported linear/attention operand types, or dst not F32
     GGML_POTAL_REJECT_SHAPE,     // not 2-D; I8: not M = N = 16 with K = 16 or 32
     GGML_POTAL_REJECT_LAYOUT,    // not contiguous (transposed, permuted, strided)
     GGML_POTAL_REJECT_MEMORY,    // not in host memory, or unallocated at compute time
@@ -185,6 +185,21 @@ struct ggml_backend_potal_stats {
     uint64_t paired_readback_tiles;       // MVOUT commands
     uint64_t paired_fences;               // POTAL_FENCE of paired sessions
     uint64_t paired_drains;               // drain points: fences + released scale windows
+
+    // Tagged QK/PV attention, separate from Q8_HP1 weighted MatMul and CPU ops.
+    // All MatMul partials use PoTal WS; Host preparation/reconstruction is not
+    // counted as a hardware completion. Softmax and KV-cache ops remain CPU.
+    uint64_t attention_qk_nodes;
+    uint64_t attention_pv_nodes;
+    uint64_t attention_completed;
+    uint64_t attention_failed;
+    uint64_t attention_limb_jobs;         // logical jobs that issued at least one LOOP_WS
+    uint64_t attention_residual_jobs;     // separately reconstructed upper stream limbs
+    uint64_t attention_loop_ws;
+    uint64_t attention_qk_shared_acc_jobs; // one doubled-K same-ACC job per Q limb
+    uint64_t attention_pv_corrections;     // low-limb jobs with one final ACC bias phase
+    uint64_t attention_bias_mvins;        // one full-width INT32 bias MVIN per output tile
+    double   attention_wall_s;           // preparation, issuer, reconstruction; not FPGA-only time
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);

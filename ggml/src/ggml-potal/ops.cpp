@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "log.hpp"
+#include "matmul/attention.hpp"
 #include "matmul/dense.hpp"
 #include "matmul/execution.hpp"
 #include "matmul/options.hpp"
@@ -27,6 +28,8 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 
 namespace ggml::potal {
 
@@ -131,6 +134,53 @@ ggml_status mul_mat_i8(backend_state & state, ggml_tensor * node, const mul_mat_
     log::debug("potal.backend", "[POTAL_BACKEND] node=%s dispatch=HARDWARE hw_gemm_count=%llu", node->name,
                (unsigned long long) st.gemm_completed);
     record_unmeasured_npu();
+    return GGML_STATUS_SUCCESS;
+}
+
+ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
+    auto & stats = state.stats;
+    (attention::get_role(node) == attention::role::qk ? stats.attention_qk_nodes : stats.attention_pv_nodes)++;
+    const auto start = clock_type::now();
+    const attention::result result = attention::execute_hardware(node);
+    stats.attention_wall_s += seconds_since(start);
+    stats.attention_limb_jobs += result.jobs;
+    stats.attention_residual_jobs += result.residual_jobs;
+    stats.attention_loop_ws += result.loops;
+    stats.attention_qk_shared_acc_jobs += result.paired_k_jobs;
+    stats.attention_pv_corrections += result.correction_jobs;
+    stats.attention_bias_mvins += result.bias_updates;
+    stats.hw_requests += result.jobs;
+    stats.scale_writes += result.scale_writes;
+    stats.scale_releases += result.scale_releases;
+    stats.tlb_flushes += result.tlb_flushes;
+    stats.scale_s += result.scale_s;
+    stats.issue_s += result.issue_s;
+    stats.fence_s += result.fence_s;
+    stats.last_status = result.status;
+    if (result.status != POTAL_OK) {
+        ++stats.attention_failed;
+        // Attention accepts strided outputs; poison logical elements only.
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        for (int64_t b = 0; b < node->ne[3]; ++b)
+            for (int64_t h = 0; h < node->ne[2]; ++h)
+                for (int64_t i = 0; i < node->ne[1]; ++i)
+                    for (int64_t j = 0; j < node->ne[0]; ++j) {
+                        auto * p = static_cast<char *>(node->data) +
+                                   b * node->nb[3] + h * node->nb[2] + i * node->nb[1] + j * node->nb[0];
+                        std::memcpy(p, &nan, sizeof(nan));
+                    }
+        log::failure("potal.attention", "[POTAL_ATTENTION] node=%s status=%s stage=%s fatal=%d",
+                     node->name, potal_status_name(result.status), result.stage ? result.stage : "-", result.fatal);
+        return GGML_STATUS_FAILED;
+    }
+    ++stats.attention_completed;
+    log::debug("potal.attention", "[POTAL_ATTENTION] node=%s role=%s dispatch=HARDWARE limb_jobs=%llu "
+               "loop_ws=%llu bias_mvins=%llu",
+               node->name, attention::get_role(node) == attention::role::qk ? "QK" : "PV",
+               (unsigned long long)result.jobs, (unsigned long long)result.loops,
+               (unsigned long long)result.bias_updates);
+    ggml::gemmini::performance::record_npu("POTAL", "attention", "work_total_cycles", 0, false,
+                                          "unavailable_device_counter");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -579,6 +629,9 @@ ggml_potal_reject check_op(const ggml_tensor * op) {
     if (op->op != GGML_OP_MUL_MAT) {
         return GGML_POTAL_REJECT_OP;
     }
+    if (attention::get_role(op) != attention::role::none) {
+        return attention::check(op, false);
+    }
     return is_hp1_mul_mat(op) ? check_mul_mat_hp1(op, false, nullptr) : check_mul_mat(op, false, nullptr);
 }
 
@@ -589,10 +642,16 @@ ggml_potal_reject check_compute(const ggml_tensor * node) {
     if (node->op != GGML_OP_MUL_MAT) {
         return GGML_POTAL_REJECT_OP;
     }
+    if (attention::get_role(node) != attention::role::none) {
+        return attention::check(node, true);
+    }
     return is_hp1_mul_mat(node) ? check_mul_mat_hp1(node, true, nullptr) : check_mul_mat(node, true, nullptr);
 }
 
 ggml_status compute_mul_mat(backend_state & state, ggml_tensor * node, int node_index) {
+    if (attention::get_role(node) != attention::role::none) {
+        return mul_mat_attention(state, node);
+    }
     if (is_hp1_mul_mat(node)) {
         hp1_shape s = {};
         check_mul_mat_hp1(node, true, &s); // passed check_compute

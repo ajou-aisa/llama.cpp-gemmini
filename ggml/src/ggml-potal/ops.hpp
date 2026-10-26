@@ -4,6 +4,7 @@
 //
 //   MUL_MAT I8 x I8 -> F32, M = N = 16, K = 16|32   validated single GEMM (matmul/pack.hpp)
 //   MUL_MAT F32 x Q8_HP1 -> F32, any 2-D shape      tiled PoTal GEMM (matmul/dense.hpp)
+//   Tagged QK/PV F16/F32 -> F32, heads/batches      attention WS (matmul/attention.hpp)
 //   NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE             metadata only
 //
 // Everything else is rejected by supports_op and runs on another backend.

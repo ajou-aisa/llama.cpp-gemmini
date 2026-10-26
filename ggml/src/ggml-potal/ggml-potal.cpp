@@ -112,6 +112,16 @@ void potal_free(ggml_backend_t backend) {
         (unsigned long long) st.paired_readbacks, (unsigned long long) st.paired_readback_tiles,
         (unsigned long long) st.paired_fences, (unsigned long long) st.paired_drains);
     // Debug records are flushed per record; drain the buffered cycle log too.
+    if (st.attention_qk_nodes || st.attention_pv_nodes) {
+        ggml::potal::log::debug("potal.attention",
+            "[POTAL_ATTENTION] summary qk_nodes=%llu pv_nodes=%llu completed=%llu failed=%llu "
+            "limb_jobs=%llu residual_jobs=%llu loop_ws=%llu shared_acc_qk_jobs=%llu bias_mvins=%llu",
+            (unsigned long long)st.attention_qk_nodes, (unsigned long long)st.attention_pv_nodes,
+            (unsigned long long)st.attention_completed, (unsigned long long)st.attention_failed,
+            (unsigned long long)st.attention_limb_jobs, (unsigned long long)st.attention_residual_jobs,
+            (unsigned long long)st.attention_loop_ws, (unsigned long long)st.attention_qk_shared_acc_jobs,
+            (unsigned long long)st.attention_bias_mvins);
+    }
     (void) ggml::gemmini::log::cycle.flush();
     delete static_cast<potal_context *>(backend->context);
     delete backend;

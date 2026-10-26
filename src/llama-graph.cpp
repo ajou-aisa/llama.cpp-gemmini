@@ -4,7 +4,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-kv-cache.h"
-#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
 #include "ggml-gemmini.h"
 #endif
 
@@ -1249,7 +1249,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
         const bool potal_attention = cparams.offload_kqv &&
             (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
             (v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16) && q->type == GGML_TYPE_F32;
@@ -1293,19 +1293,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
-#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
         if (potal_attention) {
             ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
             ggml_backend_t selected = nullptr;
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                 auto * backend = ggml_backend_sched_get_backend(sched, i);
-                if (strcmp(ggml_backend_name(backend), "GEMMINI") == 0 &&
+#if GGML_POTAL_ATTENTION
+                const char * attention_backend = "POTAL";
+#else
+                const char * attention_backend = "GEMMINI";
+#endif
+                if (strcmp(ggml_backend_name(backend), attention_backend) == 0 &&
                     ggml_backend_supports_op(backend, potal_kq) && ggml_backend_supports_op(backend, kqv)) {
                     selected = backend;
                     break;
                 }
             }
-            GGML_ASSERT(selected && "A4NKS attention requires a Gemmini backend supporting both QK and PV");
+            GGML_ASSERT(selected && "Attention offload requires the selected backend to support both QK and PV");
             ggml_backend_sched_set_tensor_backend(sched, potal_kq, selected);
             ggml_backend_sched_set_tensor_backend(sched, kqv, selected);
         }

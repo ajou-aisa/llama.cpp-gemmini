@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "llama-context.h"
 #include "ggml-cpu.h"
+#include "ggml-gemmini.h"
 #include "ggml-potal.h"
 #include "json.hpp"
 
@@ -34,7 +35,7 @@ struct Options {
     std::string model, prompt, output, forced;
     std::string backend = "potal", route = "serial";
     int prompt_tokens = 16, generated = 8, repeats = 1;
-    bool capture = false, warmup = false, help = false;
+    bool capture = false, warmup = false, help = false, attention = false;
 };
 
 Options parse(int argc, char ** argv) {
@@ -44,6 +45,8 @@ Options parse(int argc, char ** argv) {
         if (key == "--help") out.help = true;
         else if (key == "--capture") out.capture = true;
         else if (key == "--warmup") out.warmup = true;
+        else if (key == "--no-warmup") out.warmup = false;
+        else if (key == "--attention") out.attention = true;
         else {
             if (++i == argc) throw std::runtime_error("missing option value: " + key);
             const std::string value = argv[i];
@@ -87,7 +90,7 @@ std::ofstream output(const std::string & path) {
 struct Observation {
     llama_context * context = nullptr;
     std::array<std::array<uint64_t, GGML_OP_COUNT>, 3> operations{};
-    uint64_t cpu_hp1 = 0, unknown_matmul = 0;
+    uint64_t cpu_hp1 = 0, unknown_matmul = 0, cpu_attention = 0, potal_attention = 0;
     json matmuls = json::array();
 };
 
@@ -103,9 +106,16 @@ bool observe(ggml_tensor * tensor, bool ask, void * opaque) {
         if (!backend) ++data.unknown_matmul;
         const bool hp1 = tensor->src[0] && tensor->src[0]->type == GGML_TYPE_Q8_HP1;
         if (owner == 1 && hp1) ++data.cpu_hp1;
+        const auto role = ggml_gemmini_get_attention_role(tensor);
+        if (role != GGML_GEMMINI_ATTENTION_NONE) {
+            if (owner == 0) ++data.potal_attention;
+            else if (owner == 1) ++data.cpu_attention;
+        }
         data.matmuls.push_back({
             {"name", tensor->name}, {"backend", backend ? ggml_backend_name(backend) : "UNKNOWN"},
             {"weight_type", tensor->src[0] ? ggml_type_name(tensor->src[0]->type) : "NONE"},
+            {"attention_role", role == GGML_GEMMINI_ATTENTION_QK ? "QK" :
+                               role == GGML_GEMMINI_ATTENTION_PV ? "PV" : "NONE"},
             {"shape", {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]}}
         });
     }
@@ -132,6 +142,10 @@ json counters(const ggml_backend_potal_stats & before, const ggml_backend_potal_
     COUNTER(scale_writes); COUNTER(scale_releases);
     COUNTER(radix_reconstructions); COUNTER(merges_completed); COUNTER(compensation_failed);
     COUNTER(gemm_failed);
+    COUNTER(attention_qk_nodes); COUNTER(attention_pv_nodes);
+    COUNTER(attention_completed); COUNTER(attention_failed);
+    COUNTER(attention_limb_jobs); COUNTER(attention_residual_jobs); COUNTER(attention_loop_ws);
+    COUNTER(attention_qk_shared_acc_jobs); COUNTER(attention_pv_corrections); COUNTER(attention_bias_mvins);
 #undef COUNTER
     data["weight_prepare_ms"] = (after.weight_pack_s - before.weight_pack_s) * 1000.0;
     data["weight_allocate_ms"] = (after.weight_alloc_s - before.weight_alloc_s) * 1000.0;
@@ -141,6 +155,7 @@ json counters(const ggml_backend_potal_stats & before, const ggml_backend_potal_
     data["fence_api_ms"] = (after.fence_s - before.fence_s) * 1000.0;
     data["activation_quant_ms"] = (after.act_quant_s - before.act_quant_s) * 1000.0;
     data["pipeline_wall_ms"] = (after.pipeline_wall_s - before.pipeline_wall_s) * 1000.0;
+    data["attention_wall_ms"] = (after.attention_wall_s - before.attention_wall_s) * 1000.0;
     data["last_status"] = after.last_status;
     data["issuer_ready"] = after.issuer_ready;
     data["issuer_cpu"] = after.issuer_cpu;
@@ -270,9 +285,14 @@ public:
                 if (observation.matmuls.empty())
                     throw std::runtime_error("scheduler callback observed no MatMul nodes");
                 if (observation.unknown_matmul) throw std::runtime_error("unknown MatMul backend");
+                if (options.attention && options.backend == "potal" &&
+                    (observation.cpu_attention != 0 || observation.potal_attention != 24))
+                    throw std::runtime_error("Attention backend assignments are incomplete or used CPU");
                 steps[step] = {{"step", step}, {"input_position", batch.value.pos[0]},
                     {"kv_tokens", cached}, {"kv_position_max", position}, {"selected", best},
                     {"emitted_ms", emitted[step]}, {"cpu_hp1_matmul", observation.cpu_hp1},
+                    {"cpu_attention_matmul", observation.cpu_attention},
+                    {"potal_attention_matmul", observation.potal_attention},
                     {"matmuls", observation.matmuls}, {"operations", json::array()}};
                 for (int backend = 0; backend < 3; ++backend)
                     for (int op = 0; op < GGML_OP_COUNT; ++op)
@@ -327,6 +347,14 @@ public:
                 throw std::runtime_error("incomplete or failed GPT2 hardware execution");
             if (options.route != "serial" && hardware["paired_stripes"].get<uint64_t>() == 0)
                 throw std::runtime_error("requested Paired route executed no Paired stripe");
+            if (options.attention &&
+                (hardware["attention_qk_nodes"].get<uint64_t>() != uint64_t(12 * generated) ||
+                 hardware["attention_pv_nodes"].get<uint64_t>() != uint64_t(12 * generated) ||
+                 hardware["attention_completed"].get<uint64_t>() != uint64_t(24 * generated) ||
+                 hardware["attention_failed"].get<uint64_t>() != 0 ||
+                 hardware["attention_qk_shared_acc_jobs"].get<uint64_t>() == 0 ||
+                 hardware["attention_bias_mvins"].get<uint64_t>() == 0))
+                throw std::runtime_error("incomplete or failed PoTal Attention hardware execution");
         } else if (after.hp1_completed != before.hp1_completed) {
             throw std::runtime_error("CPU reference unexpectedly used POTAL");
         }
@@ -345,7 +373,7 @@ int main(int argc, char ** argv) try {
         std::puts("potal-full-inference --model GGUF --prompt-file TEXT --output PREFIX\n"
                   "  [--backend potal|cpu] [--route serial|paired|conservative]\n"
                   "  [--prompt-tokens 1..256] [--generate 2..32] [--repeat 1..3]\n"
-                  "  [--capture] [--warmup] [--force-tokens FILE]\n"
+                  "  [--capture] [--no-warmup|--warmup] [--attention] [--force-tokens FILE]\n"
                   "Warmup is a separate complete two-token request.\n"
                   "With --capture --warmup, capture one full warmup request; measure uncaptured repeats.\n"
                   "Capture timings are diagnostic, not primary performance samples.");
@@ -376,7 +404,7 @@ int main(int argc, char ** argv) try {
     context_params.n_batch = 256;
     context_params.n_ubatch = 256;
     context_params.n_threads = context_params.n_threads_batch = 3;
-    context_params.offload_kqv = false;
+    context_params.offload_kqv = options.attention && options.backend == "potal";
     context_params.flash_attn = false;
     context_params.op_offload = options.backend == "potal";
     context_params.no_perf = false;
@@ -390,7 +418,8 @@ int main(int argc, char ** argv) try {
     Request request(options, context.get(), llama_model_get_vocab(model.get()));
     json manifest = {{"model", options.model}, {"parameters", llama_model_n_params(model.get())},
         {"model_load_ms", load_ms}, {"context_init_ms", context_ms}, {"prompt_ids", request.prompt},
-        {"n_ctx", 512}, {"n_batch", 256}, {"n_ubatch", 256}, {"threads", 3}, {"kv_type", "F16"}};
+        {"n_ctx", 512}, {"n_batch", 256}, {"n_ubatch", 256}, {"threads", 3}, {"kv_type", "F16"},
+        {"attention_offload", context_params.offload_kqv}, {"warmup", options.warmup}};
     { auto file = output(options.output + ".model.json"); file << manifest.dump(2) << '\n'; }
     if (options.warmup) request.run(options.capture ? options.generated : 2, "warmup");
     for (int i = 0; i < options.repeats; ++i) request.run(options.generated, "request" + std::to_string(i));

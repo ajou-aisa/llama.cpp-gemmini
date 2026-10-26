@@ -69,6 +69,7 @@ _Static_assert(sizeof(acc_t) == 4 && (acc_t)-1 < 0, "PoTal API requires signed 3
 #define MVOUT_ROWS_SHIFT        48
 #define MVOUT_COLS_SHIFT        32
 #define LOCAL_ADDR_ACC          ((uint64_t)1 << 31)
+#define LOCAL_ADDR_ACCUMULATE   ((uint64_t)1 << 30)
 #define LOCAL_ADDR_FULL_ACC_ROW ((uint64_t)1 << 29)
 
 /* LOOP_WS_CONFIG_BOUNDS: 16-bit I/J/K iterators (rs2) and pads (rs1) at [15:0]/[31:16]/[47:32]. */
@@ -596,6 +597,53 @@ potal_status potal_acc_readback_encode(const potal_acc_readback *r, potal_rocc_c
     return POTAL_OK;
 }
 
+potal_status potal_acc_bias_check(const potal_acc_bias *b) {
+    if (b == NULL || b->acc_bank > 1 || b->i_tiles == 0 || b->j_tiles == 0 ||
+        b->i_tiles > LOOP_WS_FIELD16_MAX || b->j_tiles > LOOP_WS_FIELD16_MAX ||
+        b->pad_i >= POTAL_HW_DIM || b->pad_j >= POTAL_HW_DIM) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t columns = (uint64_t)b->j_tiles * POTAL_HW_DIM - b->pad_j;
+    if (!tile_pointer_ok(b->values, columns * sizeof(int32_t), POTAL_HW_DIM * sizeof(int32_t))) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t tiles = (uint64_t)b->i_tiles * b->j_tiles;
+    if (tiles > POTAL_WORK_IDS_PER_LOOP || tiles * POTAL_HW_DIM > POTAL_HW_ACC_ROWS / 2) {
+        return POTAL_ERR_CAPACITY;
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_acc_bias_encode(const potal_acc_bias *b, potal_rocc_cmd *config_ld,
+                                   potal_rocc_cmd *mvins, uint32_t capacity, uint32_t *count) {
+    const potal_status status = potal_acc_bias_check(b);
+    if (status != POTAL_OK) {
+        return status;
+    }
+    if (config_ld == NULL || mvins == NULL || count == NULL) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    *count = b->i_tiles * b->j_tiles;
+    if (*count > capacity) {
+        return POTAL_ERR_CAPACITY;
+    }
+    /* State 0, shrink=0, identity scale; stride 0 repeats the bias row. */
+    *config_ld = cmd(config_ld_rs1(0), 0);
+    uint32_t t = 0;
+    for (uint32_t i = 0; i < b->i_tiles; ++i) {
+        const uint64_t rows = POTAL_HW_DIM - (i + 1 == b->i_tiles ? b->pad_i : 0);
+        for (uint32_t j = 0; j < b->j_tiles; ++j, ++t) {
+            const uint64_t columns = POTAL_HW_DIM - (j + 1 == b->j_tiles ? b->pad_j : 0);
+            const uint64_t row = (uint64_t)b->acc_bank * (POTAL_HW_ACC_ROWS / 2) +
+                                 ((uint64_t)i * b->j_tiles + j) * POTAL_HW_DIM;
+            const uint64_t dram = (uint64_t)(uintptr_t)b->values + (uint64_t)j * POTAL_HW_DIM * sizeof(int32_t);
+            mvins[t] = cmd(dram, (rows << MVOUT_ROWS_SHIFT) | (columns << MVOUT_COLS_SHIFT) |
+                                 LOCAL_ADDR_ACC | LOCAL_ADDR_ACCUMULATE | row);
+        }
+    }
+    return POTAL_OK;
+}
+
 #if defined(__riscv)
 
 /* Set by a GEMM issue, cleared by a successful POTAL_FENCE. */
@@ -738,7 +786,7 @@ struct potal_paired_session {
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
     const char       *error_stage;
-    uint32_t          outstanding_loops, outstanding_readbacks;
+    uint32_t          outstanding_loops, outstanding_readbacks, outstanding_acc_updates;
     uint64_t          commands;
     uint64_t          drains;               /* accepted FENCE / RELEASE drain points */
     int               index_open;          /* a CONFIG whose writes are not complete */
@@ -791,6 +839,7 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
         case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: potal_rocc_loop_ws_strides_dc(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_LOOP_WS:                   potal_rocc_loop_ws(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_MVOUT:                     potal_rocc_mvout(rs1, rs2); return POTAL_OK;
+        case POTAL_FUNCT_MVIN:                      potal_rocc_mvin(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_FLUSH:                     potal_rocc_flush(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_SCALE_WRITE:               return hw_status(potal_rocc_scale_write(rs1, rs2));
         case POTAL_FUNCT_SCALE_RELEASE:             return hw_status(potal_rocc_scale_release(rs1, rs2));
@@ -867,6 +916,7 @@ static potal_status paired_raw(
 static void paired_drained(potal_paired_session *s) {
     s->outstanding_loops = 0;
     s->outstanding_readbacks = 0;
+    s->outstanding_acc_updates = 0;
     for (uint32_t p = 0; p < POTAL_PAIRS; ++p) {
         s->pair[p].outstanding = 0;
     }
@@ -914,7 +964,8 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
-    const int outstanding = s->outstanding_loops != 0 || s->outstanding_readbacks != 0;
+    const int outstanding = s->outstanding_loops != 0 || s->outstanding_readbacks != 0 ||
+                            s->outstanding_acc_updates != 0;
     int       live        = 0;
     for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) {
         live |= s->slot_columns[slot] != 0;
@@ -945,6 +996,7 @@ potal_paired_session_status potal_paired_session_query(const potal_paired_sessio
     q.error_stage = s->failed ? s->error_stage : NULL;
     q.outstanding_loops = s->outstanding_loops;
     q.outstanding_readbacks = s->outstanding_readbacks;
+    q.outstanding_acc_updates = s->outstanding_acc_updates;
     q.index_transaction_open = (uint32_t)s->index_open;
     q.index_transaction_pair = s->index_pair;
     q.index_transaction_written = s->index_written;
@@ -971,7 +1023,7 @@ potal_status potal_paired_tlb_flush(potal_paired_session *s) {
     if (ready != POTAL_OK) {
         return ready;
     }
-    if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0) {
+    if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0 || s->outstanding_acc_updates != 0) {
         return POTAL_ERR_BUSY; /* no flush under in-flight DMA */
     }
     if (!paired_can_issue(s)) {
@@ -1115,6 +1167,9 @@ potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_pai
     if (ready != POTAL_OK) {
         return ready;
     }
+    if (s->outstanding_acc_updates != 0) {
+        return POTAL_ERR_BUSY;
+    }
     potal_gemm_ws_program p;
     const potal_status status = potal_paired_loop_ws_encode(pl, &p);
     if (status != POTAL_OK) {
@@ -1163,6 +1218,9 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
     if (ready != POTAL_OK) {
         return ready;
     }
+    if (s->outstanding_acc_updates != 0) {
+        return POTAL_ERR_BUSY;
+    }
     potal_rocc_cmd config_st;
     potal_rocc_cmd mvouts[POTAL_WORK_IDS_PER_LOOP];
     uint32_t count = 0;
@@ -1181,6 +1239,36 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
     return POTAL_OK;
 }
 
+potal_status potal_paired_acc_bias_issue(potal_paired_session *s, const potal_acc_bias *bias) {
+    const potal_status ready = paired_ready(s);
+    if (ready != POTAL_OK) {
+        return ready;
+    }
+    if (s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates) {
+        return POTAL_ERR_BUSY;
+    }
+    potal_rocc_cmd config_ld;
+    potal_rocc_cmd mvins[POTAL_WORK_IDS_PER_LOOP];
+    uint32_t count = 0;
+    const potal_status status = potal_acc_bias_encode(bias, &config_ld, mvins, POTAL_WORK_IDS_PER_LOOP, &count);
+    if (status != POTAL_OK) {
+        return status;
+    }
+    if (!paired_can_issue(s)) {
+        return POTAL_ERR_NO_HARDWARE;
+    }
+#if defined(__riscv)
+    potal_cpu_fence_rw();
+#endif
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld.rs1, config_ld.rs2, 0, "acc_bias");
+    for (uint32_t i = 0; i < count; ++i) {
+        /* Keep ownership even if a test sink reports an uncertain partial issue. */
+        s->outstanding_acc_updates++;
+        PAIRED_RAW(s, POTAL_FUNCT_MVIN, mvins[i].rs1, mvins[i].rs2, 0, "acc_bias");
+    }
+    return POTAL_OK;
+}
+
 potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
@@ -1191,7 +1279,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s->failed && strcmp(s->error_stage != NULL ? s->error_stage : "", "fence") == 0) {
         return s->error; /* a fence that did not answer OK is not retried */
     }
-    if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0) {
+    if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0 || s->outstanding_acc_updates != 0) {
         const potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
 #if defined(__riscv)
         potal_cpu_fence_rw();

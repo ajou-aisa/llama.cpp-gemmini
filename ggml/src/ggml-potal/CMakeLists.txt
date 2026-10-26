@@ -56,6 +56,12 @@ set_target_properties(potal-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRE
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-api-test COMMAND potal-api-test)
 endif()
+add_executable(potal-attention-api-test tests/potal-attention-api-test.c)
+target_link_libraries(potal-attention-api-test PRIVATE potal-api)
+set_target_properties(potal-attention-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-attention-api-test COMMAND potal-attention-api-test)
+endif()
 
 # Standalone Linux Indexed Weight diagnostic; --self-test checks C11 encoders on the host.
 if (POTAL_HW_DIM EQUAL 16 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -239,6 +245,9 @@ set(POTAL_BACKEND_SOURCES
     log.hpp
     ops.cpp
     ops.hpp
+    matmul/attention.cpp
+    matmul/attention-hw.cpp
+    matmul/attention.hpp
     matmul/dense.cpp
     matmul/dense.hpp
     matmul/execution.cpp
@@ -322,6 +331,22 @@ endfunction()
 
 ggml_add_backend_library(ggml-potal ggml-potal.cpp ${POTAL_BACKEND_SOURCES})
 potal_add_backend_settings(ggml-potal)
+set_source_files_properties(matmul/attention.cpp matmul/attention-hw.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+
+add_executable(potal-attention-test tests/potal-attention-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-attention-test)
+target_include_directories(potal-attention-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-attention-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-attention-test COMMAND potal-attention-test)
+endif()
+
+add_executable(potal-full-inference tests/potal-full-inference.cpp)
+target_include_directories(potal-full-inference PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src ${CMAKE_CURRENT_SOURCE_DIR}/../../../common)
+target_compile_features(potal-full-inference PRIVATE cxx_std_17)
+target_link_libraries(potal-full-inference PRIVATE llama ggml)
 
 # Hardware-free checks (host and target): registration, supports_op contract,
 # packing against a CPU-backend golden, scheduler placement, no fake success.
@@ -448,6 +473,11 @@ target_link_libraries(potal-residual-merge-bench PRIVATE ggml)
 
 # FireSim hardware test: real GGML MUL_MAT graphs computed by the POTAL backend.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    add_executable(potal-attention-smoke tests/potal-attention-smoke.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-attention-smoke)
+    target_include_directories(potal-attention-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-attention-smoke PRIVATE ggml)
+
     add_executable(potal-ggml-smoke tests/potal-ggml-smoke.cpp)
     target_link_libraries(potal-ggml-smoke PRIVATE ggml)
 
