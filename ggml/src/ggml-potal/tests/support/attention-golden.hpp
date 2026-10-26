@@ -68,9 +68,47 @@ inline bool column_bias(const stationary & b, size_t column, int32_t & out) {
 
 // Inputs are deliberately prepared fixtures. Stream operands are derived again
 // from their integer codes, so an incorrect prepared limb cannot bless itself.
-// split_panels models the forbidden Host merge, solely for adversarial witnesses.
+// Each pass starts a fresh ACC and uses the original carrier, including high.
+inline std::vector<int32_t> qk_pass(const stream & a, const stationary & b,
+                                   size_t q_limb, size_t k_limb) {
+    std::vector<int32_t> out(a.rows * b.n, 0);
+    for (size_t i = 0; i < a.rows; ++i) {
+        for (size_t j = 0; j < b.n; ++j) {
+            int32_t acc = 0;
+            for (size_t begin = 0; begin < a.kp; begin += 16) {
+                wide dot = 0;
+                for (size_t k = begin; k < begin + 16 && k < a.k; ++k)
+                    dot += wide{digits(a.codes[i * a.kp + k])[q_limb]} *
+                           b.limbs[k_limb][k * b.n + j];
+                const auto carrier = b.carriers[(begin / 32) * b.n + j];
+                acc = clamp32(wide{acc} + shifted(dot, carrier, 0));
+            }
+            out[i * b.n + j] = acc;
+        }
+    }
+    return out;
+}
+
+// The old shared-ACC/high+8 recurrence is available only for counterexamples.
 inline bool evaluate(const stream & a, const stationary & b, role operation,
-                     std::vector<int64_t> & out, bool split_panels = false) {
+                     std::vector<int64_t> & out, bool legacy_shared_qk = false) {
+    if (operation == role::qk && !legacy_shared_qk) {
+        std::vector<int64_t> values(a.rows * b.n, 0);
+        wide place = 1;
+        for (size_t limb = 0; limb < a.limb_count; ++limb, place *= 256) {
+            const auto low = qk_pass(a, b, limb, 0);
+            const auto high = qk_pass(a, b, limb, 1);
+            for (size_t index = 0; index < values.size(); ++index) {
+                const wide combined = wide{low[index]} + wide{256} * high[index];
+                if (combined < INT64_MIN || combined > INT64_MAX) return false;
+                const wide reconstructed = wide{values[index]} + combined * place;
+                if (reconstructed < INT64_MIN || reconstructed > INT64_MAX) return false;
+                values[index] = static_cast<int64_t>(reconstructed);
+            }
+        }
+        out = std::move(values);
+        return true;
+    }
     std::vector<int32_t> bias(b.n,0);
     if (operation == role::pv)
         for (size_t j = 0; j < b.n; ++j)
@@ -82,10 +120,8 @@ inline bool evaluate(const stream & a, const stationary & b, role operation,
             wide place = 1;
             for (size_t limb = 0; limb < a.limb_count; ++limb, place *= 256) {
                 int32_t acc = 0;
-                wide panels = 0;
                 const size_t passes = operation == role::qk ? 2 : 1;
                 for (size_t panel = 0; panel < passes; ++panel) {
-                    if (split_panels) acc = 0;
                     for (size_t begin = 0; begin < a.kp; begin += 16) {
                         wide dot = 0;
                         for (size_t k = begin; k < begin + 16; ++k) {
@@ -99,13 +135,12 @@ inline bool evaluate(const stream & a, const stationary & b, role operation,
                         const uint32_t carrier = b.carriers[(begin / 32) * b.n + j];
                         acc = clamp32(wide{acc} + shifted(dot, carrier, offset));
                     }
-                    if (split_panels) panels += acc;
                 }
                 // Exactly one atomic ACC addition after the complete low job.
                 // No correction belongs to any upper P limb.
                 if (operation == role::pv && limb == 0)
                     acc = clamp32(wide{acc} + bias[j]);
-                reconstructed += (split_panels ? panels : wide{acc}) * place;
+                reconstructed += wide{acc} * place;
                 // Reconstruct only a completed stream limb, never a K panel.
                 if (reconstructed < std::numeric_limits<int64_t>::min() ||
                     reconstructed > std::numeric_limits<int64_t>::max()) return false;

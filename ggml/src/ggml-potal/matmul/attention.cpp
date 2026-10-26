@@ -128,7 +128,7 @@ int32_t scu(int32_t partial, uint32_t carrier, unsigned offset) {
     return sat32(int64_t(partial) * (int64_t{1} << shift));
 }
 
-void reconstruct(int64_t & accumulator, int32_t part, size_t limb) {
+void reconstruct(int64_t & accumulator, int64_t part, size_t limb) {
     const __int128_t value = static_cast<__int128_t>(accumulator) +
                              static_cast<__int128_t>(part) * (static_cast<__int128_t>(1) << (bits * limb));
     require(value >= INT64_MIN && value <= INT64_MAX, POTAL_ERR_CAPACITY);
@@ -365,8 +365,9 @@ void integer_reference(const stream & activation, const stationary & weight, rol
     for (size_t limb = 0; limb < activation.limb_count; ++limb) {
         for (size_t i = 0; i < activation.rows; ++i) {
             for (size_t j = 0; j < weight.n; ++j) {
-                int32_t acc = 0;
+                int64_t stationary_sum = 0;
                 for (size_t pass = 0; pass < (operation == role::qk ? 2u : 1u); ++pass) {
+                    int32_t acc = 0;
                     for (size_t begin = 0; begin < activation.kp; begin += POTAL_HW_DIM) {
                         int32_t partial = 0;
                         for (size_t k = begin; k < begin + POTAL_HW_DIM && k < activation.k; ++k) {
@@ -374,13 +375,14 @@ void integer_reference(const stream & activation, const stationary & weight, rol
                                        weight.limbs[operation == role::qk ? pass : 0][k * weight.n + j];
                         }
                         const uint32_t carrier = weight.carriers[(begin / block_k) * weight.n + j];
-                        acc = sat32(int64_t(acc) + scu(partial, carrier, unsigned(pass * bits)));
+                        acc = sat32(int64_t(acc) + scu(partial, carrier, 0));
                     }
+                    if (operation == role::pv && limb == 0) {
+                        acc = sat32(int64_t(acc) + correction[j]);
+                    }
+                    reconstruct(stationary_sum, acc, pass);
                 }
-                if (operation == role::pv && limb == 0) {
-                    acc = sat32(int64_t(acc) + correction[j]);
-                }
-                reconstruct(out[i * weight.n + j], acc, limb);
+                reconstruct(out[i * weight.n + j], stationary_sum, limb);
             }
         }
     }
@@ -398,8 +400,10 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
     }
     for (size_t limb = 0; limb < activation.limb_count; ++limb) {
         const size_t passes = operation == role::qk ? 2 : 1;
-        const size_t k_total = product(activation.kp, passes);
-        require(activation.rows <= UINT32_MAX && weight.n <= UINT32_MAX && k_total <= UINT32_MAX, POTAL_ERR_CAPACITY);
+        const size_t k_total = activation.kp;
+        const size_t selection_k = product(activation.kp, passes);
+        require(activation.rows <= UINT32_MAX && weight.n <= UINT32_MAX && selection_k <= UINT32_MAX,
+                POTAL_ERR_CAPACITY);
         hp1_operands operands;
         require(operands.allocate({ int64_t(activation.rows), int64_t(weight.n), int64_t(k_total) }),
                 POTAL_ERR_CAPACITY);
@@ -409,34 +413,22 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
             require(bool(bias_dma), POTAL_ERR_CAPACITY);
             std::memcpy(bias_dma.get(), correction.data(), weight.n * sizeof(int32_t));
         }
-        for (size_t pass = 0; pass < passes; ++pass) {
-            for (size_t i = 0; i < activation.rows; ++i) {
-                for (size_t k = 0; k < activation.k; ++k) {
-                    operands.a[i * operands.lda + pass * activation.kp + k] =
-                        activation.limbs[limb][i * activation.kp + k];
-                }
+        for (size_t i = 0; i < activation.rows; ++i) {
+            for (size_t k = 0; k < activation.k; ++k) {
+                operands.a[i * operands.lda + k] = activation.limbs[limb][i * activation.kp + k];
             }
-            for (size_t k = 0; k < weight.kp; ++k) {
-                for (size_t j = 0; j < weight.n; ++j) {
-                    operands.own.b[(pass * weight.kp + k) * operands.ldb + j] =
-                        weight.limbs[operation == role::qk ? pass : 0][k * weight.n + j];
-                }
-            }
-            for (size_t block = 0; block < weight.kp / block_k; ++block) {
-                for (size_t j = 0; j < weight.n; ++j) {
-                    const uint32_t carrier = weight.carriers[block * weight.n + j];
-                    const uint32_t offset = uint32_t(pass * bits);
-                    require(carrier == POTAL_CARRIER_ZERO || carrier <= POTAL_CARRIER_MAX_SHIFT - offset);
-                    operands.own.carriers[(pass * weight.kp / block_k + block) * operands.cstride + j] =
-                        carrier == POTAL_CARRIER_ZERO ? carrier : carrier + offset;
-                }
+        }
+        for (size_t block = 0; block < weight.kp / block_k; ++block) {
+            for (size_t j = 0; j < weight.n; ++j) {
+                operands.own.carriers[block * operands.cstride + j] =
+                    weight.carriers[block * weight.n + j];
             }
         }
         potal_tile_plan plan;
-        require(potal_tile_select(activation.rows, weight.n, k_total, block_k / POTAL_HW_DIM, &plan) == POTAL_OK,
+        require(potal_tile_select(activation.rows, weight.n, selection_k, block_k / POTAL_HW_DIM, &plan) == POTAL_OK,
                 POTAL_ERR_CAPACITY);
-        // A K panel must not straddle the lower/upper or biased/correction
-        // boundary. All lower panels precede all upper panels for each ACC.
+        // Preserve the original doubled-K selection's I/J/K and whole-block
+        // panel boundaries. Each QK stationary limb now owns a complete GEMM.
         const size_t original_tiles = weight.kp / POTAL_HW_DIM;
         plan.tile_K = std::min(plan.tile_K, original_tiles);
         if (operation == role::pv && limb == 0) {
@@ -464,38 +456,63 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
         descriptor.tile_i = uint32_t(plan.tile_I);
         descriptor.tile_j = uint32_t(plan.tile_J);
         descriptor.tile_k = uint32_t(plan.tile_K);
-        const planned_result completed = operation == role::qk || limb != 0 ? run(descriptor) :
-            corrected(descriptor, static_cast<const int32_t *>(bias_dma.get()), weight.n);
-        const auto & work = completed.report;
-        report.jobs += work.loop_ws != 0;
-        report.loops += work.loop_ws;
-        report.fences += work.fences;
-        report.scale_writes += work.scale_writes;
-        report.scale_releases += work.scale_releases;
-        report.tlb_flushes += completed.tlb_flushes;
-        report.scale_s += work.scale_s;
-        report.issue_s += work.issue_s;
-        report.fence_s += work.fence_s;
-        if (!completed.ok) {
-            report.fatal = completed.fatal;
-            report.stage = completed.stage ? completed.stage : "attention_ws";
-            if (completed.fatal) {
-                operands.abandon(); // Unknown DMA completion: keep every operand alive.
-                (void) bias_dma.release();
-            }
-            require(false, completed.status != POTAL_OK ? completed.status : POTAL_ERR_BAD_RESPONSE);
+        std::vector<int64_t> stationary_sum;
+        if (operation == role::qk) {
+            stationary_sum.assign(out.size(), 0);
         }
-        require(completed.status == POTAL_OK && work.loop_ws && work.fences >= work.loop_ws &&
-                work.scale_writes == work.scale_releases, POTAL_ERR_BAD_RESPONSE);
-        report.residual_jobs += limb != 0;
-        report.paired_k_jobs += operation == role::qk;
-        report.correction_jobs += operation == role::pv && limb == 0;
-        report.bias_updates += operation == role::pv && limb == 0 ?
-            ((activation.rows + POTAL_HW_DIM - 1) / POTAL_HW_DIM) *
-            ((weight.n + POTAL_HW_DIM - 1) / POTAL_HW_DIM) : 0;
-        for (size_t i = 0; i < activation.rows; ++i) {
-            for (size_t j = 0; j < weight.n; ++j) {
-                reconstruct(out[i * weight.n + j], operands.c[i * operands.ldc + j], limb);
+        for (size_t pass = 0; pass < passes; ++pass) {
+            for (size_t k = 0; k < weight.kp; ++k) {
+                for (size_t j = 0; j < weight.n; ++j) {
+                    operands.own.b[k * operands.ldb + j] =
+                        weight.limbs[operation == role::qk ? pass : 0][k * weight.n + j];
+                }
+            }
+            // Regular WS overwrites the first K panel, accumulates later
+            // panels, and stores C only at the final panel. Its fence covers
+            // that store before Host consumption or reuse for the next limb.
+            const planned_result completed = operation == role::qk || limb != 0 ? run(descriptor) :
+                corrected(descriptor, static_cast<const int32_t *>(bias_dma.get()), weight.n);
+            const auto & work = completed.report;
+            report.jobs += work.loop_ws != 0;
+            report.loops += work.loop_ws;
+            report.fences += work.fences;
+            report.scale_writes += work.scale_writes;
+            report.scale_releases += work.scale_releases;
+            report.tlb_flushes += completed.tlb_flushes;
+            report.scale_s += work.scale_s;
+            report.issue_s += work.issue_s;
+            report.fence_s += work.fence_s;
+            if (!completed.ok) {
+                report.fatal = completed.fatal;
+                report.stage = completed.stage ? completed.stage : "attention_ws";
+                if (completed.fatal) {
+                    operands.abandon(); // Unknown DMA completion: keep every operand alive.
+                    (void) bias_dma.release();
+                }
+                require(false, completed.status != POTAL_OK ? completed.status : POTAL_ERR_BAD_RESPONSE);
+            }
+            require(completed.status == POTAL_OK && work.loop_ws && work.fences >= work.loop_ws &&
+                    work.scale_writes == work.scale_releases, POTAL_ERR_BAD_RESPONSE);
+            report.residual_jobs += limb != 0;
+            report.qk_limb_jobs += operation == role::qk;
+            report.correction_jobs += operation == role::pv && limb == 0;
+            report.bias_updates += operation == role::pv && limb == 0 ?
+                ((activation.rows + POTAL_HW_DIM - 1) / POTAL_HW_DIM) *
+                ((weight.n + POTAL_HW_DIM - 1) / POTAL_HW_DIM) : 0;
+            for (size_t i = 0; i < activation.rows; ++i) {
+                for (size_t j = 0; j < weight.n; ++j) {
+                    const int32_t value = operands.c[i * operands.ldc + j];
+                    if (operation == role::qk) {
+                        reconstruct(stationary_sum[i * weight.n + j], value, pass);
+                    } else {
+                        reconstruct(out[i * weight.n + j], value, limb);
+                    }
+                }
+            }
+        }
+        if (operation == role::qk) {
+            for (size_t index = 0; index < out.size(); ++index) {
+                reconstruct(out[index], stationary_sum[index], limb);
             }
         }
     }

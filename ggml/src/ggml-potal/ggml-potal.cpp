@@ -115,11 +115,11 @@ void potal_free(ggml_backend_t backend) {
     if (st.attention_qk_nodes || st.attention_pv_nodes) {
         ggml::potal::log::debug("potal.attention",
             "[POTAL_ATTENTION] summary qk_nodes=%llu pv_nodes=%llu completed=%llu failed=%llu "
-            "limb_jobs=%llu residual_jobs=%llu loop_ws=%llu shared_acc_qk_jobs=%llu bias_mvins=%llu",
+            "limb_jobs=%llu residual_jobs=%llu loop_ws=%llu separate_acc_qk_jobs=%llu bias_mvins=%llu",
             (unsigned long long)st.attention_qk_nodes, (unsigned long long)st.attention_pv_nodes,
             (unsigned long long)st.attention_completed, (unsigned long long)st.attention_failed,
             (unsigned long long)st.attention_limb_jobs, (unsigned long long)st.attention_residual_jobs,
-            (unsigned long long)st.attention_loop_ws, (unsigned long long)st.attention_qk_shared_acc_jobs,
+            (unsigned long long)st.attention_loop_ws, (unsigned long long)st.attention_qk_limb_jobs,
             (unsigned long long)st.attention_bias_mvins);
     }
     (void) ggml::gemmini::log::cycle.flush();

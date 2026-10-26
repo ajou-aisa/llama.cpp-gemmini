@@ -196,7 +196,7 @@ struct ggml_backend_potal_stats {
     uint64_t attention_limb_jobs;         // logical jobs that issued at least one LOOP_WS
     uint64_t attention_residual_jobs;     // separately reconstructed upper stream limbs
     uint64_t attention_loop_ws;
-    uint64_t attention_qk_shared_acc_jobs; // one doubled-K same-ACC job per Q limb
+    uint64_t attention_qk_limb_jobs;       // completed independent K-low/high jobs for every Q limb
     uint64_t attention_pv_corrections;     // low-limb jobs with one final ACC bias phase
     uint64_t attention_bias_mvins;        // one full-width INT32 bias MVIN per output tile
     double   attention_wall_s;           // preparation, issuer, reconstruction; not FPGA-only time

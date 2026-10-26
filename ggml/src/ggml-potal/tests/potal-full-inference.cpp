@@ -145,7 +145,7 @@ json counters(const ggml_backend_potal_stats & before, const ggml_backend_potal_
     COUNTER(attention_qk_nodes); COUNTER(attention_pv_nodes);
     COUNTER(attention_completed); COUNTER(attention_failed);
     COUNTER(attention_limb_jobs); COUNTER(attention_residual_jobs); COUNTER(attention_loop_ws);
-    COUNTER(attention_qk_shared_acc_jobs); COUNTER(attention_pv_corrections); COUNTER(attention_bias_mvins);
+    COUNTER(attention_qk_limb_jobs); COUNTER(attention_pv_corrections); COUNTER(attention_bias_mvins);
 #undef COUNTER
     data["weight_prepare_ms"] = (after.weight_pack_s - before.weight_pack_s) * 1000.0;
     data["weight_allocate_ms"] = (after.weight_alloc_s - before.weight_alloc_s) * 1000.0;
@@ -352,7 +352,7 @@ public:
                  hardware["attention_pv_nodes"].get<uint64_t>() != uint64_t(12 * generated) ||
                  hardware["attention_completed"].get<uint64_t>() != uint64_t(24 * generated) ||
                  hardware["attention_failed"].get<uint64_t>() != 0 ||
-                 hardware["attention_qk_shared_acc_jobs"].get<uint64_t>() == 0 ||
+                 hardware["attention_qk_limb_jobs"].get<uint64_t>() == 0 ||
                  hardware["attention_bias_mvins"].get<uint64_t>() == 0))
                 throw std::runtime_error("incomplete or failed PoTal Attention hardware execution");
         } else if (after.hp1_completed != before.hp1_completed) {

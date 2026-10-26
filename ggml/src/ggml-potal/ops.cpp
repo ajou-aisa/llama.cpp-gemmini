@@ -146,7 +146,7 @@ ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
     stats.attention_limb_jobs += result.jobs;
     stats.attention_residual_jobs += result.residual_jobs;
     stats.attention_loop_ws += result.loops;
-    stats.attention_qk_shared_acc_jobs += result.paired_k_jobs;
+    stats.attention_qk_limb_jobs += result.qk_limb_jobs;
     stats.attention_pv_corrections += result.correction_jobs;
     stats.attention_bias_mvins += result.bias_updates;
     stats.hw_requests += result.jobs;

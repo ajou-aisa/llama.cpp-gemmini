@@ -42,8 +42,9 @@ potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batc
                             size_t begin, size_t rows, role operation, stream & out);
 
 // Software integer reference, never a backend execution route. For every Q
-// limb: all K-low DIM partials, then all K-high partials with SCU offset +8,
-// into one Sat32 accumulator. PV adds the exact block-column bias ONCE to
+// limb: independently completed K-low and K-high INT32 ACCs use the same SCU
+// Delta. Checked Host INT64 combines low + 256*high, then the Q radix limbs.
+// PV adds the exact block-column bias ONCE to
 // the completed low-limb INT32 ACC. Upper P limbs have separate INT32 ACCs
 // and reconstruct with the corrected low result in checked Host INT64, as
 // explicitly selected for H3-7B. Bias outside INT32 is rejected, not clipped.
@@ -56,7 +57,7 @@ struct result {
     potal_status status = POTAL_OK;
     const char * stage = nullptr;
     bool fatal = false;
-    uint64_t jobs = 0, residual_jobs = 0, paired_k_jobs = 0, correction_jobs = 0;
+    uint64_t jobs = 0, residual_jobs = 0, qk_limb_jobs = 0, correction_jobs = 0;
     uint64_t bias_updates = 0;
     uint64_t loops = 0, fences = 0, scale_writes = 0, scale_releases = 0, tlb_flushes = 0;
     double scale_s = 0, issue_s = 0, fence_s = 0;
@@ -64,8 +65,8 @@ struct result {
 
 // The runner is the existing planned WS execution seam. Tests bind the
 // RTL-semantics emulator; production binds the hart-0 issuer. No CPU fallback.
-// K-low/K-high (or biased-low/correction) are consecutive K panels of ONE
-// logical GEMM: C is absent until the final panel. PV's corrected runner keeps
+// QK K-low/K-high are separate complete GEMMs: each starts a fresh ACC epoch,
+// and C is absent until that limb's final K panel. PV's corrected runner keeps
 // a known ACC bank, applies one final full-width bias MVIN and reads it back.
 using corrected_runner = std::function<planned_result(const potal_stripe_gemm_desc &,
                                                        const int32_t *, size_t)>;

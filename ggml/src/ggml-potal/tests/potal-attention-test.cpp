@@ -156,7 +156,7 @@ void test_reference() {
     check("INT32_MIN stays exact", a.limbs[3][a.kp] == -128 && a.limbs[4][a.kp] == 0);
     compare_reference("all five Q limbs and K limits", a, b, role::qk);
 
-    for (size_t k : {size_t(1), size_t(17), size_t(31), size_t(32), size_t(33), size_t(65)}) {
+    for (size_t k : {size_t(1), size_t(17), size_t(31), size_t(32), size_t(33), size_t(64), size_t(65)}) {
         std::vector<int32_t> ac(2*k), wc(k*3);
         for (size_t i = 0; i < ac.size(); ++i) ac[i] = int32_t((i*773)%100003)-50001;
         for (size_t i = 0; i < wc.size(); ++i) wc[i] = int32_t((i*997)%65408)-32768;
@@ -168,16 +168,24 @@ void test_reference() {
         compare_reference("QK tail "+std::to_string(k), x, w, role::qk);
     }
 
-    // Low +127 and upper -1 cancel differently when each panel is saturated
-    // before a forbidden INT64 merge. The forbidden merge finishes at -1;
-    // the required shared accumulator finishes at INT32_MIN.
+    // Independent passes saturate before radix weighting. High uses Delta,
+    // not Delta+8; the obsolete shared recurrence finishes at INT32_MIN.
     a = make_stream(1, 32, std::vector<int32_t>(32, 127), role::qk, 1);
     b = make_weight(32, 1, std::vector<int32_t>(32, -129), role::qk, 20);
     std::vector<int64_t> shared, split;
-    check("QK shared-ACC witness evaluates", golden::evaluate(a,b,role::qk,shared) &&
+    check("QK independent low/high signed raw ACCs",
+          golden::qk_pass(a,b,0,0) == std::vector<int32_t>{INT32_MAX} &&
+          golden::qk_pass(a,b,0,1) == std::vector<int32_t>{INT32_MIN});
+    check("QK independent and legacy witnesses evaluate", golden::evaluate(a,b,role::qk,shared) &&
           golden::evaluate(a,b,role::qk,split,true));
-    check("QK separate-K INT64 is observably wrong", shared != split && shared == std::vector<int64_t>{INT32_MIN});
-    compare_reference("QK saturation order lower-all then upper-all", a,b,role::qk);
+    check("QK independent passes reject old shared result",
+          shared == std::vector<int64_t>{-547608330241LL} && split == std::vector<int64_t>{INT32_MIN});
+    compare_reference("QK complete low/high passes at original Delta", a,b,role::qk);
+    auto corrupted = a;
+    corrupted.limbs[0].assign(corrupted.codes.size(),0);
+    std::vector<int64_t> independent;
+    check("QK oracle derives Q digits from original codes",
+          golden::evaluate(corrupted,b,role::qk,independent) && independent == shared);
 
     const std::vector<int32_t> p = {0, 1, 127, 128, 255, 256, 32768, 65408, 65535};
     a = make_stream(p.size(), 1, p, role::pv);
@@ -284,6 +292,27 @@ void test_reference() {
     check("independent completed-limb reconstruction overflows", !golden::evaluate(a,b,role::qk,shared));
     check("reference rejects INT64 overflow", attention::reference(a,b,role::qk,got) != POTAL_OK);
     check("overflow publishes no partial reference output", got == std::vector<int64_t>{778899});
+
+    // Limb 3 overflows INT64 before limb 4 cancels it. A wide final-only
+    // range check would wrongly accept this otherwise representable result.
+    std::vector<int32_t> overflow_q(33,0), overflow_k(33,0);
+    overflow_q[0] = 0x7f000000; overflow_k[0] = 257;
+    overflow_q[32] = INT32_MAX; overflow_k[32] = -1;
+    a = make_stream(1,33,overflow_q,role::qk);
+    b = make_weight(33,1,overflow_k,role::qk);
+    b.carriers = {31,23};
+    const golden::wide final_only = golden::wide{8388608} +
+        golden::wide{257} * INT32_MAX * (golden::wide{1} << 24) -
+        (golden::wide{1} << 55);
+    check("QK later cancellation would fit final INT64",
+          final_only >= INT64_MIN && final_only <= INT64_MAX);
+    shared = {778899};
+    check("QK intermediate overflow rejects before later cancellation",
+          !golden::evaluate(a,b,role::qk,shared) && shared == std::vector<int64_t>{778899});
+    got = {778899};
+    check("QK reference intermediate overflow publishes nothing",
+          attention::reference(a,b,role::qk,got) == POTAL_ERR_CAPACITY &&
+          got == std::vector<int64_t>{778899});
 }
 
 bool limbs_match(const stream & a, role r) {
@@ -449,40 +478,66 @@ struct emu_runner {
     uint64_t calls = 0;
     bool panels_ok = true;
     size_t logical_k;
+    potal_stripe_gemm_desc low{};
+    std::vector<int8_t> low_a;
+    std::vector<uint32_t> low_carriers;
 
     explicit emu_runner(size_t k) : logical_k((k+31)/32*32) {}
 
     planned_result run(const potal_stripe_gemm_desc & d) {
         ++calls;
-        // One descriptor must include all lower K blocks before all upper K
-        // blocks. A Host merge is not equivalent.
-        panels_ok = panels_ok && d.k == 2*logical_k && d.scale_block_k == 32;
-        if (d.k == 2*logical_k && d.carriers && d.b && d.a) {
-            for (size_t block = 0; block < logical_k/32; ++block) {
-                for (size_t j = 0; j < d.n; ++j) {
-                    const auto lo = d.carriers[block*d.carrier_stride+j];
-                    const auto hi = d.carriers[(block+logical_k/32)*d.carrier_stride+j];
-                    panels_ok = panels_ok && hi == (lo == POTAL_CARRIER_ZERO ? lo : lo+8);
-                }
-            }
+        // Independent complete passes retain the old doubled-K tile selection,
+        // but never duplicate A or add 8 to the high pass's carriers.
+        // DMA row alignment can pad lda beyond logical K; that padding is
+        // zero, not a second copy of the Q limb.
+        panels_ok = panels_ok && d.k == logical_k && d.lda >= logical_k &&
+                    d.scale_block_k == 32 && !emu.in_flight;
+        potal_tile_plan frozen;
+        const auto selected = potal_tile_select(d.m,d.n,2*logical_k,2,&frozen);
+        panels_ok = panels_ok && selected == POTAL_OK;
+        if (selected == POTAL_OK) {
+            frozen.tile_K = std::min(frozen.tile_K,logical_k/POTAL_HW_DIM);
+            while (frozen.tile_K && (logical_k/POTAL_HW_DIM % frozen.tile_K || frozen.tile_K % 2))
+                --frozen.tile_K;
+            panels_ok = panels_ok && d.tile_i == frozen.tile_I && d.tile_j == frozen.tile_J &&
+                        d.tile_k == frozen.tile_K;
+        }
+        if (d.k == logical_k && d.carriers && d.b && d.a) {
+            std::vector<int8_t> activation;
+            std::vector<uint32_t> carriers;
             for (size_t i = 0; i < d.m; ++i)
                 for (size_t k = 0; k < logical_k; ++k)
-                    panels_ok = panels_ok && d.a[i*d.lda+k] == d.a[i*d.lda+logical_k+k];
+                    activation.push_back(d.a[i*d.lda+k]);
+            for (size_t i = 0; i < d.m; ++i)
+                for (size_t k = logical_k; k < d.lda; ++k)
+                    panels_ok = panels_ok && d.a[i*d.lda+k] == 0;
+            for (size_t block = 0; block < logical_k/32; ++block) {
+                for (size_t j = 0; j < d.n; ++j)
+                    carriers.push_back(d.carriers[block*d.carrier_stride+j]);
+            }
+            if (calls % 2) {
+                low = d;
+                low_a = std::move(activation);
+                low_carriers = std::move(carriers);
+            } else {
+                panels_ok = panels_ok && d.m == low.m && d.n == low.n &&
+                            d.work_kind == low.work_kind && activation == low_a && carriers == low_carriers;
+            }
         }
         return run_planned_stripe_gemm(session,d);
     }
 };
 
 void execute_case(role r, size_t k, size_t m, bool gaps, size_t repeat = 1,
-                  ggml_type wt = GGML_TYPE_F16, ggml_type at = GGML_TYPE_F32) {
-    graph g(r,k,3,m,gaps,2,repeat,2,repeat,wt,at);
+                  ggml_type wt = GGML_TYPE_F16, ggml_type at = GGML_TYPE_F32, size_t n = 3) {
+    graph g(r,k,n,m,gaps,2,repeat,2,repeat,wt,at);
     // Per-row constant magnitudes make the Q local stage independent of
     // adaptation policy. Every product is an exactly representable power of two.
     for (size_t b = 0; b < 2; ++b)
         for (size_t h = 0; h < 2; ++h)
-            for (size_t j = 0; j < 3; ++j)
+            for (size_t j = 0; j < n; ++j)
                 for (size_t x = 0; x < k; ++x)
-                    g.w.set(x,j,std::ldexp(j == 1 ? -1.0f : 1.0f,int(h+b+j)),h,b);
+                    g.w.set(x,j,std::ldexp(j == 1 ? -1.0f : 1.0f,int(h+b+j%3)),h,b);
     for (size_t b = 0; b < 2*repeat; ++b)
         for (size_t h = 0; h < 2*repeat; ++h)
             for (size_t i = 0; i < m; ++i)
@@ -498,14 +553,15 @@ void execute_case(role r, size_t k, size_t m, bool gaps, size_t repeat = 1,
     for (size_t b = 0; b < 2*repeat; ++b)
         for (size_t h = 0; h < 2*repeat; ++h)
             for (size_t i = 0; i < m; ++i)
-                for (size_t j = 0; j < 3; ++j) {
+                for (size_t j = 0; j < n; ++j) {
                     // Direct float math is exact for this fixture; no production
                     // preparation or attention reference derives the answer.
                     const float want = float(k)*g.a.get(0,i,h,b)*g.w.get(0,j,h/repeat,b/repeat);
                     exact = exact && g.out.get(j,i,h,b) == want;
                 }
     check(name+" independent values across all heads/batches",exact);
-    check(name+" lower-upper panels share logical GEMM",e.panels_ok && e.calls > 0);
+    check(name+" independent low/high descriptors and frozen tiles",
+          e.panels_ok && e.calls > 0 && e.calls % 2 == 0 && result.qk_limb_jobs == e.calls);
     check(name+" QK has no PV correction",result.correction_jobs == 0);
     check(name+" balanced scales and no live DMA",e.emu.writes == e.emu.releases && e.emu.scales.empty() &&
           !e.emu.in_flight && !e.emu.scale_miss);
@@ -532,8 +588,9 @@ void test_execute() {
     // with the disproved all-ones/SCU+7 recurrence.
     for (role r : {role::qk}) {
         execute_case(r,32,4,false); // Prefill.
-        for (size_t k : {size_t(1),size_t(17),size_t(33),size_t(65)}) execute_case(r,k,1,true,2);
-        execute_case(r,33,3,true,1,GGML_TYPE_F32,GGML_TYPE_F16);
+        for (size_t k : {size_t(1),size_t(17),size_t(33),size_t(64),size_t(65)}) execute_case(r,k,1,true,2);
+        execute_case(r,4097,1,true); // Multiple frozen K panels within each independent pass.
+        execute_case(r,33,3,true,2,GGML_TYPE_F32,GGML_TYPE_F16,19);
         graph g(r,33,3,2,true);
         g.w.fill(0); g.a.fill(r == role::qk ? 1 : 0.5f);
         emu_runner zero(33);
@@ -568,17 +625,36 @@ void test_execute() {
             if (++calls == 2) {
                 planned_result error;
                 error.status = POTAL_ERR_BAD_RESPONSE;
+                error.stage = "between_qk_passes";
                 return error;
             }
             return later.run(d);
         });
-        check("later-job failure reached",calls == 2 && failed.status != POTAL_OK);
+        check("failure between low/high preserves status and completed count",
+              calls == 2 && failed.status == POTAL_ERR_BAD_RESPONSE && !failed.fatal &&
+              failed.stage && std::strcmp(failed.stage,"between_qk_passes") == 0 &&
+              failed.qk_limb_jobs == 1 && later.calls == 1 && !later.emu.in_flight);
         check("later-job failure publishes no earlier results",g.out.storage == before);
+
+        emu_runner fatal_high(33);
+        calls = 0;
+        const auto fatal = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) {
+            if (++calls == 2)
+                fatal_high.emu.fail_fence_at = int(fatal_high.emu.fence_calls + 1);
+            return fatal_high.run(d);
+        });
+        check("fatal high completion preserves fence failure and stops",
+              calls == 2 && fatal.status == POTAL_HW_BAD_COMMAND && fatal.fatal &&
+              fatal.stage && std::strcmp(fatal.stage,"fence") == 0 && fatal.qk_limb_jobs == 1);
+        check("fatal high completion retains pending scales and sticky owner",
+              fatal_high.emu.in_flight && !fatal_high.emu.scales.empty() &&
+              fatal_high.emu.writes > fatal_high.emu.releases && fatal_high.session.ws.report.fatal);
+        check("fatal high completion publishes no output",g.out.storage == before);
     }
 
     // A calculable K block with mixed low/high signs, plus a tiny second block
     // establishing carrier 20. Q's single exponent bucket gives code 16384.
-    // This catches separate low/high Host merges on the real emulator route.
+    // This distinguishes independent original-Delta passes from shared/high+8.
     graph g(role::qk,64,1,1);
     g.a.fill(1);
     std::vector<int32_t> codes(64,16384);
@@ -592,14 +668,67 @@ void test_execute() {
     std::vector<int64_t> expected, forbidden;
     if (check("QK execute saturation witness fits",
               golden::evaluate(a,b,role::qk,expected) && golden::evaluate(a,b,role::qk,forbidden,true))) {
-        check("QK execute witness distinguishes separate K merges",expected != forbidden);
+        check("QK execute exact independent and obsolete shared witnesses",
+              expected == std::vector<int64_t>{70927089860352LL} &&
+              forbidden == std::vector<int64_t>{549755813632LL});
+        check("QK execute independent active-limb raw ACC witnesses",
+              golden::qk_pass(a,b,1,0) == std::vector<int32_t>{INT32_MAX} &&
+              golden::qk_pass(a,b,1,1) == std::vector<int32_t>{1073872895});
         emu_runner e(64);
-        const auto result = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) { return e.run(d); });
+        std::vector<std::vector<int32_t>> raw_passes;
+        const auto result = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) {
+            auto completed = e.run(d);
+            if (completed.ok) {
+                std::vector<int32_t> values;
+                for (size_t i = 0; i < d.m; ++i)
+                    for (size_t j = 0; j < d.n; ++j) values.push_back(d.c[i*d.ldc+j]);
+                raw_passes.push_back(std::move(values));
+            }
+            return completed;
+        });
         const float want = static_cast<float>(std::ldexp(static_cast<double>(expected[0]),-48));
-        check("QK execute shared-ACC saturation result",result.status == POTAL_OK && g.out.get(0,0) == want);
+        check("QK execute independent-pass saturation result",
+              result.status == POTAL_OK && want == 0.251983642578125f && g.out.get(0,0) == want);
+        bool raw_exact = raw_passes.size() == 2*a.limb_count;
+        for (size_t pass = 0; raw_exact && pass < raw_passes.size(); ++pass)
+            raw_exact = raw_passes[pass] == golden::qk_pass(a,b,pass/2,pass%2);
+        check("QK execute every completed raw pass matches independent oracle",
+              raw_exact && result.qk_limb_jobs == raw_passes.size());
         check("QK execute saturation panels and balanced scales",e.panels_ok && e.emu.loops > 0 &&
               e.emu.writes == e.emu.releases && e.emu.scales.empty());
     }
+
+    // Real preparation produces five folded Q digits. The completed limb-3
+    // term reaches INT64_MIN before an earlier negative term is included;
+    // the later carry limb must not repair this checked intermediate overflow.
+    graph overflow_graph(role::qk,64,1,1,false,1,1,1,1,GGML_TYPE_F32);
+    for (size_t k = 0; k < 64; ++k) {
+        overflow_graph.a.set(k,0,k < 32 ? std::ldexp(1.0f,20) : 1.0f);
+        overflow_graph.w.set(k,0,k < 32 ? 1.0f : std::ldexp(1.0f,-30));
+    }
+    stream overflow_activation;
+    stationary overflow_weight;
+    const bool overflow_prepared =
+        attention::prepare_stream(overflow_graph.a.t,0,0,0,1,role::qk,overflow_activation) == POTAL_OK &&
+        attention::prepare_stationary(overflow_graph.w.t,0,0,role::qk,overflow_weight) == POTAL_OK;
+    std::vector<int64_t> overflow_expected{778899};
+    check("QK execute overflow fixture preserves folded codes and Delta",
+          overflow_prepared && overflow_activation.limb_count == 5 &&
+          overflow_activation.codes[0] == INT32_MAX &&
+          overflow_weight.carriers == std::vector<uint32_t>{30,0});
+    check("QK execute overflow is independently required",
+          overflow_prepared && !golden::evaluate(overflow_activation,overflow_weight,role::qk,overflow_expected) &&
+          overflow_expected == std::vector<int64_t>{778899});
+    const auto untouched = overflow_graph.out.storage;
+    emu_runner overflow_runner(64);
+    const auto overflow_result = attention::execute(&overflow_graph.out.t,
+        [&](const potal_stripe_gemm_desc & d) { return overflow_runner.run(d); });
+    check("QK execute rejects overflow after completed passes",
+          overflow_result.status == POTAL_ERR_CAPACITY && !overflow_result.fatal &&
+          overflow_result.qk_limb_jobs == 8 && overflow_runner.calls == 8);
+    check("QK execute overflow publishes nothing and leaves no DMA",
+          overflow_graph.out.storage == untouched && !overflow_runner.emu.in_flight &&
+          overflow_runner.emu.scales.empty() && overflow_runner.emu.writes == overflow_runner.emu.releases);
 }
 
 void test_pv_execute() {
