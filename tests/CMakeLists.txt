@@ -837,7 +837,7 @@ add_test(NAME test-gemmini-exsia-profile-contract
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-profile-contract.cmake)
 
 set(_GGML_GEMMINI_EXSIA_CASES
-    all baseline dispatch direct-executor stripe-geometry stripe-anchor non-exsia-capture-context)
+    all baseline dispatch direct-executor stripe-geometry non-exsia-capture-context)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
     _GGML_GEMMINI_WEIGHT_BITS_VALUE EQUAL 8)
     list(APPEND _GGML_GEMMINI_EXSIA_CASES

@@ -39,64 +39,6 @@ Run the quantized model:
 
 When running the larger models, make sure you have enough disk space to store all the intermediate files.
 
-## Microsoft MXINT values in HP1 storage
-
-`mxint-hp1.py` converts the original F16 weights with the unmodified Microsoft
-`quantize_mx_op`, then stores its exact output in the existing Q4_HP1/Q8_HP1 GGUF
-layout. Use block size 32, E8M0 shared scales, `max` exponent selection, and
-round-to-nearest-even. INT4 uses symmetric codes `[-7, 7]`; INT8 uses `[-127, 127]`.
-Microsoft's INT4 extension is not a separately named OCP v1 format. This is HP1
-storage of MXINT numerical values, not the MX wire encoding.
-
-Create an all-matrix HP1 template using the existing quantizer, then convert:
-
-```bash
-git clone https://github.com/microsoft/microxcaling.git /path/to/microxcaling
-git -C /path/to/microxcaling checkout 7bc41952de394f5cc5e782baf132e7c7542eb4e4
-# Python requires numpy and torch, as well as the repository's gguf-py package.
-build/bin/llama-quantize --pure model.fp16.gguf model.Q4_HP1.gguf Q4_HP1
-python3 tools/quantize/mxint-hp1.py \
-  --input model.fp16.gguf --template model.Q4_HP1.gguf \
-  --output model.MXINT4.HP1.gguf --bits 4 \
-  --mx-path /path/to/microxcaling --decoder-lib build/bin/libggml-base.so
-```
-
-For MXINT8, use a Q8_HP1 template and `--bits 8`. The template must come from the
-same input: all matrices, including embedding and output head, must be HP1;
-one-dimensional F32 tensors and metadata are retained. Only the original F16
-weights feed the Microsoft quantizer. The adapter retains a per-channel PoT base
-and nonnegative block exponent offsets, checks every converted value with the
-existing C decoder, and rejects unsupported scale ranges or unproved integer
-accumulator bounds. It refuses to overwrite an output and writes a checksum and
-conversion report beside the GGUF. No inference-time candidate selection or
-activation/residual change is made; the ordinary HP1 quantizer stays available.
-
-Verification:
-
-```bash
-python3 tests/test-mxint-hp1.py \
-  --mx-path /path/to/microxcaling --decoder-lib build/bin/libggml-base.so
-```
-
-## PoTal stripe anchor
-
-Select the activation stripe anchor at build time:
-
-```bash
-cmake -S . -B build -DGGML_GEMMINI_EXSIA_STRIPE_ANCHOR=2  # default: TOP2
-cmake -S . -B build -DGGML_GEMMINI_EXSIA_STRIPE_ANCHOR=3  # TOP3 experiment
-cmake --build build
-```
-
-TOP3 selects the third-largest **distinct block exponent in the stripe**, falling
-back to TOP2/TOP1 when fewer values exist; an all-zero stripe uses exponent zero.
-Every block above the chosen anchor follows the existing residual selection path.
-Block-local outlier selection, local quantization followed by integer folding,
-limb decomposition, SCU accumulation, and attention settings are unchanged. This
-option does not implement direct original-float-to-stripe quantization. It changes
-activations only; a GGUF can be reused across TOP2/TOP3 builds. Test the configured
-anchor with `test-gemmini-exsia --case=stripe-anchor`.
-
 ## Memory/Disk Requirements
 
 As the models are currently fully loaded into memory, you will need adequate disk space to save them and sufficient RAM to load them. At the moment, memory and disk requirements are the same.
