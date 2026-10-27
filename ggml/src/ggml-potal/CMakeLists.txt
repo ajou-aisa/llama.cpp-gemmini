@@ -101,6 +101,23 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-stripe-api-test COMMAND potal-stripe-api-test)
 endif()
 
+option(POTAL_E4B2_TESTS "Build isolated general resident RTL/ISA acceptance tests" OFF)
+if (POTAL_E4B2_TESTS)
+    add_executable(potal-e4b2-test tests/potal-e4b2-test.cpp tests/potal-e4b2-c11-test.c)
+    set_target_properties(potal-e4b2-test PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    target_compile_features(potal-e4b2-test PRIVATE cxx_std_17)
+    target_include_directories(potal-e4b2-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4b2-test PRIVATE potal-api)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-e4b2-test COMMAND potal-e4b2-test)
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+        add_executable(potal-e4b2-rocc tests/potal-e4b2-rocc.c)
+        set_target_properties(potal-e4b2-rocc PROPERTIES
+            C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    endif()
+endif()
+
 # Hardware smoke test: RISC-V only, and only for the validated DIM16 GEMM path.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     if (POTAL_HW_DIM EQUAL 16)
@@ -340,6 +357,13 @@ target_include_directories(potal-attention-test PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(potal-attention-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-attention-test COMMAND potal-attention-test)
+endif()
+
+if (POTAL_E4B2_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    add_executable(potal-e4b2-hardware tests/potal-e4b2-hardware.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-e4b2-hardware)
+    target_include_directories(potal-e4b2-hardware PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4b2-hardware PRIVATE ggml)
 endif()
 
 add_executable(potal-paired-inventory tests/potal-paired-inventory.cpp ${POTAL_BACKEND_SOURCES})

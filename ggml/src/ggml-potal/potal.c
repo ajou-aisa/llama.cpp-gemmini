@@ -644,6 +644,178 @@ potal_status potal_acc_bias_encode(const potal_acc_bias *b, potal_rocc_cmd *conf
     return POTAL_OK;
 }
 
+/* ---- Resident I1/P1: pure transport and physical admission ---------------- */
+
+static uint32_t resident_ws_tiles(uint32_t n) {
+    return n / 16u + (n % 16u != 0);
+}
+
+static uint32_t resident_ws_b_base(const potal_resident_ws_load *d) {
+    return (d->pair + 1) * 8192u -
+        resident_ws_tiles(d->k_rows) * resident_ws_tiles(d->j_columns) * 16u;
+}
+
+static int resident_ws_geometry(void) {
+    return POTAL_HW_DIM == 16 && POTAL_HW_BANK_NUM == 4 &&
+        POTAL_HW_BANK_ROWS == 4096 && POTAL_HW_ACC_ROWS == 1024 &&
+        POTAL_HW_INDEX_ENTRIES == 32 && POTAL_SCALE_ENTRIES == 256;
+}
+
+potal_status potal_resident_ws_shift_carrier(int64_t shift, uint32_t *carrier) {
+    if (!carrier || shift < 0 || shift > POTAL_CARRIER_MAX_SHIFT)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    *carrier = (uint32_t)shift;
+    return POTAL_OK;
+}
+
+potal_status potal_resident_ws_load_check(const potal_resident_ws_load *d) {
+    if (!d || d->pair >= 2 || !d->k_rows || !d->j_columns ||
+        !d->weight_id || !d->weight_generation ||
+        d->k_begin % 16 || d->j_begin % 16 ||
+        d->k_begin > UINT64_MAX - d->k_rows || d->j_begin > UINT64_MAX - d->j_columns ||
+        d->source_stride < d->j_columns)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (!resident_ws_geometry()) return POTAL_ERR_UNSUPPORTED;
+    if (d->k_rows > 28u * 16u || d->j_columns > 9u * 16u ||
+        d->main_a_tiles >= 256 ||
+        (uint64_t)resident_ws_tiles(d->k_rows) * resident_ws_tiles(d->j_columns) * 16 > 4096)
+        return POTAL_ERR_CAPACITY;
+    const uint64_t span = matrix_extent(d->k_rows, d->j_columns, d->source_stride, 1);
+    if (!span || span > POTAL_RESIDENT_WS_POOL_BYTES) return POTAL_ERR_INVALID_ARGUMENT;
+    return POTAL_OK;
+}
+
+potal_status potal_resident_ws_view_encode(const potal_resident_ws_view *v, potal_rocc_cmd *out) {
+    if (!v || !out || v->enable > 1 || v->pair > 1 || v->indexed > 1 || v->acc_bank > 1)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (!resident_ws_geometry()) return POTAL_ERR_UNSUPPORTED;
+    if (!v->enable) {
+        if (v->pair || v->indexed || v->acc_bank || v->mode || v->b_base || v->b_pitch ||
+            v->indexed_j_origin || v->acc_base) return POTAL_ERR_INVALID_ARGUMENT;
+        *out = cmd(0, 0);
+        return POTAL_OK;
+    }
+    const uint32_t begin = (2 * v->pair + 1) * 4096u;
+    if (v->mode != 1 || v->b_base < begin || v->b_base >= begin + 4096 ||
+        v->b_base % 16 || !v->b_pitch || v->b_pitch % 16 || v->b_pitch > 144 ||
+        v->acc_base % 16 || v->acc_base > 496 ||
+        (!v->indexed && v->indexed_j_origin) ||
+        v->indexed_j_origin >= v->b_pitch / 16)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    *out = cmd((uint64_t)v->b_base | ((uint64_t)v->b_pitch << 16) |
+                   ((uint64_t)v->indexed_j_origin << 32) | ((uint64_t)v->acc_base << 48),
+               1u | ((uint64_t)v->pair << 1) | ((uint64_t)v->indexed << 2) |
+                   ((uint64_t)v->acc_bank << 3) | UINT64_C(0x10));
+    return POTAL_OK;
+}
+
+potal_status potal_resident_ws_run_check(const potal_resident_ws_load *l,
+    const potal_resident_ws_run *d, const int8_t *a, size_t bytes) {
+    potal_status status = potal_resident_ws_load_check(l);
+    if (status != POTAL_OK) return status;
+    if (!d || !a || d->path > 1 || d->indexed > 1 || d->first > 1 || d->last > 1 ||
+        !d->output_id || !d->i_rows || d->i_rows > 16 || !d->j_columns || !d->k_rows ||
+        d->j_offset % 16 || d->scale_generation > 255 ||
+        d->a_stride < d->k_rows || d->a_offset > bytes ||
+        (uintptr_t)a > UINTPTR_MAX - bytes ||
+        ((uintptr_t)a + d->a_offset) % 16 ||
+        (d->path && !d->indexed) || (d->first && d->sequence))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (d->k_rows > 448 || d->j_columns > 144) return POTAL_ERR_CAPACITY;
+    if (d->j_columns > l->j_columns || d->j_offset > l->j_columns - d->j_columns ||
+        d->original_i > UINT64_MAX - d->i_rows) return POTAL_ERR_INVALID_ARGUMENT;
+    const uint32_t nk = resident_ws_tiles(d->k_rows), nj = resident_ws_tiles(d->j_columns);
+    if (d->acc_tile >= 32 || nj > 32 - d->acc_tile ||
+        d->a_offset_tiles >= 256 || nk > 256 - d->a_offset_tiles ||
+        d->scale_base >= 256 || nk * nj > 256 - d->scale_base)
+        return POTAL_ERR_CAPACITY;
+    if ((!d->path && (d->a_offset_tiles || nk > l->main_a_tiles)) ||
+        (d->path && d->a_offset_tiles < l->main_a_tiles) ||
+        d->sequence > UINT64_MAX - nk)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t extent = matrix_extent(d->i_rows, d->k_rows, d->a_stride, 1);
+    if (!extent || extent > bytes - d->a_offset || extent > DRAM_OFFSET_LIMIT)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (!d->indexed) {
+        if (d->index.owner || d->index.generation || d->k_offset % 16 ||
+            d->k_rows > l->k_rows || d->k_offset > l->k_rows - d->k_rows ||
+            (d->k_rows % 16 && d->k_offset + d->k_rows != l->k_rows))
+            return POTAL_ERR_INVALID_ARGUMENT;
+    } else {
+        if (d->k_rows > 32) return POTAL_ERR_CAPACITY;
+        if (d->k_offset >= l->k_rows) return POTAL_ERR_INVALID_ARGUMENT;
+        for (uint32_t p = 0; p < nk; ++p) {
+            if (!d->fragment_counts[p] || d->fragment_counts[p] > 16 ||
+                (p + 1 == nk && d->fragment_counts[p] != d->k_rows - p * 16) ||
+                (!d->path && d->fragment_counts[p] != (p + 1 == nk ? d->k_rows - p * 16 : 16)))
+                return POTAL_ERR_INVALID_ARGUMENT;
+        }
+    }
+    if (!d->path && (d->k_offset % 16 || d->k_rows > l->k_rows ||
+        d->k_offset > l->k_rows - d->k_rows ||
+        (d->k_rows % 16 && d->k_offset + d->k_rows != l->k_rows)))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    return POTAL_OK;
+}
+
+potal_status potal_resident_ws_run_encode(const potal_resident_ws_load *l,
+    const potal_resident_ws_run *d, const int8_t *a, size_t bytes,
+    potal_resident_ws_program *out) {
+    if (!out) return POTAL_ERR_INVALID_ARGUMENT;
+    potal_status status = potal_resident_ws_run_check(l, d, a, bytes);
+    if (status != POTAL_OK) return status;
+    const uint32_t nk = resident_ws_tiles(d->k_rows), nj = resident_ws_tiles(d->j_columns);
+    const potal_loop_ws loop = {
+        a + d->a_offset, NULL, NULL, d->a_stride, 0, 0, 1, nj, nk,
+        16 - d->i_rows, nj * 16 - d->j_columns, nk * 16 - d->k_rows,
+        d->scale_base, d->scale_generation, 1, d->first ? 0 : POTAL_GEMM_ACCUMULATE
+    };
+    const uint32_t pitch = resident_ws_tiles(l->j_columns) * 16;
+    const potal_resident_ws_view view = {
+        1, l->pair, d->indexed, d->path, 1,
+        resident_ws_b_base(l) + (d->indexed ? 0 : (d->k_offset / 16) * pitch + d->j_offset),
+        pitch, d->indexed ? d->j_offset / 16 : 0, d->acc_tile * 16
+    };
+    potal_resident_ws_program p;
+    status = potal_resident_ws_view_encode(&view, &p.view);
+    if (status != POTAL_OK) return status;
+    encode_program(&loop, &p.loop);
+    const uint64_t spad = l->pair + 1;
+    p.loop.loop_ws.rs1 |= UINT64_C(8) | (spad << LOOP_WS_A_SPAD_SHIFT) |
+        (spad << LOOP_WS_B_SPAD_SHIFT) | (UINT64_C(1) << LOOP_WS_PAIRED_SHIFT) |
+        ((uint64_t)d->path << LOOP_WS_RESIDUAL_SHIFT) | ((uint64_t)d->indexed << LOOP_WS_INDEXED_SHIFT);
+    p.loop.loop_ws.rs2 = (uint64_t)d->a_offset_tiles << LOOP_WS_A_OFFSET_SHIFT;
+    *out = p;
+    return POTAL_OK;
+}
+
+potal_status potal_resident_ws_readback_encode(const potal_resident_ws_readback *d,
+    int32_t *destination, size_t bytes, potal_rocc_cmd *config_st,
+    potal_rocc_cmd *mvouts, uint32_t capacity, uint32_t *count) {
+    if (!d || !config_st || !mvouts || !count || d->bank > 1 ||
+        !d->rows || d->rows > 16 || !d->columns || d->stride < d->columns ||
+        d->stride > UINT32_MAX / sizeof(int32_t)) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!resident_ws_geometry()) return POTAL_ERR_UNSUPPORTED;
+    if (d->columns > 144 || d->acc_tile >= 32 ||
+        resident_ws_tiles(d->columns) > 32 - d->acc_tile ||
+        resident_ws_tiles(d->columns) > capacity) return POTAL_ERR_CAPACITY;
+    const uint64_t span = matrix_extent(d->rows, d->columns, d->stride, sizeof(int32_t));
+    if (!tile_pointer_ok(destination, span, 64) || span > bytes)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint32_t n = resident_ws_tiles(d->columns);
+    potal_rocc_cmd records[POTAL_RESIDENT_WS_MAX_J];
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint32_t cols = d->columns - j * 16 < 16 ? d->columns - j * 16 : 16;
+        records[j] = cmd((uint64_t)(uintptr_t)(destination + j * 16),
+            ((uint64_t)d->rows << 48) | ((uint64_t)cols << 32) |
+                acc_local_addr(d->bank, (d->acc_tile + j) * 16));
+    }
+    memcpy(mvouts, records, n * sizeof(*records));
+    *config_st = cmd(CONFIG_ST, d->stride * sizeof(int32_t));
+    *count = n;
+    return POTAL_OK;
+}
+
 #if defined(__riscv)
 
 /* Set by a GEMM issue, cleared by a successful POTAL_FENCE. */
@@ -655,6 +827,7 @@ static potal_status hw_status(uint64_t rd) {
 
 potal_status potal_scale_write(uint32_t slot, uint32_t generation, uint32_t column,
                                uint32_t carrier) {
+    if (paired_owner == 2) return POTAL_ERR_BUSY;
     uint64_t rs1;
     if (potal_scale_key_encode(slot, generation, column, &rs1) != POTAL_OK ||
         !potal_carrier_is_valid(carrier)) {
@@ -664,6 +837,7 @@ potal_status potal_scale_write(uint32_t slot, uint32_t generation, uint32_t colu
 }
 
 potal_status potal_scale_release(uint32_t slot, uint32_t generation, uint32_t column) {
+    if (paired_owner == 2) return POTAL_ERR_BUSY;
     uint64_t rs1;
     if (potal_scale_key_encode(slot, generation, column, &rs1) != POTAL_OK) {
         return POTAL_ERR_INVALID_ARGUMENT;
@@ -730,6 +904,7 @@ potal_status potal_loop_ws_issue(const potal_loop_ws *l) {
 
 potal_status potal_scale_write(uint32_t slot, uint32_t generation, uint32_t column,
                                uint32_t carrier) {
+    if (paired_owner == 2) return POTAL_ERR_BUSY;
     uint64_t rs1;
     if (potal_scale_key_encode(slot, generation, column, &rs1) != POTAL_OK ||
         !potal_carrier_is_valid(carrier)) {
@@ -739,6 +914,7 @@ potal_status potal_scale_write(uint32_t slot, uint32_t generation, uint32_t colu
 }
 
 potal_status potal_scale_release(uint32_t slot, uint32_t generation, uint32_t column) {
+    if (paired_owner == 2) return POTAL_ERR_BUSY;
     uint64_t rs1;
     if (potal_scale_key_encode(slot, generation, column, &rs1) != POTAL_OK) {
         return POTAL_ERR_INVALID_ARGUMENT;
@@ -771,6 +947,60 @@ potal_status potal_loop_ws_issue(const potal_loop_ws *l) {
 /* ---- H2 paired session ---------------------------------------------------- */
 
 #include <stdlib.h>
+#if defined(__riscv)
+#include <sys/mman.h>
+#endif
+
+typedef struct resident_ws_pair {
+    potal_resident_ws_load load;
+    potal_resident_ws_ref token;
+    int loading, readable;
+} resident_ws_pair;
+
+typedef struct resident_ws_scale {
+    potal_resident_ws_ref token, resident;
+    uint64_t block, column;
+} resident_ws_scale;
+
+typedef struct resident_ws_index {
+    potal_resident_ws_ref token, resident;
+    uint32_t count;
+    uint64_t original[32];
+} resident_ws_index;
+
+typedef struct resident_ws_epoch {
+    potal_resident_ws_epoch declaration;
+    potal_resident_ws_fragment *fragments; /* owned copy; declaration borrows it */
+    potal_resident_ws_ref token;
+    uint64_t total, next;
+    int initialized, final;
+} resident_ws_epoch;
+
+typedef struct resident_ws_receipt {
+    potal_resident_ws_ref token;
+    potal_resident_ws_readback readback;
+    int ready;
+} resident_ws_receipt;
+
+enum resident_ws_pending { RESIDENT_WS_NONE, RESIDENT_WS_LOAD, RESIDENT_WS_COMPUTE, RESIDENT_WS_READBACK };
+
+typedef struct resident_ws_state {
+    potal_resident_ws_status status;
+    void *pool[6];
+    void (*destroy_sink)(void *);
+    potal_resident_ws_counter_fn counter;
+    uint64_t owner, sequence;
+    int in_call, issue_complete;
+    enum resident_ws_pending kind;
+    uint32_t pending_pair, pending_bank, pending_tile, pending_count, pending_last;
+    uint64_t pending_next;
+    potal_resident_ws_ref pending_refs[9];
+    resident_ws_pair pair[2];
+    resident_ws_scale scale[256];
+    resident_ws_index index[2];
+    resident_ws_epoch epoch[2][32];
+    resident_ws_receipt receipt[2];
+} resident_ws_state;
 
 typedef struct paired_pair_state {
     int      resident_b;
@@ -782,6 +1012,7 @@ typedef struct paired_pair_state {
 
 struct potal_paired_session {
     potal_paired_sink sink;
+    resident_ws_state *resident;            /* NULL for every legacy session */
     int               failed;
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
@@ -799,6 +1030,12 @@ struct potal_paired_session {
 };
 
 _Static_assert(POTAL_HW_DIM <= 64, "slot_columns holds one bit per column");
+
+static void resident_ws_completed(potal_paired_session *s);
+static potal_status resident_ws_fence(potal_paired_session *s);
+static potal_status resident_ws_cleanup(potal_paired_session *s);
+static potal_status resident_ws_release(potal_paired_session *s, uint32_t slot,
+    uint32_t generation, uint32_t column);
 
 static potal_status paired_fail(potal_paired_session *s, potal_status status, const char *stage) {
     if (!s->failed) {
@@ -837,7 +1074,10 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
         case POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC:   potal_rocc_loop_ws_addrs_dc(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB: potal_rocc_loop_ws_strides_ab(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: potal_rocc_loop_ws_strides_dc(rs1, rs2); return POTAL_OK;
-        case POTAL_FUNCT_LOOP_WS:                   potal_rocc_loop_ws(rs1, rs2); return POTAL_OK;
+        case POTAL_FUNCT_LOOP_WS:
+            if (xd) return hw_status(potal_rocc_resident_loop_ws(rs1, rs2));
+            potal_rocc_loop_ws(rs1, rs2); return POTAL_OK;
+        case POTAL_FUNCT_RESIDENT_VIEW:             return hw_status(potal_rocc_resident_view(rs1, rs2));
         case POTAL_FUNCT_MVOUT:                     potal_rocc_mvout(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_MVIN:                      potal_rocc_mvin(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_FLUSH:                     potal_rocc_flush(rs1, rs2); return POTAL_OK;
@@ -921,6 +1161,7 @@ static void paired_drained(potal_paired_session *s) {
         s->pair[p].outstanding = 0;
     }
     s->drains++;
+    if (s->resident) resident_ws_completed(s);
 }
 
 static potal_status paired_ready(const potal_paired_session *s) {
@@ -964,6 +1205,7 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->resident) return POTAL_ERR_BUSY; /* pointer-to-pointer resident close owns storage */
     const int outstanding = s->outstanding_loops != 0 || s->outstanding_readbacks != 0 ||
                             s->outstanding_acc_updates != 0;
     int       live        = 0;
@@ -1019,6 +1261,7 @@ potal_paired_session_status potal_paired_session_query(const potal_paired_sessio
 }
 
 potal_status potal_paired_tlb_flush(potal_paired_session *s) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1033,7 +1276,7 @@ potal_status potal_paired_tlb_flush(potal_paired_session *s) {
     return POTAL_OK;
 }
 
-potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, uint32_t generation,
+static potal_status paired_scale_write_core(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                       uint32_t column, uint32_t carrier) {
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
@@ -1062,7 +1305,7 @@ potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, ui
     return POTAL_OK;
 }
 
-potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, uint32_t generation,
+static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                         uint32_t column) {
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
@@ -1089,7 +1332,7 @@ potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, 
     return POTAL_OK;
 }
 
-potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
+static potal_status paired_index_config_core(potal_paired_session *s, const potal_index_config *cfg) {
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1115,7 +1358,7 @@ potal_status potal_paired_index_config(potal_paired_session *s, const potal_inde
     return POTAL_OK;
 }
 
-potal_status potal_paired_index_write(potal_paired_session *s, const potal_index_write *w) {
+static potal_status paired_index_write_core(potal_paired_session *s, const potal_index_write *w) {
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1145,7 +1388,30 @@ potal_status potal_paired_index_write(potal_paired_session *s, const potal_index
     return POTAL_OK;
 }
 
-static potal_status paired_issue_program(potal_paired_session *s, const potal_gemm_ws_program *p, const char *stage) {
+potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, uint32_t generation,
+                                      uint32_t column, uint32_t carrier) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
+    return paired_scale_write_core(s, slot, generation, column, carrier);
+}
+
+potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, uint32_t generation,
+                                        uint32_t column) {
+    if (s && s->resident) return resident_ws_release(s, slot, generation, column);
+    return paired_scale_release_core(s, slot, generation, column);
+}
+
+potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
+    return paired_index_config_core(s, cfg);
+}
+
+potal_status potal_paired_index_write(potal_paired_session *s, const potal_index_write *w) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
+    return paired_index_write_core(s, w);
+}
+
+static potal_status paired_issue_program_view(potal_paired_session *s, const potal_gemm_ws_program *p,
+    const potal_rocc_cmd *view, const char *stage) {
 #if defined(__riscv)
     potal_cpu_fence_rw(); /* prior CPU stores to A/B visible before the DMA reads them */
 #endif
@@ -1158,11 +1424,18 @@ static potal_status paired_issue_program(potal_paired_session *s, const potal_ge
     PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC, p->addrs_dc.rs1, p->addrs_dc.rs2, 0, stage);
     PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB, p->strides_ab.rs1, p->strides_ab.rs2, 0, stage);
     PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC, p->strides_dc.rs1, p->strides_dc.rs2, 0, stage);
-    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS, p->loop_ws.rs1, p->loop_ws.rs2, 0, stage);
+    if (view) PAIRED_RAW(s, POTAL_FUNCT_RESIDENT_VIEW, view->rs1, view->rs2, 1, stage);
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS, p->loop_ws.rs1, p->loop_ws.rs2, view != NULL, stage);
     return POTAL_OK;
 }
 
+/* Keep the private baseline signature used by the included-core E4A harness. */
+static potal_status paired_issue_program(potal_paired_session *s, const potal_gemm_ws_program *p, const char *stage) {
+    return paired_issue_program_view(s, p, NULL, stage);
+}
+
 potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_paired_loop_ws *pl) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1214,6 +1487,7 @@ potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_pai
 }
 
 potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const potal_acc_readback *r) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1240,6 +1514,7 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
 }
 
 potal_status potal_paired_acc_bias_issue(potal_paired_session *s, const potal_acc_bias *bias) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1273,6 +1548,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->resident) return resident_ws_cleanup(s);
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1313,6 +1589,7 @@ potal_status potal_paired_fence(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->resident) return resident_ws_fence(s);
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1325,4 +1602,786 @@ potal_status potal_paired_fence(potal_paired_session *s) {
     }
     paired_drained(s);
     return POTAL_OK;
+}
+
+/* ---- Owning resident mode ------------------------------------------------ */
+
+/* Single-threaded issuer identity, independent of the eight-bit wire generation. */
+static uint64_t resident_ws_owner_sequence;
+
+static int resident_ws_same(potal_resident_ws_ref a, potal_resident_ws_ref b) {
+    return a.owner && a.generation && a.owner == b.owner && a.generation == b.generation;
+}
+
+static potal_status resident_ws_ready(const potal_paired_session *s, int allow_pending) {
+    if (!s || !s->resident) return POTAL_ERR_INVALID_ARGUMENT;
+    const resident_ws_state *r = s->resident;
+    if (r->in_call) return POTAL_ERR_BUSY;
+    if (s->failed) return s->error;
+    if (r->status.state != POTAL_RESIDENT_WS_READY) return POTAL_ERR_BUSY;
+    if (!allow_pending && (r->status.pending || r->status.control_pending)) return POTAL_ERR_BUSY;
+    return POTAL_OK;
+}
+
+static potal_status resident_ws_token(resident_ws_state *r, potal_resident_ws_ref *out) {
+    if (r->sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    *out = (potal_resident_ws_ref){r->owner, ++r->sequence};
+    return POTAL_OK;
+}
+
+static int resident_ws_find(const resident_ws_state *r, potal_resident_ws_ref token) {
+    for (uint32_t p = 0; p < 2; ++p)
+        if (r->pair[p].readable && resident_ws_same(r->pair[p].token, token)) return (int)p;
+    return -1;
+}
+
+static potal_status resident_ws_failed(potal_paired_session *s, potal_status status,
+    const char *stage, int quarantine) {
+    (void)paired_fail(s, status, stage);
+    s->resident->status.state = quarantine ? POTAL_RESIDENT_WS_QUARANTINED : POTAL_RESIDENT_WS_FAILED;
+    return status;
+}
+
+/* Only paired_drained calls this: a matching, successful global completion.
+ * Release is allDrained too; CPU ordering must precede publication there.
+ * Global single-pending admission keeps every staged epoch/token immutable.
+ */
+static void resident_ws_completed(potal_paired_session *s) {
+    resident_ws_state *r = s->resident;
+#if defined(__riscv)
+    potal_cpu_fence_rw();
+#endif
+    int publish = !s->failed && r->issue_complete;
+    if (r->kind == RESIDENT_WS_LOAD) {
+        publish = publish && resident_ws_same(r->pair[r->pending_pair].token, r->pending_refs[0]);
+    } else if (r->kind == RESIDENT_WS_COMPUTE || r->kind == RESIDENT_WS_READBACK) {
+        for (uint32_t j = 0; j < r->pending_count; ++j)
+            publish = publish && resident_ws_same(
+                r->epoch[r->pending_bank][r->pending_tile + j].token, r->pending_refs[j]);
+    }
+    r->status.last_drain = POTAL_OK;
+    if (r->kind == RESIDENT_WS_LOAD) {
+        resident_ws_pair *p = &r->pair[r->pending_pair];
+        p->loading = 0;
+        p->readable = publish;
+        if (publish) {
+            paired_pair_state *c = &s->pair[r->pending_pair];
+            c->resident_b = 1;
+            c->b_sp_base = resident_ws_b_base(&p->load);
+            c->b_j_tiles = resident_ws_tiles(p->load.j_columns);
+            c->b_k_rows = p->load.k_rows;
+            c->main_a_tiles = p->load.main_a_tiles;
+            c->index_valid = 0;
+        }
+    } else if (r->kind == RESIDENT_WS_COMPUTE) {
+        for (uint32_t j = 0; j < r->pending_count; ++j) {
+            resident_ws_epoch *e = &r->epoch[r->pending_bank][r->pending_tile + j];
+            e->initialized = publish;
+            e->final = publish && r->pending_last;
+            if (publish) e->next = r->pending_next;
+            else e->token = (potal_resident_ws_ref){0, 0};
+        }
+    } else if (r->kind == RESIDENT_WS_READBACK) {
+        r->receipt[r->pending_bank].ready = publish;
+    }
+    r->kind = RESIDENT_WS_NONE;
+    r->issue_complete = 0;
+    r->status.pending = 0;
+    r->status.control_pending = 0;
+}
+
+/* The counter path deliberately does not truncate a response to potal_status.
+ * There is no public raw issuing escape, and only the two frozen commands
+ * reach this private function. Trace selection remains the open-time cache.
+ */
+static potal_status resident_ws_counter(potal_paired_session *s, uint64_t rs1, uint64_t *value) {
+    const potal_paired_cmd_record record = {POTAL_FUNCT_COUNTER, 1, rs1, 0};
+    s->commands++;
+#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+    if (s->trace_enabled) {
+        fprintf(stderr, "[POTAL_RAW] ENTER seq=%llu funct=126 xd=1 rs1=0x%016llx rs2=0x0000000000000000\n",
+            (unsigned long long)s->commands, (unsigned long long)rs1);
+        fflush(stderr);
+    }
+#endif
+    potal_status status;
+    if (s->sink.cmd) {
+        status = s->resident->counter(s->sink.ctx, &record, value);
+    } else {
+#if defined(__riscv)
+        *value = potal_rocc_counter(rs1, 0);
+        status = POTAL_OK;
+#else
+        (void)value;
+        status = POTAL_ERR_NO_HARDWARE;
+#endif
+    }
+#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+    if (s->trace_enabled) {
+        fprintf(stderr, "[POTAL_RAW] EXIT seq=%llu funct=126 status=%d response=0x%016llx\n",
+            (unsigned long long)s->commands, (int)status,
+            (unsigned long long)(status == POTAL_OK ? *value : 0));
+        fflush(stderr);
+    }
+#endif
+    return status;
+}
+
+static void resident_ws_free(potal_paired_session *s) {
+    resident_ws_state *r = s->resident;
+    for (uint32_t b = 0; b < 2; ++b)
+        for (uint32_t t = 0; t < 32; ++t)
+            free(r->epoch[b][t].fragments);
+    for (uint32_t i = 0; i < 6; ++i) {
+#if defined(__riscv)
+        if (!r->status.software_only && r->pool[i]) (void)munlock(r->pool[i], POTAL_RESIDENT_WS_POOL_BYTES);
+#endif
+        free(r->pool[i]);
+    }
+    if (r->destroy_sink) r->destroy_sink(s->sink.ctx);
+    free(r);
+    free(s);
+    paired_owner = 0;
+}
+
+potal_status potal_paired_resident_open(const potal_resident_ws_options *options,
+    potal_paired_session **out) {
+    if (!out) return POTAL_ERR_INVALID_ARGUMENT;
+    *out = NULL;
+    if (options && (!options->sink.cmd || !options->sink.ctx || !options->destroy_sink || !options->counter))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (!resident_ws_geometry()) return POTAL_ERR_UNSUPPORTED;
+#if !defined(__riscv)
+    if (!options) return POTAL_ERR_NO_HARDWARE;
+#endif
+    if (resident_ws_owner_sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    potal_paired_session *s = NULL;
+    potal_status status = potal_paired_session_open(options ? &options->sink : NULL, &s);
+    if (status != POTAL_OK) return status;
+    resident_ws_state *r = calloc(1, sizeof(*r));
+    if (!r) {
+        (void)potal_paired_session_close(s); /* No resident state or command yet. */
+        return POTAL_ERR_CAPACITY;
+    }
+    s->resident = r;
+    paired_owner = 2; /* Existing owner, resident mode; not another lock. */
+    r->in_call = 1;
+    r->status.software_only = options != NULL;
+    r->counter = options ? options->counter : NULL;
+    for (uint32_t i = 0; i < 6; ++i) {
+        r->pool[i] = aligned_alloc(64, POTAL_RESIDENT_WS_POOL_BYTES);
+        if (!r->pool[i]) { status = POTAL_ERR_CAPACITY; break; }
+        memset(r->pool[i], 0, POTAL_RESIDENT_WS_POOL_BYTES);
+#if defined(__riscv)
+        if (!options && mlock(r->pool[i], POTAL_RESIDENT_WS_POOL_BYTES) != 0) {
+            status = POTAL_ERR_CAPACITY;
+            break;
+        }
+#endif
+    }
+    uint64_t value = 0;
+    if (status == POTAL_OK) status = resident_ws_counter(s, UINT64_C(0xA), &value);
+    if (status == POTAL_OK) status = resident_ws_counter(s, POTAL_RESIDENT_WS_COUNTER_TAG, &value);
+    if (status == POTAL_OK && value != POTAL_RESIDENT_WS_CAPABILITY) status = POTAL_ERR_UNSUPPORTED;
+    if (status != POTAL_OK) {
+        /* Only counter configuration could have changed; no extension or DMA.
+         * Failed open never adopts the caller's software context. */
+        resident_ws_free(s);
+        return status;
+    }
+    r->owner = ++resident_ws_owner_sequence;
+    r->status.capability_matched = 1;
+    r->status.owned_bytes = UINT64_C(6) * POTAL_RESIDENT_WS_POOL_BYTES;
+    r->status.state = POTAL_RESIDENT_WS_NEW;
+    r->destroy_sink = options ? options->destroy_sink : NULL;
+    r->in_call = 0;
+    *out = s;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_prepare(potal_paired_session *s) {
+    if (!s || !s->resident) return POTAL_ERR_INVALID_ARGUMENT;
+    resident_ws_state *r = s->resident;
+    if (r->in_call) return POTAL_ERR_BUSY;
+    if (s->failed) return s->error;
+    if (r->status.state != POTAL_RESIDENT_WS_NEW || r->status.control_pending)
+        return POTAL_ERR_BUSY;
+    r->status.control_pending = 1;
+    r->in_call = 1;
+    const potal_status status = paired_raw(s, POTAL_FUNCT_FLUSH, 0, 0, 0);
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "resident_prepare", 0);
+    return resident_ws_fence(s);
+}
+
+static potal_status resident_ws_fence(potal_paired_session *s) {
+    resident_ws_state *r = s->resident;
+    if (r->in_call) return POTAL_ERR_BUSY;
+    if (s->failed) return s->error; /* Recovery is explicit cleanup, never a second direct Fence. */
+    if (r->status.state != POTAL_RESIDENT_WS_READY &&
+        !(r->status.state == POTAL_RESIDENT_WS_NEW && r->status.control_pending))
+        return POTAL_ERR_BUSY;
+    r->in_call = 1;
+    const potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
+    r->in_call = 0;
+    r->status.last_drain = status;
+    if (status != POTAL_OK) {
+        r->status.unknown_fence = 1;
+        return resident_ws_failed(s, status, "fence", 1);
+    }
+    paired_drained(s);
+    r->status.state = POTAL_RESIDENT_WS_READY;
+    return POTAL_OK;
+}
+
+static potal_status resident_ws_release(potal_paired_session *s, uint32_t slot,
+    uint32_t generation, uint32_t column) {
+    potal_status status = resident_ws_ready(s, 1);
+    if (status != POTAL_OK) return status;
+    uint64_t key;
+    if (potal_scale_key_encode(slot, generation, column, &key) != POTAL_OK ||
+        !(s->slot_columns[slot] & (UINT64_C(1) << column)) || s->slot_generation[slot] != generation)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    resident_ws_state *r = s->resident;
+    r->in_call = 1;
+    status = paired_scale_release_core(s, slot, generation, column);
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "scale_release", 1);
+    if (!s->slot_columns[slot]) memset(&r->scale[slot], 0, sizeof(r->scale[slot]));
+    return POTAL_OK;
+}
+
+static potal_status resident_ws_cleanup(potal_paired_session *s) {
+    resident_ws_state *r = s->resident;
+    if (r->in_call) return POTAL_ERR_BUSY;
+    if (r->status.state == POTAL_RESIDENT_WS_CLEANED) return r->status.cleanup_status;
+    if (r->status.state == POTAL_RESIDENT_WS_QUARANTINED || r->status.unknown_fence)
+        return s->error;
+    if (r->status.state != POTAL_RESIDENT_WS_FAILED || r->status.cleanup_attempted)
+        return POTAL_ERR_BUSY;
+    r->status.cleanup_attempted = 1;
+    r->in_call = 1;
+    /* Even a failed first CONFIG/LOOP/MVOUT can have effects without core counters. */
+    potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
+    r->status.last_drain = status;
+    r->status.cleanup_status = status;
+    if (status != POTAL_OK) {
+        r->in_call = 0;
+        r->status.unknown_fence = 1; /* independent of the preserved first error stage */
+        return resident_ws_failed(s, status, "fence", 1);
+    }
+    paired_drained(s); /* s->failed prevents every publication. */
+    for (uint32_t slot = 0; slot < 256; ++slot) {
+        for (uint32_t c = 0; c < 16; ++c) {
+            if (!(s->slot_columns[slot] & (UINT64_C(1) << c))) continue;
+            uint64_t key;
+            (void)potal_scale_key_encode(slot, s->slot_generation[slot], c, &key);
+            status = paired_raw(s, POTAL_FUNCT_SCALE_RELEASE, key, 0, 1);
+            if (status != POTAL_OK) {
+                r->in_call = 0;
+                r->status.cleanup_status = status;
+                return resident_ws_failed(s, status, "cleanup_release", 1);
+            }
+            s->slot_columns[slot] &= ~(UINT64_C(1) << c);
+            paired_drained(s);
+        }
+    }
+    s->index_open = 0;
+    memset(s->pair, 0, sizeof(s->pair));
+    memset(r->pair, 0, sizeof(r->pair));
+    memset(r->scale, 0, sizeof(r->scale));
+    memset(r->index, 0, sizeof(r->index));
+    memset(r->receipt, 0, sizeof(r->receipt));
+    for (uint32_t b = 0; b < 2; ++b) for (uint32_t t = 0; t < 32; ++t) {
+        r->epoch[b][t].token = (potal_resident_ws_ref){0, 0};
+        r->epoch[b][t].initialized = 0;
+    }
+    r->status.cleanup_status = POTAL_OK;
+    r->status.state = POTAL_RESIDENT_WS_CLEANED;
+    r->in_call = 0;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_buffer_view(potal_paired_session *s,
+    potal_resident_ws_buffer which, void **data, size_t *bytes) {
+    const potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if ((unsigned)which > POTAL_RESIDENT_WS_RESIDUAL_A || !data || !bytes)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    *data = s->resident->pool[which];
+    *bytes = POTAL_RESIDENT_WS_POOL_BYTES;
+    return POTAL_OK;
+}
+
+potal_resident_ws_status potal_paired_resident_query(const potal_paired_session *s) {
+    potal_resident_ws_status q;
+    memset(&q, 0, sizeof(q));
+    if (s && s->resident) {
+        const resident_ws_state *r = s->resident;
+        q = r->status;
+        q.core = potal_paired_session_query(s);
+        for (uint32_t p = 0; p < 2; ++p) {
+            q.residents[p] = r->pair[p].readable ? r->pair[p].token : (potal_resident_ws_ref){0, 0};
+            q.readable[p] = (uint32_t)r->pair[p].readable;
+            q.loading[p] = (uint32_t)r->pair[p].loading;
+        }
+    }
+    return q;
+}
+
+potal_status potal_paired_resident_close(potal_paired_session **session) {
+    if (!session || !*session || !(*session)->resident) return POTAL_ERR_INVALID_ARGUMENT;
+    potal_paired_session *s = *session;
+    resident_ws_state *r = s->resident;
+    if (r->in_call) return POTAL_ERR_BUSY;
+    if (r->status.state == POTAL_RESIDENT_WS_FAILED || r->status.state == POTAL_RESIDENT_WS_QUARANTINED)
+        return s->error;
+    if (r->status.pending || r->status.control_pending || s->index_open ||
+        s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates)
+        return POTAL_ERR_BUSY;
+    for (uint32_t p = 0; p < 2; ++p)
+        if (r->pair[p].readable || r->pair[p].loading) return POTAL_ERR_BUSY;
+    for (uint32_t slot = 0; slot < 256; ++slot)
+        if (s->slot_columns[slot]) return POTAL_ERR_BUSY;
+    for (uint32_t bank = 0; bank < 2; ++bank)
+        for (uint32_t tile = 0; tile < 32; ++tile)
+            if (r->epoch[bank][tile].initialized && !r->epoch[bank][tile].final)
+                return POTAL_ERR_BUSY;
+    const potal_status status = s->failed ? s->error : POTAL_OK;
+    r->in_call = 1;
+    *session = NULL;
+    resident_ws_free(s);
+    return status;
+}
+
+potal_status potal_paired_resident_load_issue(potal_paired_session *s,
+    const potal_resident_ws_load *load) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    status = potal_resident_ws_load_check(load);
+    if (status != POTAL_OK) return status;
+    resident_ws_state *r = s->resident;
+    const potal_resident_ws_load d = *load;
+    if (r->pair[d.pair].readable || r->pair[d.pair].loading) return POTAL_ERR_BUSY;
+    potal_resident_ws_ref token;
+    status = resident_ws_token(r, &token);
+    if (status != POTAL_OK) return status;
+    r->pair[d.pair] = (resident_ws_pair){d, token, 1, 0};
+    memset(&r->index[d.pair], 0, sizeof(r->index[d.pair]));
+    s->pair[d.pair].resident_b = 0;
+    s->pair[d.pair].index_valid = 0;
+    r->kind = RESIDENT_WS_LOAD;
+    r->pending_pair = d.pair;
+    r->pending_refs[0] = token;
+    r->status.pending = 1; /* Premarked before CONFIG and any possible B DMA. */
+    r->issue_complete = 0;
+    r->in_call = 1;
+#if defined(__riscv)
+    potal_cpu_fence_rw();
+#endif
+    status = paired_raw(s, POTAL_FUNCT_CONFIG, config_ld_rs1(0), d.source_stride, 0);
+    const uint32_t nk = resident_ws_tiles(d.k_rows), nj = resident_ws_tiles(d.j_columns);
+    const uint32_t base = resident_ws_b_base(&d);
+    for (uint32_t k = 0; status == POTAL_OK && k < nk; ++k) {
+        for (uint32_t j = 0; status == POTAL_OK && j < nj; ++j) {
+            const uint32_t nr = d.k_rows - k * 16 < 16 ? d.k_rows - k * 16 : 16;
+            const uint32_t nc = d.j_columns - j * 16 < 16 ? d.j_columns - j * 16 : 16;
+            const uint64_t source = (uint64_t)(uintptr_t)r->pool[d.pair] +
+                (uint64_t)k * 16 * d.source_stride + j * 16;
+            const uint32_t row = base + (k * nj + j) * 16;
+            r->status.attempted_b_mvins++;
+            status = paired_raw(s, POTAL_FUNCT_MVIN, source,
+                ((uint64_t)nr << 48) | ((uint64_t)nc << 32) | row, 0);
+        }
+    }
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "resident_b_load", 0);
+    r->issue_complete = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_get(potal_paired_session *s, uint32_t pair,
+    potal_resident_ws_ref *resident) {
+    const potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (pair >= 2 || !resident) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!s->resident->pair[pair].readable) return POTAL_ERR_BUSY;
+    *resident = s->resident->pair[pair].token;
+    return POTAL_OK;
+}
+
+static int resident_ws_cpu_span(const void *p, uint64_t bytes) {
+    return p && bytes && bytes <= SIZE_MAX && (uintptr_t)p <= UINTPTR_MAX - bytes;
+}
+
+potal_status potal_paired_resident_scale_program(potal_paired_session *s,
+    const potal_resident_ws_scales *d, potal_resident_ws_ref *scale) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!d || !scale || !d->partials || !d->j_columns || d->generation > 255 ||
+        d->carrier_stride < d->j_columns) return POTAL_ERR_INVALID_ARGUMENT;
+    resident_ws_state *r = s->resident;
+    const int pair = resident_ws_find(r, d->resident);
+    if (pair < 0) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_resident_ws_load *l = &r->pair[pair].load;
+    const uint32_t nj = resident_ws_tiles(d->j_columns);
+    if (d->base >= 256 || (uint64_t)d->partials * nj > 256 - d->base)
+        return POTAL_ERR_CAPACITY;
+    if (d->j_begin < l->j_begin || d->j_columns > l->j_columns ||
+        d->j_begin - l->j_begin > l->j_columns - d->j_columns ||
+        (d->j_begin - l->j_begin) % 16 ||
+        !resident_ws_cpu_span(d->original_blocks, (uint64_t)d->partials * sizeof(uint64_t)) ||
+        !resident_ws_cpu_span(d->carriers, matrix_extent(d->partials, d->j_columns,
+                                                         d->carrier_stride, sizeof(uint32_t))))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    uint32_t values[256][16];
+    resident_ws_scale bindings[256];
+    const uint32_t slots = d->partials * nj, base = d->base, generation = d->generation;
+    const uint32_t columns = d->j_columns;
+    for (uint32_t p = 0; p < d->partials; ++p) {
+        const uint64_t block = d->original_blocks[p];
+        if (block < l->k_begin / 32 || block > (l->k_begin + l->k_rows - 1) / 32)
+            return POTAL_ERR_INVALID_ARGUMENT;
+        for (uint32_t j = 0; j < nj; ++j) {
+            const uint32_t local = p * nj + j, slot = base + local;
+            if (s->slot_columns[slot]) return POTAL_ERR_CAPACITY;
+            bindings[local].resident = d->resident;
+            bindings[local].block = block;
+            bindings[local].column = d->j_begin + j * 16;
+            const uint32_t nc = columns - j * 16 < 16 ? columns - j * 16 : 16;
+            for (uint32_t c = 0; c < nc; ++c) {
+                const uint32_t v = d->carriers[(size_t)p * d->carrier_stride + j * 16 + c];
+                if (!potal_carrier_is_valid(v)) return POTAL_ERR_INVALID_ARGUMENT;
+                values[local][c] = v;
+            }
+        }
+    }
+    potal_resident_ws_ref token;
+    status = resident_ws_token(r, &token);
+    if (status != POTAL_OK) return status;
+    r->status.control_pending = 1;
+    r->in_call = 1;
+    for (uint32_t i = 0; status == POTAL_OK && i < slots; ++i) {
+        const uint32_t j = i % nj;
+        const uint32_t nc = columns - j * 16 < 16 ? columns - j * 16 : 16;
+        bindings[i].token = token;
+        r->scale[base + i] = bindings[i];
+        for (uint32_t c = 0; status == POTAL_OK && c < nc; ++c)
+            status = paired_scale_write_core(s, base + i, generation, c, values[i][c]);
+    }
+    r->in_call = 0;
+    if (status != POTAL_OK)
+        return resident_ws_failed(s, status, "resident_scale", 1); /* Acceptance may be untracked. */
+    r->status.control_pending = 0;
+    *scale = token;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_index_program(potal_paired_session *s,
+    const potal_resident_ws_indices *d, potal_resident_ws_ref *index) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!d || !index || !d->count) return POTAL_ERR_INVALID_ARGUMENT;
+    if (d->count > 32) return POTAL_ERR_CAPACITY;
+    if (!resident_ws_cpu_span(d->original_k, (uint64_t)d->count * sizeof(uint64_t)))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    resident_ws_state *r = s->resident;
+    const int pair = resident_ws_find(r, d->resident);
+    if (pair < 0) return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->index_open) return POTAL_ERR_BUSY;
+    const potal_resident_ws_load *l = &r->pair[pair].load;
+    resident_ws_index next;
+    memset(&next, 0, sizeof(next));
+    next.resident = d->resident;
+    next.count = d->count;
+    const potal_index_config config = {
+        (uint32_t)pair, resident_ws_b_base(l), resident_ws_tiles(l->j_columns), l->k_rows, d->count
+    };
+    status = potal_index_config_check(&config);
+    if (status != POTAL_OK) return status;
+    for (uint32_t i = 0; i < d->count; ++i) {
+        next.original[i] = d->original_k[i];
+        if (next.original[i] < l->k_begin || next.original[i] - l->k_begin >= l->k_rows)
+            return POTAL_ERR_INVALID_ARGUMENT;
+        const potal_index_write w = {i, (uint32_t)(next.original[i] - l->k_begin)};
+        status = potal_index_write_check(&config, &w);
+        if (status != POTAL_OK) return status;
+    }
+    status = resident_ws_token(r, &next.token);
+    if (status != POTAL_OK) return status;
+    memset(&r->index[pair], 0, sizeof(r->index[pair]));
+    s->pair[pair].index_valid = 0;
+    r->status.control_pending = 1; /* Partial Index acceptance also requires cleanup drain. */
+    r->in_call = 1;
+    status = paired_index_config_core(s, &config);
+    for (uint32_t i = 0; status == POTAL_OK && i < next.count; ++i) {
+        const potal_index_write w = {i, (uint32_t)(next.original[i] - l->k_begin)};
+        status = paired_index_write_core(s, &w);
+    }
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "resident_index", 0);
+    r->index[pair] = next;
+    r->status.control_pending = 0;
+    *index = next.token;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_retire(potal_paired_session *s, potal_resident_ws_ref resident) {
+    const potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    resident_ws_state *r = s->resident;
+    const int pair = resident_ws_find(r, resident);
+    if (pair < 0) return POTAL_ERR_INVALID_ARGUMENT;
+    for (uint32_t slot = 0; slot < 256; ++slot)
+        if (s->slot_columns[slot] && resident_ws_same(r->scale[slot].resident, resident))
+            return POTAL_ERR_BUSY;
+    memset(&r->pair[pair], 0, sizeof(r->pair[pair]));
+    memset(&r->index[pair], 0, sizeof(r->index[pair]));
+    memset(&s->pair[pair], 0, sizeof(s->pair[pair]));
+    /* Physical ACC epochs retain values and identity independently of B. */
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_epoch_begin(potal_paired_session *s,
+    const potal_resident_ws_epoch *d, potal_resident_ws_ref *reference) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!d || !reference || d->path > 1 || d->acc_tile >= 32 ||
+        !d->rows || d->rows > 16 || !d->columns || d->columns > 16 ||
+        !d->output_id || !d->weight_id || !d->weight_generation ||
+        d->original_i > UINT64_MAX - d->rows || d->original_j % 16 ||
+        d->original_j > UINT64_MAX - d->columns ||
+        d->logical_k_begin >= d->logical_k_end)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    resident_ws_state *r = s->resident;
+    resident_ws_epoch *old = &r->epoch[d->path][d->acc_tile];
+    if (old->initialized && !old->final) return POTAL_ERR_BUSY;
+    resident_ws_epoch next;
+    memset(&next, 0, sizeof(next));
+    next.declaration = *d;
+    next.declaration.fragments = NULL;
+    if (!d->path) {
+        if (d->logical_k_begin % 16 || d->fragments || d->fragment_count)
+            return POTAL_ERR_INVALID_ARGUMENT;
+        const uint64_t length = d->logical_k_end - d->logical_k_begin;
+        next.total = length / 16 + (length % 16 != 0);
+    } else {
+        if (!d->fragment_count || d->fragment_count > SIZE_MAX / sizeof(*d->fragments) ||
+            !resident_ws_cpu_span(d->fragments, d->fragment_count * sizeof(*d->fragments)))
+            return POTAL_ERR_INVALID_ARGUMENT;
+        uint64_t previous = 0;
+        int have_previous = 0;
+        for (size_t p = 0; p < d->fragment_count; ++p) {
+            const potal_resident_ws_fragment *f = &d->fragments[p];
+            if (!f->count || f->count > 16) return POTAL_ERR_INVALID_ARGUMENT;
+            for (uint32_t q = 0; q < f->count; ++q) {
+                const uint64_t k = f->original_k[q];
+                if (k < d->logical_k_begin || k >= d->logical_k_end ||
+                    k / 32 != f->original_k[0] / 32 ||
+                    (have_previous && k <= previous)) return POTAL_ERR_INVALID_ARGUMENT;
+                previous = k;
+                have_previous = 1;
+            }
+        }
+        next.total = d->fragment_count;
+    }
+    if (r->sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    if (d->path) {
+        potal_resident_ws_fragment *copy = malloc(d->fragment_count * sizeof(*copy));
+        if (!copy) return POTAL_ERR_CAPACITY;
+        memcpy(copy, d->fragments, d->fragment_count * sizeof(*copy));
+        next.fragments = copy;
+        next.declaration.fragments = copy;
+    }
+    (void)resident_ws_token(r, &next.token); /* Capacity was checked before allocation/mutation. */
+    free(old->fragments);
+    *old = next;
+    r->receipt[d->path].ready = 0;
+    *reference = next.token;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_run_check(const potal_paired_session *s,
+    const potal_resident_ws_run *d) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!d) return POTAL_ERR_INVALID_ARGUMENT;
+    const resident_ws_state *r = s->resident;
+    const int pair = resident_ws_find(r, d->resident);
+    if (pair < 0 || d->path > 1) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_resident_ws_load *l = &r->pair[pair].load;
+    const int8_t *activation = r->pool[2 + d->path];
+    status = potal_resident_ws_run_check(l, d, activation, POTAL_RESIDENT_WS_POOL_BYTES);
+    if (status != POTAL_OK) return status;
+    const uint32_t nk = resident_ws_tiles(d->k_rows), nj = resident_ws_tiles(d->j_columns);
+    const resident_ws_index *ix = &r->index[pair];
+    if (d->indexed) {
+        const paired_pair_state *p = &s->pair[pair];
+        if (!resident_ws_same(ix->token, d->index) || !resident_ws_same(ix->resident, d->resident) ||
+            ix->count != d->k_rows || s->index_open || !p->index_valid ||
+            p->index.b_sp_base != resident_ws_b_base(l) ||
+            p->index.j_tiles != resident_ws_tiles(l->j_columns) ||
+            p->index.source_k_rows != l->k_rows || p->index.active_rows != d->k_rows ||
+            ix->original[0] < l->k_begin || ix->original[0] - l->k_begin != d->k_offset)
+            return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    /* Every destination is checked before ANY token, pending flag or command
+     * changes. One stale lane rejects the entire multi-J operation. */
+    for (uint32_t j = 0; j < nj; ++j) {
+        const resident_ws_epoch *e = &r->epoch[d->path][d->acc_tile + j];
+        const potal_resident_ws_epoch *v = &e->declaration;
+        const uint32_t cols = d->j_columns - j * 16 < 16 ? d->j_columns - j * 16 : 16;
+        if (!resident_ws_same(e->token, d->epochs[j]) || e->final ||
+            v->path != d->path || v->acc_tile != d->acc_tile + j ||
+            v->rows != d->i_rows || v->columns != cols ||
+            v->output_id != d->output_id || v->original_i != d->original_i ||
+            v->original_j != l->j_begin + d->j_offset + j * 16 ||
+            v->weight_id != l->weight_id || v->weight_generation != l->weight_generation ||
+            e->next != d->sequence || d->sequence > e->total ||
+            nk > e->total - d->sequence || d->last != (d->sequence + nk == e->total) ||
+            (d->first ? e->initialized : !e->initialized))
+            return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t p = 0; p < nk; ++p) {
+        const uint32_t valid = d->indexed ? d->fragment_counts[p] :
+            (d->k_rows - p * 16 < 16 ? d->k_rows - p * 16 : 16);
+        const uint64_t first = d->indexed ? ix->original[p * 16] :
+            l->k_begin + d->k_offset + p * 16;
+        const uint64_t block = first / 32;
+        for (uint32_t q = 0; q < valid; ++q) {
+            const uint64_t k = d->indexed ? ix->original[p * 16 + q] : first + q;
+            if (k < l->k_begin || k - l->k_begin >= l->k_rows || k / 32 != block)
+                return POTAL_ERR_INVALID_ARGUMENT;
+        }
+        if (d->indexed && p + 1 < nk) {
+            /* All Index entries, including filler, were range-checked at
+             * programming; every interior filler A byte must be zero. */
+            for (uint32_t q = valid; q < 16; ++q)
+                for (uint32_t row = 0; row < d->i_rows; ++row)
+                    if (activation[d->a_offset + (size_t)row * d->a_stride + p * 16 + q])
+                        return POTAL_ERR_INVALID_ARGUMENT;
+        }
+        for (uint32_t j = 0; j < nj; ++j) {
+            const resident_ws_epoch *e = &r->epoch[d->path][d->acc_tile + j];
+            const potal_resident_ws_epoch *v = &e->declaration;
+            if (!d->path) {
+                const uint64_t expected = v->logical_k_begin + (d->sequence + p) * 16;
+                const uint64_t left = v->logical_k_end - expected;
+                const uint32_t expected_count = left < 16 ? (uint32_t)left : 16;
+                if (first != expected || valid != expected_count) return POTAL_ERR_INVALID_ARGUMENT;
+                for (uint32_t q = 0; d->indexed && q < valid; ++q)
+                    if (ix->original[p * 16 + q] != expected + q) return POTAL_ERR_INVALID_ARGUMENT;
+            } else {
+                const potal_resident_ws_fragment *f = &v->fragments[d->sequence + p];
+                if (valid != f->count) return POTAL_ERR_INVALID_ARGUMENT;
+                for (uint32_t q = 0; q < valid; ++q)
+                    if (ix->original[p * 16 + q] != f->original_k[q]) return POTAL_ERR_INVALID_ARGUMENT;
+            }
+            const uint32_t slot = d->scale_base + p * nj + j;
+            const resident_ws_scale *b = &r->scale[slot];
+            const uint32_t cols = d->j_columns - j * 16 < 16 ? d->j_columns - j * 16 : 16;
+            const uint64_t mask = (UINT64_C(1) << cols) - 1;
+            if (!resident_ws_same(b->token, d->scale) || !resident_ws_same(b->resident, d->resident) ||
+                b->block != block || b->column != l->j_begin + d->j_offset + j * 16 ||
+                s->slot_generation[slot] != d->scale_generation ||
+                (s->slot_columns[slot] & mask) != mask)
+                return POTAL_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_issue(potal_paired_session *s, const potal_resident_ws_run *run) {
+    potal_status status = potal_paired_resident_run_check(s, run);
+    if (status != POTAL_OK) return status;
+    const potal_resident_ws_run d = *run;
+    resident_ws_state *r = s->resident;
+    const uint32_t pair = (uint32_t)resident_ws_find(r, d.resident);
+    potal_resident_ws_program p;
+    status = potal_resident_ws_run_encode(&r->pair[pair].load, &d,
+        r->pool[2 + d.path], POTAL_RESIDENT_WS_POOL_BYTES, &p);
+    if (status != POTAL_OK) return status;
+    r->kind = RESIDENT_WS_COMPUTE;
+    r->pending_pair = pair;
+    r->pending_bank = d.path;
+    r->pending_tile = d.acc_tile;
+    r->pending_count = resident_ws_tiles(d.j_columns);
+    r->pending_next = d.sequence + resident_ws_tiles(d.k_rows);
+    r->pending_last = d.last;
+    memcpy(r->pending_refs, d.epochs, r->pending_count * sizeof(*d.epochs));
+    r->receipt[d.path].ready = 0;
+    r->status.pending = 1; /* Includes a partial baseline/view/run configuration. */
+    r->issue_complete = 0;
+    s->pair[pair].outstanding++;
+    s->outstanding_loops++;
+    r->in_call = 1;
+    status = paired_issue_program_view(s, &p.loop, &p.view, "resident_loop_ws");
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "resident_loop_ws", 0);
+    r->issue_complete = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_readback_issue(potal_paired_session *s,
+    const potal_resident_ws_readback *readback, potal_resident_ws_ref *receipt) {
+    potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!readback || !receipt || readback->bank > 1) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_resident_ws_readback d = *readback;
+    resident_ws_state *r = s->resident;
+    potal_rocc_cmd config, commands[9];
+    uint32_t n;
+    status = potal_resident_ws_readback_encode(&d, r->pool[4 + d.bank],
+        POTAL_RESIDENT_WS_POOL_BYTES, &config, commands, 9, &n);
+    if (status != POTAL_OK) return status;
+    for (uint32_t j = 0; j < n; ++j) {
+        const resident_ws_epoch *e = &r->epoch[d.bank][d.acc_tile + j];
+        const uint32_t cols = d.columns - j * 16 < 16 ? d.columns - j * 16 : 16;
+        if (!resident_ws_same(e->token, d.epochs[j]) || !e->initialized ||
+            e->next != d.sequences[j] || e->declaration.rows != d.rows ||
+            e->declaration.columns != cols) return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    potal_resident_ws_ref token;
+    status = resident_ws_token(r, &token);
+    if (status != POTAL_OK) return status;
+    r->receipt[d.bank] = (resident_ws_receipt){token, d, 0};
+    r->kind = RESIDENT_WS_READBACK;
+    r->pending_bank = d.bank;
+    r->pending_tile = d.acc_tile;
+    r->pending_count = n;
+    memcpy(r->pending_refs, d.epochs, n * sizeof(*d.epochs));
+    r->status.pending = 1;
+    r->issue_complete = 0;
+    s->outstanding_readbacks++;
+    r->in_call = 1;
+    status = paired_raw(s, POTAL_FUNCT_CONFIG, config.rs1, config.rs2, 0);
+    for (uint32_t j = 0; status == POTAL_OK && j < n; ++j)
+        status = paired_raw(s, POTAL_FUNCT_MVOUT, commands[j].rs1, commands[j].rs2, 0);
+    r->in_call = 0;
+    if (status != POTAL_OK) return resident_ws_failed(s, status, "resident_readback", 0);
+    r->issue_complete = 1;
+    *receipt = token;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_resident_result(potal_paired_session *s, potal_resident_ws_ref receipt,
+    const int32_t **data, size_t *stride) {
+    const potal_status status = resident_ws_ready(s, 0);
+    if (status != POTAL_OK) return status;
+    if (!data || !stride) return POTAL_ERR_INVALID_ARGUMENT;
+    const resident_ws_state *r = s->resident;
+    for (uint32_t b = 0; b < 2; ++b) {
+        const resident_ws_receipt *snapshot = &r->receipt[b];
+        if (!snapshot->ready || !resident_ws_same(snapshot->token, receipt)) continue;
+        const potal_resident_ws_readback *d = &snapshot->readback;
+        for (uint32_t j = 0; j < resident_ws_tiles(d->columns); ++j) {
+            const resident_ws_epoch *e = &r->epoch[b][d->acc_tile + j];
+            if (!e->initialized || !resident_ws_same(e->token, d->epochs[j]) ||
+                e->next != d->sequences[j]) return POTAL_ERR_INVALID_ARGUMENT;
+        }
+        *data = r->pool[4 + b];
+        *stride = d->stride;
+        return POTAL_OK;
+    }
+    return POTAL_ERR_INVALID_ARGUMENT;
 }

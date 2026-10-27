@@ -370,6 +370,8 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const pota
 #define POTAL_FUNCT_FENCE                     25
 #define POTAL_FUNCT_INDEX_WRITE               26
 #define POTAL_FUNCT_INDEX_CONFIG              27
+#define POTAL_FUNCT_RESIDENT_VIEW             28
+#define POTAL_FUNCT_COUNTER                  126
 
 /* ---- H2 paired / indexed execution (potal_paired_*) ---------------------- */
 
@@ -635,6 +637,190 @@ potal_status potal_paired_fence(potal_paired_session *session);
  * did not answer OK is not retried by this API.
  */
 potal_status potal_paired_session_cleanup(potal_paired_session *session);
+
+/* ---- Opt-in resident I1/P1 interface (fixed DIM16/SP4x4096/ACC1024) ------
+ *
+ * Uses the SAME opaque session and paired owner, not the test-only E4A
+ * potal_resident_handle. Ordinary paired issuers/close/flush are blocked in
+ * this mode. Checked paired Fence, Scale Release and cleanup remain shared.
+ * One DMA transaction at a time; no prefetch/overlap or scheduler adoption.
+ *
+ * Hardware open probes the known base COUNTER126 ISA, BEFORE any extension:
+ * setup rs1=0xA clears counter0 configuration/value and snapshot selection;
+ * exact tagged read must return POTAL_RESIDENT_WS_CAPABILITY. This probe is
+ * not safe discovery of an arbitrary unknown accelerator. It runs under the
+ * paired owner before workload counters are configured. No environment
+ * override exists. Native null-options open returns NO_HARDWARE.
+ *
+ * Non-NULL options select SOFTWARE-ONLY command emulation, even on RISC-V.
+ * The old status sink ABI is unchanged. counter supplies a 64-bit response
+ * for the two exact counter commands, using sink.ctx. On successful open the
+ * session adopts that non-NULL context and its destructor; on failed open
+ * the caller retains it. Quarantine never destroys context, buffers or owner.
+ * Callbacks may query status, but reentrant mutation returns BUSY.
+ *
+ * All returned buffer aliases must remain untouched during pending work.
+ * Retained buffers are six aligned 64 KiB pools: B0/B1, Main/Residual A,
+ * and two private readback pools. Only the four input pools are mutable.
+ * Result aliases expire on a later writer/readback of that bank or close.
+ * Open/prepare/use/cleanup/close belong inside one issuer_owner callback.
+ */
+#define POTAL_RESIDENT_WS_CAPABILITY UINT64_C(0x504f544102100007)
+#define POTAL_RESIDENT_WS_COUNTER_TAG UINT64_C(0x504f544100000000)
+#define POTAL_RESIDENT_WS_POOL_BYTES 65536u
+#define POTAL_RESIDENT_WS_MAX_J 9u
+#define POTAL_RESIDENT_WS_MAX_K 28u
+
+typedef struct potal_resident_ws_ref {
+    uint64_t owner, generation; /* nonzero, nonwrapping software incarnation */
+} potal_resident_ws_ref;
+
+typedef potal_status (*potal_resident_ws_counter_fn)(
+    void *ctx, const potal_paired_cmd_record *record, uint64_t *response);
+typedef struct potal_resident_ws_options {
+    potal_paired_sink sink;
+    void (*destroy_sink)(void *);
+    potal_resident_ws_counter_fn counter;
+} potal_resident_ws_options;
+
+typedef enum potal_resident_ws_buffer {
+    POTAL_RESIDENT_WS_B0 = 0, POTAL_RESIDENT_WS_B1 = 1,
+    POTAL_RESIDENT_WS_MAIN_A = 2, POTAL_RESIDENT_WS_RESIDUAL_A = 3
+} potal_resident_ws_buffer;
+
+typedef struct potal_resident_ws_load {
+    uint32_t pair, k_rows, j_columns, main_a_tiles;
+    uint64_t k_begin, j_begin, weight_id, weight_generation;
+    size_t source_stride; /* bytes in the owned B pool; base offset is zero */
+} potal_resident_ws_load;
+
+/* Exact funct28 payload. Disabled means ALL fields zero. mode must be 1
+ * when enabled. Bases and pitch are DIM16 rows, ACC base is bank-local. */
+typedef struct potal_resident_ws_view {
+    uint32_t enable, pair, indexed, acc_bank, mode;
+    uint32_t b_base, b_pitch, indexed_j_origin, acc_base;
+} potal_resident_ws_view;
+
+typedef struct potal_resident_ws_scales {
+    potal_resident_ws_ref resident;
+    uint32_t base, generation, partials, j_columns;
+    uint64_t j_begin;
+    const uint64_t *original_blocks; /* one block32 ID per ordered P1 partial */
+    const uint32_t *carriers;        /* [partials][carrier_stride] */
+    size_t carrier_stride;          /* uint32_t elements, >= j_columns */
+} potal_resident_ws_scales;
+
+typedef struct potal_resident_ws_indices {
+    potal_resident_ws_ref resident;
+    uint32_t count;                 /* 1..32, including interior filler */
+    const uint64_t *original_k;     /* copied; filler may repeat valid K */
+} potal_resident_ws_indices;
+
+typedef struct potal_resident_ws_fragment {
+    uint32_t count;                 /* 1..16 meaningful entries, one block32 */
+    uint64_t original_k[16];        /* strictly increasing meaningful entries */
+} potal_resident_ws_fragment;
+
+/* Immutable per-physical-tile declaration, copied by epoch_begin.
+ * Main: fragments=NULL/count=0, total partials derived from logical K.
+ * Residual: exact ordered fragment manifest; legitimate gaps are explicit.
+ * No run can change its logical extent, contribution count or identities.
+ */
+typedef struct potal_resident_ws_epoch {
+    uint32_t path, acc_tile, rows, columns;
+    uint64_t output_id, original_i, original_j, weight_id, weight_generation;
+    uint64_t logical_k_begin, logical_k_end;
+    size_t fragment_count;
+    const potal_resident_ws_fragment *fragments;
+} potal_resident_ws_epoch;
+
+typedef struct potal_resident_ws_run {
+    potal_resident_ws_ref resident, scale, index; /* index all-zero for native */
+    potal_resident_ws_ref epochs[POTAL_RESIDENT_WS_MAX_J];
+    uint32_t path, indexed, k_offset, j_offset, k_rows, j_columns, i_rows;
+    uint32_t a_offset_tiles, scale_base, scale_generation, acc_tile;
+    size_t a_offset, a_stride;      /* bytes in owned path A pool */
+    uint64_t output_id, original_i, sequence; /* sequence counts DIM partials */
+    uint32_t first, last;
+    uint32_t fragment_counts[2];    /* indexed only; final equals shape tail */
+} potal_resident_ws_run;
+
+typedef struct potal_resident_ws_program {
+    potal_gemm_ws_program loop;     /* baseline nine configs + extended run */
+    potal_rocc_cmd view;            /* inserted immediately before run */
+} potal_resident_ws_program;
+
+typedef struct potal_resident_ws_readback {
+    uint32_t bank, acc_tile, rows, columns; /* I1, <=9 contiguous output tiles */
+    size_t stride;                        /* INT32 elements in private pool */
+    potal_resident_ws_ref epochs[POTAL_RESIDENT_WS_MAX_J];
+    uint64_t sequences[POTAL_RESIDENT_WS_MAX_J]; /* completed contribution counts */
+} potal_resident_ws_readback;
+
+typedef enum potal_resident_ws_state {
+    POTAL_RESIDENT_WS_NEW, POTAL_RESIDENT_WS_READY, POTAL_RESIDENT_WS_FAILED,
+    POTAL_RESIDENT_WS_CLEANED, POTAL_RESIDENT_WS_QUARANTINED
+} potal_resident_ws_state;
+
+typedef struct potal_resident_ws_status {
+    potal_paired_session_status core;
+    uint32_t state, software_only, capability_matched, pending, control_pending;
+    uint32_t unknown_fence, cleanup_attempted;
+    potal_status last_drain, cleanup_status;
+    uint64_t owned_bytes, attempted_b_mvins;
+    potal_resident_ws_ref residents[POTAL_PAIRS];
+    uint32_t readable[POTAL_PAIRS], loading[POTAL_PAIRS];
+} potal_resident_ws_status;
+
+/* Pure checks/encoders: no session or issue, output unchanged on rejection.
+ * Run encoding checks physical geometry and A extent. The session's separate
+ * run_check also checks live bindings, immutable epochs and filler bytes.
+ */
+/* Mathematical shifts must use this check before narrowing to carrier bits.
+ * Shift zero is identity; POTAL_CARRIER_ZERO remains a separate encoded value. */
+potal_status potal_resident_ws_shift_carrier(int64_t shift, uint32_t *carrier);
+potal_status potal_resident_ws_load_check(const potal_resident_ws_load *load);
+potal_status potal_resident_ws_view_encode(const potal_resident_ws_view *view, potal_rocc_cmd *out);
+potal_status potal_resident_ws_run_check(const potal_resident_ws_load *load,
+    const potal_resident_ws_run *run, const int8_t *activation, size_t bytes);
+potal_status potal_resident_ws_run_encode(const potal_resident_ws_load *load,
+    const potal_resident_ws_run *run, const int8_t *activation, size_t bytes,
+    potal_resident_ws_program *out);
+potal_status potal_resident_ws_readback_encode(const potal_resident_ws_readback *readback,
+    int32_t *destination, size_t bytes, potal_rocc_cmd *config_st,
+    potal_rocc_cmd *mvouts, uint32_t capacity, uint32_t *count);
+
+potal_status potal_paired_resident_open(const potal_resident_ws_options *options,
+    potal_paired_session **out);
+potal_status potal_paired_resident_prepare(potal_paired_session *session);
+potal_status potal_paired_resident_buffer_view(potal_paired_session *session,
+    potal_resident_ws_buffer which, void **data, size_t *bytes);
+potal_status potal_paired_resident_load_issue(potal_paired_session *session,
+    const potal_resident_ws_load *load);
+potal_status potal_paired_resident_get(potal_paired_session *session, uint32_t pair,
+    potal_resident_ws_ref *resident);
+potal_status potal_paired_resident_scale_program(potal_paired_session *session,
+    const potal_resident_ws_scales *scales, potal_resident_ws_ref *scale);
+potal_status potal_paired_resident_index_program(potal_paired_session *session,
+    const potal_resident_ws_indices *indices, potal_resident_ws_ref *index);
+potal_status potal_paired_resident_epoch_begin(potal_paired_session *session,
+    const potal_resident_ws_epoch *epoch, potal_resident_ws_ref *reference);
+potal_status potal_paired_resident_run_check(const potal_paired_session *session,
+    const potal_resident_ws_run *run);
+potal_status potal_paired_resident_issue(potal_paired_session *session,
+    const potal_resident_ws_run *run);
+/* Receipt is reserved at issue, readable only after successful global drain.
+ * It binds every tile's epoch incarnation AND completed contribution count. */
+potal_status potal_paired_resident_readback_issue(potal_paired_session *session,
+    const potal_resident_ws_readback *readback, potal_resident_ws_ref *receipt);
+potal_status potal_paired_resident_result(potal_paired_session *session,
+    potal_resident_ws_ref receipt, const int32_t **data, size_t *stride);
+potal_status potal_paired_resident_retire(potal_paired_session *session,
+    potal_resident_ws_ref resident);
+/* Refused close retains *session. Safe cleaned close consumes it but returns
+ * the original sticky error. Quarantine has no retry/free/close operation. */
+potal_status potal_paired_resident_close(potal_paired_session **session);
+potal_resident_ws_status potal_paired_resident_query(const potal_paired_session *session);
 
 #ifdef __cplusplus
 }
