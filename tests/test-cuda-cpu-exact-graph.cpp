@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-gemmini.h"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-buffer.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gpu-cpu-exact.hpp"
 #include "../tools/perplexity/perplexity-cuda-cpu-exact.hpp"
 #if defined(GGML_GEMMINI_CUDA_RTN_ATTENTION) && GGML_GEMMINI_CUDA_RTN_ATTENTION
@@ -374,6 +375,45 @@ static void rtn_attention_fixture(size_t k, size_t rows, size_t columns, const c
 }
 #endif
 
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+static void hp1_weight_buffer_lifetime(ggml_type type) {
+    if (!TEST_CPU_EXACT_HP1) return;
+    const size_t k=64,n=2049,rows=9;
+    auto packed=weights(type,k,n);
+    std::vector<uint8_t> storage(packed.size()+64);
+    auto * address=reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(storage.data())+63)&~uintptr_t(63));
+    ggml_backend_t backend=ggml_backend_gemmini_init(); require(backend,"Lifetime backend init");
+    auto * ctx=ggml_init({size_t(16)<<20,nullptr,false}); require(ctx,"Lifetime context init");
+    auto * w=ggml_new_tensor_2d(ctx,type,k,n);
+    auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,rows);
+    for (size_t i=0;i<k*rows;++i) static_cast<float *>(x->data)[i]=float(int(i*71%129)-64)/127.0f;
+    auto * result=ggml_mul_mat(ctx,w,x);
+    auto * graph=ggml_new_graph(ctx); ggml_build_forward_expand(graph,result);
+    std::vector<uint8_t> original(ggml_nbytes(result)),expected(original.size());
+    for (int generation=0;generation<2;++generation) {
+        if (generation) {
+            // Same host address, new model weights, retained backend.
+            if (type==GGML_TYPE_Q4_HP1) static_cast<block_q4_hp1 *>(address)[0].qs[0]^=7;
+            else static_cast<block_q8_hp1 *>(address)[0].qs[0]^=7;
+        } else std::memcpy(address,packed.data(),packed.size());
+        auto * buffer=ggml::gemmini::gemmini_buffer_from_host_ptr(address,packed.size());
+        ggml_backend_buffer_set_usage(buffer,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        w->data=address; w->buffer=buffer;
+        require(setenv(gemmini_gpu::enable_env,"0",1)==0,"Lifetime environment");
+        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"Lifetime CPU graph");
+        std::memcpy(expected.data(),result->data,expected.size());
+        require(setenv(gemmini_gpu::enable_env,"1",1)==0,"Lifetime environment");
+        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"Lifetime CUDA graph");
+        require(std::memcmp(expected.data(),result->data,expected.size())==0,"CUDA reused freed weight buffer cache");
+        if (!generation) original=expected;
+        else require(original!=expected,"Lifetime fixture did not change output");
+        ggml_backend_buffer_free(buffer); w->buffer=nullptr;
+    }
+    ggml_backend_free(backend); ggml_free(ctx);
+    std::puts("PASS HP1 CUDA 2048-column tile/tail and WEIGHTS buffer free/address reuse with retained backend");
+}
+#endif
+
 int main() {
     try {
 #if defined(GGML_GEMMINI_CUDA_RTN_ATTENTION) && GGML_GEMMINI_CUDA_RTN_ATTENTION
@@ -397,6 +437,9 @@ int main() {
         else if (TEST_CPU_EXACT_HP1) { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1}; }
         else { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0}; }
         for (ggml_type type : types) { fixture(type,1); fixture(type,5); }
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        hp1_weight_buffer_lifetime(types.front());
+#endif
         if (!TEST_CPU_EXACT_HP1) {
             fixture(TEST_CPU_EXACT_FLOAT ? (GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0) : types.front(),1,true);
         } else { hp1_missing_gpu_proof(types.front()); }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -197,13 +198,13 @@ static void main_fixtures(unsigned bits) {
     check_main(boundary,signs,2);
 
     weights mixed(bits,19,160);
-    std::vector<int32_t> a(7*mixed.k);
+    std::vector<int32_t> a(17*mixed.k);
     for (size_t i = 0; i < a.size(); ++i) a[i] = int((i*53)%(2*limit))-limit;
     for (size_t c = 0; c < mixed.columns; ++c) {
         for (size_t b = 0; b < mixed.k/32; ++b) mixed.exponent(c,b,exponents[(c+b)%5]);
         for (size_t t = 0; t < mixed.k; ++t) mixed.code(c,t,int((c*37+t*19)%(2*limit))-limit);
     }
-    check_main(mixed,a,7);
+    check_main(mixed,a,17);
 
     weights cancellation(bits,1,96);
     std::vector<int32_t> ones(96,1);
@@ -303,11 +304,98 @@ static void residual_fixtures(unsigned bits) {
     std::printf("HP1_SCU residual bits=%u balanced_limbs cross_block_lane_saturation INT64 no_partial_publish PASS\n",bits);
 }
 
-int main() {
+static void benchmark(unsigned bits) {
+    constexpr size_t rows = 128, columns = 512;
+    const int limit = 1 << (bits-1);
+    for (size_t k : {size_t(2048), size_t(8192)}) {
+        weights w(bits, columns, k);
+        std::vector<int32_t> a(rows*k), output(rows*columns);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = int((i*53)%(2*limit))-limit;
+        for (size_t c = 0; c < columns; ++c) {
+            for (size_t b = 0; b < k/32; ++b) w.exponent(c,b,int16_t((c+b)%4));
+            for (size_t t = 0; t < k; ++t) w.code(c,t,int((c*37+t*19)%(2*limit))-limit);
+        }
+        require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "benchmark weight cache");
+        counts observed;
+        const auto expected = main_oracle(w,a,rows,observed);
+        const auto run = [&] {
+            require(ggml_cuda_hp1_scu_main(a.data(),w.data(),bits,rows,columns,k,output.data()), "benchmark main");
+        };
+        for (int i = 0; i < 3; ++i) run();
+        require(output == expected, "benchmark main integer mismatch");
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) run();
+        const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/10;
+        require(output == expected, "benchmark repeated main integer mismatch");
+        std::printf("HP1_SCU_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1\n",
+                    bits,rows,columns,k,ms);
+        std::vector<uint32_t> offsets(rows+1);
+        std::vector<event> events;
+        const int32_t residual = 3*(1 << bits);
+        for (size_t r = 0; r < rows; ++r) {
+            for (size_t b = 0; b < k/32; ++b) {
+                events.push_back({uint32_t(b*32),residual});
+                events.push_back({uint32_t(b*32+17),residual});
+            }
+            offsets[r+1] = uint32_t(events.size());
+        }
+        std::vector<int64_t> residual_output(rows*columns), residual_expected(rows*columns);
+        for (size_t c = 0; c < columns; ++c) {
+            int64_t value = 0;
+            for (size_t b = 0; b < k/32; ++b)
+                value += int64_t(residual)*(w.code(c,b*32)+w.code(c,b*32+17))*(int64_t{1} << ((c+b)%4));
+            for (size_t r = 0; r < rows; ++r) residual_expected[r*columns+c] = value;
+        }
+        const auto residual_run = [&] {
+            require(ggml_cuda_hp1_scu_residual(w.data(),w.bytes(),bits,rows,columns,k,
+                    offsets.data(),events.data(),events.size(),residual_output.data()) == status::success,
+                    "benchmark residual");
+        };
+        for (int i = 0; i < 3; ++i) residual_run();
+        require(residual_output == residual_expected, "benchmark residual integer mismatch");
+        const auto residual_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) residual_run();
+        const double residual_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-residual_start).count()/10;
+        require(residual_output == residual_expected, "benchmark repeated residual mismatch");
+        std::printf("HP1_SCU_RESIDUAL_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1\n",
+                    bits,rows,columns,k,residual_ms);
+        ggml_cuda_hp1_scu_clear_weights();
+    }
+}
+
+static void cache_fixture(unsigned bits) {
+    weights w(bits,37,64);
+    std::vector<int32_t> a(17*w.k,1);
+    for (size_t c = 0; c < w.columns; ++c)
+        for (size_t t = 0; t < w.k; ++t) w.code(c,t,int((c+t)%7)-3);
+    require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "register immutable weights");
+    check_main(w,a,17);
+    counts observed;
+    const auto expected = main_oracle(w,a,17,observed);
+    std::vector<int32_t> tile(17*19);
+    const auto * start = static_cast<const uint8_t *>(w.data())+11*(w.k/32)*(bits == 4 ? 24 : 40);
+    require(ggml_cuda_hp1_scu_main(a.data(),start,bits,17,19,w.k,tile.data()), "cached weight subrange");
+    for (size_t r = 0; r < 17; ++r) for (size_t c = 0; c < 19; ++c)
+        require(tile[r*19+c] == expected[r*w.columns+11+c], "cached subrange integer mismatch");
+    check_residual(w,{0,2,3},{{0,257},{32,-257},{17,INT32_MIN}});
+    ggml_cuda_hp1_scu_clear_weights();
+    w.code(0,0,3);
+    check_main(w,a,17);
+    require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "re-register changed weights");
+    check_main(w,a,17);
+    ggml_cuda_hp1_scu_clear_weights();
+    std::printf("HP1_SCU cache bits=%u main residual subranges invalidation PASS\n",bits);
+}
+
+int main(int argc, char ** argv) {
+    std::setvbuf(stdout,nullptr,_IONBF,0);
     try {
         for (unsigned bits : {4u,8u}) {
             main_fixtures(bits);
             residual_fixtures(bits);
+            cache_fixture(bits);
+            if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) benchmark(bits);
         }
     } catch (const std::exception &) {
         return 1;

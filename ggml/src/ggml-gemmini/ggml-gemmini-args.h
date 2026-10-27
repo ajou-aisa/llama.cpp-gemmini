@@ -8,6 +8,9 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -226,6 +229,13 @@ typedef struct ggml_gemmini_args_t {
     // Checked available backing extent for native block readers. Native
     // dispatch requires a nonzero extent covering every declared block.
     size_t native_weight_bytes = 0;
+    struct WeightValidation {
+        using Key = std::tuple<uintptr_t,size_t,size_t,size_t,size_t,size_t,size_t,int,int,bool>;
+        std::mutex mutex;
+        std::set<Key> accepted;
+    };
+    // Shared only by slices of one operation; never reused across weight updates.
+    std::shared_ptr<WeightValidation> weight_validation;
 
     // Dense affine weight fields (default path, no mode flag needed)
     const uint8_t *  c_b            = nullptr; // [J * blocks_per_row] per-block effective code

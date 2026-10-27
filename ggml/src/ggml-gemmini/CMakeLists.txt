@@ -140,7 +140,7 @@ if (GGML_GEMMINI_CUDA_CPU_EXACT)
     target_compile_options(ggml-gemmini-cuda-cpu-exact PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--ftz=false;--fmad=false;--prec-div=true;--prec-sqrt=true>)
     target_include_directories(ggml-gemmini-cuda-cpu-exact PRIVATE ../../include ..)
-    target_link_libraries(ggml-gemmini-cuda-cpu-exact PUBLIC CUDA::cudart ggml-base)
+    target_link_libraries(ggml-gemmini-cuda-cpu-exact PUBLIC CUDA::cudart CUDA::cublas ggml-base)
     target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-cuda-cpu-exact)
     target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_CUDA_CPU_EXACT=1)
 endif()

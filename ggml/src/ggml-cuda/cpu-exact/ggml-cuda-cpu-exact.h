@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-constexpr size_t GGML_CUDA_CPU_EXACT_MAX_COLUMNS = 512;
+constexpr size_t GGML_CUDA_CPU_EXACT_MAX_COLUMNS = 2048;
 struct ggml_cuda_residual_event { uint32_t k; int32_t value; };
 enum class ggml_cuda_residual_status { success, invalid_input, overflow, gpu_failure };
 

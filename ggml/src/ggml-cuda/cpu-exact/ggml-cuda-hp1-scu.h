@@ -3,6 +3,10 @@
 
 // Opt-in Gemmini arithmetic. This does not change quantization or attention.
 GGML_API bool ggml_hp1_scu_enabled();
+// shortcut: immutable inference weights; add version keys before in-place weight updates.
+// Clear the cache before modifying registered weights or releasing their model.
+GGML_API bool ggml_cuda_hp1_scu_cache_weights(const void * weights, size_t bytes);
+GGML_API void ggml_cuda_hp1_scu_clear_weights();
 GGML_API bool ggml_cuda_hp1_scu_main(const int32_t * a, const void * weights, unsigned bits,
     size_t rows, size_t columns, size_t k, int32_t * output);
 GGML_API ggml_cuda_residual_status ggml_cuda_hp1_scu_residual(const void * weights,

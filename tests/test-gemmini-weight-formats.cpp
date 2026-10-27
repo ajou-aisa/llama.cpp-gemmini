@@ -323,6 +323,30 @@ bool test_q4_h0_matches_canonical_dequantization() {
     return ok;
 }
 
+bool test_reader_validation_cache() {
+    for (uint8_t bits : {uint8_t(4),uint8_t(8)}) {
+        ReaderFixture fixture(bits,Family::HP1);
+        fixture.args.weight_validation = std::make_shared<ggml_gemmini_args_t::WeightValidation>();
+        const auto plan = fixture.resolve();
+        if (!check(plan.valid && !fixture.args.weight_validation->accepted.empty(),"initial cached metadata validation")) return false;
+        const auto entries = fixture.args.weight_validation->accepted.size();
+        auto slice = fixture.args;
+        slice.I = 7;
+        if (!check(wreader::validate(slice,plan) == ReaderStatus::Success &&
+                   fixture.args.weight_validation->accepted.size() == entries,"operation slices share checked metadata")) return false;
+        slice.native_weight_bytes = 0;
+        if (!check(wreader::validate(slice,plan) != ReaderStatus::Success,"cached metadata still checks storage extent")) return false;
+        ReaderFixture other(bits,Family::HP1);
+        other.args.weight_validation = fixture.args.weight_validation;
+        if (bits == 4) other.q4_hp1.m = -1; else other.q8_hp1.m = -1;
+        if (!check(!other.resolve().valid,"different weight pointer cannot reuse validated metadata")) return false;
+        fixture.args.weight_validation = std::make_shared<ggml_gemmini_args_t::WeightValidation>();
+        if (bits == 4) fixture.q4_hp1.m = -1; else fixture.q8_hp1.m = -1;
+        if (!check(!fixture.resolve().valid,"new operation revalidates modified weights")) return false;
+    }
+    return true;
+}
+
 bool test_reader_failure_table() {
     bool ok = true;
 
@@ -702,6 +726,7 @@ int main(int argc, char ** argv) {
         ok = test_q4_h0_matches_canonical_dequantization() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {
+        ok = test_reader_validation_cache() && ok;
         ok = test_reader_failure_table() && ok;
     }
     if (ok) {

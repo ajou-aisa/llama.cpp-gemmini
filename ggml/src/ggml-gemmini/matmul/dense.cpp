@@ -415,7 +415,10 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
                 }
                 scratch.metal_activation.resize(max_rows_in_tile * args.K);
                 if (fused_hp1) {
-                    scratch.fused_weight_scales.resize(max_columns_in_tile * (args.K / 32));
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+                    if (!ggml_hp1_scu_enabled())
+#endif
+                        scratch.fused_weight_scales.resize(max_columns_in_tile * (args.K / 32));
                 } else {
                     scratch.metal_weight.resize(max_columns_in_tile * args.K);
                     scratch.metal_dots.resize(max_rows_in_tile * max_columns_in_tile * ((args.K + metal_fragment - 1) / metal_fragment));
@@ -474,7 +477,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
             if (fused_hp1) {
                 // Keep scale conversion in the existing CPU helpers, including the
                 // legacy Q8 underflow/overflow rules. CUDA only moves the ordered sum.
-                for (size_t column = 0; column < column_count; ++column) {
+                for (size_t column = 0; !ggml_hp1_scu_enabled() && column < column_count; ++column) {
                     for (size_t block = 0; block < args.K / 32; ++block) {
                         double scale = 0.0;
                         if (legacy_hp1) {

@@ -99,6 +99,9 @@ static const char * ggml_backend_gemmini_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_gemmini_free(ggml_backend_t backend) {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    ggml_cuda_hp1_scu_clear_weights();
+#endif
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     delete ctx;
     delete backend;
@@ -173,6 +176,17 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
             break;
         case GGML_OP_MUL_MAT: {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            const auto * weight = node->src[0];
+            if (gemmini_gpu::enabled() && ggml_hp1_scu_enabled() && weight && weight->data &&
+                (weight->type == GGML_TYPE_Q4_HP1 || weight->type == GGML_TYPE_Q8_HP1) && ggml_is_contiguous(weight)) {
+                const auto * storage = weight;
+                while (!storage->buffer && storage->view_src) storage = storage->view_src;
+                if (ggml::gemmini::is_gemmini_buffer(storage->buffer) &&
+                    ggml_backend_buffer_get_usage(storage->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                    ggml_cuda_hp1_scu_cache_weights(weight->data,ggml_nbytes(weight));
+            }
+#endif
 #if defined(GGML_GEMMINI_CUDA_RTN)
             if (ggml_cuda_rtn_enabled()) {
                 if (!ggml_cuda_rtn_compute(node)) {

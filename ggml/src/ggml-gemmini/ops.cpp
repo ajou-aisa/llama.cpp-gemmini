@@ -980,6 +980,15 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
     const auto *        src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
     ggml_gemmini_args_t args;
     args.model_arch = ctx->model_arch.c_str();
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (gemmini_gpu::enabled() && ggml_hp1_scu_enabled() &&
+        (src0->type == GGML_TYPE_Q4_HP1 || src0->type == GGML_TYPE_Q8_HP1)) {
+        const auto * storage = src0;
+        while (!storage->buffer && storage->view_src) storage = storage->view_src;
+        if (storage->buffer && ggml_backend_buffer_get_usage(storage->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+            args.weight_validation = std::make_shared<ggml_gemmini_args_t::WeightValidation>();
+    }
+#endif
     args.matmul_layer =
         resolve_backend_matmul_layer(ctx->model_arch, src0->name, src1->name, dst->name);
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
