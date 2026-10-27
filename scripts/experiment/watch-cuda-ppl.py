@@ -3,6 +3,8 @@
 import argparse
 import importlib.util
 import json
+import contextlib
+import io
 from pathlib import Path
 import re
 import time
@@ -48,9 +50,16 @@ def show(output, config):
         result = read(output / job['id'] / 'full/result.json')
         state, count, ppl, elapsed, eta = 'WAIT', '-', '-', '--:--:--', '--:--:--'
         if result:
-            done += 1
-            state, count, ppl = 'DONE', f'{result["chunks"]}/{job["full_chunks"]}', f'{result["ppl"]:.6f}'
-            elapsed = duration(result['seconds'])
+            try:
+                checked = queue.verify(output / job['id'] / 'full/ppl.log', job, job['full_chunks'])
+                queue.require(all(result.get(k) == v for k, v in checked.items()), 'Result differs from verified log')
+                queue.require(read(output / job['id'] / 'full/manifest.json').get('job') == job, 'Job changed')
+                queue.require((output / job['id'] / 'full/exit-status.txt').read_text().strip() == '0', 'Run failed')
+                done += 1
+                state, count, ppl = 'DONE', f'{result["chunks"]}/{job["full_chunks"]}', f'{result["ppl"]:.6f}'
+                elapsed = duration(result['seconds'])
+            except (OSError, ValueError, KeyError, RuntimeError):
+                state = 'INVALID'
         elif status.get('smoke_only') and (output / job['id'] / 'smoke/result.json').exists():
             smoke = read(output / job['id'] / 'smoke/result.json')
             state, count, ppl = 'SMOKE DONE', '1/1', f'{smoke["ppl"]:.6f}'
@@ -69,13 +78,30 @@ def show(output, config):
             rows = re.findall(r'^\s*(\d+)\s+([\d.eE+-]+)\s+[\d.eE+-]+\s+[\d.eE+-]+\s*$', text, re.M)
             seconds = time.time() - status['started_at']
             elapsed = duration(seconds)
-            if rows:
+            chunks = re.findall(r'\bPPL_CHUNK ([^\r\n]*)\r?\n', text)
+            entries = []
+            for chunk in chunks:
+                try:
+                    entry = dict(field.split('=', 1) for field in chunk.split())
+                    if int(entry['scored_tokens']) > 0 and queue.math.isfinite(float(entry['nll'])):
+                        entries.append(entry)
+                except (ValueError, KeyError):
+                    continue
+            if entries:
+                completed = len(entries)
+                total = 1 if phase == 'smoke' else job['full_chunks']
+                nll = sum(float(c['nll']) for c in entries)
+                tokens = sum(int(c['scored_tokens']) for c in entries)
+                count, ppl = f'{completed}/{total}', f'{queue.math.exp(nll / tokens):.6f}*'
+                if state != 'STOPPED':
+                    eta = duration(seconds / completed * max(0, total - completed))
+            elif rows:
                 completed = int(rows[-1][0]) // 512 + 1
                 total = 1 if phase == 'smoke' else job['full_chunks']
                 count, ppl = f'{completed}/{total}', rows[-1][1] + '*'
                 if state != 'STOPPED':
                     eta = duration(seconds / completed * max(0, total - completed))
-        print(f'{job["id"]:<27} {job["bits"]}/{job["bits"]:<3} {state:<11} {count:>9} {ppl:>11} {elapsed:>9} {eta:>9}')
+        print(f'{job["id"]:<27} {job["bits"]}/{job.get("weight_bits", job["bits"]):<3} {state:<11} {count:>9} {ppl:>11} {elapsed:>9} {eta:>9}')
     print(f'\nCompleted: {done}/{len(plan.get("jobs", []))} full runs. * = partial cumulative PPL.')
     print('Ctrl+C closes this monitor only. No inference is started by this program.')
 
@@ -85,10 +111,19 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=ROOT / 'output/cuda-ppl')
     parser.add_argument('--config', type=Path, default=ROOT / 'scripts/experiment/cuda-ppl-jobs.example.json')
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--json', action='store_true', help='Single machine-readable snapshot')
     parser.add_argument('--interval', type=float, default=5)
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error('--interval must be positive')
+    if args.json:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            show(args.output.resolve(), args.config)
+        print(json.dumps(dict(status=read(args.output / 'status.json'),
+                              plan=read(args.output / 'plan.json') or read(args.config),
+                              display=capture.getvalue())))
+        raise SystemExit(0)
     try:
         while True:
             if not args.once:

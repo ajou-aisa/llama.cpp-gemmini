@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import signal
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,9 +83,12 @@ def verify(log, job, chunks):
     dense, attention = (7 * layers + 1) * count, 2 * layers * count
 
     def proof(prefix):
-        entries = re.findall(r'^' + prefix + r' (.*)$', text, re.M)
-        require(len(entries) == 1, 'Missing/duplicate ' + prefix)
-        return json.loads(entries[0])
+        markers = re.findall(r'^' + re.escape(prefix) + r'\b', text, re.M)
+        require(len(markers) == 1, 'Missing/duplicate ' + prefix)
+        # Combined stdout/stderr can insert a bare newline even inside a JSON key.
+        entry = re.search(r'^' + re.escape(prefix) + r' (\{[^{}]*\})(?=\r?$)', text, re.M)
+        require(entry is not None, 'Malformed ' + prefix)
+        return json.loads(entry[1].replace('\r', '').replace('\n', ''))
 
     result = dict(chunks=count, scored_tokens=tokens, nll=nll, ppl=ppl)
     if job['kind'] == 'potal':
@@ -123,6 +127,16 @@ def verify(log, job, chunks):
             result['hp1_proof'] = h
         else:
             require('RTN_WA_HP1_PROOF ' not in text, 'Unexpected HP1 weights in Q4_0/E4M3 job')
+    if job['kind'] == 'nvfp4':
+        n = proof('NVFP4_PROOF')
+        expected = dict(schema='nvfp4-fake-v1', complete=True, format='NVFP4', weight_bits=4,
+                        activation_bits=4, attention_bits=16, block_size=16, scale_format='E4M3FN',
+                        tensor_scale='FP32', rounding='RNE', global_scaling='dynamic_tensor_amax',
+                        weight_scaling='tensor_amax_once', native_fp4=False,
+                        gemm='dequant_f16_fp32_acc', dense_gpu_calls=dense,
+                        verified_dense_calls=dense, attention_gpu_calls=attention)
+        require(all(n.get(k) == v for k, v in expected.items()), 'Wrong official NVFP4 reference profile/coverage')
+        result['nvfp4_proof'] = n
     result['cuda_proof'] = p
     return result
 
@@ -131,10 +145,12 @@ def inputs(job, dataset):
     binary = (ROOT / job['binary']).resolve()
     paths = [binary, (ROOT / job['model']).resolve(), dataset]
     paths += sorted(binary.parent.glob('*.so*'))
+    if job['kind'] == 'nvfp4':
+        paths.append((ROOT / job['preload']).resolve())
     cache = binary.parent.parent / 'CMakeCache.txt'
     require(cache.is_file(), 'Missing build configuration: ' + str(cache))
     config = dict(re.findall(r'^([A-Za-z_][A-Za-z0-9_]*):[A-Za-z_]+=(.*)$', cache.read_text(), re.M))
-    expected = {'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION': 'OFF'}
+    expected = {'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION': 'OFF', 'GGML_CUDA': 'OFF'}
     if job['kind'] == 'potal':
         expected.update(GGML_GEMMINI_CUDA_CPU_EXACT='ON', GGML_GEMMINI_CUDA_RTN_ATTENTION='ON',
                         GGML_GEMMINI_ACTIVATION_QUANT='EXSIA', GGML_GEMMINI_ENABLE_RMD='ON',
@@ -146,6 +162,8 @@ def inputs(job, dataset):
                         GGML_GEMMINI_EXSIA_STRIPE_ANCHOR=str(job['anchor']))
     else:
         expected.update(GGML_GEMMINI_CUDA_RTN='ON', GGML_GEMMINI_ENABLE_RMD='OFF')
+    if 'cuda_architectures' in job:
+        expected['CMAKE_CUDA_ARCHITECTURES'] = job['cuda_architectures']
     require(all(config.get(k) == v for k, v in expected.items()), 'Wrong build profile: ' + job['id'])
     paths.append(cache)
     for path in paths:
@@ -161,8 +179,10 @@ def settings(job, dataset, phase, identity):
                '--batch-size', '512', '--ubatch-size', '512', '--threads', '4', '--threads-batch', '4',
                '--gpu-layers', '0', '--cache-type-k', 'f16', '--cache-type-v', 'f16',
                '--seed', '42', '--no-warmup', '--ppl-stride', '0', '--ppl-output-type', '1']
-    env = dict(OMP_NUM_THREADS='4', OMP_DYNAMIC='FALSE', OMP_WAIT_POLICY='PASSIVE', KMP_BLOCKTIME='0',
+    env = dict(NVIDIA_TF32_OVERRIDE='0', OMP_NUM_THREADS='4', OMP_DYNAMIC='FALSE', OMP_WAIT_POLICY='PASSIVE', KMP_BLOCKTIME='0',
                LD_LIBRARY_PATH=str(binary.parent), GGML_CUDA_RTN_A_BITS=str(job['bits']))
+    if job['kind'] == 'nvfp4':
+        env.update(GGML_CUDA_NVFP4='1', LD_PRELOAD=str((ROOT / job['preload']).resolve()))
     if job['kind'] == 'potal':
         env.update(GGML_GEMMINI_CUDA_CPU_EXACT='1', GGML_GEMMINI_HP1_SCU='1',
                    GGML_GEMMINI_CUDA_CPU_EXACT_Q6_HEAD='0', GGML_CUDA_RTN_A_BITS='16')
@@ -170,7 +190,7 @@ def settings(job, dataset, phase, identity):
                 environment=env, input_sha256=identity, runner_sha256=digest(Path(__file__)))
 
 
-def run_case(job, dataset, output, phase, identity):
+def run_case(job, dataset, output, phase, identity, lock_fd):
     directory = output / job['id'] / phase
     expected = settings(job, dataset, phase, identity)
     chunks = 1 if phase == 'smoke' else job['full_chunks']
@@ -187,24 +207,35 @@ def run_case(job, dataset, output, phase, identity):
         directory.rename(directory.with_name(f'{phase}.interrupted-{time.time_ns()}'))
     directory.mkdir(parents=True)
     write(directory / 'manifest.json', expected)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(('GGML_', 'GEMMINI_', 'OMP_', 'KMP_'))}
+    env = {k: v for k, v in os.environ.items() if k != 'LD_PRELOAD' and not k.startswith(('GGML_', 'GEMMINI_', 'OMP_', 'KMP_'))}
     env.update(expected['environment'])
     started = time.time()
     write(output / 'status.json', dict(state='running', job=job['id'], phase=phase, pid=os.getpid(),
                                      start_ticks=start_ticks(os.getpid()), boot_id=boot_id(), started_at=started))
     print('Starting:', job['id'], phase, flush=True)
     with (directory / 'ppl.log').open('w') as log:
-        child = subprocess.Popen(expected['command'], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+        # The inference also owns the lock if its queue parent is killed before recording its PID.
+        child = subprocess.Popen(expected['command'], cwd=ROOT, env=env, stdout=log,
+                                 stderr=subprocess.STDOUT, pass_fds=(lock_fd,))
         write(directory / 'execution.json', dict(pid=child.pid, start_ticks=start_ticks(child.pid), boot_id=boot_id(),
                                                 started_at=started, command=expected['command']))
-        code = child.wait()
+        try:
+            code = child.wait()
+        except BaseException:
+            child.terminate()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            raise
     elapsed = time.time() - started
     (directory / 'exit-status.txt').write_text(str(code) + '\n')
     require(code == 0, f'Inference failed ({code}): {directory / "ppl.log"}')
     require(inputs(job, dataset) == identity, 'Inputs changed during inference')
     checked = verify(directory / 'ppl.log', job, chunks)
     write(directory / 'result.json', dict(id=job['id'], family=job['family'], phase=phase,
-          activation_bits=job['bits'], weight_bits=job['bits'], compensation=job['kind'] == 'potal',
+          activation_bits=job['bits'], weight_bits=job.get('weight_bits', job['bits']), compensation=job['kind'] == 'potal',
           anchor=job.get('anchor'), seconds=elapsed, **checked))
     with (output / 'results.tsv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=['id', 'family', 'activation_bits', 'weight_bits',
@@ -226,20 +257,33 @@ def main():
     parser.add_argument('--smoke-only', action='store_true')
     parser.add_argument('--build', action='store_true', help='Build/test each selected runtime before inference')
     args = parser.parse_args()
-    config = read(args.config)
+    config_bytes = args.config.read_bytes()
+    config = json.loads(config_bytes)
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    require(isinstance(config, dict) and isinstance(config.get('jobs'), list)
+            and isinstance(config.get('dataset'), str), 'Invalid queue configuration')
+    require(all(isinstance(j, dict) and all(k in j for k in
+                ('id', 'kind', 'bits', 'family', 'model', 'binary', 'full_chunks')) for j in config['jobs']),
+            'Missing required job fields')
     ids = [job['id'] for job in config['jobs']]
     require(len(ids) == len(set(ids)) and all(re.fullmatch(r'[A-Za-z0-9_-]+', i) for i in ids), 'Invalid/duplicate job IDs')
     require(not args.case or set(args.case) <= set(ids), 'Unknown --case')
     jobs = [j for j in config['jobs'] if not args.case or j['id'] in args.case]
     require(jobs, 'Empty queue')
     for job in jobs:
-        require(job['kind'] in ('potal', 'rtn-mx', 'rtn-e4m3') and job['bits'] in (4, 8), 'Unsupported job')
-        require(job['full_chunks'] > 0 and job['family'] in ('qwen2-0.5B', 'llama3.2-1B'), 'Invalid corpus/model')
+        require(job['kind'] in ('potal', 'rtn-mx', 'rtn-e4m3', 'rtn', 'fp16', 'nvfp4') and type(job['bits']) is int and job['bits'] in (4, 8, 16), 'Unsupported job')
+        require(type(job['full_chunks']) is int and job['full_chunks'] > 0 and job['family'] in ('qwen2-0.5B', 'llama3.2-1B'), 'Invalid corpus/model')
+        require(type(job['full_chunks']) is int and all(isinstance(job[k], str) and job[k] for k in ('binary', 'model')), 'Invalid paths/count')
+        require(job.get('weight_bits', job['bits']) in (4, 8, 16), 'Invalid weight bits')
+        require(job['kind'] != 'nvfp4' or (job['bits'] == 4 and job.get('weight_bits') == 4
+                and isinstance(job.get('preload'), str) and job['preload']), 'NVFP4 requires explicit reference preload')
+        require(job['kind'] != 'fp16' or (job['bits'] == 16 and job.get('weight_bits', 16) == 16), 'FP16 requires A16/W16')
+        require(job['kind'] not in ('potal', 'rtn-mx') or job['bits'] in (4, 8), 'HP1 requires A4/A8')
         if job['kind'] == 'potal':
-            require(job['anchor'] in (2, 3), 'Invalid stripe anchor')
+            require(job.get('anchor') in (2, 3), 'Invalid stripe anchor')
     if not args.run and not args.check:
         for job in jobs:
-            print(job['id'], f'A{job["bits"]}W{job["bits"]}', f'{job["full_chunks"]} chunks', job['binary'])
+            print(job['id'], f'A{job["bits"]}W{job.get("weight_bits", job["bits"])}', f'{job["full_chunks"]} chunks', job['binary'])
         return
     require(not args.build or args.run, '--build requires --run')
     dataset = (ROOT / config['dataset']).resolve()
@@ -248,12 +292,19 @@ def main():
             inputs(job, dataset)
             print('PASS inputs/build:', job['id'])
         return
+    require(not args.build or all(j['kind'] in ('potal', 'rtn', 'rtn-mx', 'rtn-e4m3', 'fp16') for j in jobs), 'External runtime cannot be built by this queue')
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt('terminated')))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     with (output / '.run.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            write(output / 'plan.json', dict(dataset=str(dataset), jobs=jobs))
+            for record in output.glob('*/*/execution.json'):
+                require(not alive(read(record)), 'Previous inference is still alive: ' + str(record))
+            plan = dict(dataset=str(dataset), jobs=jobs, config_sha256=config_sha256)
+            if (output / 'plan.json').exists():
+                require(read(output / 'plan.json') == plan, 'Queue configuration changed; use a new output directory')
+            write(output / 'plan.json', plan)
             built = set()
             for job in jobs:
                 build = (ROOT / job['binary']).resolve().parent.parent
@@ -266,9 +317,9 @@ def main():
                     built.add(build)
                 write(output / 'status.json', dict(state='checking_inputs', job=job['id'], pid=os.getpid()))
                 identity = inputs(job, dataset)
-                run_case(job, dataset, output, 'smoke', identity)
+                run_case(job, dataset, output, 'smoke', identity, lock.fileno())
                 if not args.smoke_only:
-                    run_case(job, dataset, output, 'full', identity)
+                    run_case(job, dataset, output, 'full', identity, lock.fileno())
             write(output / 'status.json', dict(state='complete', completed_jobs=[j['id'] for j in jobs],
                                               smoke_only=args.smoke_only, finished_at=time.time()))
         except BaseException as error:

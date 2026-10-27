@@ -26,6 +26,7 @@ for name in GEMMINI_SW_PATH CUDACXX CUDAARCHS; do
 done
 systemd-run --user --collect --unit="$unit" --description='CUDA PoTal/RTN-WA PPL queue' \
     "${build_env[@]}" \
+    --property=KillMode=control-group \
     --property="WorkingDirectory=$root" \
     --property="StandardOutput=append:$output/queue.log" \
     --property="StandardError=append:$output/queue.log" \

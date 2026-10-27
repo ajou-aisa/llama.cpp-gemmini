@@ -36,7 +36,7 @@ printf 'Configuring %s; logs: %s\n' "$profile" "$build_dir"
 cmake -S "$root" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     "-DCMAKE_CUDA_COMPILER=${CUDACXX:-/usr/local/cuda/bin/nvcc}" \
-    "-DCMAKE_CUDA_ARCHITECTURES=${CUDAARCHS:-87}" "${extra[@]}" \
+    "-DCMAKE_CUDA_ARCHITECTURES=${CUDAARCHS:-native}" "${extra[@]}" \
     -DGGML_NATIVE=ON -DGGML_GEMMINI=ON "-DGGML_GEMMINI_CUDA_CPU_EXACT=$exact" \
     "-DGGML_GEMMINI_CUDA_RTN=$rtn" "-DGGML_GEMMINI_CUDA_RTN_ATTENTION=$attention" \
     -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_BACKEND_DL=OFF -DGGML_BLAS=OFF -DGGML_LLAMAFILE=OFF \
