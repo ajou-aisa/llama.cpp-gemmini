@@ -130,12 +130,17 @@ size_t validation_block_top2_exp_rescan_count() {
 }
 #endif
 
-void ExpScanner::update_stripe_top2_exp(StripeState & stripe, int16_t exp) {
+void ExpScanner::update_stripe_top3_exp(StripeState & stripe, int16_t exp) {
     if (exp > stripe.e1) {
+        stripe.e3 = stripe.e2;
         stripe.e2 = stripe.e1;
         stripe.e1 = exp;
-    } else if (exp < stripe.e1 && exp > stripe.e2)
+    } else if (exp < stripe.e1 && exp > stripe.e2) {
+        stripe.e3 = stripe.e2;
         stripe.e2 = exp;
+    } else if (exp < stripe.e2 && exp > stripe.e3) {
+        stripe.e3 = exp;
+    }
 }
 
 std::vector<int32_t> WideQuantizer::quantize_block(const std::vector<float> & x, int16_t theta_b) {

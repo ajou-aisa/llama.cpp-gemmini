@@ -60,6 +60,75 @@ bool check(bool value, const char * message) {
 }
 
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+bool test_stripe_anchor() {
+    using namespace quants::act::exsia;
+    constexpr int16_t missing = std::numeric_limits<int16_t>::min();
+    std::vector<int16_t> exponents = {missing, -2, 1, 4, 4, 9};
+    ExpScanner scanner;
+    do {
+        StripeState stripe;
+        for (int16_t exponent : exponents)
+            scanner.update_stripe_top3_exp(stripe, exponent);
+        if (!check(stripe.e1 == 9 && stripe.e2 == 4 && stripe.e3 == 1,
+                   "distinct stripe exponents independent of scan order"))
+            return false;
+    } while (std::next_permutation(exponents.begin(), exponents.end()));
+    StripePipelineSlot slot;
+    slot.stripe.e3 = 7;
+    slot.reset_for_run();
+    if (!check(slot.stripe.e3 == missing, "stripe reset clears third exponent"))
+        return false;
+
+    constexpr size_t block_size = GGML_GEMMINI_BLOCK_SIZE;
+    constexpr size_t k = 4 * block_size;
+    ggml_gemmini_args_t args{};
+    args.I = args.J = 1;
+    args.K = args.sA = k;
+    args.tile_I = args.tile_J = 1;
+    args.tile_K = k / DIM;
+    args.activation_rows_per_stripe = DIM;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!args.A.allocate(1, k, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    Meta meta;
+    ExSIA quantizer;
+    const std::array<std::array<float, 4>, 6> inputs = {{{8,4,2,1}, {8,4,4,4},
+        {8,8,8,8}, {0,0,0,0}, {8,8,4,2}, {.5f,.25f,.125f,.0625f}}};
+    const int top2[] = {2,2,3,0,2,-2};
+    const int top3[] = {1,2,3,0,1,-3};
+    const int * anchors = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 ? top3 : top2;
+    for (size_t trial = 0; trial < inputs.size(); ++trial) {
+        std::vector<float> source(k);
+        for (size_t block = 0; block < 4; ++block)
+            std::fill_n(source.begin() + block * block_size, block_size, inputs[trial][block]);
+        ggml_tensor tensor{};
+        tensor.type = GGML_TYPE_F32;
+        tensor.data = source.data();
+        if (!check(quantizer.run(meta, &tensor, args), "anchor activation quantization"))
+            return false;
+        const int theta = anchors[trial] - (GGML_GEMMINI_ACTIVATION_BITS - 2);
+        if (!check(meta.theta == std::vector<int16_t>{int16_t(theta)}, "anchor and fallback exponents"))
+            return false;
+        size_t expected_events = 0, actual_events = 0;
+        for (size_t pos = 0; pos < k; ++pos) {
+            const bool promoted = source[pos] != 0 && std::ilogb(source[pos]) > anchors[trial];
+            const int32_t correction = quantizer.state().residual.at(pos);
+            if (!check((correction != 0) == promoted, "every block above the anchor is compensated") ||
+                !check(std::ldexp(double(args.A.get(0,pos)) + correction, theta) == source[pos],
+                       "main plus residual preserves exactly representable activations"))
+                return false;
+            expected_events += promoted;
+        }
+        for (const auto & payload : meta.direct_residuals)
+            actual_events += payload->events.size();
+        if (!check(actual_events == (GGML_GEMMINI_ENABLE_RMD ? expected_events : 0), "anchor residual capture"))
+            return false;
+    }
+    std::printf("STRIPE_ANCHOR top=%d bits=%d distinct/fallback/reset/promotion PASS\n",
+                GGML_GEMMINI_EXSIA_STRIPE_ANCHOR, GGML_GEMMINI_ACTIVATION_BITS);
+    return true;
+}
+
 bool test_evaluation_metrics_observer(const std::filesystem::path & directory) {
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
     constexpr size_t   rows = DIM + 1, columns = 65;
@@ -3570,7 +3639,7 @@ int main(int argc, char ** argv) {
                        case_name == "rmd-ws-contract-probe" ||
                        case_name == "hp1-srmd-software-ws" || case_name == "rmd-direct-parity" ||
                        case_name == "direct-executor" || case_name == "rmd-gather" ||
-                       case_name == "stripe-geometry" || case_name == "meta-rho" ||
+                       case_name == "stripe-geometry" || case_name == "stripe-anchor" || case_name == "meta-rho" ||
                        case_name == "non-outlier-clipping" || case_name == "outlier-limb" ||
                        case_name == "non-exsia-capture-context" || case_name == "packet-capture";
     if (!known) {
@@ -3580,7 +3649,7 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
+        (case_name == "all" && test_stripe_anchor() && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_outlier_limb_policy() &&
          test_exsia_packet_capture() && test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() &&
@@ -3598,6 +3667,7 @@ int main(int argc, char ** argv) {
         (case_name == "direct-executor" && test_direct_cpu_executor()) ||
         (case_name == "stripe-geometry" && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
+        (case_name == "stripe-anchor" && test_stripe_anchor()) ||
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
         (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" && test_non_outlier_clipping_policy()) ||

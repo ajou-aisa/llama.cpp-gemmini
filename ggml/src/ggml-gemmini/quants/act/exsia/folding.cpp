@@ -86,7 +86,8 @@ bool StripeFolding::run(Meta &                           meta,
         stripe.e_s               = stripe.e1;
         stripe.promote_top_block = false;
     } else {
-        stripe.e_s               = stripe.e2;
+        stripe.e_s               = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 && stripe.e3 != neg_inf
+                                       ? stripe.e3 : stripe.e2;
         stripe.promote_top_block = true;
     }
 
@@ -120,7 +121,7 @@ bool StripeFolding::run(Meta &                           meta,
             const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
                                               ? 0
                                               : static_cast<int16_t>(block_exp - stripe.e_s);
-            if (stripe.promote_top_block && block_exp == stripe.e1) {
+            if (stripe.promote_top_block && block_exp > stripe.e_s) {
                 BitMask & block_inlier_mask = stripe.scratch.folding_inlier_mask;
                 block_inlier_mask.clear_active_bits();
 

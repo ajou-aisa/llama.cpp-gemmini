@@ -172,11 +172,12 @@ void reduce_stripe_exponents(StripePipelineSlot & slot, size_t active_block_coun
     StripeState & stripe = slot.stripe;
     stripe.e1            = std::numeric_limits<int16_t>::min();
     stripe.e2            = std::numeric_limits<int16_t>::min();
+    stripe.e3            = std::numeric_limits<int16_t>::min();
 
     GGML_ASSERT(active_block_count <= slot.block_exp.size());
     ExpScanner reducer;
     for (size_t block = 0; block < active_block_count; ++block)
-        reducer.update_stripe_top2_exp(stripe, slot.block_exp[block]);
+        reducer.update_stripe_top3_exp(stripe, slot.block_exp[block]);
 }
 } // namespace
 

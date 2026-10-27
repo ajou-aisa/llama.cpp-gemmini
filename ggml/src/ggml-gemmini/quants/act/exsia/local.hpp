@@ -21,8 +21,8 @@ class ExpScanner {
 
     void update_block_top2_exp(const BlockMask & mask, BlockState & blk);
 
-    // update the stripe-level top-2 distinct exponents based on a block's max exponent
-    void update_stripe_top2_exp(StripeState & stripe, int16_t e_b);
+    // update the stripe-level top-3 distinct exponents based on a block's max exponent
+    void update_stripe_top3_exp(StripeState & stripe, int16_t e_b);
 };
 
 #if EXSIA_VALIDATION
