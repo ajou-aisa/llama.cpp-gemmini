@@ -233,9 +233,20 @@ __global__ void attention_kernel(const __half2 * x, const __half2 * w, float * o
     const size_t row = size_t(blockIdx.y) * 8 + threadIdx.y, plane = blockIdx.z;
     const size_t wh = (plane % s.xh) / (s.xh / s.wh) + (plane / s.xh) / (s.xb / s.wb) * s.wh;
     const unsigned thread = threadIdx.y * 16 + threadIdx.x;
+#if defined(__x86_64__) || defined(_M_X64)
+    // Match the x86 CPU reference's FP32 FMA accumulators; ARM uses FP16 lanes.
+    float2 lanes[16];
+#else
     __half2 lanes[16];
+#endif
 #pragma unroll
-    for (int lane = 0; lane < 16; ++lane) lanes[lane] = __float2half2_rn(0.0f);
+    for (int lane = 0; lane < 16; ++lane) {
+#if defined(__x86_64__) || defined(_M_X64)
+        lanes[lane] = make_float2(0.0f,0.0f);
+#else
+        lanes[lane] = __float2half2_rn(0.0f);
+#endif
+    }
     for (size_t k = 0; k < s.k; k += 32) {
         for (unsigned item = thread; item < 24 * 16; item += 128) {
             const unsigned local = item / 16, pair = item % 16;
@@ -252,19 +263,36 @@ __global__ void attention_kernel(const __half2 * x, const __half2 * w, float * o
         }
         __syncthreads();
 #pragma unroll
-        for (int lane = 0; lane < 16; ++lane)
+        for (int lane = 0; lane < 16; ++lane) {
+#if defined(__x86_64__) || defined(_M_X64)
+            const float2 a = __half22float2(xv[threadIdx.y][lane]);
+            const float2 b = __half22float2(wv[threadIdx.x][lane]);
+            lanes[lane].x = __fmaf_rn(a.x,b.x,lanes[lane].x);
+            lanes[lane].y = __fmaf_rn(a.y,b.y,lanes[lane].y);
+#else
             lanes[lane] = __hfma2(xv[threadIdx.y][lane], wv[threadIdx.x][lane], lanes[lane]);
+#endif
+        }
         __syncthreads();
     }
     if (row >= s.m || col >= s.n) return;
     float sum[4];
 #pragma unroll
     for (int pair = 0; pair < 2; ++pair) {
+#if defined(__x86_64__) || defined(_M_X64)
+        const float2 lo = make_float2(
+            __fadd_rn(__fadd_rn(lanes[pair].x,lanes[pair+8].x),__fadd_rn(lanes[pair+4].x,lanes[pair+12].x)),
+            __fadd_rn(__fadd_rn(lanes[pair].y,lanes[pair+8].y),__fadd_rn(lanes[pair+4].y,lanes[pair+12].y)));
+        const float2 hi = make_float2(
+            __fadd_rn(__fadd_rn(lanes[pair+2].x,lanes[pair+10].x),__fadd_rn(lanes[pair+6].x,lanes[pair+14].x)),
+            __fadd_rn(__fadd_rn(lanes[pair+2].y,lanes[pair+10].y),__fadd_rn(lanes[pair+6].y,lanes[pair+14].y)));
+#else
         const __half2 low = __hadd2(__hadd2(lanes[pair], lanes[pair + 8]),
                                    __hadd2(lanes[pair + 4], lanes[pair + 12]));
         const __half2 high = __hadd2(__hadd2(lanes[pair + 2], lanes[pair + 10]),
                                     __hadd2(lanes[pair + 6], lanes[pair + 14]));
         const float2 lo = __half22float2(low), hi = __half22float2(high);
+#endif
         sum[pair * 2] = __fadd_rn(lo.x, hi.x);
         sum[pair * 2 + 1] = __fadd_rn(lo.y, hi.y);
     }
