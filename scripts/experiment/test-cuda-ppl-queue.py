@@ -156,6 +156,22 @@ print('CUDA_RTN_PROOF '+json.dumps(dict(complete=True, activation_bits=a, attent
             status_path.write_text(json.dumps(running_status))
             display = monitor_snapshot('full-running-over-smoke')
             assert 'RUNNING' in display and 'SMOKE DONE' not in display
+            status_path.write_text(json.dumps(dict(running_status, started_at=time.time() + 3600)))
+            time.sleep(1.1)
+            display = monitor_snapshot('future-wall-clock')
+            row = next(line for line in display.splitlines() if line.startswith('fixture '))
+            assert row.split()[-2] != '00:00:00', 'Active elapsed reset after backward wall-clock jump'
+            child.terminate()
+            child.wait(timeout=5)
+            display = monitor_snapshot('post-exit-future-wall-clock')
+            row = next(line for line in display.splitlines() if line.startswith('fixture '))
+            assert 'VERIFYING' in row and row.split()[-2] != '00:00:00', 'Post-exit verification lost boot-clock elapsed'
+            execution_path.write_text(json.dumps(dict(pid=child.pid, start_ticks='invalid', boot_id='old-boot')))
+            status_path.write_text(json.dumps(dict(running_status, started_at=time.time() - 2)))
+            display = monitor_snapshot('legacy-wall-clock-fallback')
+            row = next(line for line in display.splitlines() if line.startswith('fixture '))
+            assert row.split()[-2] >= '00:00:02', 'Legacy record lost wall-clock fallback'
+            receipts.append('PASS real child elapsed survives future wall timestamp; mismatched boot uses legacy wall fallback')
         finally:
             child.terminate()
             child.wait(timeout=5)

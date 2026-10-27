@@ -5,6 +5,7 @@ import importlib.util
 import json
 import contextlib
 import io
+import os
 from pathlib import Path
 import re
 import time
@@ -25,6 +26,17 @@ def read(path):
 def duration(seconds):
     seconds = max(0, int(seconds))
     return f'{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}'
+
+
+def active_seconds(status, execution):
+    try:
+        now = time.clock_gettime(time.CLOCK_BOOTTIME)
+        started = int(execution['start_ticks']) / os.sysconf('SC_CLK_TCK')
+        if execution.get('boot_id') == queue.boot_id() and 0 < started <= now:
+            return max(0, now - started)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        pass
+    return max(0, time.time() - status['started_at'])
 
 
 def show(output, config):
@@ -79,7 +91,7 @@ def show(output, config):
             except OSError:
                 text = ''
             rows = re.findall(r'^\s*(\d+)\s+([\d.eE+-]+)\s+[\d.eE+-]+\s+[\d.eE+-]+\s*$', text, re.M)
-            seconds = time.time() - status['started_at']
+            seconds = active_seconds(status, execution)
             elapsed = duration(seconds)
             chunks = re.findall(r'\bPPL_CHUNK ([^\r\n]*)\r?\n', text)
             entries = []
