@@ -60,17 +60,20 @@ def show(output, config):
                 elapsed = duration(result['seconds'])
             except (OSError, ValueError, KeyError, RuntimeError):
                 state = 'INVALID'
-        elif status.get('smoke_only') and (output / job['id'] / 'smoke/result.json').exists():
-            smoke = read(output / job['id'] / 'smoke/result.json')
-            state, count, ppl = 'SMOKE DONE', '1/1', f'{smoke["ppl"]:.6f}'
-            elapsed = duration(smoke['seconds'])
         elif status.get('job') == job['id'] and status.get('state') == 'failed':
             state = 'FAILED'
         elif status.get('job') == job['id'] and status.get('state') == 'running':
             phase = status['phase']
             directory = output / job['id'] / phase
             execution = read(directory / 'execution.json')
-            state = ('SMOKE' if phase == 'smoke' else 'RUNNING') if execution and queue.alive(execution) else 'STOPPED'
+            if execution and queue.alive(execution):
+                state = 'SMOKE' if phase == 'smoke' else 'RUNNING'
+            else:
+                try:
+                    exited_ok = (directory / 'exit-status.txt').read_text().strip() == '0'
+                except OSError:
+                    exited_ok = False
+                state = 'VERIFYING' if exited_ok and queue.alive(status) else 'STOPPED'
             try:
                 text = (directory / 'ppl.log').read_text(errors='replace')
             except OSError:
@@ -101,6 +104,18 @@ def show(output, config):
                 count, ppl = f'{completed}/{total}', rows[-1][1] + '*'
                 if state != 'STOPPED':
                     eta = duration(seconds / completed * max(0, total - completed))
+        if state == 'WAIT' and (output / job['id'] / 'smoke/result.json').exists():
+            try:
+                directory = output / job['id'] / 'smoke'
+                smoke = read(directory / 'result.json')
+                checked = queue.verify(directory / 'ppl.log', job, 1)
+                queue.require(all(smoke.get(k) == v for k, v in checked.items()), 'Smoke result differs from verified log')
+                queue.require(read(directory / 'manifest.json').get('job') == job, 'Smoke job changed')
+                queue.require((directory / 'exit-status.txt').read_text().strip() == '0', 'Smoke failed')
+                state, count, ppl = 'SMOKE DONE', '1/1', f'{smoke["ppl"]:.6f}'
+                elapsed = duration(smoke['seconds'])
+            except (OSError, ValueError, KeyError, RuntimeError):
+                state = 'INVALID'
         print(f'{job["id"]:<27} {job["bits"]}/{job.get("weight_bits", job["bits"]):<3} {state:<11} {count:>9} {ppl:>11} {elapsed:>9} {eta:>9}')
     print(f'\nCompleted: {done}/{len(plan.get("jobs", []))} full runs. * = partial cumulative PPL.')
     print('Ctrl+C closes this monitor only. No inference is started by this program.')

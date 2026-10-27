@@ -117,6 +117,53 @@ print('CUDA_RTN_PROOF '+json.dumps(dict(complete=True, activation_bits=a, attent
         assert 'INVALID' in json.loads(invalid.stdout)['display']
         full_log.write_text(original_log)
         receipts.append('PASS monitor refuses DONE when full GPU coverage proof is incomplete')
+        # Model the observed post-exit hash interval with a real exited inference record.
+        spec = importlib.util.spec_from_file_location('monitor_state_queue', QUEUE)
+        queue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(queue)
+        status_path = output / 'status.json'
+        complete_status = status_path.read_text()
+        full_result = output / 'fixture/full/result.json'
+        saved_result = full_result.read_text()
+        full_result.unlink()
+        running_status = dict(state='running', job='fixture', phase='full', pid=os.getpid(),
+                              start_ticks=queue.start_ticks(os.getpid()), boot_id=queue.boot_id(), started_at=time.time())
+        def monitor_snapshot(label):
+            snapshot = subprocess.run([sys.executable, str(MONITOR), '--output', str(output), '--config', str(config), '--json'], capture_output=True, text=True, check=True)
+            (args.receipts / ('monitor-' + label + '.json')).write_text(snapshot.stdout)
+            return json.loads(snapshot.stdout)['display']
+        status_path.write_text(json.dumps(running_status))
+        assert 'VERIFYING' in monitor_snapshot('post-exit-verifying')
+        status_path.write_text(json.dumps(dict(running_status, start_ticks='stale')))
+        assert 'STOPPED' in monitor_snapshot('post-exit-parent-dead')
+        status_path.write_text(json.dumps(running_status))
+        exit_status = output / 'fixture/full/exit-status.txt'
+        exit_status.write_text('1\n')
+        assert 'STOPPED' in monitor_snapshot('post-exit-failed-child')
+        exit_status.write_text('0\n')
+        status_path.write_text(json.dumps(dict(running_status, job='later-job')))
+        assert 'SMOKE DONE' in monitor_snapshot('prior-smoke-done')
+        smoke_log = output / 'fixture/smoke/ppl.log'
+        saved_smoke_log = smoke_log.read_text()
+        smoke_log.write_text(saved_smoke_log.replace('"complete": true', '"complete": false'))
+        assert 'INVALID' in monitor_snapshot('prior-smoke-invalid')
+        smoke_log.write_text(saved_smoke_log)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        execution_path = output / 'fixture/full/execution.json'
+        saved_execution = execution_path.read_text()
+        try:
+            execution_path.write_text(json.dumps(dict(pid=child.pid, start_ticks=queue.start_ticks(child.pid), boot_id=queue.boot_id())))
+            status_path.write_text(json.dumps(running_status))
+            display = monitor_snapshot('full-running-over-smoke')
+            assert 'RUNNING' in display and 'SMOKE DONE' not in display
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+            execution_path.write_text(saved_execution)
+        full_result.write_text(saved_result)
+        assert 'DONE' in monitor_snapshot('full-done-priority') and 'SMOKE DONE' not in monitor_snapshot('full-done-priority')
+        status_path.write_text(complete_status)
+        receipts.append('PASS post-exit VERIFYING requires live queue/exit0; verified prior SMOKE DONE; active/full DONE priority; incomplete smoke proof rejected')
         config.write_text(config.read_text() + '\n')
         assert 'configuration changed' in run(output, '--run', ok=False).stderr
         receipts.append('PASS changed configuration hash rejected before reuse')
