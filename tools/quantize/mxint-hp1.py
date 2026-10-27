@@ -122,6 +122,7 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
     fd, name = tempfile.mkstemp(prefix=target.name + '.', suffix='.partial', dir=target.parent)
     os.close(fd)
     partial = Path(name)
+    dst = None
     try:
         shutil.copyfile(template, partial)
         src, dst = GGUFReader(source), GGUFReader(partial, 'r+')
@@ -161,7 +162,7 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
             print(f'MXINT{bits}: {tensor.name}', flush=True)
         require(matrices > 0, 'No HP1 matrices found')
         dst.data.flush()
-        with partial.open('rb') as f:
+        with partial.open('r+b') as f:
             os.fsync(f.fileno())
         require(all(digest(Path(p)) == sha for p, sha in inputs.items()), 'Conversion input changed')
         official_reference(mx_path)
@@ -179,6 +180,8 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
             f.write('\n')
         return report
     finally:
+        if dst is not None:
+            dst.data._mmap.close()
         partial.unlink(missing_ok=True)
 
 
