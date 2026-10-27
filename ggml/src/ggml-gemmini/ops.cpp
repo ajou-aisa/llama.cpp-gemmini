@@ -64,6 +64,12 @@
 #endif
 
 #include "ops.hpp"
+#if defined(GGML_GEMMINI_CUDA_RTN)
+#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#endif
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "ggml-gpu-cpu-exact.hpp"
+#endif
 
 namespace {
 constexpr bool
@@ -2038,7 +2044,7 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
         ggml::gemmini::MatMul facade(args);
         const auto            facade_result = facade.run_full();
         if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
-            GGML_ABORT("Gemmini full facade execution failed");
+            GGML_ABORT("Gemmini full facade execution failed: status=%d", static_cast<int>(facade_result.status));
         }
     }
 
@@ -2226,6 +2232,13 @@ void ggml_backend_gemmini_get_rows_q8_channel(const ggml_tensor * src0,
 
 bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t         dev,
                                              const struct ggml_tensor * op) {
+#if defined(GGML_GEMMINI_CUDA_RTN)
+    // In this opt-in mode, unsupported matmuls remain visible to the coverage guard.
+    if (ggml_cuda_rtn_enabled() && op->op == GGML_OP_MUL_MAT) return ggml_cuda_rtn_supported(op);
+#endif
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (gemmini_gpu::attention_supported(op)) return true;
+#endif
     switch (op->op) {
     case GGML_OP_NONE:
     case GGML_OP_RESHAPE:

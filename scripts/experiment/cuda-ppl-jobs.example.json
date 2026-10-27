@@ -1,0 +1,72 @@
+{
+  "dataset": "wikitext-2-raw/wiki.test.raw",
+  "jobs": [
+    {
+      "id": "llama-rtn-mx4",
+      "family": "llama3.2-1B",
+      "kind": "rtn-mx",
+      "bits": 4,
+      "full_chunks": 564,
+      "model": "models/llama3.2-1B.MXINT4_RNE.HP1.gguf",
+      "binary": "build-potal-cuda/rtn/bin/llama-perplexity"
+    },
+    {
+      "id": "llama-rtn-q4-e4m3",
+      "family": "llama3.2-1B",
+      "kind": "rtn-e4m3",
+      "bits": 4,
+      "full_chunks": 564,
+      "model": "models/llama3.2-1B.Q4_0_E4M3.gguf",
+      "binary": "build-potal-cuda/rtn/bin/llama-perplexity"
+    },
+    {
+      "id": "llama-rtn-mx8",
+      "family": "llama3.2-1B",
+      "kind": "rtn-mx",
+      "bits": 8,
+      "full_chunks": 564,
+      "model": "models/llama3.2-1B.MXINT8_RNE.HP1.gguf",
+      "binary": "build-potal-cuda/rtn/bin/llama-perplexity"
+    },
+    {
+      "id": "qwen-potal-top3-mx4",
+      "family": "qwen2-0.5B",
+      "kind": "potal",
+      "bits": 4,
+      "full_chunks": 584,
+      "model": "models/qwen2-0.5B.MXINT4_RNE.HP1.gguf",
+      "anchor": 3,
+      "binary": "build-potal-cuda/top3-a4-rmdon/bin/llama-perplexity"
+    },
+    {
+      "id": "qwen-potal-top3-mx8",
+      "family": "qwen2-0.5B",
+      "kind": "potal",
+      "bits": 8,
+      "full_chunks": 584,
+      "model": "models/qwen2-0.5B.MXINT8_RNE.HP1.gguf",
+      "anchor": 3,
+      "binary": "build-potal-cuda/top3-a8-rmdon/bin/llama-perplexity"
+    },
+    {
+      "id": "llama-potal-top3-mx4",
+      "family": "llama3.2-1B",
+      "kind": "potal",
+      "bits": 4,
+      "full_chunks": 564,
+      "model": "models/llama3.2-1B.MXINT4_RNE.HP1.gguf",
+      "anchor": 3,
+      "binary": "build-potal-cuda/top3-a4-rmdon/bin/llama-perplexity"
+    },
+    {
+      "id": "llama-potal-top3-mx8",
+      "family": "llama3.2-1B",
+      "kind": "potal",
+      "bits": 8,
+      "full_chunks": 564,
+      "model": "models/llama3.2-1B.MXINT8_RNE.HP1.gguf",
+      "anchor": 3,
+      "binary": "build-potal-cuda/top3-a8-rmdon/bin/llama-perplexity"
+    }
+  ]
+}

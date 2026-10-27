@@ -19,6 +19,9 @@
 #include <tuple>
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "ggml-gpu-cpu-exact.hpp"
+#endif
 #include "ggml-gemmini-config.hpp"
 #include "ggml-gemmini-buffer.hpp"
 #include "ggml-backend-impl.h"
@@ -63,6 +66,9 @@
 #endif
 
 #include "ops.hpp"
+#if defined(GGML_GEMMINI_CUDA_RTN)
+#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#endif
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
@@ -167,6 +173,24 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
             break;
         case GGML_OP_MUL_MAT: {
+#if defined(GGML_GEMMINI_CUDA_RTN)
+            if (ggml_cuda_rtn_enabled()) {
+                if (!ggml_cuda_rtn_compute(node)) {
+                    GGML_LOG_ERROR("CUDA RTN failed: %s\n", ggml_cuda_rtn_error());
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            }
+#endif
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            if (gemmini_gpu::attention_supported(node)) {
+                if (!gemmini_gpu::attention(node)) {
+                    GGML_LOG_ERROR("%s attention failed: %s\n",gemmini_gpu::backend,gemmini_gpu::attention_error());
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            }
+#endif
 #if LOG_DUMP
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
             ggml::gemmini::log::dump_set_node_idx(node_idx);

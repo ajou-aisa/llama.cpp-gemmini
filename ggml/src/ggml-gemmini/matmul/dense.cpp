@@ -1,5 +1,8 @@
 #include <gemmini/trace-context.hpp>
 #include "dense.hpp"
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "../ggml-gpu-cpu-exact.hpp"
+#endif
 #include "detail.hpp"
 #include "../quants/common/weight_reader.hpp"
 #include <gemmini/log.hpp>
@@ -211,15 +214,19 @@ baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & 
     return baseline_activation_quant_t::EXSIA;
 }
 
-MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
+MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool stored_block = false, bool legacy_hp1 = false) {
     using namespace quants::wreader;
     using namespace quants::wroute;
 
-    const WeightRoutePlan plan = resolve_weight_route_plan(args, WeightScaleInfoMode::CommonOutput);
+    const WeightRoutePlan plan =
+        resolve_weight_route_plan(args, WeightScaleInfoMode::CommonOutput);
     if (!plan.valid ||
-        weight_route_status(plan, WeightExecutionPath::CpuDirect) != WeightRouteStatus::Success ||
-        validate(args, plan) != WeightReaderStatus::Success || args.f_out == nullptr ||
-        !args.A.valid() || args.A.bits != plan.weight_bits || !route_covers_k(plan, args.K)) {
+        weight_route_status(plan, WeightExecutionPath::CpuDirect) !=
+            WeightRouteStatus::Success ||
+        validate(args, plan) != WeightReaderStatus::Success ||
+        args.f_out == nullptr || !args.A.valid() ||
+        args.A.bits != plan.weight_bits ||
+        !route_covers_k(plan, args.K)) {
         return MatMulStatus::invalid_contract;
     }
 
@@ -227,33 +234,65 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         plan.scales.block_size != 0 ? plan.scales.block_size : args.block_size_k;
     if (block_size == 0 || args.I == 0 || args.J == 0 || args.K == 0 ||
         args.I > std::numeric_limits<size_t>::max() / args.J ||
-        args.activation_row_offset > std::numeric_limits<size_t>::max() - args.I) {
+        args.activation_row_offset >
+            std::numeric_limits<size_t>::max() - args.I) {
         return MatMulStatus::invalid_contract;
     }
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
         gemmini_set_tile_ws(&args);
     }
-    if (args.tile_I == 0 || args.tile_J == 0 ||
+    if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0 ||
         args.tile_I > std::numeric_limits<size_t>::max() / DIM ||
-        args.tile_J > std::numeric_limits<size_t>::max() / DIM) {
+        args.tile_J > std::numeric_limits<size_t>::max() / DIM ||
+        args.tile_K > std::numeric_limits<size_t>::max() / DIM) {
         return MatMulStatus::invalid_contract;
     }
-    const size_t rows_per_tile    = args.tile_I * DIM;
-    const size_t columns_per_tile = args.tile_J * DIM;
+    bool metal_raw_dot = false;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    metal_raw_dot = gemmini_gpu::enabled();
+    if (metal_raw_dot && (args.A.bits != 4 && args.A.bits != 8)) {
+        return MatMulStatus::unsupported;
+    }
+#endif
+    bool fused_hp1 = false;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    // EXSIA applies one activation scale after the K sum. Other metadata can
+    // carry per-block scales, which must remain in the existing block loop.
+    fused_hp1 = metal_raw_dot && std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage()) &&
+        plan.route == WeightRouteKind::HP1 && block_size == 32 && args.K % 32 == 0 &&
+        (plan.weight_bits == 4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row) == args.K / 32;
+#endif
+    const size_t rows_per_tile = metal_raw_dot ? 128 : args.tile_I * DIM;
+    const size_t metal_fragment = (stored_block || legacy_hp1) && (args.tile_K * DIM) % 32 != 0 ? 16 : 32;
+    size_t columns_per_tile = args.tile_J * DIM;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (metal_raw_dot) {
+        constexpr size_t max_elements = 16 * 1024 * 1024;
+        const size_t fragments = args.K / metal_fragment + size_t(args.K % metal_fragment != 0);
+        const size_t rows = std::min(rows_per_tile,args.I);
+        // Batch more independent columns; K fragments and each output's accumulation order stay fixed.
+        columns_per_tile = std::min({gemmini_gpu::max_columns,max_elements / args.K,
+                                     max_elements / rows / (fused_hp1 ? 1 : fragments)});
+        if (columns_per_tile == 0) return MatMulStatus::invalid_contract;
+    }
+#endif
     const size_t row_tile_count =
         args.I / rows_per_tile + static_cast<size_t>(args.I % rows_per_tile != 0);
     const size_t column_tile_count =
-        args.J / columns_per_tile + static_cast<size_t>(args.J % columns_per_tile != 0);
+        args.J / columns_per_tile +
+        static_cast<size_t>(args.J % columns_per_tile != 0);
     if (row_tile_count == 0 || column_tile_count == 0 ||
-        row_tile_count > std::numeric_limits<size_t>::max() / column_tile_count) {
+        row_tile_count >
+            std::numeric_limits<size_t>::max() / column_tile_count) {
         return MatMulStatus::invalid_contract;
     }
     const size_t tile_pair_count = row_tile_count * column_tile_count;
-    if (tile_pair_count > static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max())) {
+    if (tile_pair_count >
+        static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max())) {
         return MatMulStatus::invalid_arguments;
     }
 
-    const size_t                              global_row_end = args.activation_row_offset + args.I;
+    const size_t global_row_end = args.activation_row_offset + args.I;
     const quants::act::ActivationMetadataView activation_meta(
         args, args.activation_row_offset, global_row_end);
     if (!activation_meta.valid()) {
@@ -261,79 +300,127 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
     }
     const bool block_activation =
         std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage());
+    if (stored_block && !block_activation) {
+        return MatMulStatus::invalid_contract;
+    }
+    if (legacy_hp1 && !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage())) {
+        return MatMulStatus::invalid_contract;
+    }
 
     std::vector<float> activation_scales;
     try {
-        if (!block_activation)
-            activation_scales.resize(args.I);
+        if (!block_activation) activation_scales.resize(args.I);
     } catch (const std::bad_alloc &) {
         return MatMulStatus::invalid_arguments;
     } catch (const std::length_error &) {
         return MatMulStatus::invalid_arguments;
     }
     for (size_t row = 0; row < activation_scales.size(); ++row) {
-        if (!activation_meta.scale(row, activation_scales[row])) {
+        if (legacy_hp1) {
+            const auto & meta = std::get<quants::act::exsia::Meta>(args.act_quant.storage());
+            const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(row / (args.tile_I * DIM)));
+            if (theta == INT16_MIN) return MatMulStatus::invalid_contract;
+            activation_scales[row] = gemmini_detail::apply_activation_exponent(1.0f, theta, 0);
+        } else if (!activation_meta.scale(row, activation_scales[row])) {
             return MatMulStatus::invalid_contract;
         }
     }
 
     const size_t bias_stride = args.sD != 0 ? args.sD : args.J;
-    if (args.D != nullptr) {
+    const bool apply_bias = args.D != nullptr && !stored_block && !legacy_hp1;
+    if (apply_bias) {
         if (!args.repeating_bias && args.I > 1 &&
-            bias_stride > (std::numeric_limits<size_t>::max() - (args.J - 1)) / (args.I - 1)) {
+            bias_stride >
+                (std::numeric_limits<size_t>::max() - (args.J - 1)) /
+                    (args.I - 1)) {
             return MatMulStatus::invalid_arguments;
         }
     }
 
-    const size_t output_row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
-    const size_t output_col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
-    if (args.J - 1 > std::numeric_limits<size_t>::max() / output_col_stride) {
+    const size_t output_row_stride =
+        args.stride_f_out != 0 ? args.stride_f_out : args.J;
+    const size_t output_col_stride =
+        args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
+    if (args.J - 1 >
+        std::numeric_limits<size_t>::max() / output_col_stride) {
         return MatMulStatus::invalid_arguments;
     }
     const size_t max_column_offset = (args.J - 1) * output_col_stride;
-    if (args.I - 1 > std::numeric_limits<size_t>::max() / output_row_stride) {
+    if (args.I - 1 >
+        std::numeric_limits<size_t>::max() / output_row_stride) {
         return MatMulStatus::invalid_arguments;
     }
     const size_t max_row_offset = (args.I - 1) * output_row_stride;
-    if (max_row_offset > std::numeric_limits<size_t>::max() - max_column_offset) {
+    if (max_row_offset >
+        std::numeric_limits<size_t>::max() - max_column_offset) {
         return MatMulStatus::invalid_arguments;
     }
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-    const bool output_tiles_do_not_overlap = args.I <= 1 || args.J <= 1 ||
-                                             output_row_stride > max_column_offset ||
-                                             output_col_stride > max_row_offset;
+    const bool output_tiles_do_not_overlap =
+        args.I <= 1 || args.J <= 1 ||
+        output_row_stride > max_column_offset ||
+        output_col_stride > max_row_offset;
 #endif
     std::atomic<bool> execution_valid{true};
 
     struct TileScratch {
         std::vector<int32_t> activation_codes;
         std::vector<int32_t> weight_codes;
-        std::vector<double>  weight_scales;
-        std::vector<double>  accumulations;
+        std::vector<double> weight_scales;
+        std::vector<double> accumulations;
+        std::vector<int32_t> metal_activation;
+        std::vector<int32_t> metal_weight;
+        std::vector<int32_t> metal_dots;
+        std::vector<double> fused_weight_scales;
+        std::vector<int32_t> scu_accumulations;
     };
-    const size_t max_rows_in_tile    = std::min(rows_per_tile, args.I);
+    const size_t max_rows_in_tile = std::min(rows_per_tile, args.I);
     const size_t max_columns_in_tile = std::min(columns_per_tile, args.J);
-    if (max_rows_in_tile > std::numeric_limits<size_t>::max() / block_size ||
-        max_columns_in_tile > std::numeric_limits<size_t>::max() / block_size ||
-        max_rows_in_tile > std::numeric_limits<size_t>::max() / max_columns_in_tile) {
+    if (max_rows_in_tile >
+            std::numeric_limits<size_t>::max() / block_size ||
+        max_columns_in_tile >
+            std::numeric_limits<size_t>::max() / block_size ||
+        max_rows_in_tile >
+            std::numeric_limits<size_t>::max() / max_columns_in_tile) {
         return MatMulStatus::invalid_arguments;
     }
     size_t scratch_count = 1;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-    const bool parallel_tile_execution = tile_pair_count > 1 && output_tiles_do_not_overlap;
+    const bool parallel_tile_execution =
+        tile_pair_count > 1 && output_tiles_do_not_overlap;
     if (parallel_tile_execution) {
         scratch_count =
-            std::min(tile_pair_count, static_cast<size_t>(std::max(1, omp_get_max_threads())));
+            std::min(
+                tile_pair_count,
+                static_cast<size_t>(std::max(1, omp_get_max_threads())));
     }
 #endif
     std::vector<TileScratch> tile_scratch;
     try {
         tile_scratch.resize(scratch_count);
         for (TileScratch & scratch : tile_scratch) {
-            scratch.activation_codes.resize(max_rows_in_tile * block_size);
-            scratch.weight_codes.resize(max_columns_in_tile * block_size);
+            scratch.activation_codes.resize(
+                max_rows_in_tile * block_size);
+            scratch.weight_codes.resize(
+                max_columns_in_tile * block_size);
             scratch.weight_scales.resize(max_columns_in_tile);
-            scratch.accumulations.resize(max_rows_in_tile * max_columns_in_tile);
+            scratch.accumulations.resize(
+                max_rows_in_tile * max_columns_in_tile);
+            if (metal_raw_dot) {
+                constexpr size_t max_elements = 16 * 1024 * 1024;
+                if (block_size != 32 || args.K > max_elements / max_rows_in_tile ||
+                    args.K > max_elements / max_columns_in_tile ||
+                    (!fused_hp1 && (args.K + metal_fragment - 1) / metal_fragment > max_elements / max_rows_in_tile / max_columns_in_tile)) {
+                    return MatMulStatus::invalid_contract;
+                }
+                scratch.metal_activation.resize(max_rows_in_tile * args.K);
+                if (fused_hp1) {
+                    scratch.fused_weight_scales.resize(max_columns_in_tile * (args.K / 32));
+                } else {
+                    scratch.metal_weight.resize(max_columns_in_tile * args.K);
+                    scratch.metal_dots.resize(max_rows_in_tile * max_columns_in_tile * ((args.K + metal_fragment - 1) / metal_fragment));
+                }
+            }
         }
     } catch (const std::bad_alloc &) {
         return MatMulStatus::invalid_arguments;
@@ -345,37 +432,149 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         if (!execution_valid.load(std::memory_order_relaxed)) {
             return;
         }
-        const size_t row_tile      = tile_pair / column_tile_count;
-        const size_t column_tile   = tile_pair % column_tile_count;
-        const size_t row_begin     = row_tile * rows_per_tile;
-        const size_t column_begin  = column_tile * columns_per_tile;
-        const size_t row_count     = std::min(rows_per_tile, args.I - row_begin);
-        const size_t column_count  = std::min(columns_per_tile, args.J - column_begin);
-        size_t       scratch_index = 0;
+        const size_t row_tile = tile_pair / column_tile_count;
+        const size_t column_tile = tile_pair % column_tile_count;
+        const size_t row_begin = row_tile * rows_per_tile;
+        const size_t column_begin = column_tile * columns_per_tile;
+        const size_t row_count = std::min(rows_per_tile, args.I - row_begin);
+        const size_t column_count =
+            std::min(columns_per_tile, args.J - column_begin);
+        size_t scratch_index = 0;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
         if (parallel_tile_execution) {
             scratch_index = static_cast<size_t>(omp_get_thread_num());
         }
 #endif
         TileScratch & scratch = tile_scratch[scratch_index];
-        std::fill_n(scratch.accumulations.begin(), row_count * column_count, 0.0);
+        std::fill_n(
+            scratch.accumulations.begin(),
+            row_count * column_count, 0.0);
 
-        for (size_t block_begin = 0; block_begin < args.K;) {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (metal_raw_dot) {
+            for (size_t row = 0; row < row_count; ++row) {
+                for (size_t k = 0; k < args.K; ++k) {
+                    scratch.metal_activation[row * args.K + k] = args.A.get(row_begin + row, k);
+                }
+            }
+            const bool packed_hp1=plan.route==WeightRouteKind::HP1 && args.K%32==0 &&
+                (plan.weight_bits==4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row)==args.K/32;
+            for (size_t column = 0; !packed_hp1 && column < column_count; ++column) {
+                for (size_t k = 0; k < args.K; ++k) {
+                    const auto code = read_code_validated(args, plan, column_begin + column, k);
+                    if (!code.ok()) { execution_valid.store(false); return; }
+                    scratch.metal_weight[column * args.K + k] = code.value;
+                }
+            }
+            const void * packed=plan.weight_bits==4
+                ? static_cast<const void *>(args.q4_hp1_blocks ? args.q4_hp1_blocks+column_begin*(args.K/32) : nullptr)
+                : static_cast<const void *>(args.q8_hp1_blocks ? args.q8_hp1_blocks+column_begin*(args.K/32) : nullptr);
+            bool success = false;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            if (fused_hp1) {
+                // Keep scale conversion in the existing CPU helpers, including the
+                // legacy Q8 underflow/overflow rules. CUDA only moves the ordered sum.
+                for (size_t column = 0; column < column_count; ++column) {
+                    for (size_t block = 0; block < args.K / 32; ++block) {
+                        double scale = 0.0;
+                        if (legacy_hp1) {
+                            const auto * value = args.q8_hp1_block(column_begin + column, block);
+                            if (!value) { execution_valid.store(false); return; }
+                            scale = value->m == INT16_MIN ? 0.0 :
+                                static_cast<double>(gemmini_ldexp_fast_pos(value->channel_scale, value->m));
+                        } else {
+                            const auto value = read_scale_validated(args, plan, column_begin + column, block);
+                            if (!value.ok()) { execution_valid.store(false); return; }
+                            if (value.domain == WeightScaleDomain::FloatingBlock) scale = value.floating_block_scale;
+                            else if (value.domain == WeightScaleDomain::IntegerBlockTimesColumn)
+                                scale = static_cast<double>(value.integer_block_scale) * static_cast<double>(value.column_scale);
+                            else { execution_valid.store(false); return; }
+                        }
+                        scratch.fused_weight_scales[column * (args.K / 32) + block] = scale;
+                    }
+                }
+                if (ggml_hp1_scu_enabled()) {
+                    // Factoring assumes the actual HP1 format: one finite PoT
+                    // channel scale repeated in every block. Reject a malformed
+                    // tensor instead of silently changing its numerical meaning.
+                    for (size_t c = 0; c < column_count; ++c) {
+                        const float channel = plan.weight_bits == 4
+                            ? args.q4_hp1_blocks[(column_begin+c)*(args.K/32)].channel_scale
+                            : args.q8_hp1_blocks[(column_begin+c)*(args.K/32)].channel_scale;
+                        uint32_t encoding; std::memcpy(&encoding, &channel, sizeof(encoding));
+                        if (encoding && ((encoding & 0x807fffffu) ||
+                            (encoding & 0x7f800000u) == 0 || (encoding & 0x7f800000u) == 0x7f800000u)) {
+                            execution_valid.store(false); return;
+                        }
+                        for (size_t b = 0; b < args.K/32; ++b) {
+                            const float other = plan.weight_bits == 4
+                                ? args.q4_hp1_blocks[(column_begin+c)*(args.K/32)+b].channel_scale
+                                : args.q8_hp1_blocks[(column_begin+c)*(args.K/32)+b].channel_scale;
+                            if (other != channel) { execution_valid.store(false); return; }
+                        }
+                    }
+                    // Gemmini INT32 SCU core; retain the original final scale/FP
+                    // residual merge so the accepted output contract is unchanged.
+                    if (DIM != 32) { execution_valid.store(false); return; }
+                    scratch.scu_accumulations.resize(row_count * column_count);
+                    success = ggml_cuda_hp1_scu_main(scratch.metal_activation.data(), packed,
+                        plan.weight_bits, row_count, column_count, args.K, scratch.scu_accumulations.data());
+                    if (success) for (size_t c = 0; c < column_count; ++c) {
+                        const double channel = plan.weight_bits == 4
+                            ? args.q4_hp1_blocks[(column_begin+c)*(args.K/32)].channel_scale
+                            : args.q8_hp1_blocks[(column_begin+c)*(args.K/32)].channel_scale;
+                        for (size_t r = 0; r < row_count; ++r)
+                            scratch.accumulations[r*column_count+c] =
+                                static_cast<double>(scratch.scu_accumulations[r*column_count+c]) * channel;
+                    }
+                } else {
+                    success = ggml_cuda_cpu_exact_hp1_accumulate(scratch.metal_activation.data(), packed,
+                        scratch.fused_weight_scales.data(), plan.weight_bits, row_count, column_count, args.K,
+                        legacy_hp1 ? args.tile_K * DIM : 0, scratch.accumulations.data());
+                }
+            } else
+#endif
+            success=packed_hp1
+                ? gemmini_gpu::hp1_dot(scratch.metal_activation.data(),packed,plan.weight_bits,
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data())
+                : gemmini_gpu::int_dot(scratch.metal_activation.data(),scratch.metal_weight.data(),
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data());
+            if (!success) {
+                execution_valid.store(false);
+                return;
+            }
+        }
+#endif
+
+        for (size_t block_begin = 0; !fused_hp1 && block_begin < args.K;) {
             const size_t block_index = block_begin / block_size;
             const size_t weight_block_end =
-                block_begin + std::min(block_size - block_begin % block_size, args.K - block_begin);
-            const size_t activation_block_end =
-                block_activation
-                    ? block_begin + std::min(quants::act::block::kGroupSize -
-                                                 block_begin % quants::act::block::kGroupSize,
-                                             args.K - block_begin)
-                    : weight_block_end;
-            const size_t block_count =
+                block_begin + std::min(
+                    block_size - block_begin % block_size,
+                    args.K - block_begin);
+            const size_t activation_block_end = block_activation
+                ? block_begin + std::min(
+                      quants::act::block::kGroupSize -
+                          block_begin % quants::act::block::kGroupSize,
+                      args.K - block_begin)
+                : weight_block_end;
+            size_t block_count =
                 std::min(weight_block_end, activation_block_end) - block_begin;
+            if (stored_block || legacy_hp1) {
+                block_count = std::min(block_count, args.tile_K * DIM - block_begin % (args.tile_K * DIM));
+            }
             bool tile_valid = true;
 
-            for (size_t local_column = 0; local_column < column_count; ++local_column) {
-                const size_t            column = column_begin + local_column;
+            for (size_t local_column = 0;
+                 local_column < column_count; ++local_column) {
+                const size_t column = column_begin + local_column;
+                if (legacy_hp1) {
+                    const block_q8_hp1 * block = args.q8_hp1_block(column, block_index);
+                    if (block == nullptr) { tile_valid = false; break; }
+                    scratch.weight_scales[local_column] = block->m == INT16_MIN ? 0.0 :
+                        static_cast<double>(gemmini_ldexp_fast_pos(block->channel_scale, block->m));
+                    continue;
+                }
                 const WeightScaleResult scale =
                     read_scale_validated(args, plan, column, block_index);
                 if (!scale.ok()) {
@@ -383,8 +582,10 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                     break;
                 }
                 if (scale.domain == WeightScaleDomain::FloatingBlock) {
-                    scratch.weight_scales[local_column] = scale.floating_block_scale;
-                } else if (scale.domain == WeightScaleDomain::IntegerBlockTimesColumn) {
+                    scratch.weight_scales[local_column] =
+                        scale.floating_block_scale;
+                } else if (scale.domain ==
+                           WeightScaleDomain::IntegerBlockTimesColumn) {
                     scratch.weight_scales[local_column] =
                         static_cast<double>(scale.integer_block_scale) *
                         static_cast<double>(scale.column_scale);
@@ -393,10 +594,12 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                     break;
                 }
 
-                int32_t * decoded = scratch.weight_codes.data() + local_column * block_size;
-                for (size_t local_k = 0; local_k < block_count; ++local_k) {
-                    const WeightCodeResult code =
-                        read_code_validated(args, plan, column, block_begin + local_k);
+                int32_t * decoded =
+                    scratch.weight_codes.data() +
+                    local_column * block_size;
+                for (size_t local_k = 0; !metal_raw_dot && local_k < block_count; ++local_k) {
+                    const WeightCodeResult code = read_code_validated(
+                        args, plan, column, block_begin + local_k);
                     if (!code.ok()) {
                         tile_valid = false;
                         break;
@@ -413,33 +616,55 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
             }
 
             for (size_t local_row = 0; local_row < row_count; ++local_row) {
-                int32_t * decoded = scratch.activation_codes.data() + local_row * block_size;
-                for (size_t local_k = 0; local_k < block_count; ++local_k) {
-                    decoded[local_k] = args.A.get(row_begin + local_row, block_begin + local_k);
+                int32_t * decoded =
+                    scratch.activation_codes.data() +
+                    local_row * block_size;
+                for (size_t local_k = 0; !metal_raw_dot && local_k < block_count; ++local_k) {
+                    decoded[local_k] =
+                        args.A.get(row_begin + local_row, block_begin + local_k);
                 }
             }
 
             for (size_t local_row = 0; local_row < row_count; ++local_row) {
                 const int32_t * activation =
-                    scratch.activation_codes.data() + local_row * block_size;
+                    scratch.activation_codes.data() +
+                    local_row * block_size;
                 float activation_scale = 1.0f;
                 if (block_activation &&
-                    !activation_meta.scale(row_begin + local_row, block_begin, activation_scale)) {
+                    !activation_meta.scale(
+                        row_begin + local_row, block_begin, activation_scale)) {
                     execution_valid.store(false, std::memory_order_relaxed);
                     return;
                 }
-                for (size_t local_column = 0; local_column < column_count; ++local_column) {
+                for (size_t local_column = 0;
+                     local_column < column_count; ++local_column) {
                     const int32_t * weight =
-                        scratch.weight_codes.data() + local_column * block_size;
+                        scratch.weight_codes.data() +
+                        local_column * block_size;
                     int64_t block_dot = 0;
-                    for (size_t local_k = 0; local_k < block_count; ++local_k) {
-                        block_dot += static_cast<int64_t>(activation[local_k]) *
-                                     static_cast<int64_t>(weight[local_k]);
+                    if (metal_raw_dot) {
+                        for (size_t offset = 0; offset < block_count; offset += metal_fragment) {
+                            block_dot += scratch.metal_dots[((block_begin + offset) / metal_fragment * row_count + local_row) * column_count + local_column];
+                        }
+                    } else {
+                        for (size_t local_k = 0;
+                             local_k < block_count; ++local_k) {
+                            block_dot += static_cast<int64_t>(activation[local_k]) *
+                                static_cast<int64_t>(weight[local_k]);
+                        }
                     }
                     test_detail::observe_native_integer_block_dot();
-                    scratch.accumulations[local_row * column_count + local_column] +=
-                        static_cast<double>(block_dot) * scratch.weight_scales[local_column] *
-                        static_cast<double>(activation_scale);
+                    if (stored_block) {
+                        scratch.accumulations[local_row * column_count + local_column] +=
+                            static_cast<double>(block_dot) *
+                            (scratch.weight_scales[local_column] * static_cast<double>(activation_scale));
+                    } else {
+                        scratch.accumulations[
+                            local_row * column_count + local_column] +=
+                            static_cast<double>(block_dot) *
+                            scratch.weight_scales[local_column] *
+                            static_cast<double>(activation_scale);
+                    }
                     test_detail::observe_native_post_dot_scale();
                 }
             }
@@ -448,43 +673,51 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
 
         for (size_t local_row = 0; local_row < row_count; ++local_row) {
             const size_t row = row_begin + local_row;
-            for (size_t local_column = 0; local_column < column_count; ++local_column) {
+            for (size_t local_column = 0;
+                 local_column < column_count; ++local_column) {
                 const size_t column = column_begin + local_column;
-                double       value = scratch.accumulations[local_row * column_count + local_column];
+                double value =
+                    scratch.accumulations[
+                        local_row * column_count + local_column];
                 if (!block_activation) {
                     value *= static_cast<double>(activation_scales[row]);
                 }
-                if (args.D != nullptr) {
-                    const size_t bias_row   = args.repeating_bias ? 0 : row;
-                    const size_t bias_index = bias_row * bias_stride + column;
-                    value +=
-                        args.low_D
-                            ? static_cast<double>(static_cast<const elem_t *>(args.D)[bias_index]) *
-                                  static_cast<double>(args.scale_D)
-                            : static_cast<double>(static_cast<const acc_t *>(args.D)[bias_index]) *
-                                  static_cast<double>(args.scale_D);
+                if (apply_bias) {
+                    const size_t bias_row = args.repeating_bias ? 0 : row;
+                    const size_t bias_index =
+                        bias_row * bias_stride + column;
+                    value += args.low_D
+                        ? static_cast<double>(
+                              static_cast<const elem_t *>(
+                                  args.D)[bias_index]) *
+                              static_cast<double>(args.scale_D)
+                        : static_cast<double>(
+                              static_cast<const acc_t *>(
+                                  args.D)[bias_index]) *
+                              static_cast<double>(args.scale_D);
                 }
-                args.f_out[row * output_row_stride + column * output_col_stride] =
-                    static_cast<float>(value);
+                args.f_out[
+                    row * output_row_stride +
+                    column * output_col_stride] = static_cast<float>(value);
             }
         }
     };
 
     const auto dense_task_origin = gemmini_trace_capture();
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-#pragma omp parallel if (parallel_tile_execution)
+#pragma omp parallel if(parallel_tile_execution)
 #endif
     {
         trace::ScopedContext dense_task(dense_task_origin, true);
-        trace::CpuStage      task_lifetime(
-            args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
+        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
         const auto worker_cpu_start = gemmini_cpu_timing_read();
 #endif
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp for schedule(static) nowait
 #endif
-        for (std::ptrdiff_t tile_pair = 0; tile_pair < static_cast<std::ptrdiff_t>(tile_pair_count);
+        for (std::ptrdiff_t tile_pair = 0;
+             tile_pair < static_cast<std::ptrdiff_t>(tile_pair_count);
              ++tile_pair) {
             execute_tile_pair(static_cast<size_t>(tile_pair));
         }
@@ -501,8 +734,8 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
 #endif
         gemmini_cycle_record_v2 worker_record{};
         worker_record.interval.layer = args.matmul_layer.c_str();
-        worker_record.interval.op    = "cpu.dense_worker";
-        worker_record.identity_mask  = GEMMINI_CYCLE_HAS_WORKER_ID;
+        worker_record.interval.op = "cpu.dense_worker";
+        worker_record.identity_mask = GEMMINI_CYCLE_HAS_WORKER_ID;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
         worker_record.worker_id = static_cast<uint64_t>(omp_get_thread_num());
 #endif
@@ -517,8 +750,9 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
 #endif
 #endif
     }
-    return execution_valid.load(std::memory_order_relaxed) ? MatMulStatus::success
-                                                           : MatMulStatus::invalid_contract;
+    return execution_valid.load(std::memory_order_relaxed)
+        ? MatMulStatus::success
+        : MatMulStatus::invalid_contract;
 }
 
 MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> stripe_id = {}) {
@@ -570,6 +804,9 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
                 return MatMulStatus::unsupported;
             }
             test_detail::observe_backend_dispatch(true);
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            if (gemmini_gpu::enabled()) return execute_native_matched_int_dense(args, true);
+#endif
             return tiled_matmul_auto_im2p(&args) == DenseMatmulStatus::success
                        ? MatMulStatus::success
                        : MatMulStatus::invalid_contract;
@@ -581,6 +818,13 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
             test_detail::observe_backend_dispatch(true);
             return execute_native_matched_int_dense(args);
         }
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (gemmini_gpu::enabled() && args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1) {
+            if (args.tiled_matmul_type != CPU) return MatMulStatus::unsupported;
+            test_detail::observe_backend_dispatch(true);
+            return execute_native_matched_int_dense(args, false, true);
+        }
+#endif
         test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
         if (uses_baseline_channel_route(args)) {
             tiled_matmul_auto_baseline(
