@@ -2,6 +2,8 @@
 #include "ggml-quants.h"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -30,6 +32,7 @@ static float scale(const ggml_tensor * w, int row, int block) {
     }
     return ggml_fp16_to_fp32(w->type==GGML_TYPE_Q4_0 ? static_cast<const block_q4_0 *>(w->data)[b].d : static_cast<const block_q8_0 *>(w->data)[b].d);
 }
+static bool benchmark_mode=false;
 static void dense(ggml_type type, int bits, int m, int n, int k) {
     setenv("GGML_CUDA_RTN_A_BITS",std::to_string(bits).c_str(),1);
     ggml_cuda_rtn_clear();
@@ -70,6 +73,12 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
     auto * out=ggml_mul_mat(ctx,w,x);
     require(ggml_cuda_rtn_supported(out),"dense unsupported");
     require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
+    if (benchmark_mode) {
+        const auto start=std::chrono::steady_clock::now();
+        for (int repeat=0;repeat<10;++repeat) require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/10;
+        std::printf("CUDA_RTN_BENCH type=%s A%d m=%d n=%d k=%d mean_ms=%.6f\n",ggml_type_name(type),bits,m,n,k,ms);
+    }
     // Exercise cache reuse with changed activations.
     a[m*k-1]*=-1;
     require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
@@ -149,8 +158,15 @@ static void attention(bool transposed) {
     }
     std::printf("PASS attention GQA=14/2 transposed=%d\n",int(transposed)); ggml_free(ctx);
 }
-int main() {
+int main(int argc, char ** argv) {
+    benchmark_mode=argc==2 && (!std::strcmp(argv[1],"--benchmark") || !std::strcmp(argv[1],"--benchmark-large"));
     try {
+        if (benchmark_mode && !std::strcmp(argv[1],"--benchmark-large")) { dense(GGML_TYPE_Q4_HP1,4,512,2048,2048); return 0; }
+        if (benchmark_mode) {
+            for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1})
+                for (int bits:{4,8}) dense(type,bits,128,512,2048);
+            return 0;
+        }
         for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0}) for (int bits:{4,8,16}) {
             dense(type,bits,9,35,64); dense(type,bits,17,65,896);
         }
@@ -158,6 +174,8 @@ int main() {
         for (auto type:{GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1}) for (int bits:{4,8}) {
             dense(type,bits,9,35,64); dense(type,bits,17,65,896); dense(type,bits,9,67,2048);
         }
+        for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1})
+            for (int bits:{4,8}) dense(type,bits,9,521,64);
         dense(GGML_TYPE_F16,16,9,35,64); attention(false); attention(true);
         std::puts("PASS CUDA RTN scalar oracle, ties, zeros, tile tails, weight cache, Qwen K and GQA"); return 0;
     } catch (const std::exception & e) { std::fprintf(stderr,"FAIL %s\n",e.what()); return 1; }
