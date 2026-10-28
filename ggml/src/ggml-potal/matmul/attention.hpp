@@ -48,6 +48,10 @@ potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batc
 // the completed low-limb INT32 ACC. Upper P limbs have separate INT32 ACCs
 // and reconstruct with the corrected low result in checked Host INT64, as
 // explicitly selected for H3-7B. Bias outside INT32 is rejected, not clipped.
+// H3-7C extends only a rejected PV bias: unchanged unsigned P codes run as
+// radix-2 INT8 planes if every DIM16 SCU and ACC prefix is proven nonsaturating.
+// Those completed jobs reconstruct the exact quantized dot in checked INT64.
+// Inputs that cannot be certified remain unsupported; column_bias stays strict.
 potal_status reference(const stream & activation, const stationary & weight,
                        role operation, std::vector<int64_t> & out);
 // Exact 128 * sum_block(2^carrier * sum_k(Vcode)) with checked INT32 output.
@@ -59,6 +63,7 @@ struct result {
     bool fatal = false;
     uint64_t jobs = 0, residual_jobs = 0, qk_limb_jobs = 0, correction_jobs = 0;
     uint64_t bias_updates = 0;
+    uint64_t pv_bitplane_stripes = 0, pv_bitplane_jobs = 0;
     uint64_t loops = 0, fences = 0, scale_writes = 0, scale_releases = 0, tlb_flushes = 0;
     double scale_s = 0, issue_s = 0, fence_s = 0;
 };

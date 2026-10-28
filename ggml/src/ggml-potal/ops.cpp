@@ -169,16 +169,19 @@ ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
                                    b * node->nb[3] + h * node->nb[2] + i * node->nb[1] + j * node->nb[0];
                         std::memcpy(p, &nan, sizeof(nan));
                     }
-        log::failure("potal.attention", "[POTAL_ATTENTION] node=%s status=%s stage=%s fatal=%d",
-                     node->name, potal_status_name(result.status), result.stage ? result.stage : "-", result.fatal);
+        log::failure("potal.attention", "[POTAL_ATTENTION] node=%s status=%s stage=%s fatal=%d "
+                     "pv_bitplane_stripes=%llu pv_bitplane_jobs=%llu",
+                     node->name, potal_status_name(result.status), result.stage ? result.stage : "-", result.fatal,
+                     (unsigned long long)result.pv_bitplane_stripes, (unsigned long long)result.pv_bitplane_jobs);
         return GGML_STATUS_FAILED;
     }
     ++stats.attention_completed;
     log::debug("potal.attention", "[POTAL_ATTENTION] node=%s role=%s dispatch=HARDWARE limb_jobs=%llu "
-               "loop_ws=%llu bias_mvins=%llu",
+               "loop_ws=%llu bias_mvins=%llu pv_bitplane_stripes=%llu pv_bitplane_jobs=%llu",
                node->name, attention::get_role(node) == attention::role::qk ? "QK" : "PV",
                (unsigned long long)result.jobs, (unsigned long long)result.loops,
-               (unsigned long long)result.bias_updates);
+               (unsigned long long)result.bias_updates, (unsigned long long)result.pv_bitplane_stripes,
+               (unsigned long long)result.pv_bitplane_jobs);
     ggml::gemmini::performance::record_npu("POTAL", "attention", "work_total_cycles", 0, false,
                                           "unavailable_device_counter");
     return GGML_STATUS_SUCCESS;

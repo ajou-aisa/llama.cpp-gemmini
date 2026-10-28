@@ -118,6 +118,16 @@ if (POTAL_E4B2_TESTS)
     endif()
 endif()
 
+option(POTAL_E4C2_0_TESTS "Build software-only prefetch ownership feasibility tests" OFF)
+if (POTAL_E4C2_0_TESTS)
+    add_executable(potal-e4c2-0-test tests/potal-e4c2-0-test.cpp)
+    target_compile_features(potal-e4c2-0-test PRIVATE cxx_std_17)
+    target_link_libraries(potal-e4c2-0-test PRIVATE potal-api)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-e4c2-0-test COMMAND potal-e4c2-0-test)
+    endif()
+endif()
+
 # Hardware smoke test: RISC-V only, and only for the validated DIM16 GEMM path.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     if (POTAL_HW_DIM EQUAL 16)
@@ -431,6 +441,29 @@ if (POTAL_E4B1_TESTS)
     if (NOT CMAKE_CROSSCOMPILING)
         add_test(NAME potal-e4b1-test COMMAND potal-e4b1-test)
     endif()
+endif()
+
+option(POTAL_E4C1_TESTS "Build isolated sequential paired microtile acceptance and benchmark" OFF)
+if (POTAL_E4C1_TESTS)
+    add_executable(potal-e4c1-test tests/potal-e4c1-test.cpp
+        tests/support/e4c1-sequential.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-e4c1-test)
+    target_include_directories(potal-e4c1-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4c1-test PRIVATE ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-e4c1-test COMMAND potal-e4c1-test)
+    endif()
+
+    set(_e4c1_sources ${POTAL_BACKEND_SOURCES})
+    list(REMOVE_ITEM _e4c1_sources ops.cpp)
+    add_executable(potal-e4c1-bench tests/potal-e4c1-bench.cpp
+        tests/potal-e4c1-backend.cpp tests/support/e4c1-sequential.cpp
+        ggml-potal.cpp ${_e4c1_sources})
+    potal_add_backend_settings(potal-e4c1-bench)
+    target_include_directories(potal-e4c1-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4c1-bench PRIVATE ggml)
+    set_source_files_properties(tests/potal-e4c1-test.cpp tests/potal-e4c1-bench.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 endif()
 
 add_executable(potal-full-inference tests/potal-full-inference.cpp)

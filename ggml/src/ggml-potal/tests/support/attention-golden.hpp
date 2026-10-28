@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,155 @@ inline bool evaluate(const stream & a, const stationary & b, role operation,
         }
     }
     out = std::move(values);
+    return true;
+}
+
+// H3-7C: raw command outputs are retained even when the interval certificate
+// refuses the job. This distinguishes exact dots from saturating hardware math.
+struct pv_planes {
+    std::vector<std::vector<int8_t>> digits;
+    std::vector<std::vector<int32_t>> raw;
+    std::vector<int64_t> integers;
+    bool certified = true;
+};
+
+inline bool pv_metadata(const stream & a, const stationary & b) {
+    if (!a.rows || !a.k || !b.n || a.k != b.k || a.kp != b.kp ||
+        a.kp < a.k || a.kp % 32 || a.rows > SIZE_MAX / a.kp ||
+        b.n > SIZE_MAX / b.kp || a.rows > SIZE_MAX / b.n || a.codes.size() != a.rows * a.kp ||
+        b.limbs[0].size() != b.kp * b.n || b.base.size() != b.n ||
+        b.carriers.size() != b.kp / 32 * b.n) return false;
+    for (uint32_t carrier : b.carriers)
+        if (carrier != POTAL_CARRIER_ZERO && carrier > POTAL_CARRIER_MAX_SHIFT) return false;
+    for (size_t i = 0; i < a.rows; ++i)
+        for (size_t k = 0; k < a.kp; ++k)
+            if (a.codes[i*a.kp+k] < 0 || a.codes[i*a.kp+k] > 65535 ||
+                (k >= a.k && a.codes[i*a.kp+k] != 0)) return false;
+    return true;
+}
+
+// Sparse signed binary normalization cancels large carriers BEFORE attempting
+// any bounded shift. No negative shift or shift by the width of __int128.
+inline bool binary_sum(std::map<uint32_t, wide> terms, wide & out) {
+    for (auto it = terms.begin(); it != terms.end(); ++it) {
+        const wide carry = it->second / 2;
+        it->second %= 2;
+        if (carry) {
+            if (it->first == UINT32_MAX) return false;
+            terms[it->first + 1] += carry;
+        }
+    }
+    const wide maximum = std::numeric_limits<wide>::max();
+    const wide minimum = std::numeric_limits<wide>::min();
+    wide value = 0;
+    uint32_t previous = terms.empty() ? 0 : terms.rbegin()->first;
+    for (auto it = terms.rbegin(); it != terms.rend(); ++it) {
+        uint32_t gap = previous - it->first;
+        if (value == 0) gap = 0;
+        bool consumed = false;
+        while (gap) {
+            // 2^127 - 1 fits even though the intermediate doubling does not.
+            if (gap == 1 && value == maximum/2+1 && it->second == -1) {
+                value = maximum;
+                consumed = true;
+                break;
+            }
+            if (value > maximum / 2 || value < minimum / 2) return false;
+            value *= 2;
+            --gap;
+        }
+        if (!consumed) {
+            if ((it->second > 0 && value == maximum) ||
+                (it->second < 0 && value == minimum)) return false;
+            value += it->second;
+        }
+        previous = it->first;
+    }
+    if (value != 0) {
+        if (previous >= 128) return false;
+        while (previous--) {
+            if (value > maximum / 2 || value < minimum / 2) return false;
+            value *= 2;
+        }
+    }
+    out = value;
+    return true;
+}
+
+inline bool pv_exact(const stream & a, const stationary & b, std::vector<wide> & out) {
+    if (!pv_metadata(a,b)) return false;
+    std::vector<wide> values(a.rows*b.n);
+    for (size_t i = 0; i < a.rows; ++i)
+        for (size_t j = 0; j < b.n; ++j) {
+            std::map<uint32_t, wide> terms;
+            for (size_t k = 0; k < a.k; ++k) {
+                const auto carrier = b.carriers[k/32*b.n+j];
+                if (carrier != POTAL_CARRIER_ZERO)
+                    terms[carrier] += wide{a.codes[i*a.kp+k]} * b.limbs[0][k*b.n+j];
+            }
+            if (!binary_sum(std::move(terms),values[i*b.n+j])) return false;
+        }
+    out = std::move(values);
+    return true;
+}
+
+inline bool pv_bitplanes(const stream & a, const stationary & b, pv_planes & out) {
+    if (!pv_metadata(a,b)) return false;
+    pv_planes result;
+    int32_t maximum = *std::max_element(a.codes.begin(),a.codes.end());
+    size_t count = 1;
+    for (int32_t x = maximum / 2; x; x /= 2) ++count;
+    result.digits.assign(count,std::vector<int8_t>(a.codes.size()));
+    result.raw.assign(count,std::vector<int32_t>(a.rows*b.n));
+    result.integers.assign(a.rows*b.n,0);
+    int64_t place = 1;
+    for (size_t p = 0; p < count; ++p, place *= 2) {
+        for (size_t x = 0; x < a.codes.size(); ++x)
+            result.digits[p][x] = int8_t((a.codes[x] / place) % 2);
+        for (size_t i = 0; i < a.rows; ++i)
+            for (size_t j = 0; j < b.n; ++j) {
+                int32_t acc = 0;
+                wide prefix_low = 0, prefix_high = 0;
+                for (size_t begin = 0; begin < a.kp; begin += 16) {
+                    int low = 1, high = 0;
+                    wide positive = 0, negative = 0, dot = 0;
+                    for (size_t k = begin; k < begin+16; ++k) {
+                        const int digit = result.digits[p][i*a.kp+k];
+                        const int v = b.limbs[0][k*b.n+j];
+                        dot += digit * v;
+                        if (k < a.k) {
+                            low = std::min(low,digit);
+                            high = std::max(high,digit);
+                            positive += std::max(v,0);
+                            negative += std::min(v,0);
+                        }
+                    }
+                    if (begin >= a.k) low = high = 0;
+                    wide lower = low*positive + high*negative;
+                    wide upper = high*positive + low*negative;
+                    const auto carrier = b.carriers[begin/32*b.n+j];
+                    if (carrier == POTAL_CARRIER_ZERO) lower = upper = 0;
+                    else if (carrier >= 32) {
+                        if (lower || upper) result.certified = false;
+                        // Saturated bounds still force rejection without a wide shift.
+                        lower = shifted(lower,carrier,0);
+                        upper = shifted(upper,carrier,0);
+                    } else {
+                        lower *= wide{1} << carrier;
+                        upper *= wide{1} << carrier;
+                    }
+                    prefix_low += lower;
+                    prefix_high += upper;
+                    if (lower < INT32_MIN || upper > INT32_MAX ||
+                        prefix_low < INT32_MIN || prefix_high > INT32_MAX)
+                        result.certified = false;
+                    acc = clamp32(wide{acc} + shifted(dot,carrier,0));
+                }
+                result.raw[p][i*b.n+j] = acc;
+                result.integers[i*b.n+j] += int64_t(acc)*place;
+            }
+    }
+    out = std::move(result);
     return true;
 }
 

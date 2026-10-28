@@ -224,13 +224,14 @@ void test_reference() {
     b.limbs[0][32] = 0;
     std::vector<int64_t> rejected = {778899};
     check("PV outside-INT32 exact bias rejected by golden",!golden::column_bias(b,0,bias));
-    check("PV outside-INT32 exact bias explicitly unsupported",
-          attention::reference(a,b,role::pv,rejected) == POTAL_ERR_UNSUPPORTED);
-    check("PV rejected bias publishes no partial output",rejected == std::vector<int64_t>{778899});
+    check("PV outside-INT32 bias now selects exact bitplanes",
+          attention::reference(a,b,role::pv,rejected) == POTAL_OK &&
+          rejected == std::vector<int64_t>{2147483648LL});
 
     b.limbs[0][0] = -2;
-    check("PV negative outside-INT32 bias explicitly unsupported",
-          attention::reference(a,b,role::pv,rejected) == POTAL_ERR_UNSUPPORTED);
+    check("PV negative outside-INT32 bias now selects exact bitplanes",
+          attention::reference(a,b,role::pv,rejected) == POTAL_OK &&
+          rejected == std::vector<int64_t>{-4294967296LL});
     b.limbs[0][0] = -1;
     check("PV exact INT32_MIN bias remains supported",golden::column_bias(b,0,bias) && bias == INT32_MIN);
     compare_reference("PV final atomic addition at negative bias limit",a,b,role::pv);
@@ -786,6 +787,8 @@ void test_pv_execute() {
               result.loops == upper.loops + low.main_loops &&
               result.scale_writes == upper.writes + low.scale_writes &&
               result.scale_releases == upper.releases + low.scale_releases);
+        check(name + " old representable bias never selects bitplanes",
+              result.pv_bitplane_stripes == 0 && result.pv_bitplane_jobs == 0);
     }
     graph g(role::pv, 33, 3, 2);
     g.w.fill(1); g.a.fill(1);
@@ -804,6 +807,409 @@ void test_pv_execute() {
     potal_paired_session * fresh = nullptr;
     check("PV successful cleanup releases accelerator ownership", potal_paired_session_open(&sink, &fresh) == POTAL_OK);
     check("PV cleanup session closes", potal_paired_session_close(fresh) == POTAL_OK);
+}
+
+// Test-only math never serves as a runner or CPU fallback.
+void pv_plane_reference(const std::string & name, const stream & a, const stationary & b,
+                        bool accepted) {
+    golden::pv_planes planes;
+    if (!check(name+" original-code plane oracle",golden::pv_bitplanes(a,b,planes))) return;
+    bool digits_ok = !planes.digits.empty() && planes.digits.size() <= 16;
+    for (size_t x = 0; x < a.codes.size(); ++x) {
+        int32_t reconstructed = 0, place = 1;
+        for (const auto & plane : planes.digits) {
+            digits_ok = digits_ok && (plane[x] == 0 || plane[x] == 1);
+            reconstructed += plane[x]*place;
+            place *= 2;
+        }
+        digits_ok = digits_ok && reconstructed == a.codes[x];
+    }
+    check(name+" unsigned digits reconstruct original codes",digits_ok);
+    std::vector<int64_t> got{778899};
+    const auto status = attention::reference(a,b,role::pv,got);
+    if (!accepted) {
+        check(name+" certificate refuses before publication",
+              !planes.certified && status == POTAL_ERR_UNSUPPORTED &&
+              got == std::vector<int64_t>{778899});
+        return;
+    }
+    std::vector<golden::wide> exact;
+    check(name+" certificate and independent wide dot",planes.certified && golden::pv_exact(a,b,exact));
+    bool equal = exact.size() == planes.integers.size();
+    for (size_t x = 0; x < exact.size(); ++x)
+        equal = equal && exact[x] == planes.integers[x];
+    check(name+" raw planes reconstruct exact wide quantized dot",equal);
+    check(name+" production reference equals independent planes",
+          status == POTAL_OK && got == planes.integers);
+}
+
+void test_pv_bitplane_reference() {
+    // New acceptance is triggered by column bias, never by a normal PV job.
+    for (int sign : {-1,1}) {
+        auto a = make_stream(1,64,std::vector<int32_t>(64,0),role::pv);
+        a.codes[0] = 1; a.codes[16] = 65535;
+        std::vector<int32_t> v(64,0);
+        v[0] = sign*64; v[32] = sign*64;
+        auto b = make_weight(64,1,v,role::pv,24);
+        b.carriers[1] = 0;
+        pv_plane_reference("PV signed overflow "+std::to_string(sign),a,b,true);
+        // All zeros still execute one plane when the bias requires extension.
+        a.codes.assign(a.codes.size(),0);
+        golden::pv_planes zero;
+        check("PV zero codes retain one unsigned plane",
+              golden::pv_bitplanes(a,b,zero) && zero.digits.size() == 1);
+        pv_plane_reference("PV zero codes and overflowing bias",a,b,true);
+    }
+    auto a = make_stream(1,96,std::vector<int32_t>(96,128),role::pv);
+    std::vector<int32_t> v(96,0);
+    v[0] = 127; v[32] = 127;
+    for (size_t k = 64; k < 72; ++k) v[k] = 127;
+    v[72] = 7;
+    auto b = make_weight(96,1,v,role::pv);
+    b.carriers = {17,10,0};
+    int32_t bias = 0;
+    check("PV largest positive multiple128 bias endpoint",
+          golden::column_bias(b,0,bias) && bias == 2147483520);
+    compare_reference("PV positive endpoint stays old biased limbs",a,b,role::pv);
+    v.assign(96,0); v[0] = -1;
+    b = make_weight(96,1,v,role::pv,24);
+    check("PV exact negative bias endpoint",golden::column_bias(b,0,bias) && bias == INT32_MIN);
+    compare_reference("PV negative endpoint stays old biased limbs",a,b,role::pv);
+
+    // Boundaries derive from ORIGINAL codes, not the deliberately stale limbs.
+    for (int32_t code : {127,128,255,256,65535}) {
+        a = make_stream(1,64,std::vector<int32_t>(64,0),role::pv);
+        a.codes[0] = code;
+        v.assign(64,0); v[0] = 1;
+        b = make_weight(64,1,v,role::pv,24);
+        // 65535 can saturate its exact dot, but each unsigned bit is safe.
+        pv_plane_reference("PV radix boundary "+std::to_string(code),a,b,true);
+        const auto balanced_digits = golden::digits(code);
+        int64_t balanced_code = 0, radix = 1;
+        for (int8_t digit : balanced_digits) {
+            balanced_code += int64_t(digit)*radix;
+            radix *= 256;
+        }
+        golden::pv_planes planes;
+        check("PV boundary independent balanced candidate and minimal unsigned planes",
+              balanced_code == code && golden::pv_bitplanes(a,b,planes) &&
+              planes.digits.size() == (code == 127 ? 7 : code <= 255 ? 8 : code == 256 ? 9 : 16));
+    }
+    a = make_stream(1,32,std::vector<int32_t>(32,0),role::pv);
+    a.codes[0] = 128;
+    v.assign(32,0); v[0] = 127;
+    b = make_weight(32,1,v,role::pv,24);
+    const auto candidate = golden::digits(128);
+    const int64_t balanced = int64_t(golden::shifted(golden::wide{candidate[0]}*127,24,0)) +
+                            256LL*golden::shifted(golden::wide{candidate[1]}*127,24,0);
+    check("PV unrestricted balanced256 counterexample",
+          balanced == 543313362944LL && int64_t(128)*127*(1LL<<24) == 272730423296LL);
+    pv_plane_reference("PV unsigned bit7 avoids balanced256 saturation",a,b,true);
+
+    a = make_stream(1,32,std::vector<int32_t>(32,0),role::pv);
+    a.codes[0] = 1;
+    v.assign(32,0); v[0] = -1;
+    b = make_weight(32,1,v,role::pv,31);
+    pv_plane_reference("PV exact negative SCU endpoint",a,b,true);
+    b.limbs[0][0] = 1;
+    pv_plane_reference("PV positive carrier31 cannot be certified",a,b,false);
+    b.carriers[0] = 32;
+    pv_plane_reference("PV nonzero carrier32 cannot be certified",a,b,false);
+    a.codes[0] = 0;
+    pv_plane_reference("PV zero contribution at carrier32",a,b,true);
+    a.codes[0] = 128;
+    b = make_weight(32,1,v,role::pv,24);
+
+    // A mixed digit interval loses correlation with V and must be conservative.
+    a.codes[0] = 1; a.codes[1] = 0;
+    v[0] = 127; v[1] = -127; v[2] = 127;
+    b = make_weight(32,1,v,role::pv,24);
+    b.limbs[0][16] = 1; // Outside-INT32 bias; mixed signs in first DIM16.
+    pv_plane_reference("PV mixed-sign interval SCU refusal",a,b,false);
+    a = make_stream(1,64,std::vector<int32_t>(64,1),role::pv);
+    v.assign(64,0); v[0] = 127; v[16] = 127; v[32] = -127;
+    b = make_weight(64,1,v,role::pv,24);
+    pv_plane_reference("PV ascending K prefix ACC refusal",a,b,false);
+    // Large carriers are safe only for proven-zero intervals.
+    a.codes.assign(a.codes.size(),0);
+    b.carriers = {200,199};
+    pv_plane_reference("PV large carriers proven zero",a,b,true);
+    std::vector<golden::wide> exact;
+    check("PV large carrier exact zero has no undefined shift",golden::pv_exact(a,b,exact) && exact[0] == 0);
+    a.codes[0] = 1;
+    pv_plane_reference("PV large nonzero carrier refuses",a,b,false);
+    b.carriers.assign(2,POTAL_CARRIER_ZERO);
+    compare_reference("PV ZERO carriers retain biased path",a,b,role::pv);
+    golden::pv_planes zero;
+    check("PV ZERO raw plane outputs",golden::pv_bitplanes(a,b,zero) &&
+          zero.certified && zero.integers == std::vector<int64_t>{0});
+
+    // Exact cross-block cancellation outside INT128 remains representable.
+    v.assign(64,0); v[0] = 1; v[32] = -2;
+    b = make_weight(64,1,v,role::pv);
+    b.carriers = {200,199};
+    a = make_stream(1,64,std::vector<int32_t>(64,128),role::pv);
+    check("PV independent wide cancellation beyond carrier width",
+          golden::pv_exact(a,b,exact) && exact == std::vector<golden::wide>{0});
+    golden::wide near_limit = 0;
+    check("PV exact wide near-limit cancellation remains representable",
+          golden::binary_sum({{127,1},{0,-1}},near_limit) &&
+          near_limit == std::numeric_limits<golden::wide>::max());
+    std::vector<int64_t> cancelled{778899};
+    check("PV wide cross-block bias cancellation remains old",
+          attention::reference(a,b,role::pv,cancelled) == POTAL_OK &&
+          cancelled == std::vector<int64_t>{0});
+
+    // Invalid code extent, range, padding, and stationary metadata publish nothing.
+    a = make_stream(1,33,std::vector<int32_t>(33,1),role::pv);
+    v.assign(33,0); v[0] = 64;
+    b = make_weight(33,1,v,role::pv,24);
+    auto refuse = [&](const stream & x, const stationary & w) {
+        std::vector<int64_t> got{778899};
+        golden::pv_planes invalid;
+        check("PV invalid original codes/metadata reject atomically",
+              !golden::pv_bitplanes(x,w,invalid) &&
+              attention::reference(x,w,role::pv,got) != POTAL_OK &&
+              got == std::vector<int64_t>{778899});
+    };
+    auto invalid = a; invalid.codes.pop_back(); refuse(invalid,b);
+    invalid = a; invalid.codes[0] = -1; refuse(invalid,b);
+    invalid = a; invalid.codes[0] = 65536; refuse(invalid,b);
+    invalid = a; invalid.codes[33] = 1; refuse(invalid,b);
+    auto bad_weight = b; bad_weight.carriers.pop_back(); refuse(a,bad_weight);
+    bad_weight = b; bad_weight.limbs[0].pop_back(); refuse(a,bad_weight);
+    bad_weight = b; bad_weight.base.clear(); refuse(a,bad_weight);
+    bad_weight = b; bad_weight.carriers[0] = 0xffffffffu; refuse(a,bad_weight);
+    invalid = a; invalid.kp = 32; refuse(invalid,b);
+}
+
+void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject = false) {
+    graph g(role::pv,k,n,m,true,heads,1,1,1,GGML_TYPE_F32);
+    g.w.fill(0); g.a.fill(0);
+    for (size_t h = 0; h < heads; ++h) {
+        for (size_t j = 0; j < n; ++j) {
+            const float sign = j%2 ? -1.0f : 1.0f;
+            g.w.set(0,j,sign,h);
+            if (k > 32) g.w.set(32,j,sign*(h+1 == heads ? std::ldexp(1.0f,-24) : 0.5f),h);
+            if (reject) g.w.set(1,j,sign,h);
+        }
+        for (size_t i = 0; i < m; ++i) {
+            g.a.set(0,i,std::ldexp(1.0f,reject ? -15 : -16),h);
+            // Moving the maximum into V's nonzero DIM16 creates an unsafe
+            // unsigned-plane contribution, before any command may be issued.
+            g.a.set(reject ? 1 : 16,i,1.0f-std::ldexp(1.0f,reject ? -15 : -16),h);
+        }
+    }
+    struct job {
+        stream a;
+        stationary b;
+        size_t plane;
+        bool bitplane;
+        std::vector<int32_t> raw;
+    };
+    std::vector<job> jobs;
+    std::vector<float> expected(heads*m*n);
+    size_t selected_stripes = 0, selected_jobs = 0, old_stripes = 0;
+    potal_tile_plan stripes;
+    if (!check("PV fixture stripe selection",potal_tile_select(m,n,(k+31)/32*32,2,&stripes) == POTAL_OK)) return;
+    for (size_t h = 0; h < heads; ++h) {
+        stationary b;
+        if (!check("PV real V preparation",attention::prepare_stationary(g.w.t,h,0,role::pv,b) == POTAL_OK)) return;
+        for (size_t begin = 0; begin < m; begin += stripes.tile_I*16) {
+            stream a;
+            const size_t rows = std::min(m-begin,stripes.tile_I*16);
+            if (!check("PV real P preparation",attention::prepare_stream(g.a.t,h,0,begin,rows,role::pv,a) == POTAL_OK)) return;
+            std::vector<int32_t> bias;
+            const auto bias_status = attention::column_bias(b,bias);
+            const bool bitplane = bias_status == POTAL_ERR_UNSUPPORTED;
+            check("PV extension trigger is only strict column bias",
+                  bias_status == POTAL_OK || bitplane);
+            std::vector<int64_t> integers;
+            if (bitplane) {
+                golden::pv_planes planes;
+                if (!check("PV prepared unsigned planes",golden::pv_bitplanes(a,b,planes))) return;
+                if (reject) {
+                    check("PV rejected fixture requires interval refusal",!planes.certified);
+                    continue;
+                }
+                std::vector<golden::wide> exact;
+                if (!check("PV accepted fixture independent certificate",
+                           planes.certified && golden::pv_exact(a,b,exact))) return;
+                bool equal = exact.size() == planes.integers.size();
+                for (size_t x = 0; x < exact.size(); ++x) equal = equal && exact[x] == planes.integers[x];
+                check("PV accepted fixture exact wide integer equality",equal);
+                integers = planes.integers;
+                for (size_t p = 0; p < planes.raw.size(); ++p)
+                    jobs.push_back({a,b,p,true,planes.raw[p]});
+                ++selected_stripes;
+                selected_jobs += planes.raw.size();
+                if (k > 32) {
+                    check("PV normalized guard fixture constants",
+                          a.scale == -16 && a.codes[0] == 1 && a.codes[16] == 65535 &&
+                          b.base[0] == -30 && b.carriers[0] == 24 &&
+                          b.carriers[b.n] == 0 && b.limbs[0][0] == 64 &&
+                          b.limbs[0][32*b.n] == 64);
+                    bool normalized = true;
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < n; ++j) {
+                            normalized = normalized &&
+                                integers[i*n+j] == (j%2 ? -1LL : 1LL)*(1LL<<30);
+                            for (size_t block = 2; block < b.kp/32; ++block)
+                                normalized = normalized && b.carriers[block*b.n+j] == POTAL_CARRIER_ZERO;
+                        }
+                    check("PV normalized exact output is signed 2^-16",normalized);
+                }
+            } else {
+                if (!check("PV old path independent arithmetic",golden::evaluate(a,b,role::pv,integers))) return;
+                for (size_t p = 1; p < a.limb_count; ++p) jobs.push_back({a,b,p,false,{}});
+                ++old_stripes;
+            }
+            for (size_t i = 0; i < rows; ++i)
+                for (size_t j = 0; j < n; ++j)
+                    expected[(h*m+begin+i)*n+j] = float(std::ldexp(double(integers[i*n+j]),a.scale+b.base[j]));
+        }
+    }
+    potal_test::emulator emu;
+    auto ops = emu.ops();
+    potal_stripe_session session = {{&ops,0,{}}};
+    potal_test::attention_emulator corrected;
+    auto sink = corrected.sink();
+    size_t ordinary_calls = 0, corrected_calls = 0;
+    bool descriptors = true, raw_equal = true;
+    const auto before = g.out.storage;
+    const auto result = attention::execute(&g.out.t,
+        [&](const potal_stripe_gemm_desc & d) {
+            const size_t index = ordinary_calls++;
+            if (index >= jobs.size()) {
+                descriptors = false;
+                return planned_result{};
+            }
+            const auto & job = jobs[index];
+            const auto & a = job.a;
+            const auto & b = job.b;
+            descriptors = descriptors && !emu.in_flight && d.k == a.kp && d.m == a.rows && d.n == b.n &&
+                          d.work_kind == (job.plane == 0 ? POTAL_STRIPE_WORK_MAIN : POTAL_STRIPE_WORK_RESIDUAL);
+            potal_tile_plan plan;
+            if (potal_tile_select(a.rows,b.n,a.kp,2,&plan) != POTAL_OK) descriptors = false;
+            else {
+                plan.tile_K = std::min(plan.tile_K,a.kp/16);
+                if (job.bitplane)
+                    plan.tile_K = std::min(plan.tile_K,size_t(POTAL_HW_BANK_ROWS)/
+                                          (std::max(plan.tile_I,plan.tile_J)*16));
+                while (plan.tile_K && (a.kp/16 % plan.tile_K || plan.tile_K%2)) --plan.tile_K;
+                descriptors = descriptors && d.tile_i == plan.tile_I && d.tile_j == plan.tile_J &&
+                              d.tile_k == plan.tile_K;
+            }
+            int64_t place = 1;
+            for (size_t p = 0; p < job.plane; ++p) place *= 2;
+            for (size_t i = 0; i < d.m; ++i)
+                for (size_t x = 0; x < d.lda; ++x) {
+                    const int digit = x >= a.k ? 0 : job.bitplane ?
+                        int(a.codes[i*a.kp+x]/place%2) : a.limbs[job.plane][i*a.kp+x];
+                    descriptors = descriptors && d.a[i*d.lda+x] == digit;
+                }
+            for (size_t x = 0; x < d.k; ++x)
+                for (size_t j = 0; j < d.n; ++j)
+                    descriptors = descriptors && d.b[x*d.ldb+j] == b.limbs[0][x*b.n+j];
+            for (size_t block = 0; block < d.k/32; ++block)
+                for (size_t j = 0; j < d.n; ++j)
+                    descriptors = descriptors && d.carriers[block*d.carrier_stride+j] == b.carriers[block*b.n+j];
+            const auto completed = run_planned_stripe_gemm(session,d);
+            if (job.bitplane && completed.ok)
+                for (size_t i = 0; i < d.m; ++i)
+                    for (size_t j = 0; j < d.n; ++j)
+                        raw_equal = raw_equal && d.c[i*d.ldc+j] == job.raw[i*d.n+j];
+            return completed;
+        },
+        [&](const potal_stripe_gemm_desc & d, const int32_t * bias, size_t columns) {
+            ++corrected_calls;
+            return attention::run_corrected(d,bias,columns,&sink);
+        });
+    const std::string name = "PV H3-7C "+std::to_string(m)+"x"+std::to_string(n)+"x"+std::to_string(k)+
+                             " heads="+std::to_string(heads);
+    if (reject) {
+        check(name+" refuses before any command or output",
+              result.status == POTAL_ERR_UNSUPPORTED && !result.fatal && ordinary_calls == 0 &&
+              corrected_calls == 0 && emu.commands.empty() && corrected.records.empty() &&
+              g.out.storage == before && result.pv_bitplane_jobs == 0);
+    } else {
+        bool bits_equal = result.status == POTAL_OK;
+        for (size_t h = 0; h < heads; ++h)
+            for (size_t i = 0; i < m; ++i)
+                for (size_t j = 0; j < n; ++j) {
+                    const float got = g.out.get(j,i,h);
+                    const float want = expected[(h*m+i)*n+j];
+                    bits_equal = bits_equal && std::memcmp(&got,&want,sizeof(float)) == 0;
+                }
+        check(name+" bitwise F32 independent output",bits_equal);
+        check(name+" raw completed command C and descriptors",raw_equal && descriptors && ordinary_calls == jobs.size());
+        check(name+" selects only required stripes and completed planes",
+              result.pv_bitplane_stripes == selected_stripes && result.pv_bitplane_jobs == selected_jobs &&
+              corrected_calls == old_stripes && result.correction_jobs == old_stripes &&
+              result.jobs == ordinary_calls+corrected_calls);
+        if (heads == 12)
+            check(name+" historical guard class preserves first eleven heads",
+                  old_stripes == 11 && selected_stripes == 1 && selected_jobs == 16);
+        if (old_stripes == 0)
+            check(name+" no corrected runner or bias MVIN",corrected_calls == 0 && corrected.bias_mvins == 0);
+    }
+    check(name+" balanced scales and clean DMA",
+          !emu.in_flight && !emu.scale_miss && emu.scales.empty() && emu.writes == emu.releases &&
+          corrected.errors.empty() && !corrected.scale_miss && corrected.scale_writes == corrected.scale_releases);
+}
+
+void test_pv_bitplane_execute() {
+    // Padded K32/64/96; partial M/N; multi-tile M/N; single-row Decode.
+    pv_bitplane_execute(32,1,3,1);
+    pv_bitplane_execute(33,3,19,1);
+    pv_bitplane_execute(65,17,33,1);
+    pv_bitplane_execute(96,33,65,1);
+    pv_bitplane_execute(4097,1,3,1);
+    pv_bitplane_execute(33,2,3,1,true);
+    // Historical shape and guard class, NOT the unrecorded original operands.
+    pv_bitplane_execute(288,1,64,12);
+
+    for (bool fatal : {false,true}) {
+        graph g(role::pv,64,1,1);
+        g.w.fill(0); g.a.fill(0);
+        g.w.set(0,0,1); g.w.set(32,0,std::ldexp(1.0f,-24));
+        g.a.set(0,0,std::ldexp(1.0f,-16));
+        g.a.set(16,0,1.0f-std::ldexp(1.0f,-16));
+        const auto before = g.out.storage;
+        potal_test::emulator emu;
+        auto ops = emu.ops();
+        potal_stripe_session session = {{&ops,0,{}}};
+        size_t calls = 0;
+        const auto result = attention::execute(&g.out.t,
+            [&](const potal_stripe_gemm_desc & d) {
+                if (++calls == 2) {
+                    if (!fatal) {
+                        planned_result failed;
+                        failed.status = POTAL_ERR_BAD_RESPONSE;
+                        failed.stage = "between_pv_bitplanes";
+                        return failed;
+                    }
+                    emu.fail_fence_at = int(emu.fence_calls + 1);
+                }
+                return run_planned_stripe_gemm(session,d);
+            },
+            [](const potal_stripe_gemm_desc &, const int32_t *, size_t) { return planned_result{}; });
+        check("PV later-plane failure preserves completed jobs and publication",
+              calls == 2 && result.status != POTAL_OK && result.fatal == fatal &&
+              result.pv_bitplane_stripes == 1 && result.pv_bitplane_jobs == 1 &&
+              result.correction_jobs == 0 && result.bias_updates == 0 && g.out.storage == before);
+        if (fatal) {
+            check("PV fatal plane retains unknown DMA and Scale ownership",
+                  result.status == POTAL_HW_BAD_COMMAND && result.stage &&
+                  std::strcmp(result.stage,"fence") == 0 && emu.in_flight &&
+                  !emu.scales.empty() && emu.writes > emu.releases && session.ws.report.fatal);
+        } else {
+            check("PV recoverable plane failure leaves completed DMA clean",
+                  result.status == POTAL_ERR_BAD_RESPONSE && result.stage &&
+                  std::strcmp(result.stage,"between_pv_bitplanes") == 0 &&
+                  !emu.in_flight && emu.scales.empty() && emu.writes == emu.releases);
+        }
+    }
 }
 
 void test_contract() {
@@ -884,6 +1290,8 @@ int main() {
     test_contract();
     test_execute();
     test_pv_execute();
+    test_pv_bitplane_reference();
+    test_pv_bitplane_execute();
     ggml_free(context);
     std::printf("POTAL_ATTENTION_TEST %s\n",failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

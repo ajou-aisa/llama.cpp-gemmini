@@ -78,11 +78,12 @@ static void test_scale_control(void) {
 
     /* Hardware checks on raw encodings, priority per PoTalScaleCommandIngress. */
     expect("A hw invalid carrier", raw_write(key(4, 1, 0), 0xffffffffu), POTAL_HW_INVALID_SCALE);
-    expect("A hw invalid column", raw_write(key(6, 1, DIM), 1), POTAL_HW_INVALID_COLUMN);
+    /* DIM16 has four column bits; column 16 sets a reserved encoding bit. */
+    expect("A hw invalid column", raw_write(key(6, 1, DIM), 1), POTAL_HW_INVALID_ENCODING);
     expect("A hw reserved rs1 bit", raw_write(key(5, 1, 0) | (1ull << 22), 1), POTAL_HW_INVALID_ENCODING);
     expect("A hw nonzero rs2 high", raw_write(key(5, 1, 0), 1ull << 32), POTAL_HW_INVALID_ENCODING);
     expect("A hw encoding before column", raw_write(key(6, 1, DIM) | (1ull << 22), 1), POTAL_HW_INVALID_ENCODING);
-    expect("A hw column before carrier", raw_write(key(6, 1, DIM), 0xffffffffu), POTAL_HW_INVALID_COLUMN);
+    expect("A hw encoding before carrier", raw_write(key(6, 1, DIM), 0xffffffffu), POTAL_HW_INVALID_ENCODING);
     expect("A hw fence nonzero rs1", (potal_status)potal_rocc_fence(1, 0), POTAL_HW_INVALID_ENCODING);
     /* Rejected writes must not have allocated their slots. */
     expect("A rejected slot 4 not allocated", potal_scale_release(4, 1, 0), POTAL_HW_RELEASE_MISS);

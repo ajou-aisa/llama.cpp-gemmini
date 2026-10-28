@@ -463,6 +463,85 @@ void qk_saturation(ggml_backend_t hardware, ggml_backend_t cpu) {
                 (unsigned long long)(after.attention_loop_ws - before.attention_loop_ws));
 }
 
+bool pv_range() {
+    // Historical shape and rejection class, not unrecorded H3-7 tensor values.
+    // Heads 0..10 keep the original path; head 11 has wide positive/negative
+    // biases. A normalized P row puts its large code in a zero-V microtile.
+    constexpr size_t k = 288, n = 64, heads = 12;
+    ggml_init_params params{4u << 20, nullptr, false};
+    ggml_context_ptr context(ggml_init(params));
+    if (!context) { check("PV range context", false); return false; }
+    auto * weight = ggml_new_tensor_4d(context.get(), GGML_TYPE_F16, k, n, heads, 1);
+    auto * input = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, k, 1, heads, 1);
+    for (size_t h = 0; h < heads; ++h) {
+        for (size_t x = 0; x < k; ++x) {
+            set(input, x, 0, h, 0, x == 0 ? std::ldexp(1.0f, -16) :
+                                      x == 16 ? 1.0f - std::ldexp(1.0f, -16) : 0);
+            for (size_t j = 0; j < n; ++j) {
+                const float sign = j % 2 ? -1.0f : 1.0f;
+                set(weight, x, j, h, 0, x == 0 ? sign :
+                    x == 32 ? std::ldexp(sign, h + 1 == heads ? -24 : -1) : 0);
+            }
+        }
+    }
+    bool prepared = true;
+    for (size_t h = 0; h < heads; ++h) {
+        attention::stationary w;
+        attention::stream a;
+        std::vector<int32_t> correction{12345};
+        prepared = prepared &&
+            attention::prepare_stationary(*weight, h, 0, attention::role::pv, w) == POTAL_OK &&
+            attention::prepare_stream(*input, h, 0, 0, 1, attention::role::pv, a) == POTAL_OK;
+        if (!prepared) break;
+        const auto status = attention::column_bias(w, correction);
+        prepared = a.scale == -16 && a.codes[0] == 1 && a.codes[16] == 65535 &&
+            status == (h + 1 == heads ? POTAL_ERR_UNSUPPORTED : POTAL_OK);
+        if (h + 1 == heads) {
+            prepared = prepared && correction == std::vector<int32_t>{12345};
+            for (size_t j = 0; prepared && j < n; ++j) {
+                prepared = w.base[j] == -30 && w.carriers[j] == 24 &&
+                    w.carriers[n + j] == 0 &&
+                    w.limbs[0][j] == (j % 2 ? -64 : 64) &&
+                    w.limbs[0][32 * n + j] == (j % 2 ? -64 : 64);
+            }
+        }
+    }
+    check("PV range unchanged codes and exact INT32 bias rejection", prepared);
+    if (!prepared) return false;
+    auto * output = ggml_mul_mat(context.get(), weight, input);
+    ggml_gemmini_set_attention_role(output, GGML_GEMMINI_ATTENTION_PV);
+    const auto result = attention::execute_hardware(output);
+    const bool success = result.status == POTAL_OK && !result.fatal;
+    check("PV range real hardware execution", success);
+    if (!success) return false;
+    bool exact = true;
+    for (size_t h = 0; h < heads; ++h) {
+        for (size_t j = 0; j < n; ++j) {
+            float actual;
+            const auto * source = static_cast<const char *>(output->data) +
+                                  h * output->nb[2] + j * output->nb[0];
+            std::memcpy(&actual, source, sizeof(actual));
+            exact = exact && actual == std::ldexp(j % 2 ? -1.0f : 1.0f, -16);
+        }
+    }
+    const bool commands = result.jobs == 49 && result.pv_bitplane_stripes == 1 &&
+        result.pv_bitplane_jobs == 16 && result.correction_jobs == 11 && result.bias_updates == 44 &&
+        result.qk_limb_jobs == 0 && result.loops >= result.jobs && result.fences >= result.loops &&
+        result.scale_writes > 0 && result.scale_writes == result.scale_releases;
+    check("PV range exact independently calculated F32 output", exact);
+    check("PV range old bias and new plane commands balanced", commands);
+    std::printf("POTAL_ATTENTION_PV_RANGE M=1 N=%zu K=%zu heads=%zu "
+                "jobs=%llu bitplane_stripes=%llu bitplane_jobs=%llu corrections=%llu bias_mvins=%llu "
+                "loop_ws=%llu fences=%llu scale_writes=%llu scale_releases=%llu exact=%d status=%d\n",
+                n, k, heads, (unsigned long long)result.jobs,
+                (unsigned long long)result.pv_bitplane_stripes, (unsigned long long)result.pv_bitplane_jobs,
+                (unsigned long long)result.correction_jobs, (unsigned long long)result.bias_updates,
+                (unsigned long long)result.loops, (unsigned long long)result.fences,
+                (unsigned long long)result.scale_writes, (unsigned long long)result.scale_releases,
+                exact, int(result.status));
+    return exact && commands;
+}
+
 void bias_saturation() {
     hp1_operands operands;
     if (!operands.allocate({16, 16, 32})) { check("bias DMA allocation", false); return; }
@@ -501,8 +580,9 @@ void bias_saturation() {
 
 int main(int argc, char ** argv) {
     const bool multi_panel_only = argc == 2 && std::strcmp(argv[1], "--multi-panel-only") == 0;
-    if (argc != 1 && !multi_panel_only) {
-        std::fprintf(stderr, "Usage: %s [--multi-panel-only]\n", argv[0]);
+    const bool pv_range_only = argc == 2 && std::strcmp(argv[1], "--pv-range-only") == 0;
+    if (argc != 1 && !multi_panel_only && !pv_range_only) {
+        std::fprintf(stderr, "Usage: %s [--multi-panel-only|--pv-range-only]\n", argv[0]);
         return 2;
     }
     ggml_init_params params{1u << 20, nullptr, true};
@@ -510,6 +590,11 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr hardware(ggml_backend_potal_init()), cpu(ggml_backend_cpu_init());
     if (!initialization || !hardware || !cpu) return 1;
     ggml_backend_cpu_set_n_threads(cpu.get(), 3);
+    if (pv_range_only) {
+        const bool success = pv_range();
+        std::printf("POTAL_ATTENTION_SMOKE %s\n", success && !failures ? "PASS" : "FAIL");
+        return success && !failures ? 0 : 1;
+    }
     if (!multi_panel_only) {
         run_case(hardware.get(), cpu.get(), attention::role::qk, 64, 4, GGML_TYPE_F16, true, true);
         run_case(hardware.get(), cpu.get(), attention::role::qk, 33, 1, GGML_TYPE_F32, true, false);

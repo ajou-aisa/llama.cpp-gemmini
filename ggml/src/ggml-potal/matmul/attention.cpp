@@ -128,9 +128,9 @@ int32_t scu(int32_t partial, uint32_t carrier, unsigned offset) {
     return sat32(int64_t(partial) * (int64_t{1} << shift));
 }
 
-void reconstruct(int64_t & accumulator, int64_t part, size_t limb) {
+void reconstruct(int64_t & accumulator, int64_t part, size_t limb, unsigned digit_bits = bits) {
     const __int128_t value = static_cast<__int128_t>(accumulator) +
-                             static_cast<__int128_t>(part) * (static_cast<__int128_t>(1) << (bits * limb));
+                             static_cast<__int128_t>(part) * (static_cast<__int128_t>(1) << (digit_bits * limb));
     require(value >= INT64_MIN && value <= INT64_MAX, POTAL_ERR_CAPACITY);
     accumulator = static_cast<int64_t>(value);
 }
@@ -354,15 +354,102 @@ void make_bias(const stationary & weight, std::vector<int32_t> & out) {
     }
 }
 
+// A rejected bias does not imply that another saturated decomposition is
+// equivalent. Admit unsigned bit planes only when intervals prove that every
+// SCU contribution and every ascending-K ACC prefix stays in signed INT32.
+// This bounds arithmetic; it does not compute a CPU dot product or output.
+unsigned pv_bitplanes(const stream & activation, const stationary & weight,
+                      std::vector<int32_t> & correction) {
+    try {
+        make_bias(weight, correction);
+        return 0; // Preserve the complete legacy path, including saturation.
+    } catch (potal_status status) {
+        if (status != POTAL_ERR_UNSUPPORTED) {
+            throw;
+        }
+    }
+    require(POTAL_HW_DIM == 16, POTAL_ERR_UNSUPPORTED);
+    require(activation.codes.size() == product(activation.rows, activation.kp));
+    uint32_t maximum = 0;
+    for (size_t i = 0; i < activation.rows; ++i) {
+        for (size_t k = 0; k < activation.kp; ++k) {
+            const int32_t code = activation.codes[i * activation.kp + k];
+            require(code >= 0 && code <= 65535 && (k < activation.k || code == 0));
+            maximum = std::max(maximum, uint32_t(code));
+        }
+    }
+    unsigned planes = 1;
+    while (maximum >> planes) {
+        ++planes;
+    }
+    const size_t tiles = activation.kp / POTAL_HW_DIM;
+    // [negative sum, positive sum] for each physical DIM16 V microtile.
+    std::vector<std::array<int32_t, 2>> sums(product(tiles, weight.n));
+    for (size_t t = 0; t < tiles; ++t) {
+        for (size_t j = 0; j < weight.n; ++j) {
+            for (size_t k = t * POTAL_HW_DIM; k < std::min((t + 1) * POTAL_HW_DIM, weight.k); ++k) {
+                const int32_t value = weight.limbs[0][k * weight.n + j];
+                sums[t * weight.n + j][value < 0 ? 0 : 1] += value;
+            }
+        }
+    }
+    // AND/OR give the exact minimum/maximum digit of every binary plane.
+    std::vector<std::array<uint32_t, 2>> limits(product(activation.rows, tiles));
+    for (size_t i = 0; i < activation.rows; ++i) {
+        for (size_t t = 0; t < tiles; ++t) {
+            auto & range = limits[i * tiles + t];
+            range = {t * POTAL_HW_DIM < activation.k ? 65535u : 0u, 0u};
+            for (size_t k = t * POTAL_HW_DIM; k < std::min((t + 1) * POTAL_HW_DIM, activation.k); ++k) {
+                const uint32_t code = uint32_t(activation.codes[i * activation.kp + k]);
+                range[0] &= code;
+                range[1] |= code;
+            }
+        }
+    }
+    for (unsigned plane = 0; plane < planes; ++plane) {
+        for (size_t i = 0; i < activation.rows; ++i) {
+            for (size_t j = 0; j < weight.n; ++j) {
+                int64_t lower = 0, upper = 0;
+                for (size_t t = 0; t < tiles; ++t) {
+                    const uint32_t carrier = weight.carriers[(t * POTAL_HW_DIM / block_k) * weight.n + j];
+                    if (carrier == POTAL_CARRIER_ZERO) {
+                        continue;
+                    }
+                    const auto & range = limits[i * tiles + t];
+                    const auto & sum = sums[t * weight.n + j];
+                    const int64_t minimum = (range[0] >> plane) & 1u;
+                    const int64_t maximum = (range[1] >> plane) & 1u;
+                    int64_t lo = minimum * sum[1] + maximum * sum[0];
+                    int64_t hi = maximum * sum[1] + minimum * sum[0];
+                    if (carrier >= 32) {
+                        require(lo == 0 && hi == 0, POTAL_ERR_UNSUPPORTED);
+                        continue;
+                    }
+                    const int64_t factor = int64_t{1} << carrier;
+                    lo *= factor;
+                    hi *= factor;
+                    require(lo >= INT32_MIN && hi <= INT32_MAX, POTAL_ERR_UNSUPPORTED);
+                    lower += lo;
+                    upper += hi;
+                    require(lower >= INT32_MIN && upper <= INT32_MAX, POTAL_ERR_UNSUPPORTED);
+                }
+            }
+        }
+    }
+    correction.clear();
+    return planes;
+}
+
 void integer_reference(const stream & activation, const stationary & weight, role operation,
                         std::vector<int64_t> & out) {
     validate_prepared(activation, weight, operation);
     out.assign(product(activation.rows, weight.n), 0);
     std::vector<int32_t> correction;
+    unsigned planes = 0;
     if (operation == role::pv) {
-        make_bias(weight, correction);
+        planes = pv_bitplanes(activation, weight, correction);
     }
-    for (size_t limb = 0; limb < activation.limb_count; ++limb) {
+    for (size_t limb = 0; limb < (planes ? planes : activation.limb_count); ++limb) {
         for (size_t i = 0; i < activation.rows; ++i) {
             for (size_t j = 0; j < weight.n; ++j) {
                 int64_t stationary_sum = 0;
@@ -371,18 +458,21 @@ void integer_reference(const stream & activation, const stationary & weight, rol
                     for (size_t begin = 0; begin < activation.kp; begin += POTAL_HW_DIM) {
                         int32_t partial = 0;
                         for (size_t k = begin; k < begin + POTAL_HW_DIM && k < activation.k; ++k) {
-                            partial += int32_t(activation.limbs[limb][i * activation.kp + k]) *
+                            const size_t index = i * activation.kp + k;
+                            const int32_t digit = planes ? int32_t((uint32_t(activation.codes[index]) >> limb) & 1u) :
+                                                          int32_t(activation.limbs[limb][index]);
+                            partial += digit *
                                        weight.limbs[operation == role::qk ? pass : 0][k * weight.n + j];
                         }
                         const uint32_t carrier = weight.carriers[(begin / block_k) * weight.n + j];
                         acc = sat32(int64_t(acc) + scu(partial, carrier, 0));
                     }
-                    if (operation == role::pv && limb == 0) {
+                    if (operation == role::pv && limb == 0 && !planes) {
                         acc = sat32(int64_t(acc) + correction[j]);
                     }
                     reconstruct(stationary_sum, acc, pass);
                 }
-                reconstruct(out[i * weight.n + j], stationary_sum, limb);
+                reconstruct(out[i * weight.n + j], stationary_sum, limb, planes ? 1 : bits);
             }
         }
     }
@@ -394,11 +484,13 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
     validate_prepared(activation, weight, operation);
     out.assign(product(activation.rows, weight.n), 0);
     std::vector<int32_t> correction;
+    unsigned planes = 0;
     if (operation == role::pv) {
         require(bool(corrected), POTAL_ERR_UNSUPPORTED);
-        make_bias(weight, correction);
+        planes = pv_bitplanes(activation, weight, correction);
+        report.pv_bitplane_stripes += planes != 0;
     }
-    for (size_t limb = 0; limb < activation.limb_count; ++limb) {
+    for (size_t limb = 0; limb < (planes ? planes : activation.limb_count); ++limb) {
         const size_t passes = operation == role::qk ? 2 : 1;
         const size_t k_total = activation.kp;
         const size_t selection_k = product(activation.kp, passes);
@@ -408,14 +500,16 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
         require(operands.allocate({ int64_t(activation.rows), int64_t(weight.n), int64_t(k_total) }),
                 POTAL_ERR_CAPACITY);
         std::unique_ptr<void, decltype(&std::free)> bias_dma(nullptr, std::free);
-        if (operation == role::pv && limb == 0) {
+        if (operation == role::pv && limb == 0 && !planes) {
             bias_dma.reset(dma_alloc(product(operands.n_pad, sizeof(int32_t))));
             require(bool(bias_dma), POTAL_ERR_CAPACITY);
             std::memcpy(bias_dma.get(), correction.data(), weight.n * sizeof(int32_t));
         }
         for (size_t i = 0; i < activation.rows; ++i) {
             for (size_t k = 0; k < activation.k; ++k) {
-                operands.a[i * operands.lda + k] = activation.limbs[limb][i * activation.kp + k];
+                const size_t index = i * activation.kp + k;
+                operands.a[i * operands.lda + k] = planes ?
+                    int8_t((uint32_t(activation.codes[index]) >> limb) & 1u) : activation.limbs[limb][index];
             }
         }
         for (size_t block = 0; block < weight.kp / block_k; ++block) {
@@ -470,7 +564,7 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
             // Regular WS overwrites the first K panel, accumulates later
             // panels, and stores C only at the final panel. Its fence covers
             // that store before Host consumption or reuse for the next limb.
-            const planned_result completed = operation == role::qk || limb != 0 ? run(descriptor) :
+            const planned_result completed = operation == role::qk || limb != 0 || planes ? run(descriptor) :
                 corrected(descriptor, static_cast<const int32_t *>(bias_dma.get()), weight.n);
             const auto & work = completed.report;
             report.jobs += work.loop_ws != 0;
@@ -495,8 +589,9 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
                     work.scale_writes == work.scale_releases, POTAL_ERR_BAD_RESPONSE);
             report.residual_jobs += limb != 0;
             report.qk_limb_jobs += operation == role::qk;
-            report.correction_jobs += operation == role::pv && limb == 0;
-            report.bias_updates += operation == role::pv && limb == 0 ?
+            report.pv_bitplane_jobs += planes != 0;
+            report.correction_jobs += operation == role::pv && limb == 0 && !planes;
+            report.bias_updates += operation == role::pv && limb == 0 && !planes ?
                 ((activation.rows + POTAL_HW_DIM - 1) / POTAL_HW_DIM) *
                 ((weight.n + POTAL_HW_DIM - 1) / POTAL_HW_DIM) : 0;
             for (size_t i = 0; i < activation.rows; ++i) {
@@ -505,7 +600,7 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
                     if (operation == role::qk) {
                         reconstruct(stationary_sum[i * weight.n + j], value, pass);
                     } else {
-                        reconstruct(out[i * weight.n + j], value, limb);
+                        reconstruct(out[i * weight.n + j], value, limb, planes ? 1 : bits);
                     }
                 }
             }
