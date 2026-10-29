@@ -100,6 +100,10 @@ bool paired_auto_requested(bool * invalid);
 // false with *invalid set when the value is neither.
 bool paired_fences_conservative(bool * invalid);
 
+// Explicit, default-OFF DIM32 optimization; never enables the resident extension.
+bool paired_ktile_requested(bool * invalid);
+bool paired_prefetch_requested(bool * invalid);
+
 // nullptr when PoTal executes the resolved mode, residual backend and stripe
 // job capacity with the configured activation algorithm, else why not.
 constexpr const char * unsupported_combination(MatmulInvocationMode mode, RmdBackend backend,

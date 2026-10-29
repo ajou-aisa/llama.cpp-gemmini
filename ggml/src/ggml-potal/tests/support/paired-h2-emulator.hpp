@@ -38,16 +38,19 @@ struct h2_emulator {
     };
 
     std::vector<int8_t>   sp  = std::vector<int8_t>(sp_rows * D, 0);
+    std::vector<uint64_t> sp_written = std::vector<uint64_t>(sp_rows, 0);
     std::vector<int32_t>  acc = std::vector<int32_t>(acc_rows * D, 0);
     scale_entry           scales[POTAL_SCALE_ENTRIES][D];
     index_table           tables[2];
     uint32_t              selected_table = 0;
     uint64_t              ld_stride[2] = { 0, 0 }, st_stride = 0;
+    uint64_t              ld_config[2] = { 0, 0 };
     uint64_t              bounds_rs1 = 0, bounds_rs2 = 0, a_dram = 0, b_dram = 0, d_dram = 0, c_dram = 0,
                           a_stride = 0, b_stride = 0, c_stride_elems = 0;
     // Counters and records.
     uint64_t    main_loops = 0, residual_loops = 0, index_configs = 0, index_writes = 0, scale_writes = 0,
                 scale_releases = 0, mvouts = 0, fences = 0, flushes = 0, b_loads = 0;
+    uint64_t    raw_b_mvins = 0, raw_b_bytes = 0, resident_main_loops = 0;
     std::vector<potal_paired_cmd_record> records;
     std::string                          errors;      // contract violations seen (empty: none)
     bool                                 scale_miss = false;
@@ -79,6 +82,7 @@ struct h2_emulator {
             case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB: a_stride = r.rs1; b_stride = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: c_stride_elems = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS: return loop_ws(r.rs1, r.rs2);
+            case POTAL_FUNCT_MVIN: return mvin_b(r.rs1, r.rs2);
             case POTAL_FUNCT_MVOUT: return mvout(r.rs1, r.rs2);
             case POTAL_FUNCT_SCALE_WRITE: return scale_write(r.rs1, r.rs2);
             case POTAL_FUNCT_SCALE_RELEASE: return scale_release(r.rs1);
@@ -92,10 +96,43 @@ struct h2_emulator {
 
     potal_status config(uint64_t rs1, uint64_t rs2) {
         switch (rs1 & 3) {
-            case 1: ld_stride[(rs1 >> 3) & 3] = rs2; break; // CONFIG_LD: state id at [4:3], row bytes in rs2
+            case 1: { // CONFIG_LD: state id at [4:3], row bytes in rs2
+                const size_t state = (rs1 >> 3) & 3;
+                if (state >= 2) return POTAL_HW_BAD_COMMAND;
+                ld_stride[state] = rs2;
+                ld_config[state] = rs1;
+                break;
+            }
             case 2: st_stride = rs2; break;                 // CONFIG_ST: row bytes
             default: break;                                 // CONFIG_EX
         }
+        return POTAL_OK;
+    }
+
+    // Ordinary state-0 MVIN of one B tile. This copies real bytes into the
+    // explicit SP model; it models no DMA timing or completion certificate.
+    potal_status mvin_b(uint64_t source, uint64_t shape) {
+        const uint32_t row = uint32_t(shape);
+        const uint32_t cols = (shape >> 32) & 0xFFFF;
+        const uint32_t rows = shape >> 48;
+        const uint64_t expected = (uint64_t(D) << 16) | (uint64_t(1) << 8) | 1;
+        if (!source || source % D || rows == 0 || rows > D || cols == 0 || cols > D ||
+            row >= sp_rows || rows > sp_rows - row || row % D ||
+            row / POTAL_HW_BANK_ROWS % 2 != 1 ||
+            (row + rows - 1) / POTAL_HW_BANK_ROWS != row / POTAL_HW_BANK_ROWS ||
+            ld_config[0] != expected || ld_stride[0] < cols) {
+            err("raw B MVIN fields or layout");
+            return POTAL_HW_INVALID_ADDRESS;
+        }
+        const auto * src = reinterpret_cast<const int8_t *>(uintptr_t(source));
+        for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t c = 0; c < cols; ++c) {
+                sp[(size_t(row) + r) * D + c] = src[r * ld_stride[0] + c];
+                sp_written[row + r] |= uint64_t(1) << c;
+            }
+        }
+        ++raw_b_mvins;
+        raw_b_bytes += uint64_t(rows) * cols;
         return POTAL_OK;
     }
 
@@ -189,10 +226,6 @@ struct h2_emulator {
             err("indexed LOOP_WS needs residual mode and B DRAM 0");
             return POTAL_HW_BAD_COMMAND;
         }
-        if (!indexed && b_dram == 0) {
-            err("Main LOOP_WS without B");
-            return POTAL_HW_BAD_COMMAND;
-        }
         const uint32_t pair      = a_spad - 1;
         const size_t   a_base    = (size_t) pair * half_rows + (size_t) offset_tiles * D;
         const size_t   bank_rows = POTAL_HW_BANK_ROWS;
@@ -221,6 +254,8 @@ struct h2_emulator {
                 err("B beyond the weight bank");
                 return POTAL_HW_BAD_COMMAND;
             }
+        }
+        if (!indexed && b_dram != 0) {
             const int8_t * b = reinterpret_cast<const int8_t *>((uintptr_t) b_dram);
             for (uint32_t k = 0; k < K; ++k) {
                 const uint32_t rows = D - (k + 1 == K ? pad_k : 0);
@@ -231,10 +266,27 @@ struct h2_emulator {
                         for (uint32_t c = 0; c < D; ++c) {
                             dst[c] = (kk < rows && c < cols) ? b[((size_t) k * D + kk) * b_stride + (size_t) j * D + c] : 0;
                         }
+                        sp_written[b_start + ((size_t) k * J + j) * D + kk] = ~uint64_t(0) >> (64 - D);
                     }
                 }
             }
             b_loads++;
+        } else if (!indexed) {
+            // Null-B Main is legal only when every used physical B byte exists.
+            // The C11 state-machine tests separately prove generation ownership.
+            for (uint32_t k = 0; k < K; ++k) {
+                for (uint32_t j = 0; j < J; ++j) {
+                    const uint32_t cols = D - (j + 1 == J ? pad_j : 0);
+                    const uint64_t mask = ~uint64_t(0) >> (64 - cols);
+                    for (uint32_t r = 0; r < D - (k + 1 == K ? pad_k : 0); ++r) {
+                        if ((sp_written[b_start + ((size_t) k * J + j) * D + r] & mask) != mask) {
+                            err("resident Main reads unwritten B");
+                            return POTAL_HW_INVALID_ADDRESS;
+                        }
+                    }
+                }
+            }
+            ++resident_main_loops;
         }
         const index_table & t = tables[pair];
         if (indexed && (!t.configured || t.active_rows != (uint32_t) (K * D - pad_k))) {

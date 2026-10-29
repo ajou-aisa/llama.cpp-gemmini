@@ -39,8 +39,10 @@
 #include "log.hpp"
 #include "matmul/dense.hpp"
 #include "matmul/options.hpp"
+#include "matmul/paired-auto.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
+#include "support/paired-support.hpp"
 #include "support/stripe-golden.hpp"
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
@@ -158,15 +160,19 @@ struct route_run {
     ggml_backend_potal_stats before = {}, after = {};
 };
 
-enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL };
+enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL, ROUTE_KTILE, ROUTE_PREFETCH };
 
 const char * route_name(route_kind k) {
+    if (k == ROUTE_KTILE) return "ktile";
+    if (k == ROUTE_PREFETCH) return "prefetch";
     return k == ROUTE_PAIRED ? "paired" : k == ROUTE_PAIRED_CONSERVATIVE ? "paired_conservative" : "serial";
 }
 
 void select_route(route_kind k) {
     setenv("GGML_POTAL_PAIRED_AUTO", k == ROUTE_SERIAL ? "OFF" : "ON", 1);
     setenv("GGML_POTAL_PAIRED_FENCES", k == ROUTE_PAIRED_CONSERVATIVE ? "CONSERVATIVE" : "RTL", 1);
+    setenv("GGML_POTAL_PAIRED_KTILE", k == ROUTE_KTILE || k == ROUTE_PREFETCH ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_PREFETCH", k == ROUTE_PREFETCH ? "ON" : "OFF", 1);
 }
 
 route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, ggml_cgraph * g, ggml_tensor * y,
@@ -335,13 +341,16 @@ void print_stats(const char * name, const char * phase, route_kind route, int it
     COUNT_FIELD(scale_writes); COUNT_FIELD(scale_releases);
     COUNT_FIELD(paired_readbacks); COUNT_FIELD(paired_readback_tiles);
     COUNT_FIELD(paired_fences); COUNT_FIELD(paired_drains); COUNT_FIELD(paired_fallback_stripes);
+    COUNT_FIELD(paired_prefetch_loads); COUNT_FIELD(paired_prefetch_mvins);
+    COUNT_FIELD(paired_prefetch_bytes_declared); COUNT_FIELD(paired_resident_main_loop_ws);
+    TIME_FIELD(paired_residual_prefetch_issue_s);
     COUNT_FIELD(stripes_semantic_completed);
     std::printf("\n");
 #undef TIME_FIELD
 #undef COUNT_FIELD
 }
 
-void bench_one(ggml_backend_t potal, const bench_case & c, int repeat) {
+void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool compare_ktile, bool compare_prefetch) {
     std::mt19937 rng(20261023); // one fixed tensor pair for every route and repeat
     ggml_init_params ip = { (size_t) (4 * (c.n * c.k + 2 * c.m * c.n + c.m * c.k) + 64 * 1024 * 1024), nullptr, false };
     ggml_context_ptr ctx(ggml_init(ip));
@@ -372,8 +381,11 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat) {
     ggml_tensor * y = ggml_mul_mat(ctx.get(), cached_w, x);
     ggml_cgraph * g = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(g, y);
-    const route_kind routes[] = { ROUTE_SERIAL, ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE };
-    std::array<std::vector<route_run>, 3> cold, steady;
+    const route_kind routes[] = { compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL,
+                                  compare_prefetch ? ROUTE_KTILE : ROUTE_PAIRED,
+                                  compare_prefetch ? ROUTE_PREFETCH :
+                                  compare_ktile ? ROUTE_KTILE : ROUTE_PAIRED_CONSERVATIVE };
+    std::array<std::vector<route_run>, 5> cold, steady;
     // Untimed route warmups initialize the issuer and route code; each output is checked.
     for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false);
     for (int i = 0; i < repeat; ++i) {
@@ -417,10 +429,15 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat) {
         summary(c.name, "cold", route, cold[(int) route]);
         summary(c.name, "steady", route, steady[(int) route]);
     }
-    const double serial = median([&] { std::vector<double> v; for (const auto & r : steady[ROUTE_SERIAL]) v.push_back(r.compute_ms); return v; }());
-    for (route_kind route : { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE }) {
+    const route_kind reference = compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL;
+    const double reference_ms = median([&] { std::vector<double> v; for (const auto & r : steady[reference]) v.push_back(r.compute_ms); return v; }());
+    for (route_kind route : routes) {
+        if (route == reference) continue;
         std::vector<double> v; for (const auto & r : steady[(int) route]) v.push_back(r.compute_ms);
-        std::printf("POTAL_BENCH_RATIO case=%s route=%s serial_over_route=%.6f\n", c.name, route_name(route), serial / median(v));
+        if (compare_prefetch)
+            std::printf("POTAL_PREFETCH_RATIO case=%s route=%s h2_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
+        else
+            std::printf("POTAL_BENCH_RATIO case=%s route=%s serial_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
     }
     ggml_backend_potal_clear_weight_cache(potal); // buffer will be freed next
 }
@@ -495,11 +512,175 @@ bool select_pipeline_mode() {
     return why == nullptr;
 }
 
+bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
+    if (POTAL_HW_DIM != 32) return false;
+    uint32_t observation_generation = 0;
+    const auto saturate = [](int64_t x) {
+        return int32_t(std::max<int64_t>(INT32_MIN, std::min<int64_t>(INT32_MAX, x)));
+    };
+    const auto scaled = [&](int64_t x, uint32_t carrier) {
+        if (carrier == POTAL_CARRIER_ZERO || x == 0) return int32_t(0);
+        if (carrier >= 32) return x < 0 ? INT32_MIN : INT32_MAX;
+        return saturate(x * (INT64_C(1) << carrier));
+    };
+    for (int fixture = 0; fixture < (observe ? 3 : 2); ++fixture) {
+        const bool gapped = fixture == 1;
+        const bool full_rows = fixture == 2;
+        potal_test::paired_fixture f(full_rows ? 63 : 17, full_rows ? 129 : 65,
+            gapped ? 512 : 544, 20261023,
+            [](size_t block, size_t column) { return int16_t(block % 4 == 0 ? 24 : column % 3); });
+        potal_tile_plan plan;
+        if (!f.ok || potal_frozen_plan(f.M, f.N, f.K, full_rows ? 2 : 1,
+                                     full_rows ? 4 : 2, 4, 1, &plan) != POTAL_OK) return false;
+        residual::decoded_packet packet;
+        if (full_rows) {
+            for (uint32_t row = 0; row < f.M; ++row) packet.rows.push_back({0, row});
+        } else {
+            packet.rows = {{0, 0}, {1, 16}};
+        }
+        for (size_t block = 0; block < f.K / 32; block += gapped ? 2 : 1) {
+            residual::run run;
+            run.block_id = uint32_t(block);
+            run.local_k = {1, 7, 29};
+            packet.runs.push_back(run);
+            packet.k_compact += 3;
+        }
+        packet.digits.resize(packet.rows.size() * packet.k_compact);
+        for (size_t i = 0; i < packet.digits.size(); ++i)
+            packet.digits[i] = int8_t(i % 3 == 0 ? -128 : 127);
+        const size_t ldc = align_up(f.N, POTAL_HW_DIM);
+        std::unique_ptr<int32_t, potal_test::dma_deleter> main_output(
+            static_cast<int32_t *>(dma_alloc(align_up(f.M, POTAL_HW_DIM) * ldc * sizeof(int32_t))));
+        std::unique_ptr<int32_t, potal_test::dma_deleter> residual_output(
+            static_cast<int32_t *>(dma_alloc(align_up(packet.rows.size(), POTAL_HW_DIM) * ldc * sizeof(int32_t))));
+        if (!main_output || !residual_output) return false;
+        std::vector<int32_t> main_expected(f.M * f.N), residual_expected(packet.rows.size() * f.N);
+        // Independent wide arithmetic; never use the production SCU helper,
+        // emulator, Scale lowering, or the command plan for expected values.
+        for (size_t row = 0; row < f.M; ++row) {
+            for (size_t column = 0; column < f.N; ++column) {
+                int32_t acc = 0;
+                for (size_t block = 0; block < f.K / 32; ++block) {
+                    int64_t dot = 0;
+                    for (size_t k = block * 32; k < (block + 1) * 32; ++k)
+                        dot += int64_t(f.a.get()[row * f.lda + k]) * f.code_at(k, column);
+                    acc = saturate(int64_t(acc) + scaled(dot, f.carrier_at(block, column)));
+                }
+                main_expected[row * f.N + column] = acc;
+            }
+        }
+        for (size_t row = 0; row < packet.rows.size(); ++row) {
+            for (size_t column = 0; column < f.N; ++column) {
+                int32_t acc = 0;
+                size_t compact = 0;
+                for (const auto & run : packet.runs) {
+                    int64_t dot = 0;
+                    for (uint16_t local : run.local_k)
+                        dot += int64_t(packet.digits[row * packet.k_compact + compact++]) *
+                               f.code_at(size_t(run.block_id) * 32 + local, column);
+                    acc = saturate(int64_t(acc) + scaled(dot, f.carrier_at(run.block_id, column)));
+                }
+                residual_expected[row * f.N + column] = acc;
+            }
+        }
+        for (int mode = 0; mode < (with_prefetch ? 3 : 2); ++mode) {
+            const bool reuse = mode != 0;
+            potal_paired_request request;
+            request.rows = f.M; request.n = f.N; request.k = f.K;
+            request.main_plan = &plan; request.a = f.a.get(); request.lda = f.lda;
+            request.weight = &f.weight; request.residual = &packet;
+            request.c_main = main_output.get(); request.ldc_main = ldc;
+            request.c_residual = residual_output.get(); request.ldc_residual = ldc;
+            request.ktile_scale_reuse = reuse;
+            request.next_k_prefetch = mode == 2;
+            if (observe) request.generation = &observation_generation;
+            potal_paired_report report;
+            issuer_owner owner;
+            std::string why;
+            potal_status status = POTAL_OK;
+            uint64_t cycles[7] = {};
+            potal_status observation = POTAL_OK;
+            const bool started = owner.start([&](const owner_runners & runners) {
+                if (!observe) {
+                    runners.paired(request, report);
+                } else {
+                    // This callback runs on the existing single issuer's hart.
+                    potal_paired_session *session = nullptr;
+                    observation = potal_paired_session_open(nullptr, &session);
+                    if (observation == POTAL_OK)
+                        observation = potal_paired_observation_begin(session, nullptr);
+                    if (observation == POTAL_OK) {
+                        potal_paired_matmul_auto(request, session, report);
+                        if (report.status != potal_paired_status::ok) {
+                            std::fprintf(stderr, "POTAL_OBSERVATION_EXECUTION status=%s stage=%s hw=%d detail=%s\n",
+                                potal_paired_status_name(report.status), report.stage ? report.stage : "-",
+                                int(report.hw_status), report.detail.c_str());
+                        }
+                        if (!report.fatal && !potal_paired_session_query(session).failed)
+                            observation = potal_paired_observation_end(session, cycles);
+                    }
+                    if (session) {
+                        const potal_status closed = potal_paired_h2_query(session).active ?
+                            potal_paired_h2_close(&session) : potal_paired_session_close(session);
+                        if (closed != POTAL_OK) {
+                            report.fatal = true;
+                            report.hw_status = closed;
+                            report.stage = "observation_close";
+                        }
+                    }
+                }
+                return consume_outcome{report.fatal, report.hw_status, report.stage};
+            }, why, status);
+            owner.join();
+            bool exact = started && observation == POTAL_OK && report.status == potal_paired_status::ok;
+            for (size_t row = 0; exact && row < f.M; ++row)
+                for (size_t column = 0; column < f.N; ++column)
+                    exact = exact && main_output.get()[row * ldc + column] == main_expected[row * f.N + column];
+            for (size_t row = 0; exact && row < packet.rows.size(); ++row)
+                for (size_t column = 0; column < f.N; ++column)
+                    exact = exact && residual_output.get()[row * ldc + column] == residual_expected[row * f.N + column];
+            exact = exact && report.counts.scale_writes == report.counts.scale_releases &&
+                    (report.counts.scale_reused_windows > 0) == (reuse && !gapped) &&
+                    (report.counts.prefetch_loads > 0) == (mode == 2);
+            std::printf("POTAL_KTILE_RAW_GOLDEN %s gapped=%d reuse=%d prefetch=%d main_i32=%zu residual_i32=%zu "
+                        "reused_windows=%llu scale_writes=%llu scale_releases=%llu prefetch_loads=%llu resident_main=%llu\n",
+                        exact ? "PASS" : "FAIL", int(gapped), int(reuse), int(mode == 2), main_expected.size(), residual_expected.size(),
+                        (unsigned long long)report.counts.scale_reused_windows,
+                        (unsigned long long)report.counts.scale_writes, (unsigned long long)report.counts.scale_releases,
+                        (unsigned long long)report.counts.prefetch_loads,
+                        (unsigned long long)report.counts.resident_main_loop_ws);
+            if (observe) {
+                std::printf("POTAL_PREFETCH_OBSERVATION mode=%d gapped=%d status=%d fixture=%d rows=%zu columns=%zu "
+                    "b0_write_cycles=%llu b1_write_cycles=%llu mac0_cycles=%llu mac1_cycles=%llu "
+                    "mac0_b1_cycles=%llu mac1_b0_cycles=%llu cross_pair_cycles=%llu\n",
+                    mode, int(gapped), int(observation), fixture, f.M, f.N,
+                    (unsigned long long)cycles[0], (unsigned long long)cycles[1],
+                    (unsigned long long)cycles[2], (unsigned long long)cycles[3],
+                    (unsigned long long)cycles[4], (unsigned long long)cycles[5],
+                    (unsigned long long)cycles[6]);
+            }
+            if (report.fatal) {
+                f.a.release(); f.weight.abandon(); main_output.release(); residual_output.release();
+            }
+            if (!exact) return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--ktile-golden") == 0)
+        return ktile_raw_golden() ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--prefetch-golden") == 0)
+        return ktile_raw_golden(true) ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--prefetch-observe") == 0)
+        return ktile_raw_golden(true, true) ? 0 : 1;
     const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
-    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    const bool compare_ktile = argc > 1 && std::strcmp(argv[1], "--bench-ktile") == 0;
+    const bool compare_prefetch = argc > 1 && std::strcmp(argv[1], "--bench-prefetch") == 0;
+    const bool bench = compare_ktile || compare_prefetch || (argc > 1 && std::strcmp(argv[1], "--bench") == 0);
     const char * case_name = nullptr;
     int repeat = 7;
     if (bench) {
@@ -539,7 +720,7 @@ int main(int argc, char ** argv) {
         }
         for (const bench_case & c : bench_cases) {
             if (std::strcmp(c.name, case_name) == 0) {
-                bench_one(potal.get(), c, repeat);
+                bench_one(potal.get(), c, repeat, compare_ktile, compare_prefetch);
                 std::printf("POTAL_BENCH %s case=%s failures=%d\n", failures ? "FAIL" : "PASS", case_name, failures);
                 return failures ? 1 : 0;
             }

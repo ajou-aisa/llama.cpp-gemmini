@@ -638,6 +638,107 @@ potal_status potal_paired_fence(potal_paired_session *session);
  */
 potal_status potal_paired_session_cleanup(potal_paired_session *session);
 
+/* ---- Opt-in managed H2 panels (physical DIM32, ordinary H2 ISA) ----------
+ *
+ * Begin upgrades a clean paired session, mutually exclusive with resident_ws.
+ * The descriptor is copied; its entire borrowed allocation must stay mapped
+ * and immutable until h2_close consumes the session. Quarantine retains that
+ * obligation indefinitely, together with all A/readback/sink dependencies.
+ * No capability probe, funct28, extended run or raw escape is introduced.
+ *
+ * A panel declares one Main reader (ordinal 0), then readers-1 Residual
+ * readers in ordinal order. The immutable, prevalidated caller plan owns the
+ * exact ACC and fragment manifest. This interface checks physical geometry,
+ * B identity, reader counts, Index bindings and live Scale generations.
+ * Begin publishes the entire borrowed B allocation with a CPU memory fence
+ * while the session is idle. Its immutable lifetime permits later prefetch
+ * without another CPU fence (Rocket CPU fences stall on RoCC busy).
+ * Normal Main loads real B and may chain Residual without a new barrier.
+ * A prefetch issues CONFIG_LD state 0 and one DIM tile per MVIN; while it is
+ * pending, only completion, current ACC readback and Scale Release may issue.
+ * panel_begin(prefetch=0) may reserve the next panel before current issue.
+ * panel_prefetch loads that still-unused prepared reference without repeating
+ * descriptor validation. Pure refusals preserve it for corrected continuation;
+ * preparation is not cancellable and does not relax retirement or close.
+ * Main always supplies its REAL ordinary descriptor, even after prefetch:
+ * after full validation only its encoded B address is suppressed.
+ *
+ * Issue success is not completion. Only successful checked global Fence or
+ * live Scale Release publishes fully issued B and completes issued readers.
+ * get is observation only: BUSY until published, INVALID_ARGUMENT for stale
+ * refs. Retirement requires all declared readers issued/completed, no global
+ * pending/control/source work, closed Index transaction and zero live Scale
+ * columns. It clears that generation's B/Index only, never ACC contents.
+ * Save the retirement receipt in the caller; never retire a newer generation
+ * when the old plan later reaches its logical retirement operation.
+ *
+ * Every attempted command is owned before effects, including partial loads,
+ * programs and readbacks. First error is sticky. One explicit cleanup Fence
+ * can recover an answered failure; successful cleanup discards identities
+ * and releases actual live Scale columns. A failed Fence/Release or cleanup
+ * quarantines ownership: no retry, publication, close, free or fallback.
+ * Failed cleaned close consumes *session but returns the original error.
+ * Sink callbacks may query status; reentrant mutation returns BUSY.
+ */
+typedef struct potal_h2_weight {
+    const int8_t *base;
+    uint64_t k, n;                 /* original prepared matrix extents */
+    size_t ldb, bytes;             /* real row stride and accessible allocation */
+} potal_h2_weight;
+
+typedef struct potal_h2_panel {
+    uint64_t residency_index, k_begin, j_begin; /* original element offsets */
+    uint32_t pair, k_tiles, j_tiles, pad_j;
+    uint32_t main_i_tiles, main_pad_i;
+    uint32_t readers;              /* 1 Main + all declared Residual windows */
+} potal_h2_panel;
+
+typedef struct potal_h2_ref {
+    uint64_t owner, generation;    /* nonzero, nonwrapping software incarnations */
+    uint32_t pair;
+} potal_h2_ref;
+
+typedef struct potal_h2_panel_status {
+    potal_h2_ref ref;
+    uint64_t residency_index;
+    uint32_t declared, prefetched, loading, readable;
+    uint32_t readers_declared, readers_issued, readers_completed;
+} potal_h2_panel_status;
+
+typedef struct potal_h2_status {
+    potal_paired_session_status core;
+    uint32_t active, source_bound, pending_b, source_pending, control_pending;
+    uint32_t unknown_completion, quarantined, cleanup_attempted, cleaned;
+    potal_status last_drain, cleanup_status;
+    uint64_t attempted_b_mvins;
+    potal_h2_panel_status panel[POTAL_PAIRS];
+} potal_h2_status;
+
+potal_status potal_paired_h2_begin(potal_paired_session *session, const potal_h2_weight *weight);
+potal_status potal_paired_h2_panel_begin(potal_paired_session *session,
+    const potal_h2_panel *panel, uint32_t prefetch, potal_h2_ref *reference);
+potal_status potal_paired_h2_panel_prefetch(potal_paired_session *session, potal_h2_ref reference);
+potal_status potal_paired_h2_loop_issue(potal_paired_session *session,
+    potal_h2_ref reference, uint32_t reader_ordinal, const potal_paired_loop_ws *loop);
+potal_status potal_paired_h2_panel_get(potal_paired_session *session, potal_h2_ref reference);
+potal_status potal_paired_h2_panel_retire(potal_paired_session *session, potal_h2_ref reference);
+potal_h2_status potal_paired_h2_query(const potal_paired_session *session);
+potal_status potal_paired_h2_close(potal_paired_session **session);
+
+/* Diagnostic-only observation on the same issuer. Begin requires a new idle
+ * session; end requires all commands drained and Scale entries released.
+ * Seven target-clock cycle counts: B0/B1 physical writes, pair0/pair1 PE00 MAC,
+ * MAC0&B1, MAC1&B0, either overlap. These are not completion certificates.
+ * A software sink must supply counter with the same borrowed sink.ctx.
+ * No timing or hardware claim follows from software-sink values. */
+#define POTAL_PREFETCH_OBSERVATION_TAG UINT64_C(0x504f425300000000)
+#define POTAL_PREFETCH_OBSERVATION_CAPABILITY UINT64_C(0x504f425301200007)
+typedef potal_status (*potal_observation_counter_fn)(void *ctx,
+    const potal_paired_cmd_record *record, uint64_t *value);
+potal_status potal_paired_observation_begin(potal_paired_session *session,
+    potal_observation_counter_fn counter);
+potal_status potal_paired_observation_end(potal_paired_session *session, uint64_t cycles[7]);
+
 /* ---- Opt-in resident I1/P1 interface (fixed DIM16/SP4x4096/ACC1024) ------
  *
  * Uses the SAME opaque session and paired owner, not the test-only E4A

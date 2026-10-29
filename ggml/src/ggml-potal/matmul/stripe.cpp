@@ -619,6 +619,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         counts_.paired_readback_tiles += n.paired_readback_tiles;
         counts_.paired_fences += n.paired_fences;
         counts_.paired_drains += n.paired_drains;
+        counts_.paired_prefetch_loads += n.paired_prefetch_loads;
+        counts_.paired_prefetch_mvins += n.paired_prefetch_mvins;
+        counts_.paired_prefetch_bytes_declared += n.paired_prefetch_bytes_declared;
+        counts_.paired_resident_main_loop_ws += n.paired_resident_main_loop_ws;
+        counts_.paired_residual_prefetch_issue_s += n.paired_residual_prefetch_issue_s;
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
@@ -726,6 +731,10 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                               std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
             }
             paired_route = ps == potal_paired_status::ok;
+            if (!paired_route && cfg_.paired_ktile_scale_reuse) {
+                return failed("paired_plan", POTAL_ERR_UNSUPPORTED, false,
+                              "explicit K-tile request cannot use Serial fallback: " + why);
+            }
             if (profile) {
                 const double plan_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - plan_start).count();
@@ -777,6 +786,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             pq.plan         = &routing; // validated again by the executor, never re-planned
             pq.hw           = diagnostic_index ? &diagnostic_hw : nullptr;
             pq.conservative_fences = cfg_.paired_conservative_fences;
+            pq.ktile_scale_reuse = cfg_.paired_ktile_scale_reuse;
+            pq.next_k_prefetch = cfg_.paired_next_k_prefetch;
             emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
             const potal_paired_status pst = runners.paired(pq, paired);
             gemm_fatal                    = gemm_fatal || paired.fatal;
@@ -792,6 +803,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             n.paired_readback_tiles += pc.readback_tiles;
             n.paired_fences += pc.fences;
             n.paired_drains += pc.drains;
+            n.paired_prefetch_loads += pc.prefetch_loads;
+            n.paired_prefetch_mvins += pc.prefetch_mvins;
+            n.paired_prefetch_bytes_declared += pc.prefetch_bytes_declared;
+            n.paired_resident_main_loop_ws += pc.resident_main_loop_ws;
+            n.paired_residual_prefetch_issue_s += pc.residual_prefetch_issue_s;
             n.scale_writes += pc.scale_writes;
             n.scale_releases += pc.scale_releases;
             n.tlb_flushes += pc.tlb_flushes;
@@ -1184,6 +1200,12 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     }
     if (cfg.paired && !cfg.residual) {
         return refuse("options", "the paired route needs compensation=ON (the ws_packet residual)");
+    }
+    if (cfg.paired_ktile_scale_reuse && (!cfg.paired || HW_DIM != 32)) {
+        return refuse("options", "K-tile Scale reuse requires DIM32 Paired execution");
+    }
+    if (cfg.paired_next_k_prefetch && !cfg.paired_ktile_scale_reuse) {
+        return refuse("options", "Next-K prefetch requires K-tile Scale reuse");
     }
 
     std::shared_ptr<stripe_run> run;

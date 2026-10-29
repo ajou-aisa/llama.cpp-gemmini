@@ -149,7 +149,8 @@ static inline void potal_rocc_mvin(uint64_t rs1, uint64_t rs2) {
     POTAL_ROCC_0_R_R(POTAL_FUNCT_MVIN, rs1, rs2);
 }
 
-/* CPU ordering of normal loads/stores around DMA hand-off; not completion. */
+/* CPU memory ordering around DMA hand-off. Rocket also stalls this instruction
+ * on RoCC busy. Never substitute it for a checked PoTal completion response. */
 static inline void potal_cpu_fence_rw(void) {
     __asm__ volatile("fence rw, rw" ::: "memory");
 }

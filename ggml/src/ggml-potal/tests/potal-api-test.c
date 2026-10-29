@@ -12,6 +12,11 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(__unix__)
+#include <errno.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "potal.h"
 #include "potal_hw_params.h"
@@ -1012,6 +1017,593 @@ static void test_paired_host_no_hardware_before_sessions(void) {
 #endif
 }
 
+/* Managed H2 is command-level software validation, not accelerator timing. */
+static potal_h2_weight managed_weight(void) {
+    const size_t d = POTAL_HW_DIM;
+    const potal_h2_weight w = {FAKE_B, 5 * d, 3 * d - 5, 4 * d,
+        (5 * d - 1) * 4 * d + 3 * d - 5};
+    return w;
+}
+
+#if POTAL_HW_DIM == 32
+typedef struct managed_sink_state {
+    sink_state trace;
+    potal_paired_session *session;
+    uint32_t fail_at;               /* absolute command number; also injects CONFIG failures */
+    uint32_t reenter, pending_seen, readback_seen, control_seen, mvins, completed_mvins;
+} managed_sink_state;
+
+static potal_status managed_sink(void *ctx, const potal_paired_cmd_record *record) {
+    managed_sink_state *st = ctx;
+    const potal_status result = sink_cmd(&st->trace, record);
+    const potal_h2_status q = potal_paired_h2_query(st->session);
+    st->pending_seen |= q.pending_b && q.source_pending;
+    st->readback_seen |= q.core.outstanding_readbacks != 0;
+    st->control_seen |= q.control_pending;
+    if (record->funct == POTAL_FUNCT_MVIN) st->mvins++;
+    if (st->reenter) {
+        st->reenter = 0;
+        potal_h2_ref ref = {0};
+        potal_paired_session *alias = st->session;
+        check_u64("managed callback can observe premarked ownership", q.pending_b, 1);
+        check_status("managed reentrant begin", potal_paired_h2_begin(alias, NULL), POTAL_ERR_BUSY);
+        check_status("managed reentrant panel", potal_paired_h2_panel_begin(alias, NULL, 0, &ref), POTAL_ERR_BUSY);
+        check_status("managed reentrant prepared prefetch", potal_paired_h2_panel_prefetch(alias, ref), POTAL_ERR_BUSY);
+        check_status("managed reentrant loop", potal_paired_h2_loop_issue(alias, ref, 0, NULL), POTAL_ERR_BUSY);
+        check_status("managed reentrant retire", potal_paired_h2_panel_retire(alias, ref), POTAL_ERR_BUSY);
+        check_status("managed reentrant scale", potal_paired_scale_write(alias, 0, 7, 0, 0), POTAL_ERR_BUSY);
+        check_status("managed reentrant release", potal_paired_scale_release(alias, 0, 7, 0), POTAL_ERR_BUSY);
+        check_status("managed reentrant index config", potal_paired_index_config(alias, NULL), POTAL_ERR_BUSY);
+        check_status("managed reentrant index write", potal_paired_index_write(alias, NULL), POTAL_ERR_BUSY);
+        check_status("managed reentrant readback", potal_paired_acc_readback_issue(alias, NULL), POTAL_ERR_BUSY);
+        check_status("managed reentrant flush", potal_paired_tlb_flush(alias), POTAL_ERR_BUSY);
+        check_status("managed reentrant fence", potal_paired_fence(alias), POTAL_ERR_BUSY);
+        check_status("managed reentrant cleanup", potal_paired_session_cleanup(alias), POTAL_ERR_BUSY);
+        check_status("managed reentrant default close", potal_paired_session_close(alias), POTAL_ERR_BUSY);
+        check_status("managed reentrant close", potal_paired_h2_close(&alias), POTAL_ERR_BUSY);
+        check_u64("managed reentrant close retains pointer", alias == st->session, 1);
+    }
+    if (st->fail_at && st->trace.count == st->fail_at) {
+        st->fail_at = 0;
+        return POTAL_HW_INVALID_ADDRESS;
+    }
+    return result;
+}
+
+static potal_h2_panel managed_panel(uint32_t pair, uint32_t readers) {
+    const potal_h2_panel p = {
+        .residency_index = 100 + pair, .k_begin = pair ? 3 * POTAL_HW_DIM : 0,
+        .j_begin = POTAL_HW_DIM, .pair = pair, .k_tiles = pair ? 2 : 3,
+        .j_tiles = 2, .pad_j = 5, .main_i_tiles = 1, .main_pad_i = 3, .readers = readers,
+    };
+    return p;
+}
+
+static potal_paired_loop_ws managed_main(const potal_h2_panel *p) {
+    potal_paired_loop_ws l = h2_main(p->pair);
+    l.loop.b = (const int8_t *)((uintptr_t)FAKE_B + p->k_begin * 4 * POTAL_HW_DIM + p->j_begin);
+    l.loop.ldb = 4 * POTAL_HW_DIM;
+    l.loop.k_tiles = p->k_tiles;
+    l.loop.passes_per_block = p->k_tiles;
+    l.loop.pad_i = p->main_pad_i;
+    l.loop.pad_j = p->pad_j;
+    return l;
+}
+
+static potal_paired_loop_ws managed_residual(const potal_h2_panel *p) {
+    potal_paired_loop_ws l = h2_residual(p->pair, 1);
+    l.loop.pad_i = p->main_pad_i;
+    l.loop.pad_j = p->pad_j;
+    l.a_offset_tiles = p->k_tiles;
+    return l;
+}
+
+static potal_status managed_scales(potal_paired_session *s, const potal_paired_loop_ws *pl, int release) {
+    const potal_loop_ws *l = &pl->loop;
+    for (uint32_t b = 0; b < l->k_tiles / l->passes_per_block; ++b) {
+        for (uint32_t j = 0; j < l->j_tiles; ++j) {
+            const uint32_t slot = l->scale_base + b * l->j_tiles + j;
+            const uint32_t columns = POTAL_HW_DIM - (j + 1 == l->j_tiles ? l->pad_j : 0);
+            for (uint32_t col = 0; col < columns; ++col) {
+                const potal_status status = release ?
+                    potal_paired_scale_release(s, slot, l->scale_generation, col) :
+                    potal_paired_scale_write(s, slot, l->scale_generation, col, 0);
+                if (status != POTAL_OK) return status;
+            }
+        }
+    }
+    return POTAL_OK;
+}
+
+static potal_index_config managed_index(const potal_h2_panel *p) {
+    const potal_index_config cfg = {
+        .pair = p->pair,
+        .b_sp_base = (2 * p->pair + 2) * POTAL_HW_BANK_ROWS - p->k_tiles * p->j_tiles * POTAL_HW_DIM,
+        .j_tiles = p->j_tiles, .source_k_rows = p->k_tiles * POTAL_HW_DIM,
+        .active_rows = 3 * POTAL_HW_DIM / 2,
+    };
+    return cfg;
+}
+
+static void managed_open(managed_sink_state *st, potal_paired_session **s) {
+    memset(st, 0, sizeof(*st));
+    const potal_paired_sink sink = {managed_sink, st};
+    const potal_h2_weight w = managed_weight();
+    check_status("managed session open", potal_paired_session_open(&sink, s), POTAL_OK);
+    st->session = *s;
+    check_status("managed begin", potal_paired_h2_begin(*s, &w), POTAL_OK);
+}
+
+static void managed_program_equal(const sink_state *trace, uint32_t start,
+    const potal_gemm_ws_program *p, int suppress) {
+    const potal_rocc_cmd expected[] = {p->config_ld_a, p->config_ld_b, p->config_ex, p->config_st,
+        p->bounds, p->addrs_ab, p->addrs_dc, p->strides_ab, p->strides_dc, p->loop_ws};
+    const uint32_t functs[] = {0, 0, 0, 0, 9, 10, 11, 12, 13, 8};
+    check_u64("managed ordinary program has ten commands", trace->count - start, 10);
+    for (uint32_t i = 0; i < 10; ++i) {
+        const potal_paired_cmd_record *got = &trace->records[start + i];
+        check_u64("managed only B address differs", got->funct == functs[i] && got->xd == 0 &&
+            got->rs1 == expected[i].rs1 && got->rs2 == (suppress && i == 5 ? 0 : expected[i].rs2), 1);
+    }
+}
+
+static void test_managed_h2(void) {
+    managed_sink_state st;
+    potal_paired_session *s = NULL;
+    managed_open(&st, &s);
+    const potal_h2_weight w = managed_weight();
+    potal_h2_panel p0 = managed_panel(0, 2), p1 = managed_panel(1, 1);
+    potal_h2_ref r0 = {0}, r1 = {0};
+    potal_paired_loop_ws m0 = managed_main(&p0), m1 = managed_main(&p1), residual = managed_residual(&p0);
+    potal_index_config index = managed_index(&p0);
+    check_status("managed duplicate begin", potal_paired_h2_begin(s, &w), POTAL_ERR_BUSY);
+    check_status("managed initial flush", potal_paired_tlb_flush(s), POTAL_OK);
+    check_u64("managed flush control premarked", st.control_seen, 1);
+    check_status("managed flush requires drain", potal_paired_h2_panel_begin(s, &p0, 0, &r0), POTAL_ERR_BUSY);
+    check_status("managed initial fence", potal_paired_fence(s), POTAL_OK);
+
+    const uint32_t before = st.trace.count;
+    potal_h2_panel bad = p0;
+    bad.k_begin = UINT64_MAX - 31;
+    check_status("managed K offset overflow refused", potal_paired_h2_panel_begin(s, &bad, 1, &r0), POTAL_ERR_INVALID_ARGUMENT);
+    bad = p0; bad.j_begin++;
+    check_status("managed unaligned J refused", potal_paired_h2_panel_begin(s, &bad, 1, &r0), POTAL_ERR_INVALID_ARGUMENT);
+    bad = p0; bad.k_tiles = 6;
+    check_status("managed source extent refused", potal_paired_h2_panel_begin(s, &bad, 1, &r0), POTAL_ERR_INVALID_ARGUMENT);
+    bad = p0; bad.readers = 0;
+    check_status("managed zero readers refused", potal_paired_h2_panel_begin(s, &bad, 0, &r0), POTAL_ERR_INVALID_ARGUMENT);
+    bad = p0; bad.main_i_tiles = POTAL_HW_BANK_ROWS;
+    check_status("managed physical capacity refused", potal_paired_h2_panel_begin(s, &bad, 0, &r0), POTAL_ERR_CAPACITY);
+    check_u64("managed rejected panels have no effects", st.trace.count, before);
+
+    check_status("managed normal declaration", potal_paired_h2_panel_begin(s, &p0, 0, &r0), POTAL_OK);
+    check_status("managed declaration is not publication", potal_paired_h2_panel_get(s, r0), POTAL_ERR_BUSY);
+    check_status("managed declared reader not complete after fence", potal_paired_fence(s), POTAL_OK);
+    check_u64("managed unissued reader stays uncompleted", potal_paired_h2_query(s).panel[0].readers_completed, 0);
+    check_status("managed retire unissued refused", potal_paired_h2_panel_retire(s, r0), POTAL_ERR_BUSY);
+    check_status("managed no default issue bypass", potal_paired_loop_ws_issue(s, &m0), POTAL_ERR_BUSY);
+    check_status("managed no default close bypass", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_status("managed no standalone scale bypass", potal_scale_write(0, 7, 0, 0), POTAL_ERR_BUSY);
+    check_status("managed no standalone release bypass", potal_scale_release(0, 7, 0), POTAL_ERR_BUSY);
+    check_status("managed no bias bypass", potal_paired_acc_bias_issue(s, NULL), POTAL_ERR_BUSY);
+    check_status("managed no flush after declaration", potal_paired_tlb_flush(s), POTAL_ERR_BUSY);
+    check_status("managed missing scales refused", potal_paired_h2_loop_issue(s, r0, 0, &m0), POTAL_ERR_INVALID_ARGUMENT);
+    potal_h2_ref wrong_ref = r0; wrong_ref.pair = 1;
+    check_status("managed reference cannot select another pair", potal_paired_h2_loop_issue(s, wrong_ref, 0, &m0), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed Main scales", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("managed Residual scales", managed_scales(s, &residual, 0), POTAL_OK);
+    check_status("managed Residual before Main refused", potal_paired_h2_loop_issue(s, r0, 1, &residual), POTAL_ERR_INVALID_ARGUMENT);
+    potal_gemm_ws_program expected;
+    check_status("managed normal reference encode", potal_paired_loop_ws_encode(&m0, &expected), POTAL_OK);
+    uint32_t start = st.trace.count;
+    check_status("managed normal Main", potal_paired_h2_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    managed_program_equal(&st.trace, start, &expected, 0);
+    check_status("managed Main issue is not publication", potal_paired_h2_panel_get(s, r0), POTAL_ERR_BUSY);
+    check_status("managed duplicate Main refused", potal_paired_h2_loop_issue(s, r0, 0, &m0), POTAL_ERR_INVALID_ARGUMENT);
+    potal_index_config wrong_index = index; wrong_index.b_sp_base += 32;
+    check_status("managed Index identity checked", potal_paired_index_config(s, &wrong_index), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed Index config without Main fence", potal_paired_index_config(s, &index), POTAL_OK);
+    check_status("managed no prefetch inside Index transaction", potal_paired_h2_panel_begin(s, &p1, 1, &r1), POTAL_ERR_BUSY);
+    for (uint32_t i = 0; i < index.active_rows; ++i) {
+        const potal_index_write entry = {i, i};
+        check_status("managed Index entry", potal_paired_index_write(s, &entry), POTAL_OK);
+    }
+    start = st.trace.count;
+    check_status("managed prepare next before current Residual", potal_paired_h2_panel_begin(s, &p1, 0, &r1), POTAL_OK);
+    potal_h2_ref bad_prepared = r1; bad_prepared.generation++;
+    check_status("managed stale prepared reference", potal_paired_h2_panel_prefetch(s, bad_prepared), POTAL_ERR_INVALID_ARGUMENT);
+    potal_paired_loop_ws invalid_current = residual; invalid_current.loop.j_tiles++;
+    check_status("managed prepared peer survives current refusal",
+        potal_paired_h2_loop_issue(s, r0, 1, &invalid_current), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("managed preparation and refusal issue no command", st.trace.count, start);
+    potal_h2_status prepared = potal_paired_h2_query(s);
+    check_u64("managed current identity retained", prepared.panel[0].ref.generation, r0.generation);
+    check_u64("managed next identity retained unused", prepared.panel[1].ref.generation, r1.generation);
+    check_u64("managed prepared is neither loading nor published",
+        prepared.pending_b | prepared.panel[1].loading | prepared.panel[1].readable |
+        prepared.panel[1].prefetched | prepared.panel[1].readers_issued | prepared.quarantined, 0);
+    check_status("managed healthy preparation cannot be discarded by cleanup", potal_paired_session_cleanup(s), POTAL_ERR_BUSY);
+    check_status("managed prepared close retains owner", potal_paired_h2_close(&s), POTAL_ERR_BUSY);
+    check_status("managed Residual chained without fence", potal_paired_h2_loop_issue(s, r0, 1, &residual), POTAL_OK);
+    check_status("managed duplicate Residual refused", potal_paired_h2_loop_issue(s, r0, 1, &residual), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed reader count bounded", potal_paired_h2_loop_issue(s, r0, 2, &residual), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("managed both readers in flight", potal_paired_h2_query(s).core.outstanding_loops, 2);
+
+    st.reenter = 1;
+    start = st.trace.count;
+    check_status("managed prepared prefetch with peer readers in flight", potal_paired_h2_panel_prefetch(s, r1), POTAL_OK);
+    check_u64("managed prefetch CONFIG plus four tiles", st.trace.count - start, 5);
+    check_u64("managed CONFIG state0 identity block32", st.trace.records[start].rs1, UINT64_C(0x00200101));
+    check_u64("managed CONFIG original stride", st.trace.records[start].rs2, 128);
+    for (uint32_t k = 0; k < 2; ++k) for (uint32_t j = 0; j < 2; ++j) {
+        const potal_paired_cmd_record *rec = &st.trace.records[start + 1 + k * 2 + j];
+        check_u64("managed MVIN exact source from original matrix", rec->rs1,
+            UINT64_C(0x20000) + (96 + k * 32) * 128 + 32 + j * 32);
+        check_u64("managed MVIN rear pair1 row and J tail", rec->rs2,
+            (UINT64_C(32) << 48) | ((uint64_t)(j ? 27 : 32) << 32) |
+            (4 * POTAL_HW_BANK_ROWS - 128 + (k * 2 + j) * 32));
+        check_u64("managed raw MVIN opcode", rec->funct, POTAL_FUNCT_MVIN);
+    }
+    check_u64("managed pending was visible before first CONFIG", st.pending_seen, 1);
+    /* A deterministic sink-model DMA completion event, not a hardware claim.
+     * Software sees no barrier response at this event and cannot publish B. */
+    st.completed_mvins = st.mvins;
+    check_u64("managed sink load event contains four tiles", st.completed_mvins, 4);
+    check_status("managed physical progress cannot publish", potal_paired_h2_panel_get(s, r1), POTAL_ERR_BUSY);
+    check_u64("managed observation cannot complete peer readers", potal_paired_h2_query(s).panel[0].readers_completed, 0);
+    check_status("managed pending B blocks Main", potal_paired_h2_loop_issue(s, r1, 0, &m1), POTAL_ERR_BUSY);
+    check_status("managed pending B blocks metadata", potal_paired_scale_write(s, 9, 1, 0, 0), POTAL_ERR_BUSY);
+    check_status("managed pending B blocks Index config", potal_paired_index_config(s, &index), POTAL_ERR_BUSY);
+    const potal_index_write extra_index = {0, 0};
+    check_status("managed pending B blocks Index write", potal_paired_index_write(s, &extra_index), POTAL_ERR_BUSY);
+    check_status("managed only one prefetch pending", potal_paired_h2_panel_begin(s, &p1, 1, &r1), POTAL_ERR_BUSY);
+    check_status("managed prepared prefetch cannot repeat", potal_paired_h2_panel_prefetch(s, r1), POTAL_ERR_BUSY);
+    potal_acc_readback rb = {.acc_bank = 0, .i_tiles = 1, .j_tiles = 2, .pad_i = 3,
+        .pad_j = 5, .c = FAKE_C, .ldc = 64};
+    potal_acc_readback alias = rb; alias.c = (int32_t *)(uintptr_t)FAKE_B;
+    check_status("managed readback cannot overwrite borrowed B", potal_paired_acc_readback_issue(s, &alias), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed current readback allowed during prefetch", potal_paired_acc_readback_issue(s, &rb), POTAL_OK);
+    check_u64("managed readback premarked before CONFIG", st.readback_seen, 1);
+    const uint64_t drains = potal_paired_h2_query(s).core.drains;
+    check_status("managed invalid Release not a certificate", potal_paired_scale_release(s, 0, 8, 0), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("managed invalid Release leaves pending B", potal_paired_h2_query(s).pending_b, 1);
+    check_status("managed valid Release publishes globally", potal_paired_scale_release(s, 0, 7, 0), POTAL_OK);
+    potal_h2_status q = potal_paired_h2_query(s);
+    check_u64("managed one global certificate", q.core.drains, drains + 1);
+    check_u64("managed peer readers completed once", q.panel[0].readers_completed, 2);
+    check_u64("managed prefetch did not complete unissued Main", q.panel[1].readers_completed, 0);
+    check_u64("managed pending source cleared by certificate", q.pending_b | q.source_pending, 0);
+    check_status("managed prefetched get published", potal_paired_h2_panel_get(s, r1), POTAL_OK);
+    check_status("managed retire blocked by global live scales", potal_paired_h2_panel_retire(s, r0), POTAL_ERR_BUSY);
+    for (uint32_t j = 0; j < 2; ++j) for (uint32_t col = 0; col < (j ? 27u : 32u); ++col) {
+        if (j == 0 && col == 0) continue;
+        check_status("managed remaining Main scale release", potal_paired_scale_release(s, j, 7, col), POTAL_OK);
+    }
+    check_status("managed Residual release", managed_scales(s, &residual, 1), POTAL_OK);
+    potal_index_config final_index = index; final_index.active_rows = 1;
+    check_status("managed final Index transaction", potal_paired_index_config(s, &final_index), POTAL_OK);
+    check_status("managed retirement requires closed Index transaction", potal_paired_h2_panel_retire(s, r0), POTAL_ERR_BUSY);
+    check_status("managed final Index slot", potal_paired_index_write(s, &extra_index), POTAL_OK);
+    check_status("managed retire completed peer", potal_paired_h2_panel_retire(s, r0), POTAL_OK);
+    check_status("managed retire prefetched but unissued reader refused", potal_paired_h2_panel_retire(s, r1), POTAL_ERR_BUSY);
+    check_u64("managed retirement preserves other pair", potal_paired_h2_query(s).panel[1].readable, 1);
+
+    check_status("managed next Main scales", managed_scales(s, &m1, 0), POTAL_OK);
+    potal_paired_loop_ws wrong = m1; wrong.loop.b = NULL;
+    check_status("managed prefetched Main still requires real B", potal_paired_h2_loop_issue(s, r1, 0, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+    wrong = m1; wrong.loop.b = FAKE_B;
+    check_status("managed wrong original B rejected", potal_paired_h2_loop_issue(s, r1, 0, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+    wrong = m1; wrong.loop.ldb = 96;
+    check_status("managed wrong real stride rejected", potal_paired_h2_loop_issue(s, r1, 0, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+    wrong = m1; wrong.loop.pad_k = 1;
+    check_status("managed Main K padding forbidden", potal_paired_h2_loop_issue(s, r1, 0, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+    wrong = m1; wrong.resident_b = 1;
+    check_status("managed old resident signature forbidden", potal_paired_h2_loop_issue(s, r1, 0, &wrong), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed prefetch reference encode", potal_paired_loop_ws_encode(&m1, &expected), POTAL_OK);
+    st.trace.count = 0; /* Bound storage for the exact ten-command comparison. */
+    check_status("managed prefetched Main issues ordinary program", potal_paired_h2_loop_issue(s, r1, 0, &m1), POTAL_OK);
+    managed_program_equal(&st.trace, 0, &expected, 1);
+    check_u64("managed no resident extension command", sink_has(&st.trace, POTAL_FUNCT_RESIDENT_VIEW), 0);
+    check_status("managed release completes Main", managed_scales(s, &m1, 1), POTAL_OK);
+    check_status("managed retire pair1", potal_paired_h2_panel_retire(s, r1), POTAL_OK);
+
+    const potal_h2_ref stale = r0;
+    p0.readers = 1; p0.residency_index = 102;
+    st.trace.count = 0;
+    check_status("managed next generation pair0 prefetch", potal_paired_h2_panel_begin(s, &p0, 1, &r0), POTAL_OK);
+    check_u64("managed generation grows", r0.generation > stale.generation, 1);
+    for (uint32_t k = 0; k < 3; ++k) for (uint32_t j = 0; j < 2; ++j) {
+        const potal_paired_cmd_record *rec = &st.trace.records[1 + k * 2 + j];
+        check_u64("managed pair0 rear layout", rec->rs2 & UINT64_C(0xffffffff),
+            2 * POTAL_HW_BANK_ROWS - 192 + (k * 2 + j) * 32);
+        check_u64("managed pair0 source stride", rec->rs1, UINT64_C(0x20000) + k * 32 * 128 + 32 + j * 32);
+    }
+    check_status("managed stale get refused", potal_paired_h2_panel_get(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed stale retirement refused", potal_paired_h2_panel_retire(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("managed stale retire cannot clear new B", potal_paired_h2_query(s).panel[0].loading, 1);
+    check_status("managed explicit Fence publishes", potal_paired_fence(s), POTAL_OK);
+    check_status("managed new Main scales", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("managed new Main", potal_paired_h2_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    check_status("managed new scale release", managed_scales(s, &m0, 1), POTAL_OK);
+    check_status("managed new retirement", potal_paired_h2_panel_retire(s, r0), POTAL_OK);
+    check_status("managed retirement preserves ACC readback", potal_paired_acc_readback_issue(s, &rb), POTAL_OK);
+    check_status("managed close waits for readback", potal_paired_h2_close(&s), POTAL_ERR_BUSY);
+    check_status("managed final readback Fence", potal_paired_fence(s), POTAL_OK);
+    check_status("managed close consumes session", potal_paired_h2_close(&s), POTAL_OK);
+    check_u64("managed pointer consumed", s == NULL, 1);
+
+    managed_open(&st, &s);
+    check_status("managed another owner panel", potal_paired_h2_panel_begin(s, &p0, 1, &r0), POTAL_OK);
+    check_u64("managed owner incarnation changes", r0.owner != stale.owner, 1);
+    check_status("managed old owner rejected", potal_paired_h2_panel_get(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed owner publication", potal_paired_fence(s), POTAL_OK);
+    check_status("managed owner scales", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("managed owner Main", potal_paired_h2_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    check_status("managed owner release", managed_scales(s, &m0, 1), POTAL_OK);
+    check_status("managed owner retirement", potal_paired_h2_panel_retire(s, r0), POTAL_OK);
+    check_status("managed owner close", potal_paired_h2_close(&s), POTAL_OK);
+}
+
+/* Failure positions cover first CONFIG, first/partial/final MVIN, partial
+ * program and readback. A rejected last command is not a fully issued reader.
+ */
+static void test_managed_recovery(void) {
+    for (uint32_t kind = 0; kind < 6; ++kind) {
+        const uint32_t last = kind == 0 || kind == 4 ? 7 : kind == 1 || kind == 5 ? 10 : kind == 2 ? 3 : 1;
+        for (uint32_t position = 1; position <= last; ++position) {
+            managed_sink_state st;
+            potal_paired_session *s = NULL;
+            managed_open(&st, &s);
+            potal_h2_panel panel = managed_panel(0, kind == 5 ? 2 : 1);
+            potal_h2_ref ref = {0};
+            potal_paired_loop_ws main_loop = managed_main(&panel);
+            potal_paired_loop_ws residual_loop = managed_residual(&panel);
+            check_status("managed recovery live Scale", potal_paired_scale_write(s, 20, 4, 0, 0), POTAL_OK);
+            if (kind) {
+                check_status("managed recovery declare", potal_paired_h2_panel_begin(s, &panel, 0, &ref), POTAL_OK);
+                check_status("managed recovery scales", managed_scales(s, &main_loop, 0), POTAL_OK);
+                if (kind == 5)
+                    check_status("managed recovery Residual scales", managed_scales(s, &residual_loop, 0), POTAL_OK);
+                if (kind == 2 || kind == 3 || kind == 5)
+                    check_status("managed recovery Main", potal_paired_h2_loop_issue(s, ref, 0, &main_loop), POTAL_OK);
+            }
+            if (kind == 5) {
+                const potal_index_config cfg = managed_index(&panel);
+                check_status("managed recovery Index", potal_paired_index_config(s, &cfg), POTAL_OK);
+                for (uint32_t i = 0; i < cfg.active_rows; ++i) {
+                    const potal_index_write entry = {i, i};
+                    check_status("managed recovery Index slot", potal_paired_index_write(s, &entry), POTAL_OK);
+                }
+                const potal_h2_panel next = managed_panel(1, 1);
+                potal_h2_ref next_ref;
+                check_status("managed recovery prepared successor", potal_paired_h2_panel_begin(s, &next, 0, &next_ref), POTAL_OK);
+            }
+            st.fail_at = st.trace.count + position;
+            potal_status failed;
+            if (kind == 0) failed = potal_paired_h2_panel_begin(s, &panel, 1, &ref);
+            else if (kind == 1) failed = potal_paired_h2_loop_issue(s, ref, 0, &main_loop);
+            else if (kind == 4) failed = potal_paired_h2_panel_prefetch(s, ref);
+            else if (kind == 5) failed = potal_paired_h2_loop_issue(s, ref, 1, &residual_loop);
+            else if (kind == 2) {
+                const potal_acc_readback rb = {.acc_bank = 0, .i_tiles = 1, .j_tiles = 2,
+                    .pad_i = 3, .pad_j = 5, .c = FAKE_C, .ldc = 64};
+                failed = potal_paired_acc_readback_issue(s, &rb);
+            } else {
+                const potal_index_config cfg = managed_index(&panel);
+                failed = potal_paired_index_config(s, &cfg);
+            }
+            check_status("managed injected answered failure", failed, POTAL_HW_INVALID_ADDRESS);
+            potal_h2_status q = potal_paired_h2_query(s);
+            check_u64("managed first failure is sticky", q.core.failed && q.core.error == POTAL_HW_INVALID_ADDRESS, 1);
+            check_u64("managed failed operation never publishes", q.panel[0].readable, 0);
+            if (kind == 0 || kind == 4) {
+                check_u64("managed partial B owns pending and source", q.pending_b && q.source_pending, 1);
+                check_u64("managed attempted MVIN count", q.attempted_b_mvins, position - 1);
+                check_u64("managed partial B has zero old loop counters", q.core.outstanding_loops, 0);
+            } else if (kind == 1 || kind == 5) {
+                check_u64("managed partial program premarked", q.core.outstanding_loops, kind == 5 ? 2 : 1);
+                check_u64("managed failed program not issued reader", q.panel[0].readers_issued, kind == 5 ? 1 : 0);
+                if (kind == 5)
+                    check_u64("managed failed current retains prepared successor", q.panel[1].declared, 1);
+            } else if (kind == 2) {
+                check_u64("managed partial readback premarked", q.core.outstanding_readbacks, 1);
+            } else {
+                check_u64("managed failed metadata has control ownership", q.control_pending, 1);
+            }
+            check_status("managed failed direct Fence refused", potal_paired_fence(s), POTAL_HW_INVALID_ADDRESS);
+            check_status("managed failed close retains", potal_paired_h2_close(&s), POTAL_HW_INVALID_ADDRESS);
+            uint32_t start = st.trace.count;
+            check_status("managed one recoverable cleanup", potal_paired_session_cleanup(s), POTAL_OK);
+            check_u64("managed cleanup starts with Fence despite zero old counters",
+                st.trace.records[start].funct, POTAL_FUNCT_FENCE);
+            uint32_t fences = 0;
+            for (uint32_t i = start; i < st.trace.count; ++i)
+                fences += st.trace.records[i].funct == POTAL_FUNCT_FENCE;
+            check_u64("managed cleanup has exactly one Fence", fences, 1);
+            q = potal_paired_h2_query(s);
+            check_u64("managed cleanup clears actual pending and Scale work",
+                q.pending_b | q.source_pending | q.control_pending | q.core.live_scale_slots |
+                q.core.outstanding_loops | q.core.outstanding_readbacks, 0);
+            check_u64("managed cleanup discards failed identity", q.panel[0].declared, 0);
+            check_u64("managed cleanup discards prepared successor", q.panel[1].declared, 0);
+            check_u64("managed cleaned retains source until close", q.cleaned && q.source_bound, 1);
+            start = st.trace.count;
+            check_status("managed cleanup idempotent without retry", potal_paired_session_cleanup(s), POTAL_OK);
+            check_u64("managed second cleanup emits nothing", st.trace.count, start);
+            check_status("managed cleaned close returns original error", potal_paired_h2_close(&s), POTAL_HW_INVALID_ADDRESS);
+            check_u64("managed cleaned close consumes", s == NULL, 1);
+        }
+    }
+}
+
+static void managed_fatal_case(uint32_t kind) {
+    managed_sink_state st;
+    potal_paired_session *s = NULL;
+    managed_open(&st, &s);
+    potal_h2_panel panel = managed_panel(0, 1);
+    potal_h2_ref ref = {0};
+    check_status("managed fatal live Scale", potal_paired_scale_write(s, 20, 4, 0, 0), POTAL_OK);
+    const potal_status first = kind == 1 || kind == 3 ? POTAL_HW_INVALID_ADDRESS : POTAL_ERR_BAD_RESPONSE;
+    if (kind == 1 || kind == 3) st.fail_at = st.trace.count + 3;
+    check_status("managed fatal prefetch", potal_paired_h2_panel_begin(s, &panel, 1, &ref),
+        kind == 1 || kind == 3 ? POTAL_HW_INVALID_ADDRESS : POTAL_OK);
+    st.trace.fail_funct = kind == 2 || kind == 3 ? POTAL_FUNCT_SCALE_RELEASE : POTAL_FUNCT_FENCE;
+    st.trace.fail_status = POTAL_ERR_BAD_RESPONSE;
+    if (kind == 0) check_status("managed unknown Fence", potal_paired_fence(s), POTAL_ERR_BAD_RESPONSE);
+    else if (kind == 2)
+        check_status("managed unknown Release", potal_paired_scale_release(s, 20, 4, 0), POTAL_ERR_BAD_RESPONSE);
+    else check_status("managed cleanup failure", potal_paired_session_cleanup(s), POTAL_ERR_BAD_RESPONSE);
+    const potal_h2_status q = potal_paired_h2_query(s);
+    check_u64("managed independent unknown latch and quarantine", q.unknown_completion && q.quarantined, 1);
+    check_status("managed quarantine preserves first error", q.core.error, first);
+    check_u64("managed quarantine never publishes", q.panel[0].readable, 0);
+    check_u64("managed quarantine retains source binding", q.source_bound, 1);
+    const uint32_t start = st.trace.count;
+    check_status("managed quarantine Fence no retry", potal_paired_fence(s), first);
+    check_status("managed quarantine cleanup no retry", potal_paired_session_cleanup(s), first);
+    check_status("managed quarantine issue refuses", potal_paired_h2_panel_begin(s, &panel, 1, &ref), first);
+    check_status("managed quarantine get refuses", potal_paired_h2_panel_get(s, ref), first);
+    check_status("managed quarantine retire refuses", potal_paired_h2_panel_retire(s, ref), first);
+    check_status("managed quarantine close refuses", potal_paired_h2_close(&s), first);
+    check_u64("managed quarantine retains opaque handle", s != NULL, 1);
+    check_u64("managed quarantine has no new commands", st.trace.count, start);
+    potal_paired_session *other = NULL;
+    const potal_paired_sink sink = {managed_sink, &st};
+    check_status("managed quarantine retains global owner", potal_paired_session_open(&sink, &other), POTAL_ERR_BUSY);
+}
+
+static void test_managed_quarantine(void) {
+    for (uint32_t kind = 0; kind < 4; ++kind) {
+#if defined(__unix__)
+        fflush(NULL);
+        const int before = failures;
+        const pid_t child = fork();
+        if (child == 0) {
+            managed_fatal_case(kind);
+            fflush(NULL);
+            _exit(failures == before ? 0 : 1);
+        }
+        check_u64("managed fatal case forked", child >= 0, 1);
+        if (child < 0) continue;
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+        check_u64("managed isolated quarantine case", result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
+#else
+        check_u64("managed quarantine requires fork support, not skipped", 0, 1);
+        (void)kind;
+        (void)managed_fatal_case;
+#endif
+    }
+}
+#endif
+
+static void test_managed_admission(void) {
+    sink_state st;
+    memset(&st, 0, sizeof(st));
+    const potal_paired_sink sink = {sink_cmd, &st};
+    potal_paired_session *s = NULL;
+    check_status("managed admission session", potal_paired_session_open(&sink, &s), POTAL_OK);
+    potal_h2_weight w = managed_weight();
+#if POTAL_HW_DIM == 32 && !defined(__riscv)
+    check_status("managed admission close initial sink", potal_paired_session_close(s), POTAL_OK);
+    check_status("managed no-sink session", potal_paired_session_open(NULL, &s), POTAL_OK);
+    check_status("managed unavailable hardware refused before binding", potal_paired_h2_begin(s, &w), POTAL_ERR_NO_HARDWARE);
+    const potal_h2_status unavailable = potal_paired_h2_query(s);
+    check_u64("managed unavailable admission has no effects",
+        unavailable.active | unavailable.source_bound | unavailable.core.failed | unavailable.core.commands, 0);
+    check_status("managed unavailable admission ordinary close", potal_paired_session_close(s), POTAL_OK);
+    check_status("managed admission reopens owner", potal_paired_session_open(&sink, &s), POTAL_OK);
+#endif
+#if POTAL_HW_DIM == 32
+    potal_h2_weight bad = w; bad.bytes--;
+    check_status("managed insufficient accessible bytes", potal_paired_h2_begin(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    bad = w; bad.base = (const int8_t *)((uintptr_t)w.base + 1);
+    check_status("managed unaligned original base", potal_paired_h2_begin(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    bad = w; bad.ldb = (size_t)w.n - 1;
+    check_status("managed original stride too short", potal_paired_h2_begin(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    bad = w; bad.k = UINT64_MAX; bad.ldb = SIZE_MAX;
+    check_status("managed original extent overflow", potal_paired_h2_begin(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    bad = w; bad.base = (const int8_t *)(UINTPTR_MAX - 31);
+    check_status("managed original pointer overflow", potal_paired_h2_begin(s, &bad), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("managed scale before begin", potal_paired_scale_write(s, 0, 1, 0, 0), POTAL_OK);
+    check_status("managed begin cannot adopt live Scale", potal_paired_h2_begin(s, &w), POTAL_ERR_BUSY);
+    check_status("managed admission release", potal_paired_scale_release(s, 0, 1, 0), POTAL_OK);
+    check_status("managed admission begin", potal_paired_h2_begin(s, &w), POTAL_OK);
+    w.base = NULL; w.ldb = 0; /* descriptor copied; caller storage need not survive */
+    check_u64("managed no capability counter query", sink_has(&st, POTAL_FUNCT_COUNTER), 0);
+    check_status("managed empty close", potal_paired_h2_close(&s), POTAL_OK);
+#else
+    check_status("managed physical DIM16 explicitly refused", potal_paired_h2_begin(s, &w), POTAL_ERR_UNSUPPORTED);
+    check_u64("managed refusal emits no command", st.count, 0);
+    check_u64("managed refusal preserves ordinary mode", potal_paired_h2_query(s).active, 0);
+    check_status("managed refusal leaves ordinary close", potal_paired_session_close(s), POTAL_OK);
+#endif
+}
+
+typedef struct observation_test_state {
+    sink_state trace;
+    potal_paired_session *session;
+    uint64_t capability;
+    uint32_t calls;
+} observation_test_state;
+
+static potal_status observation_test_counter(void *ctx, const potal_paired_cmd_record *record,
+    uint64_t *value) {
+    observation_test_state *st = ctx;
+    check_status("observation reentrant cleanup refused", potal_paired_session_cleanup(st->session), POTAL_ERR_BUSY);
+    check_status("observation reentrant close refused", potal_paired_session_close(st->session), POTAL_ERR_BUSY);
+    st->calls++;
+    check_u64("observation only COUNTER126 xd1 rs2zero",
+        record->funct == POTAL_FUNCT_COUNTER && record->xd == 1 && record->rs2 == 0, 1);
+    if (st->calls == 1) check_u64("observation clears unsupported counter0 before probe", record->rs1, 0xA);
+    if (st->calls == 2) check_u64("observation exact tagged query", record->rs1, POTAL_PREFETCH_OBSERVATION_TAG);
+    if (st->calls >= 3 && st->calls <= 9)
+        check_u64("observation exact seven event selectors", record->rs1,
+            ((uint64_t)(45 + st->calls - 3) << 12) | ((st->calls - 3) << 4) | 8);
+    *value = record->rs1 == POTAL_PREFETCH_OBSERVATION_TAG ? st->capability :
+        UINT64_C(0x100000000) + (record->rs1 >> 4);
+    return POTAL_OK;
+}
+
+static void test_observation(void) {
+    observation_test_state st = {0};
+    const potal_paired_sink sink = {sink_cmd, &st};
+    potal_paired_session *s = NULL;
+    check_status("observation session", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+#if POTAL_HW_DIM == 32
+    check_status("observation requires wide-response sink",
+        potal_paired_observation_begin(s, NULL), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("observation rejects old image",
+        potal_paired_observation_begin(s, observation_test_counter), POTAL_ERR_UNSUPPORTED);
+    check_u64("observation rejected image only safe probe", st.calls, 2);
+    check_status("observation rejected image closes", potal_paired_session_close(s), POTAL_OK);
+    memset(&st, 0, sizeof(st));
+    st.capability = POTAL_PREFETCH_OBSERVATION_CAPABILITY;
+    check_status("observation supported session", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+    check_status("observation supported begin",
+        potal_paired_observation_begin(s, observation_test_counter), POTAL_OK);
+    check_u64("observation probe configure reset", st.calls, 10);
+    check_status("observation active close refused", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_status("observation scale", potal_paired_scale_write(s, 0, 7, 0, 0), POTAL_OK);
+    uint64_t cycles[7] = {0};
+    check_status("observation cannot snapshot live Scale", potal_paired_observation_end(s, cycles), POTAL_ERR_BUSY);
+    check_u64("observation refusal issues nothing", st.calls, 10);
+    check_status("observation release", potal_paired_scale_release(s, 0, 7, 0), POTAL_OK);
+    check_status("observation drained snapshot", potal_paired_observation_end(s, cycles), POTAL_OK);
+    for (uint32_t i = 0; i < 7; ++i)
+        check_u64("observation preserves full response width", cycles[i], UINT64_C(0x100000000) + i);
+    check_u64("observation snapshot seven reads clear", st.calls, 19);
+#else
+    check_status("observation DIM16 refusal",
+        potal_paired_observation_begin(s, observation_test_counter), POTAL_ERR_UNSUPPORTED);
+    check_u64("observation DIM16 no command", st.calls, 0);
+#endif
+    check_status("observation close", potal_paired_session_close(s), POTAL_OK);
+}
+
 int main(void) {
     printf("POTAL_API_TEST DIM=%u params_sha256=%s\n", (unsigned)potal_hw_dim(), potal_hw_params_sha256());
     check_u64("hw dim matches adapter", potal_hw_dim(), POTAL_HW_DIM);
@@ -1029,6 +1621,14 @@ int main(void) {
     test_paired_loop_ws();
     test_acc_readback();
     test_paired_host_no_hardware_before_sessions();
+    test_managed_admission();
+    test_observation();
+#if POTAL_HW_DIM == 32
+    test_managed_h2();
+    test_managed_recovery();
+    test_managed_quarantine();
+#endif
+    /* Legacy terminal poison remains last, after every managed case. */
     test_paired_session();
 
     if (failures != 0) {

@@ -1009,9 +1009,29 @@ typedef struct paired_pair_state {
     uint32_t outstanding;        /* paired LOOP_WS on this pair since the last POTAL_OK fence */
 } paired_pair_state;
 
+typedef struct h2_panel_state {
+    potal_h2_panel declaration;
+    potal_h2_panel_status status;
+    const int8_t *source;             /* derived from the bound original matrix */
+    uint32_t b_sp_base;
+    int load_issued;                 /* whole B load/program handed off, not completed */
+} h2_panel_state;
+
+typedef struct h2_state {
+    potal_h2_weight weight;
+    potal_h2_status status;
+    uint64_t owner, sequence;
+    int in_call, started, program_pending;
+    uint32_t acc_written;            /* ACC contents survive panel retirement */
+    h2_panel_state panel[POTAL_PAIRS];
+} h2_state;
+
 struct potal_paired_session {
     potal_paired_sink sink;
     resident_ws_state *resident;            /* NULL for every legacy session */
+    h2_state         *h2;                  /* mutually exclusive managed DIM32 mode */
+    potal_observation_counter_fn observation_counter;
+    int observation_active, observation_in_call;
     int               failed;
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
@@ -1035,12 +1055,20 @@ static potal_status resident_ws_fence(potal_paired_session *s);
 static potal_status resident_ws_cleanup(potal_paired_session *s);
 static potal_status resident_ws_release(potal_paired_session *s, uint32_t slot,
     uint32_t generation, uint32_t column);
+static void h2_completed(potal_paired_session *s);
+static potal_status h2_fence(potal_paired_session *s);
+static potal_status h2_cleanup(potal_paired_session *s);
+static int h2_pending(const potal_paired_session *s);
 
 static potal_status paired_fail(potal_paired_session *s, potal_status status, const char *stage) {
     if (!s->failed) {
         s->failed = 1;
         s->error = status;
         s->error_stage = stage;
+    }
+    if (s->h2 && status == POTAL_ERR_BAD_RESPONSE) {
+        s->h2->status.unknown_completion = 1;
+        s->h2->status.quarantined = 1;
     }
     return status;
 }
@@ -1063,7 +1091,10 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
     s->commands++;
     if (s->sink.cmd != NULL) {
         const potal_paired_cmd_record rec = { funct, (uint32_t)xd, rs1, rs2 };
-        return s->sink.cmd(s->sink.ctx, &rec);
+        if (s->h2) s->h2->in_call = 1;
+        const potal_status status = s->sink.cmd(s->sink.ctx, &rec);
+        if (s->h2) s->h2->in_call = 0;
+        return status;
     }
 #if defined(__riscv)
     switch (funct) {
@@ -1161,15 +1192,19 @@ static void paired_drained(potal_paired_session *s) {
     }
     s->drains++;
     if (s->resident) resident_ws_completed(s);
+    if (s->h2) h2_completed(s);
 }
 
 static potal_status paired_ready(const potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->h2 && s->h2->in_call) return POTAL_ERR_BUSY;
+    if (s->observation_in_call) return POTAL_ERR_BUSY;
     if (s->failed) {
         return s->error;
     }
+    if (s->h2 && s->h2->status.cleaned) return POTAL_ERR_BUSY;
     return POTAL_OK;
 }
 
@@ -1204,7 +1239,8 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
-    if (s->resident) return POTAL_ERR_BUSY; /* pointer-to-pointer resident close owns storage */
+    if (s->resident || s->h2) return POTAL_ERR_BUSY; /* managed pointer-to-pointer close owns storage */
+    if (s->observation_in_call || (s->observation_active && !s->failed)) return POTAL_ERR_BUSY;
     const int outstanding = s->outstanding_loops != 0 || s->outstanding_readbacks != 0 ||
                             s->outstanding_acc_updates != 0;
     int       live        = 0;
@@ -1265,12 +1301,18 @@ potal_status potal_paired_tlb_flush(potal_paired_session *s) {
     if (ready != POTAL_OK) {
         return ready;
     }
+    if (s->h2) {
+        if (s->h2->started || h2_pending(s) || s->index_open) return POTAL_ERR_BUSY;
+        for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot)
+            if (s->slot_columns[slot]) return POTAL_ERR_BUSY;
+    }
     if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0 || s->outstanding_acc_updates != 0) {
         return POTAL_ERR_BUSY; /* no flush under in-flight DMA */
     }
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
+    if (s->h2) s->h2->status.control_pending = 1;
     PAIRED_RAW(s, POTAL_FUNCT_FLUSH, 0, 0, 0, "tlb_flush");
     return POTAL_OK;
 }
@@ -1298,9 +1340,11 @@ static potal_status paired_scale_write_core(potal_paired_session *s, uint32_t sl
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
+    if (s->h2) s->h2->status.control_pending = 1;
     PAIRED_RAW(s, POTAL_FUNCT_SCALE_WRITE, rs1, carrier, 1, "scale_write");
     s->slot_columns[slot] |= bit;
     s->slot_generation[slot] = (uint8_t)generation;
+    if (s->h2) s->h2->status.control_pending = 0;
     return POTAL_OK;
 }
 
@@ -1325,7 +1369,15 @@ static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t 
      * (Controller.scala: releaseSafe := allDrained, the same signal as
      * fenceDrained): an accepted release is a drain point, like POTAL_FENCE.
      */
-    PAIRED_RAW(s, POTAL_FUNCT_SCALE_RELEASE, rs1, 0, 1, "scale_release");
+    const potal_status released = paired_raw(s, POTAL_FUNCT_SCALE_RELEASE, rs1, 0, 1);
+    if (released != POTAL_OK) {
+        if (s->h2) {
+            s->h2->status.last_drain = released;
+            s->h2->status.unknown_completion = 1;
+            s->h2->status.quarantined = 1;
+        }
+        return paired_fail(s, released, "scale_release");
+    }
     s->slot_columns[slot] &= ~((uint64_t)1 << column); /* the slot is free when its last live column is released */
     paired_drained(s);
     return POTAL_OK;
@@ -1347,6 +1399,7 @@ static potal_status paired_index_config_core(potal_paired_session *s, const pota
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
+    if (s->h2) s->h2->status.control_pending = 1;
     PAIRED_RAW(s, POTAL_FUNCT_INDEX_CONFIG, c.rs1, c.rs2, 1, "index_config");
     /* The hardware invalidated the buffer's entries: the pair's window is valid again only when complete. */
     s->pair[cfg->pair].index_valid = 0;
@@ -1354,6 +1407,7 @@ static potal_status paired_index_config_core(potal_paired_session *s, const pota
     s->index_pair = cfg->pair;
     s->index_written = 0;
     s->index_cfg = *cfg;
+    if (s->h2) s->h2->status.control_pending = 0;
     return POTAL_OK;
 }
 
@@ -1376,6 +1430,7 @@ static potal_status paired_index_write_core(potal_paired_session *s, const potal
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
+    if (s->h2) s->h2->status.control_pending = 1;
     PAIRED_RAW(s, POTAL_FUNCT_INDEX_WRITE, c.rs1, c.rs2, 1, "index_write");
     s->index_written++;
     if (s->index_written == s->index_cfg.active_rows) {
@@ -1384,12 +1439,18 @@ static potal_status paired_index_write_core(potal_paired_session *s, const potal
         pr->index = s->index_cfg;
         s->index_open = 0;
     }
+    if (s->h2) s->h2->status.control_pending = 0;
     return POTAL_OK;
 }
 
 potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                       uint32_t column, uint32_t carrier) {
     if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && s->h2) {
+        const potal_status ready = paired_ready(s);
+        if (ready != POTAL_OK) return ready;
+        if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
+    }
     return paired_scale_write_core(s, slot, generation, column, carrier);
 }
 
@@ -1401,11 +1462,27 @@ potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, 
 
 potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
     if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && s->h2) {
+        const potal_status ready = paired_ready(s);
+        if (ready != POTAL_OK) return ready;
+        if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
+        if (!cfg || cfg->pair >= POTAL_PAIRS) return POTAL_ERR_INVALID_ARGUMENT;
+        const h2_panel_state *p = &s->h2->panel[cfg->pair];
+        if (!p->status.declared || !p->status.readers_issued ||
+            cfg->b_sp_base != p->b_sp_base || cfg->j_tiles != p->declaration.j_tiles ||
+            cfg->source_k_rows != p->declaration.k_tiles * POTAL_HW_DIM)
+            return POTAL_ERR_INVALID_ARGUMENT;
+    }
     return paired_index_config_core(s, cfg);
 }
 
 potal_status potal_paired_index_write(potal_paired_session *s, const potal_index_write *w) {
     if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && s->h2) {
+        const potal_status ready = paired_ready(s);
+        if (ready != POTAL_OK) return ready;
+        if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
+    }
     return paired_index_write_core(s, w);
 }
 
@@ -1434,7 +1511,7 @@ static potal_status paired_issue_program(potal_paired_session *s, const potal_ge
 }
 
 potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_paired_loop_ws *pl) {
-    if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->h2)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1501,19 +1578,29 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
     if (status != POTAL_OK) {
         return status;
     }
+    if (s->h2) {
+        if (!(s->h2->acc_written & (1u << r->acc_bank)) || s->h2->status.control_pending)
+            return POTAL_ERR_BUSY;
+        const uint64_t extent = matrix_extent((uint64_t)r->i_tiles * POTAL_HW_DIM - r->pad_i,
+            (uint64_t)r->j_tiles * POTAL_HW_DIM - r->pad_j, r->ldc, sizeof(int32_t));
+        if (ranges_overlap((uintptr_t)r->c, extent, (uintptr_t)s->h2->weight.base, s->h2->weight.bytes))
+            return POTAL_ERR_INVALID_ARGUMENT;
+        if (s->outstanding_readbacks == UINT32_MAX) return POTAL_ERR_CAPACITY;
+    }
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
+    if (s->h2) s->outstanding_readbacks++; /* before even the first CONFIG can have effects */
     PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_st.rs1, config_st.rs2, 0, "acc_readback");
     for (uint32_t t = 0; t < count; ++t) {
         PAIRED_RAW(s, POTAL_FUNCT_MVOUT, mvouts[t].rs1, mvouts[t].rs2, 0, "acc_readback");
     }
-    s->outstanding_readbacks++;
+    if (!s->h2) s->outstanding_readbacks++;
     return POTAL_OK;
 }
 
 potal_status potal_paired_acc_bias_issue(potal_paired_session *s, const potal_acc_bias *bias) {
-    if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->h2)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1547,7 +1634,9 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->observation_in_call) return POTAL_ERR_BUSY;
     if (s->resident) return resident_ws_cleanup(s);
+    if (s->h2) return h2_cleanup(s);
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1589,6 +1678,7 @@ potal_status potal_paired_fence(potal_paired_session *s) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
     if (s->resident) return resident_ws_fence(s);
+    if (s->h2) return h2_fence(s);
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1600,6 +1690,461 @@ potal_status potal_paired_fence(potal_paired_session *s) {
         return paired_fail(s, status, "fence"); /* outstanding work stays outstanding */
     }
     paired_drained(s);
+    return POTAL_OK;
+}
+
+/* ---- Managed H2: ordinary rear-packed panels and one next-B prefetch ----- */
+
+static uint64_t h2_owner_sequence;
+
+static potal_status h2_ready(const potal_paired_session *s) {
+    if (!s || !s->h2) return POTAL_ERR_INVALID_ARGUMENT;
+    return paired_ready(s);
+}
+
+static h2_panel_state *h2_find(potal_paired_session *s, potal_h2_ref ref) {
+    if (!ref.owner || !ref.generation || ref.pair >= POTAL_PAIRS) return NULL;
+    h2_panel_state *p = &s->h2->panel[ref.pair];
+    return p->status.declared && p->status.ref.owner == ref.owner &&
+        p->status.ref.generation == ref.generation ? p : NULL;
+}
+
+static int h2_live_scales(const potal_paired_session *s) {
+    for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot)
+        if (s->slot_columns[slot]) return 1;
+    return 0;
+}
+
+static int h2_pending(const potal_paired_session *s) {
+    const h2_state *h = s->h2;
+    return h->status.pending_b || h->status.control_pending || h->program_pending ||
+        h->panel[0].status.loading || h->panel[1].status.loading ||
+        s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates;
+}
+
+/* Only paired_drained reaches here. Hardware progress and status queries do not. */
+static void h2_completed(potal_paired_session *s) {
+    h2_state *h = s->h2;
+#if defined(__riscv)
+    potal_cpu_fence_rw();
+#endif
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair) {
+        h2_panel_state *p = &h->panel[pair];
+        if (p->status.loading) {
+            p->status.readable = !s->failed && p->load_issued;
+            p->status.loading = 0;
+            if (p->status.readable) {
+                paired_pair_state *pr = &s->pair[pair];
+                pr->resident_b = 1;
+                pr->b_sp_base = p->b_sp_base;
+                pr->b_j_tiles = p->declaration.j_tiles;
+                pr->b_k_rows = p->declaration.k_tiles * POTAL_HW_DIM;
+                pr->main_a_tiles = p->declaration.main_i_tiles * p->declaration.k_tiles;
+            }
+        }
+        if (!s->failed) p->status.readers_completed = p->status.readers_issued;
+        else p->status.readable = 0;
+    }
+    h->status.pending_b = 0;
+    h->status.control_pending = 0;
+    h->status.last_drain = POTAL_OK;
+    h->program_pending = 0;
+}
+
+potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weight *w) {
+    if (s && s->resident) return POTAL_ERR_BUSY;
+    potal_status status = paired_ready(s);
+    if (status != POTAL_OK) return status;
+    if (s->h2) return POTAL_ERR_BUSY;
+    if (POTAL_HW_DIM != 32 || POTAL_HW_BANK_NUM != 4) return POTAL_ERR_UNSUPPORTED;
+    if (!w || !w->base || !w->k || !w->n || w->ldb < w->n || !w->bytes)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t extent = matrix_extent(w->k, w->n, w->ldb, sizeof(int8_t));
+    if (!tile_pointer_ok(w->base, extent, POTAL_HW_DIM) || extent > w->bytes ||
+        w->bytes > UINTPTR_MAX - (uintptr_t)w->base)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates ||
+        s->index_open || h2_live_scales(s))
+        return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (s->pair[pair].resident_b || s->pair[pair].index_valid || s->pair[pair].outstanding)
+            return POTAL_ERR_BUSY;
+    if (h2_owner_sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    h2_state *h = calloc(1, sizeof(*h));
+    if (!h) return POTAL_ERR_CAPACITY;
+    h->weight = *w;
+#if defined(__riscv)
+    /* Publish the entire immutable borrowed B allocation while idle.
+     * Rocket stalls a CPU fence on RoCC busy; repeating it at prefetch
+     * would serialize the load behind the current Execute work. */
+    potal_cpu_fence_rw();
+#endif
+    h->owner = ++h2_owner_sequence;
+    h->status.active = 1;
+    h->status.source_bound = 1;
+    s->h2 = h;
+    paired_owner = 2; /* Same managed owner exclusion as resident_ws, never another issuer. */
+    return POTAL_OK;
+}
+
+/* Check every tile's source and rear SP layout before issuing any command.
+ * No caller-supplied panel pointer participates in address derivation.
+ */
+static potal_status h2_panel_check(const h2_state *h, const potal_h2_panel *d,
+    const int8_t **source, uint32_t *sp_base) {
+    if (!d || d->pair >= POTAL_PAIRS || !d->readers || !d->k_tiles || !d->j_tiles ||
+        !d->main_i_tiles || d->k_tiles > LOOP_WS_FIELD16_MAX ||
+        d->j_tiles > LOOP_WS_FIELD16_MAX || d->main_i_tiles > LOOP_WS_FIELD16_MAX ||
+        d->pad_j >= POTAL_HW_DIM || d->main_pad_i >= POTAL_HW_DIM ||
+        d->k_begin % POTAL_HW_DIM || d->j_begin % POTAL_HW_DIM)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t rows = (uint64_t)d->k_tiles * POTAL_HW_DIM;
+    const uint64_t cols = (uint64_t)d->j_tiles * POTAL_HW_DIM - d->pad_j;
+    if (d->k_begin >= h->weight.k || rows > h->weight.k - d->k_begin ||
+        d->j_begin >= h->weight.n || cols > h->weight.n - d->j_begin)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t bank_tiles = POTAL_HW_BANK_ROWS / POTAL_HW_DIM;
+    if ((uint64_t)d->k_tiles * d->j_tiles > bank_tiles ||
+        (uint64_t)d->main_i_tiles * d->k_tiles > bank_tiles ||
+        (uint64_t)d->main_i_tiles * d->j_tiles > POTAL_WORK_IDS_PER_LOOP ||
+        (uint64_t)d->main_i_tiles * d->j_tiles * POTAL_HW_DIM > POTAL_HW_ACC_ROWS / 2)
+        return POTAL_ERR_CAPACITY;
+    /* The full original extent was checked at begin: these products cannot wrap. */
+    const uint64_t offset = d->k_begin * h->weight.ldb + d->j_begin;
+    const uint64_t extent = matrix_extent(rows, cols, h->weight.ldb, sizeof(int8_t));
+    if (offset >= h->weight.bytes || !extent || extent > h->weight.bytes - offset)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uintptr_t address = (uintptr_t)h->weight.base + (uintptr_t)offset;
+    if (!tile_pointer_ok((const void *)address, extent, POTAL_HW_DIM))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t base = pair_weight_begin(d->pair) + POTAL_HW_BANK_ROWS -
+        rows * d->j_tiles;
+    if (base > UINT32_MAX || base + rows * d->j_tiles > LOCAL_ADDR_FULL_ACC_ROW)
+        return POTAL_ERR_CAPACITY;
+    *source = (const int8_t *)address;
+    *sp_base = (uint32_t)base;
+    return POTAL_OK;
+}
+
+static potal_status h2_issue_prefetch(potal_paired_session *s, h2_panel_state *p) {
+    h2_state *h = s->h2;
+    const potal_h2_panel *d = &p->declaration;
+    /* Ownership precedes CONFIG too, not merely the first successful MVIN. */
+    p->status.prefetched = 1;
+    h->status.pending_b = 1;
+    p->status.loading = 1;
+    /* B was published at begin and cannot be modified until safe close. */
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld_rs1(0), h->weight.ldb, 0, "h2_prefetch");
+    for (uint32_t k = 0; k < d->k_tiles; ++k) {
+        for (uint32_t j = 0; j < d->j_tiles; ++j) {
+            const uint64_t cols = POTAL_HW_DIM - (j + 1 == d->j_tiles ? d->pad_j : 0);
+            const uint64_t address = (uint64_t)(uintptr_t)p->source +
+                (uint64_t)k * POTAL_HW_DIM * h->weight.ldb + (uint64_t)j * POTAL_HW_DIM;
+            const uint64_t row = p->b_sp_base + ((uint64_t)k * d->j_tiles + j) * POTAL_HW_DIM;
+            h->status.attempted_b_mvins++;
+            PAIRED_RAW(s, POTAL_FUNCT_MVIN, address,
+                ((uint64_t)POTAL_HW_DIM << MVOUT_ROWS_SHIFT) | (cols << MVOUT_COLS_SHIFT) | row,
+                0, "h2_prefetch");
+        }
+    }
+    p->load_issued = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_h2_panel_begin(potal_paired_session *s,
+    const potal_h2_panel *d, uint32_t prefetch, potal_h2_ref *reference) {
+    potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!reference || prefetch > 1) return POTAL_ERR_INVALID_ARGUMENT;
+    h2_state *h = s->h2;
+    const int8_t *source;
+    uint32_t base;
+    status = h2_panel_check(h, d, &source, &base);
+    if (status != POTAL_OK) return status;
+    if (h->status.pending_b || h->status.control_pending || s->index_open ||
+        h->panel[d->pair].status.declared || s->pair[d->pair].outstanding)
+        return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (h->panel[pair].status.declared &&
+            h->panel[pair].declaration.residency_index == d->residency_index)
+            return POTAL_ERR_INVALID_ARGUMENT;
+    if (h->sequence == UINT64_MAX ||
+        (prefetch && h->status.attempted_b_mvins >
+            UINT64_MAX - (uint64_t)d->k_tiles * d->j_tiles))
+        return POTAL_ERR_CAPACITY;
+    if (prefetch && !paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    h2_panel_state *p = &h->panel[d->pair];
+    memset(p, 0, sizeof(*p));
+    p->declaration = *d;
+    p->source = source;
+    p->b_sp_base = base;
+    p->status.ref = (potal_h2_ref){h->owner, ++h->sequence, d->pair};
+    p->status.residency_index = d->residency_index;
+    p->status.declared = 1;
+    p->status.readers_declared = d->readers;
+    h->started = 1;
+    *reference = p->status.ref; /* Even an interrupted load has an owned identity. */
+    if (!prefetch) return POTAL_OK;
+    return h2_issue_prefetch(s, p);
+}
+
+potal_status potal_paired_h2_panel_prefetch(potal_paired_session *s, potal_h2_ref reference) {
+    const potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    h2_panel_state *p = h2_find(s, reference);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    h2_state *h = s->h2;
+    if (h->status.pending_b || h->status.control_pending || s->index_open ||
+        p->status.prefetched || p->status.loading || p->status.readable ||
+        p->load_issued || p->status.readers_issued || s->pair[reference.pair].outstanding)
+        return POTAL_ERR_BUSY;
+    if (h->status.attempted_b_mvins >
+        UINT64_MAX - (uint64_t)p->declaration.k_tiles * p->declaration.j_tiles)
+        return POTAL_ERR_CAPACITY;
+    return h2_issue_prefetch(s, p);
+}
+
+potal_status potal_paired_h2_loop_issue(potal_paired_session *s, potal_h2_ref reference,
+    uint32_t ordinal, const potal_paired_loop_ws *pl) {
+    potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    h2_state *h = s->h2;
+    h2_panel_state *p = h2_find(s, reference);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    if (h->status.pending_b || h->status.control_pending || s->outstanding_acc_updates)
+        return POTAL_ERR_BUSY;
+    potal_gemm_ws_program program;
+    status = potal_paired_loop_ws_encode(pl, &program); /* REAL ordinary descriptor */
+    if (status != POTAL_OK) return status;
+    const potal_loop_ws *l = &pl->loop;
+    const potal_h2_panel *d = &p->declaration;
+    if (ordinal != p->status.readers_issued || ordinal >= d->readers ||
+        pl->pair != reference.pair || l->j_tiles != d->j_tiles || l->pad_j != d->pad_j ||
+        pl->path != (ordinal ? POTAL_PAIRED_RESIDUAL : POTAL_PAIRED_MAIN))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    paired_pair_state *pr = &s->pair[reference.pair];
+    if (!ordinal) {
+        if (l->i_tiles != d->main_i_tiles || l->pad_i != d->main_pad_i ||
+            l->k_tiles != d->k_tiles || l->pad_k || l->b != p->source || l->ldb != h->weight.ldb)
+            return POTAL_ERR_INVALID_ARGUMENT;
+        if (pr->outstanding || (s->index_open && s->index_pair == reference.pair))
+            return POTAL_ERR_BUSY;
+        if (p->status.prefetched) {
+            if (!p->status.readable) return POTAL_ERR_BUSY;
+            /* The checked ordinary Main uses the exact same rear placement:
+             * (2*pair+2)*BANK_ROWS - K*J*DIM, identical K/J/pad and real stride.
+             * Only suppress the B address; no other field or ISA bit changes. */
+            program.addrs_ab.rs2 = 0;
+        }
+    } else if (!pr->resident_b || !pr->index_valid ||
+        pr->index.b_sp_base != p->b_sp_base || pr->index.j_tiles != d->j_tiles ||
+        pr->index.source_k_rows != d->k_tiles * POTAL_HW_DIM ||
+        pr->index.active_rows != l->k_tiles * POTAL_HW_DIM - l->pad_k ||
+        (s->index_open && s->index_pair == reference.pair) ||
+        pl->a_offset_tiles < d->main_i_tiles * d->k_tiles) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t block = 0; block < l->k_tiles / l->passes_per_block; ++block) {
+        for (uint32_t j = 0; j < l->j_tiles; ++j) {
+            const uint32_t slot = l->scale_base + block * l->j_tiles + j;
+            const uint32_t cols = POTAL_HW_DIM - (j + 1 == l->j_tiles ? l->pad_j : 0);
+            const uint64_t mask = UINT64_MAX >> (64 - cols);
+            if (s->slot_generation[slot] != l->scale_generation ||
+                (s->slot_columns[slot] & mask) != mask)
+                return POTAL_ERR_INVALID_ARGUMENT;
+        }
+    }
+    if (s->outstanding_loops == UINT32_MAX || pr->outstanding == UINT32_MAX)
+        return POTAL_ERR_CAPACITY;
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    h->program_pending = 1;
+    s->outstanding_loops++;
+    pr->outstanding++;
+    if (!ordinal && !p->status.prefetched) p->status.loading = 1;
+    status = paired_issue_program(s, &program, ordinal ? "h2_residual" : "h2_main");
+    if (status != POTAL_OK) return status;
+    p->status.readers_issued++;
+    h->acc_written |= 1u << (ordinal ? POTAL_PAIRED_RESIDUAL : POTAL_PAIRED_MAIN);
+    if (!ordinal) {
+        p->load_issued = 1;
+        pr->resident_b = 1; /* ordered Residual may follow; this is not publication */
+        pr->b_sp_base = p->b_sp_base;
+        pr->b_j_tiles = d->j_tiles;
+        pr->b_k_rows = d->k_tiles * POTAL_HW_DIM;
+        pr->main_a_tiles = d->main_i_tiles * d->k_tiles;
+        pr->index_valid = 0;
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_paired_h2_panel_get(potal_paired_session *s, potal_h2_ref reference) {
+    const potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    const h2_panel_state *p = h2_find(s, reference);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    return p->status.readable ? POTAL_OK : POTAL_ERR_BUSY;
+}
+
+potal_status potal_paired_h2_panel_retire(potal_paired_session *s, potal_h2_ref reference) {
+    const potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    h2_panel_state *p = h2_find(s, reference);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!p->status.readable || p->status.readers_issued != p->declaration.readers ||
+        p->status.readers_completed != p->declaration.readers || h2_pending(s) ||
+        s->index_open || h2_live_scales(s))
+        return POTAL_ERR_BUSY;
+    memset(&s->pair[reference.pair], 0, sizeof(s->pair[reference.pair]));
+    memset(p, 0, sizeof(*p)); /* No ACC clear: the caller owns the accumulator manifest. */
+    return POTAL_OK;
+}
+
+potal_h2_status potal_paired_h2_query(const potal_paired_session *s) {
+    potal_h2_status q;
+    memset(&q, 0, sizeof(q));
+    q.core = potal_paired_session_query(s);
+    if (s && s->h2) {
+        q = s->h2->status;
+        q.core = potal_paired_session_query(s);
+        for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair) {
+            q.panel[pair] = s->h2->panel[pair].status;
+            q.source_pending |= q.panel[pair].loading;
+        }
+    }
+    return q;
+}
+
+static potal_status h2_fence(potal_paired_session *s) {
+    const potal_status ready = h2_ready(s);
+    if (ready != POTAL_OK) return ready; /* Failed recovery is cleanup, never a direct retry. */
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    const potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
+    s->h2->status.last_drain = status;
+    if (status != POTAL_OK) {
+        s->h2->status.unknown_completion = 1;
+        s->h2->status.quarantined = 1;
+        return paired_fail(s, status, "fence");
+    }
+    paired_drained(s);
+    return POTAL_OK;
+}
+
+static potal_status h2_cleanup(potal_paired_session *s) {
+    h2_state *h = s->h2;
+    if (h->in_call) return POTAL_ERR_BUSY;
+    if (s->observation_in_call) return POTAL_ERR_BUSY;
+    if (h->status.quarantined || h->status.unknown_completion) return s->error;
+    if (h->status.cleaned) return h->status.cleanup_status;
+    if (!s->failed || h->status.cleanup_attempted) return POTAL_ERR_BUSY;
+    h->status.cleanup_attempted = 1;
+    /* Always drain once, even a failed first CONFIG with zero old core counts. */
+    potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
+    h->status.last_drain = status;
+    if (status != POTAL_OK) goto quarantine;
+    paired_drained(s); /* failed sessions never publish or complete declared readers */
+    for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) {
+        for (uint32_t col = 0; col < POTAL_HW_DIM; ++col) {
+            if (!(s->slot_columns[slot] & (UINT64_C(1) << col))) continue;
+            uint64_t key;
+            (void)potal_scale_key_encode(slot, s->slot_generation[slot], col, &key);
+            status = paired_raw(s, POTAL_FUNCT_SCALE_RELEASE, key, 0, 1);
+            if (status != POTAL_OK) goto quarantine;
+            s->slot_columns[slot] &= ~(UINT64_C(1) << col);
+            paired_drained(s);
+        }
+    }
+    s->index_open = 0;
+    memset(s->pair, 0, sizeof(s->pair));
+    memset(h->panel, 0, sizeof(h->panel));
+    h->acc_written = 0;
+    h->status.cleanup_status = POTAL_OK;
+    h->status.cleaned = 1;
+    return POTAL_OK;
+
+quarantine:
+    h->status.cleanup_status = status;
+    h->status.unknown_completion = 1; /* independent of the first error/stage */
+    h->status.quarantined = 1;
+    return status; /* s->error remains the original failure */
+}
+
+potal_status potal_paired_h2_close(potal_paired_session **session) {
+    if (!session || !*session || !(*session)->h2) return POTAL_ERR_INVALID_ARGUMENT;
+    potal_paired_session *s = *session;
+    h2_state *h = s->h2;
+    if (h->in_call) return POTAL_ERR_BUSY;
+    if (s->observation_in_call || (s->observation_active && !s->failed)) return POTAL_ERR_BUSY;
+    if (h->status.quarantined || h->status.unknown_completion || (s->failed && !h->status.cleaned))
+        return s->error;
+    if (h2_pending(s) || s->index_open || h2_live_scales(s)) return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (h->panel[pair].status.declared) return POTAL_ERR_BUSY;
+    const potal_status status = s->failed ? s->error : POTAL_OK;
+    *session = NULL;
+    free(h);
+    free(s);
+    paired_owner = 0;
+    return status;
+}
+
+static potal_status observation_counter(potal_paired_session *s, uint64_t rs1, uint64_t *value) {
+    const potal_paired_cmd_record record = {POTAL_FUNCT_COUNTER, 1, rs1, 0};
+    potal_status status;
+    ++s->commands;
+    if (s->sink.cmd) {
+        s->observation_in_call = 1;
+        status = s->observation_counter(s->sink.ctx, &record, value);
+        s->observation_in_call = 0;
+    } else {
+#if defined(__riscv)
+        *value = potal_rocc_counter(rs1, 0);
+        status = POTAL_OK;
+#else
+        (void)value;
+        status = POTAL_ERR_NO_HARDWARE;
+#endif
+    }
+    return status == POTAL_OK ? status : paired_fail(s, status, "observation_counter");
+}
+
+potal_status potal_paired_observation_begin(potal_paired_session *s,
+    potal_observation_counter_fn counter) {
+    potal_status status = paired_ready(s);
+    if (status != POTAL_OK) return status;
+    if (s->resident || s->commands || s->observation_active) return POTAL_ERR_BUSY;
+    if (POTAL_HW_DIM != 32) return POTAL_ERR_UNSUPPORTED;
+    if (!!s->sink.cmd != !!counter) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    s->observation_counter = counter;
+    uint64_t value = 0;
+    status = observation_counter(s, UINT64_C(0xA), &value);
+    if (status == POTAL_OK) status = observation_counter(s, POTAL_PREFETCH_OBSERVATION_TAG, &value);
+    if (status != POTAL_OK) return status;
+    if (value != POTAL_PREFETCH_OBSERVATION_CAPABILITY) return POTAL_ERR_UNSUPPORTED;
+    for (uint32_t i = 0; i < 7; ++i) {
+        status = observation_counter(s, ((uint64_t)(45 + i) << 12) | (i << 4) | 8, &value);
+        if (status != POTAL_OK) return status;
+    }
+    status = observation_counter(s, 1, &value);
+    if (status == POTAL_OK) s->observation_active = 1;
+    return status;
+}
+
+potal_status potal_paired_observation_end(potal_paired_session *s, uint64_t cycles[7]) {
+    potal_status status = paired_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!cycles || !s->observation_active) return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates ||
+        s->index_open || h2_live_scales(s) || (s->h2 && h2_pending(s))) return POTAL_ERR_BUSY;
+    uint64_t values[7], ignored = 0;
+    status = observation_counter(s, 4, &ignored);
+    for (uint32_t i = 0; status == POTAL_OK && i < 7; ++i)
+        status = observation_counter(s, i << 4, &values[i]);
+    if (status == POTAL_OK) status = observation_counter(s, 2, &ignored);
+    if (status != POTAL_OK) return status;
+    memcpy(cycles, values, sizeof(values));
+    s->observation_active = 0;
     return POTAL_OK;
 }
 

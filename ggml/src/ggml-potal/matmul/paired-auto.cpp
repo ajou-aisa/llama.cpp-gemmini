@@ -1633,6 +1633,12 @@ struct executor {
     const potal_paired_geometry & hw;
     potal_paired_staging          staging;
     std::vector<uint32_t>         hw_generation; // per scale window
+    std::vector<size_t>           scale_owner; // opt-in: physical Main owner of a logical Residual window
+    struct managed_panel {
+        potal_h2_ref reference{};
+        bool prefetched = false, retired = false;
+    };
+    std::vector<managed_panel> panels;
     size_t                        drained_upto = 0; // every op with id < drained_upto completed
     size_t                        last_op      = 0; // ops [0, last_op) were handled
     size_t                        pending_readback[2] = { potal_paired_no_index, potal_paired_no_index };
@@ -1653,10 +1659,11 @@ struct executor {
         std::fprintf(stderr,
                      "[POTAL_PROFILE] run_id=%" PRIu64 " stripe=%zu status=%s plan_ms=%.6f pack_ms=%.6f "
                      "scale_write_ms=%.6f scale_release_ms=%.6f index_ms=%.6f main_issue_ms=%.6f "
-                     "residual_issue_ms=%.6f readback_ms=%.6f fence_ms=%.6f\n",
+                     "residual_issue_ms=%.6f residual_prefetch_issue_ms=%.6f readback_ms=%.6f fence_ms=%.6f\n",
                      req.run_id, req.stripe_id, potal_paired_status_name(report.status), plan_s * 1e3, pack_s * 1e3,
                      scale_write_s * 1e3, scale_release_s * 1e3, index_s * 1e3, main_issue_s * 1e3,
-                     residual_issue_s * 1e3, readback_s * 1e3, report.counts.fence_s * 1e3);
+                     residual_issue_s * 1e3, report.counts.residual_prefetch_issue_s * 1e3,
+                     readback_s * 1e3, report.counts.fence_s * 1e3);
     }
 
     executor(const potal_paired_request & r, potal_paired_session * s, potal_paired_report & rep,
@@ -1673,13 +1680,19 @@ struct executor {
         if (!report.issued) {
             return;
         }
-        if (!fence_failed && hw_st != POTAL_ERR_NO_HARDWARE) {
+        const bool managed = req.next_k_prefetch && potal_paired_h2_query(session).active;
+        if (!fence_failed && (hw_st != POTAL_ERR_NO_HARDWARE || managed)) {
             report.cleaned = potal_paired_session_cleanup(session) == POTAL_OK;
         }
         const potal_paired_session_status q = potal_paired_session_query(session);
         report.fatal = q.outstanding_loops != 0 || q.outstanding_readbacks != 0 || q.live_scale_slots != 0 ||
                        (q.failed != 0 && !report.cleaned);
-        if (hw_st == POTAL_ERR_NO_HARDWARE && q.outstanding_loops == 0 && q.outstanding_readbacks == 0 &&
+        if (req.next_k_prefetch) {
+            const auto managed = potal_paired_h2_query(session);
+            report.fatal = report.fatal || managed.pending_b || managed.source_pending ||
+                           managed.control_pending || managed.unknown_completion || managed.quarantined;
+        }
+        if (!managed && hw_st == POTAL_ERR_NO_HARDWARE && q.outstanding_loops == 0 && q.outstanding_readbacks == 0 &&
             q.live_scale_slots == 0) {
             report.fatal = false; // nothing reached any hardware
         }
@@ -1749,6 +1762,82 @@ struct executor {
 
     // Conservative fences: everything issued so far completes first.
     potal_status drain_all() { return req.conservative_fences && drained_upto < last_op ? fence_now() : POTAL_OK; }
+
+    void prepare_scale_reuse() {
+        if (!req.ktile_scale_reuse) return;
+        const auto & plan = report.plan;
+        scale_owner.resize(plan.scale_windows.size());
+        for (const auto & w : plan.scale_windows) {
+            scale_owner[w.index] = w.index;
+            if (!w.residual) continue;
+            const auto & residency = plan.residencies[w.residency];
+            const size_t owner = plan.ops[residency.main_gemm_op].scale_window;
+            const auto & main = plan.scale_windows[owner];
+            const auto & panel = report.tile.panels[residency.panel];
+            const auto & window = panel.windows[w.window];
+            const size_t first = report.tile.fragments[window.fragment_begin].block_id;
+            if (main.residency != w.residency || main.j_tiles != w.j_tiles ||
+                main.program_op >= w.program_op || main.release_op <= w.release_op ||
+                first < panel.block_begin) continue;
+            const size_t offset = first - panel.block_begin;
+            if (offset > main.blocks || w.blocks > main.blocks - offset) continue;
+            bool consecutive = window.fragment_end - window.fragment_begin == w.blocks;
+            for (size_t f = window.fragment_begin; consecutive && f < window.fragment_end; ++f) {
+                consecutive = report.tile.fragments[f].block_id == first + f - window.fragment_begin;
+            }
+            size_t slot_offset = 0, slots = 0, base = 0, end = 0;
+            if (!consecutive || !mul(offset, w.j_tiles, slot_offset) ||
+                !mul(w.blocks, w.j_tiles, slots) || !add(main.slot_base, slot_offset, base) ||
+                !add(base, slots, end) || end > main.slot_base + main.slots ||
+                end > POTAL_HW_SCALE_ENTRIES) continue;
+            scale_owner[w.index] = owner;
+        }
+    }
+
+    potal_paired_status prepare_prefetch() {
+        if (!req.next_k_prefetch) return potal_paired_status::ok;
+        size_t prefix = 0, bytes = 0;
+        if (!mul(req.k - 1, req.weight->ldb, prefix) || !add(prefix, req.n, bytes)) {
+            return fail(potal_paired_status::invalid_argument, "h2_begin", "weight extent overflow", POTAL_OK);
+        }
+        panels.resize(report.plan.residencies.size());
+        const potal_h2_weight weight{req.weight->b, req.k, req.n, req.weight->ldb, bytes};
+        const potal_status st = potal_paired_h2_begin(session, &weight);
+        return st == POTAL_OK ? potal_paired_status::ok : hw_fail("h2_begin", st, nullptr);
+    }
+
+    potal_paired_status declare_panel(size_t residency, const potal_paired_op & op) {
+        const auto & r = report.plan.residencies[residency];
+        const auto & panel = report.tile.panels[r.panel];
+        potal_h2_panel declaration{};
+        declaration.residency_index = r.index;
+        declaration.k_begin = panel.k_begin;
+        declaration.j_begin = r.j_group * report.tile.tile_J * hw.dim;
+        declaration.pair = uint32_t(r.pair);
+        declaration.k_tiles = uint32_t(panel.k_tiles);
+        declaration.j_tiles = uint32_t(r.j_tiles);
+        declaration.pad_j = uint32_t(group_pad_j(r.j_group));
+        declaration.main_i_tiles = uint32_t(report.tile.tile_I);
+        declaration.main_pad_i = uint32_t(report.tile.pad_I);
+        declaration.readers = uint32_t(r.consumers);
+        const potal_status st = potal_paired_h2_panel_begin(session, &declaration, 0,
+                                                          &panels[residency].reference);
+        return st == POTAL_OK ? potal_paired_status::ok : hw_fail("h2_panel_begin", st, &op);
+    }
+
+    potal_paired_status prefetch_next(const potal_paired_op & op) {
+        const size_t next = op.residency + 1;
+        const potal_status st = potal_paired_h2_panel_prefetch(session, panels[next].reference);
+        report.issued = true;
+        // Fresh session, exclusive prefetch ownership: cumulative attempts.
+        report.counts.prefetch_mvins = potal_paired_h2_query(session).attempted_b_mvins;
+        if (st != POTAL_OK) return hw_fail("b_prefetch", st, &op);
+        panels[next].prefetched = true;
+        report.counts.prefetch_loads++;
+        const auto & r = report.plan.residencies[next];
+        report.counts.prefetch_bytes_declared += uint64_t(report.tile.panels[r.panel].k_rows) * r.cols;
+        return potal_paired_status::ok;
+    }
 
     potal_paired_status prepare_window_diag() {
         const char * enabled = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
@@ -1905,6 +1994,14 @@ struct executor {
         const potal_paired_k_panel &      pan = report.tile.panels[op.panel];
         const uint32_t                    gen = next_generation();
         hw_generation[w.index]                = gen;
+        if (req.ktile_scale_reuse && scale_owner[w.index] != w.index) {
+            // The immutable plan proves identical original K/J/weight identity,
+            // and the owning Main allocation remains live through this window.
+            hw_generation[w.index] = hw_generation[scale_owner[w.index]];
+            report.counts.scale_reused_windows++;
+            report.counts.scale_reused_columns += w.blocks * (w.j_tiles * hw.dim - group_pad_j(op.j_group));
+            return potal_paired_status::ok;
+        }
         const size_t col_base = op.j_group * report.tile.tile_J * hw.dim;
         const size_t pad_j    = group_pad_j(op.j_group);
         const auto   t        = exec_clock::now();
@@ -1936,6 +2033,12 @@ struct executor {
     }
 
     potal_paired_status scale_release(const potal_paired_op & op) {
+        if (req.ktile_scale_reuse && scale_owner[op.scale_window] != op.scale_window) {
+            // An alias owns no allocation to release. Preserve the exact global
+            // drain boundary, including stores and the other pair's readers.
+            const potal_status st = fence_now();
+            return st == POTAL_OK ? potal_paired_status::ok : hw_fail("fence", st, &op);
+        }
         const potal_status ds = drain_all();
         if (ds != POTAL_OK) {
             return hw_fail("fence", ds, &op);
@@ -1969,13 +2072,42 @@ struct executor {
     }
 
     potal_paired_status issue_loop(const potal_paired_loop_ws & l, const char * stage, const potal_paired_op & op) {
+        const bool combined = req.next_k_prefetch && op.kind == potal_paired_op_kind::residual_gemm &&
+            op.id == report.plan.residencies[op.residency].last_residual_op &&
+            op.panel + 1 < report.tile.k_panels;
+        if (combined) {
+            const auto & current = report.plan.residencies[op.residency];
+            const size_t next = current.index + 1;
+            const auto & successor = report.plan.residencies[next];
+            if (successor.j_group != current.j_group || successor.panel != current.panel + 1 ||
+                successor.pair == current.pair || panels[next].reference.owner ||
+                (next >= potal_paired_pairs && !panels[next - potal_paired_pairs].retired)) {
+                return fail(potal_paired_status::invalid_execution_plan, "b_prefetch",
+                            "successor pair is not retired for the next K panel", POTAL_OK);
+            }
+            const auto prepared = declare_panel(next, op);
+            if (prepared != potal_paired_status::ok) return prepared;
+        }
         const auto         t  = exec_clock::now();
-        const potal_status st = potal_paired_loop_ws_issue(session, &l);
+        const uint32_t reader = op.kind == potal_paired_op_kind::main_gemm ? 0 : uint32_t(op.window + 1);
+        const potal_status st = req.next_k_prefetch ?
+            potal_paired_h2_loop_issue(session, panels[op.residency].reference, reader, &l) :
+            potal_paired_loop_ws_issue(session, &l);
+        report.issued = true;
+        if (st != POTAL_OK && req.next_k_prefetch) return hw_fail(stage, st, &op);
+        potal_paired_status prefetched = potal_paired_status::ok;
+        if (st == POTAL_OK && op.kind == potal_paired_op_kind::residual_gemm) {
+            report.counts.residual_loop_ws++;
+            // CLOCK_MONOTONIC's RISC-V VDSO uses CPU fences, which Rocket
+            // stalls on RoCC busy. Keep all clock reads outside this pair.
+            if (combined) prefetched = prefetch_next(op);
+        }
+        if (prefetched != potal_paired_status::ok && report.fatal) return prefetched;
         const double elapsed = seconds_since(t);
         report.counts.issue_s += elapsed;
-        if (profile) (op.kind == potal_paired_op_kind::main_gemm ? main_issue_s : residual_issue_s) += elapsed;
-        report.issued = true;
-        return st == POTAL_OK ? potal_paired_status::ok : hw_fail(stage, st, &op);
+        if (combined) report.counts.residual_prefetch_issue_s += elapsed;
+        else if (profile) (op.kind == potal_paired_op_kind::main_gemm ? main_issue_s : residual_issue_s) += elapsed;
+        return st == POTAL_OK ? prefetched : hw_fail(stage, st, &op);
     }
 
     potal_paired_status main_gemm(const potal_paired_op & op) {
@@ -2012,6 +2144,8 @@ struct executor {
         const potal_paired_status st = issue_loop(l, "main_loop_ws", op);
         if (st == potal_paired_status::ok) {
             report.counts.main_loop_ws++;
+            if (req.next_k_prefetch && panels[op.residency].prefetched)
+                report.counts.resident_main_loop_ws++;
         }
         return st;
     }
@@ -2085,6 +2219,13 @@ struct executor {
         l.loop.scale_base        = (uint32_t) report.plan.scale_windows[op.scale_window].slot_base;
         l.loop.scale_generation  = hw_generation[op.scale_window];
         l.loop.passes_per_block  = 1; // one carrier per fragment
+        if (req.ktile_scale_reuse && scale_owner[op.scale_window] != op.scale_window) {
+            const auto & main = report.plan.scale_windows[scale_owner[op.scale_window]];
+            const auto & panel = report.tile.panels[op.panel];
+            const auto & window = panel.windows[op.window];
+            const size_t first = report.tile.fragments[window.fragment_begin].block_id;
+            l.loop.scale_base = (uint32_t) (main.slot_base + (first - panel.block_begin) * main.j_tiles);
+        }
         l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
         l.path                   = POTAL_PAIRED_RESIDUAL;
         l.pair                   = (uint32_t) op.pair;
@@ -2093,7 +2234,6 @@ struct executor {
         l.indexed                = 1;
         const potal_paired_status st = issue_loop(l, "residual_loop_ws", op);
         if (st == potal_paired_status::ok) {
-            report.counts.residual_loop_ws++;
             if (window_diag) {
                 return diagnose_window(op);
             }
@@ -2135,6 +2275,16 @@ struct executor {
         const potal_paired_execution_plan & plan = report.plan;
         hw_generation.assign(plan.scale_windows.size(), 0);
         for (const potal_paired_op & op : plan.ops) {
+            if (req.next_k_prefetch && op.kind == potal_paired_op_kind::scale_program &&
+                !plan.scale_windows[op.scale_window].residual) {
+                if (!panels[op.residency].reference.owner) {
+                    const auto declared = declare_panel(op.residency, op);
+                    if (declared != potal_paired_status::ok) return declared;
+                } else {
+                    const auto ready = potal_paired_h2_panel_get(session, panels[op.residency].reference);
+                    if (ready != POTAL_OK) return hw_fail("b_publication", ready, &op);
+                }
+            }
             // Completion the plan requires before this op (retire, residual A reuse): a
             // drain point already passed, or an explicit fence.
             if (op.kind != potal_paired_op_kind::scale_release) { // the release is held by the hardware itself
@@ -2164,6 +2314,17 @@ struct executor {
             if (st != potal_paired_status::ok) {
                 return st;
             }
+            if (req.next_k_prefetch && op.kind == potal_paired_op_kind::scale_release &&
+                !plan.scale_windows[op.scale_window].residual) {
+                const auto retired = potal_paired_h2_panel_retire(session, panels[op.residency].reference);
+                if (retired != POTAL_OK) return hw_fail("h2_retire", retired, &op);
+                panels[op.residency].retired = true;
+            }
+            if (req.next_k_prefetch && op.kind == potal_paired_op_kind::pair_retire &&
+                !panels[op.residency].retired) {
+                return fail(potal_paired_status::invalid_execution_plan, "h2_retire",
+                            "logical retirement has no matching physical retirement receipt", POTAL_OK);
+            }
             report.counts.ops++;
             last_op = op.id + 1;
         }
@@ -2171,6 +2332,13 @@ struct executor {
         const potal_status st = fence_now();
         if (st != POTAL_OK) {
             return hw_fail("fence", st, nullptr);
+        }
+        if (req.next_k_prefetch) {
+            const auto state = potal_paired_h2_query(session);
+            if (state.pending_b || state.source_pending || state.control_pending || state.quarantined ||
+                state.panel[0].declared || state.panel[1].declared) {
+                return hw_fail("h2_complete", POTAL_ERR_BUSY, nullptr);
+            }
         }
         return potal_paired_status::ok;
     }
@@ -2238,7 +2406,17 @@ potal_paired_status potal_paired_run_session(const potal_paired_request & req, c
     const potal_paired_status st = potal_paired_matmul_auto(req, s, report);
     // Not fatal: drained (or cleaned), the accelerator is free. Fatal: close keeps it
     // owned when work may be outstanding; the owner treats the accelerator as unknown.
-    (void) potal_paired_session_close(s);
+    const bool managed = req.next_k_prefetch && potal_paired_h2_query(s).active;
+    const potal_status closed = managed ?
+        potal_paired_h2_close(&s) : potal_paired_session_close(s);
+    if (managed && s != nullptr) report.fatal = true;
+    if (st == potal_paired_status::ok && closed != POTAL_OK) {
+        report.status = potal_paired_status::execution_failed;
+        report.stage = "h2_close";
+        report.hw_status = closed;
+        report.detail = "checked H2 session close refused";
+        return report.status;
+    }
     return st;
 }
 
@@ -2284,6 +2462,15 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         }
         if (*req.generation > POTAL_GENERATION_MAX) {
             return ex.fail(potal_paired_status::invalid_argument, "request", "generation counter beyond 8 bits", POTAL_OK);
+        }
+        if (req.ktile_scale_reuse && (POTAL_HW_DIM != 32 || hw.dim != 32 || hw.block_k != 32 ||
+                                     req.main_plan->passes_per_block != 1)) {
+            return ex.fail(potal_paired_status::invalid_argument, "ktile",
+                           "K-tile Scale reuse requires physical DIM32 and K32", POTAL_ERR_UNSUPPORTED);
+        }
+        if (req.next_k_prefetch && !req.ktile_scale_reuse) {
+            return ex.fail(potal_paired_status::invalid_argument, "prefetch",
+                           "Next-K prefetch requires K-tile Scale reuse", POTAL_ERR_UNSUPPORTED);
         }
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
@@ -2372,6 +2559,10 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             return st;
         }
 
+        // Specialize only Scale lowering, after validating the immutable H2 plan.
+        // No allocation or alias proof is deferred until after command effects.
+        ex.prepare_scale_reuse();
+
         // 4. TLB maintenance before the first DMA of this stripe (the session is drained).
         if (req.tlb_flush) {
             const auto         t  = exec_clock::now();
@@ -2383,6 +2574,8 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             }
             report.counts.tlb_flushes++;
         }
+        st = ex.prepare_prefetch();
+        if (st != potal_paired_status::ok) return st;
 
         // 5. The plan's ops, then the final drain.
         st = ex.run();

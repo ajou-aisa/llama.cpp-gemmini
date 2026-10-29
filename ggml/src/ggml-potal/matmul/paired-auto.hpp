@@ -485,12 +485,20 @@ struct potal_paired_request {
     // RTL ordering of the stream (resident-B RAW, ACC RAW, release drain): the H2-validated
     // fence placement, at the cost of the Main / Residual overlap.
     bool                    conservative_fences = false;
+    // Explicit DIM32 K32 specialization of the validated H2 schedule. Eligible
+    // consecutive-original-block Residual windows read their live Main Scale
+    // allocation; their logical release becomes a checked global Fence.
+    bool                    ktile_scale_reuse = false;
+    bool                    next_k_prefetch = false; // explicit managed-H2 load admission; publication still requires global drain
 };
 
 struct potal_paired_counts {
     uint64_t main_loop_ws = 0, residual_loop_ws = 0, index_configs = 0, index_writes = 0, scale_writes = 0,
              scale_releases = 0, readbacks = 0, readback_tiles = 0, fences = 0, drains = 0, tlb_flushes = 0,
              ops = 0;
+    uint64_t scale_reused_windows = 0, scale_reused_columns = 0;
+    uint64_t prefetch_loads = 0, prefetch_mvins = 0, prefetch_bytes_declared = 0, resident_main_loop_ws = 0;
+    double residual_prefetch_issue_s = 0; // Combined CPU API interval; not DMA/compute duration
     // Owner-thread seconds inside the session calls (steady clock, as tiling.cpp's
     // potal_ws_report): SCALE_WRITE / RELEASE, command issue (LOOP_WS, INDEX_*, MVOUT,
     // FLUSH), POTAL_FENCE. A release also waits for the drain it implies.

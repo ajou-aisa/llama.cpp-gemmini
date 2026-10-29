@@ -199,6 +199,8 @@ struct pipeline_config {
     // GGML_POTAL_PAIRED_FENCES=CONSERVATIVE: the paired executor fences before every
     // Indexed LOOP_WS, ACC readback and scale release (potal_paired_request).
     bool            paired_conservative_fences = false;
+    bool            paired_ktile_scale_reuse = false; // explicit DIM32-only Scale specialization
+    bool            paired_next_k_prefetch = false;
     // Optional; called on the thread of each step after its record, holding no
     // lock of the run (it may query or abort the run). Order across threads:
     // stripe_event::sequence.
@@ -260,6 +262,9 @@ struct pipeline_counts {
     uint64_t paired_readback_tiles      = 0; // MVOUT commands
     uint64_t paired_fences              = 0;
     uint64_t paired_drains              = 0; // fences + released scale windows (each is a drain point)
+    uint64_t paired_prefetch_loads = 0, paired_prefetch_mvins = 0, paired_prefetch_bytes_declared = 0;
+    uint64_t paired_resident_main_loop_ws = 0;
+    double paired_residual_prefetch_issue_s = 0;
     double   act_quant_s                = 0; // ExSIA quantize_activation call, including producer capacity waits
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;
