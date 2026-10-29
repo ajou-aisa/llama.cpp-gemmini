@@ -139,8 +139,8 @@ typedef struct potal_gemm_ws_program {
 /*
  * Validate a GEMM request. Order: argument errors, then hardware capacity
  * (scale window, work IDs, SPAD/ACC), then the validated scope. The validated
- * scope is DIM16, m == n == 16, k in {16, 32}; anything else that the RTL could
- * accept returns POTAL_ERR_UNSUPPORTED.
+ * scope is DIM16 or DIM32, m == n == DIM, k in {DIM, 2*DIM}; anything else
+ * that the RTL could accept returns POTAL_ERR_UNSUPPORTED.
  */
 potal_status potal_gemm_ws_check(const potal_gemm_ws *gemm);
 

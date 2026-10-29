@@ -160,7 +160,7 @@ void test_tile_select() {
         }
     }
     potal_tile_plan plan;
-    check("A K not whole scale blocks rejected", potal_tile_select(4, 16, 48, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
+    check("A K not whole scale blocks rejected", potal_tile_select(4, DIM, 3 * DIM, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
     check("A zero dimension rejected", potal_tile_select(0, 16, 32, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
 }
 
@@ -212,8 +212,8 @@ void test_tiled_execution() {
         int    carriers;
     };
     const shape shapes[] = {
-        { 16, 16, 32, 0 },   // the validated single GEMM
-        { 16, 16, 64, 1 },   // one tile, K=64: through potal_loop_ws (unvalidated scope)
+        { DIM, DIM, 32, 0 }, // the validated single GEMM on either HP1 geometry
+        { DIM, DIM, 96, 1 }, // beyond the bounded two-DIM legacy API: LOOP_WS
         { 5, 40, 96, 1 },    // padding in I and J
         { 37, 100, 640, 0 }, // multi-I/J, padded
         { 3, 160, 4096, 1 }, // K chunks (accumulate, C NULL)
@@ -255,9 +255,13 @@ void test_tiled_execution() {
         check(name, session.report.invocations == plan.I0 * plan.J0 * plan.K0 &&
                         session.report.fences == session.report.invocations && emu.scales.empty() &&
                         session.report.scale_writes == session.report.scale_releases && !session.report.fatal);
-        if (s.m == 16 && s.n == 16 && s.k == 32) {
+        if (s.m == DIM && s.n == DIM && s.k == 32) {
             check("B validated shape issued through potal_gemm_ws_issue",
                   emu.gemms == 1 && session.report.validated_gemms == 1);
+        }
+        if (s.m == DIM && s.n == DIM && s.k == 96) {
+            check("B K beyond two DIM uses LOOP_WS, not the bounded single GEMM",
+                  emu.gemms == 0 && session.report.validated_gemms == 0 && emu.loops == 1);
         }
         if (s.k == 4096) {
             check("B K chunks: K0 > 1 accumulated across invocations", plan.K0 > 1 && equal);
@@ -778,14 +782,24 @@ void test_routes() {
                   (route.k_groups ? "one GEMM per 32-wide K group" : "one GEMM over the whole K"),
               r.ok && r.jobs == (route.k_groups ? (uint64_t) (K / 32) : 1u) &&
                   r.k_groups == (route.k_groups ? (size_t) (K / 32) : 0u));
-        // Independent of the route code: the algorithm's own dequantization of
-        // the codes (cpu_direct residuals are not part of it; H covers them).
+        // BLOCK and EXSIA dequantization expand cpu_direct residuals as well
+        // as the dense codes. Compare like with like: the Main result above
+        // remains checked independently, then complete its captured residuals.
+        // Tensor/token/stripe dequantizers expand only ws_packet residuals,
+        // not the cpu_direct payloads captured by this fixture.
+        const bool residual_dequant = a == algo::block || a == algo::exsia;
+        const compensation_result comp = r.ok && residual_dequant ? apply_compensation(c.args) : compensation_result{};
+        const size_t payloads = gq::activation_direct_residuals(c.args).size();
+        if (residual_dequant) {
+            check(name + " complete output executes every captured direct residual",
+                  r.ok && comp.ok && comp.payloads == payloads && comp.executed == payloads);
+        }
         std::vector<float>        xhat;
         const bool                dq   = dequantize_with(a, c.args, xhat);
         const double              err  = dq ? rel_l2(c.out(), fp_reference(c, xhat)) : 1.0;
         std::printf("     %s %s rel_l2(dst, dequant(A) x dequant(W)) = %.3g\n", algo_name(a), route.name, err);
         check(name + " dst == the algorithm's dequantized activation x dequantized HP1 (rel_l2 < 1e-5)",
-              dq && err < 1e-5);
+              comp.ok && dq && err < 1e-5);
     }
 }
 
@@ -899,7 +913,7 @@ void test_ggml_contract() {
     ggml_tensor * tagged = mm(GGML_TYPE_Q8_HP1, GGML_TYPE_F32, 64, 16, 16);
     tagged->op_params[1] = 1;
     check("F tagged MUL_MAT rejected (op_params)", check_op(tagged) == GGML_POTAL_REJECT_OP_PARAMS);
-    check("F I8 x I8 16x16x32 still accepted", check_op(mm(GGML_TYPE_I8, GGML_TYPE_I8, 32, 16, 16)) ==
+    check("F I8 x I8 DIM x DIM x K32 still accepted", check_op(mm(GGML_TYPE_I8, GGML_TYPE_I8, 32, DIM, DIM)) ==
                                                    GGML_POTAL_REJECT_NONE);
 
     // The CPU backend refuses Q8_HP1 MUL_MAT: a PoTal reject can never become
@@ -1219,11 +1233,19 @@ void test_weight_cache() {
                                                                          !o.allocate({ 3, N + 1, K }, *first));
     }
 
-    // W13: through the backend. On the host the PoTal job fails (no
-    // accelerator, fatal): the weight was prepared and cached, then abandoned
-    // (never freed, never reused) because the hardware state is unknown.
+    // W13: through the backend. Legacy FULL / serial-pipeline hardware
+    // failures are fatal and abandon the prepared weight. On the host a
+    // Paired request instead gets NO_HARDWARE before any command takes
+    // effect; its recoverable refusal safely retains the cached weight.
     {
         ggml_backend_ptr potal(ggml_backend_potal_init());
+        const auto selected = ggml::gemmini::resolve_matmul_options();
+        bool invalid_paired = false;
+        const bool paired = options::paired_auto_requested(&invalid_paired);
+        const bool retain = selected.ok() && !invalid_paired &&
+                            selected.options.mode == options::MatmulInvocationMode::stripe_pipeline &&
+                            options::compensation && paired;
+        check("W13 selected mode is valid", selected.ok() && !invalid_paired);
         const auto       compute = [&](ggml_tensor * w0, ggml_backend_potal_stats & st) {
             mm_args     m(w0, 2, 11);
             ggml_cgraph * g = ggml_new_graph(m.ctx.get());
@@ -1242,11 +1264,16 @@ void test_weight_cache() {
                   s1.weight_packs == 1 && s1.weight_pack_bytes == first->bytes() && s1.weight_pack_s > 0 &&
                   (std::getenv("GGML_POTAL_WEIGHT_CACHE_MB") != nullptr ||
                    s1.weight_cache_budget == (uint64_t(1024) << 20)));
-        check("W13 backend: fatal hardware failure abandons the entry; the next node prepares again",
-              s1.weight_cache_entries == 0 && r2 == GGML_STATUS_FAILED && s2.weight_cache_misses == 2 &&
-                  s2.weight_cache_hits == 0 && s2.weight_validations == 2);
+        check("W13 backend: no hardware completes no work",
+              s1.last_status == POTAL_ERR_NO_HARDWARE && s1.hp1_completed == 0 && s2.hp1_completed == 0 &&
+                  s1.tiled_invocations == 0 && s1.paired_main_loop_ws == 0 && s1.scale_writes == 0);
+        check(retain ? "W13 backend: Paired no-effect refusal retains the entry; the next node is a HIT"
+                     : "W13 backend: fatal hardware failure abandons the entry; the next node prepares again",
+              s1.weight_cache_entries == (retain ? 1u : 0u) && r2 == GGML_STATUS_FAILED &&
+                  s2.weight_cache_entries == (retain ? 1u : 0u) && s2.weight_cache_misses == (retain ? 1u : 2u) &&
+                  s2.weight_cache_hits == (retain ? 1u : 0u) && s2.weight_validations == (retain ? 1u : 2u));
         check("W13 backend: buffer-less weight UNCACHED", r3 == GGML_STATUS_FAILED && s3.weight_cache_uncached == 1 &&
-                                                              s3.weight_cache_entries == 0 && s3.weight_validations == 3);
+                  s3.weight_cache_entries == (retain ? 1u : 0u) && s3.weight_validations == (retain ? 2u : 3u));
         ggml_backend_potal_clear_weight_cache(potal.get());
     }
 

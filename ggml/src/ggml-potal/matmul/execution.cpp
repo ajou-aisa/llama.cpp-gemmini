@@ -34,7 +34,7 @@
 #    include <thread>
 #endif
 
-static_assert(POTAL_HW_DIM == 16, "ggml-potal offloads the validated DIM16 GEMM only");
+static_assert(POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32, "ggml-potal requires DIM16 or DIM32");
 
 namespace ggml::potal {
 
@@ -52,7 +52,7 @@ constexpr uint32_t SCALE_SLOT = 192;
 // flight; they are never freed, so an unfinished GEMM cannot hit reused memory.
 alignas(POTAL_HW_MAX_BYTES) int8_t  stage_a[DIM * K_STAGE];
 alignas(POTAL_HW_MAX_BYTES) int8_t  stage_b[K_STAGE * DIM];
-alignas(POTAL_HW_MAX_BYTES) int32_t stage_c[DIM * DIM];
+alignas(DIM * sizeof(int32_t)) int32_t stage_c[DIM * DIM];
 
 potal_gemm_ws make_request(uint32_t k, uint32_t generation) {
     potal_gemm_ws g    = {};

@@ -1,12 +1,12 @@
 /*
- * PoTal multicore smoke test (RISC-V Linux, DIM16 Sat32 SoC with one PoTal on hart 0).
+ * PoTal multicore smoke test (RISC-V Linux, DIM16/32 Sat32 SoC with one PoTal on hart 0).
  *
  * One issuer pthread owns the accelerator: it is pinned to the Linux CPU whose
  * /proc/cpuinfo "hart" is 0 and is the only thread that issues RoCC commands
  * (TLB FLUSH, SCALE_WRITE/RELEASE, GEMM, FENCE). CPU workers (pthreads, or an
  * OpenMP team with --mode=openmp) are each pinned to a different other CPU and
  * run a verifiable INT8 quantize + INT32 dot-product kernel while the issuer
- * runs DIM16 GEMMs.
+ * runs DIM-sized GEMMs.
  *
  * Evidence reported separately:
  *   cpu_multicore_verified  every worker ran on its own pinned non-PoTal CPU
@@ -46,11 +46,11 @@
 #include "potal.h"
 #include "potal_hw_params.h"
 
-#if POTAL_HW_DIM != 16
-#error "potal-multicore-smoke validates the DIM16 GEMM path only"
+#if POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32
+#error "potal-multicore-smoke requires DIM16 or DIM32"
 #endif
 
-#define DIM          16
+#define DIM          POTAL_HW_DIM
 #define K_MAX        (2 * DIM)
 #define SENTINEL     (-9999)
 #define MAX_CPUS     64
@@ -467,7 +467,7 @@ static void *worker_thread(void *arg) {
 
 static int8_t  A[DIM][K_MAX] __attribute__((aligned(POTAL_HW_MAX_BYTES)));
 static int8_t  B[K_MAX][DIM] __attribute__((aligned(POTAL_HW_MAX_BYTES)));
-static int32_t C[DIM][DIM]   __attribute__((aligned(POTAL_HW_MAX_BYTES)));
+static int32_t C[DIM][DIM]   __attribute__((aligned(DIM * sizeof(int32_t))));
 
 /* Golden model, same semantics as potal-api-smoke.c. */
 static int32_t sat32(int64_t v) {
@@ -485,11 +485,11 @@ static int32_t scu(int32_t raw, uint32_t carrier) {
 }
 
 static uint32_t carrier_for(int block, int col) {
-    static const uint32_t carriers[DIM] = {
+    static const uint32_t carriers[16] = {
         0, 1, POTAL_CARRIER_ZERO, 2, 5, 13, 20, 31,
         32, 32767, 3, POTAL_CARRIER_ZERO, 7, 0, 1, 4,
     };
-    return carriers[(col + 5 * block) % DIM];
+    return carriers[(col + 5 * block) % 16];
 }
 
 static int issuer_fail(const char *step, potal_status s) {
@@ -775,7 +775,7 @@ static void usage(const char *argv0) {
             "Usage: %s [--mode=pthread|openmp] [--workers=N] [--iterations=N] [--work-units=N] [--verbose]\n"
             "  --workers     CPU worker threads (default: OMP_NUM_THREADS in openmp mode, else all\n"
             "                allowed online CPUs except the hart0 CPU)\n"
-            "  --iterations  PoTal GEMMs (alternating K16/K32, default 4)\n"
+            "  --iterations  PoTal GEMMs (alternating K=DIM/2*DIM, default 4)\n"
             "  --work-units  work units per worker (default 4000; raise to cover more GEMMs)\n",
             argv0);
 }

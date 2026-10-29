@@ -1338,26 +1338,34 @@ int main() {
               !r.ok && r.stage != nullptr && std::string(r.stage) == "options");
         std::printf("[SKIP] pipeline cases need GGML_GEMMINI_ACTIVATION_QUANT=EXSIA\n");
     } else {
-        node        nd(200, 320, 128, 7, 400.0f); // 3 stripes with outliers
+        node        nd(200, 320, 128, 7, 400.0f); // DIM16: 3 stripes; DIM32: 4 stripes.
         golden_node g(nd);
+        const size_t stripe_rows = D == 32 ? 64 : 80;
+        const size_t stripe_count = D == 32 ? 4 : 3;
+        const bool geometry = nd.plan.tile_I == (D == 32 ? 2u : 5u) &&
+                              nd.plan.tile_J == (D == 32 ? 4u : 6u) &&
+                              nd.plan.tile_K == (D == 32 ? 4u : 8u) &&
+                              nd.plan.tile_I * D == stripe_rows && nd.stripes() == stripe_count;
         check("fixture: >= 3 stripes from the frozen plan, golden built" +
                   std::string(options::compensation ? ", stripe 0 has a residual packet" : ""),
-              nd.ok && g.ok && nd.stripes() >= 3 && (!options::compensation || g.packets.count(0) == 1));
-        if (nd.ok && g.ok && nd.stripes() >= 3) {
+              nd.ok && g.ok && geometry && (!options::compensation || g.packets.count(0) == 1));
+        if (nd.ok && g.ok && geometry && (!options::compensation || g.packets.count(0) == 1)) {
             test_overlap(nd, g);
             test_serialized_vs_pipelined(nd, g);
             test_failures(nd);
             test_contract(nd);
             test_repeated(nd, g);
         }
-        node        two(140, 320, 128, 9, 400.0f); // 2 stripes
+        // Main(0) stays held until quant_end. Exactly two stripes must fit
+        // capacity 2; a third stripe would block the producer before quant_end.
+        node        two(D == 32 ? 112 : 140, 320, 128, 9, 400.0f);
         golden_node g2(two);
-        if (two.ok && g2.ok) {
+        if (two.ok && g2.ok && two.stripes() == 2 && two.plan.tile_I * D == stripe_rows) {
             test_immutability(g2, two);
         } else {
             check("C fixture", false);
         }
-        if (nd.ok && g.ok && nd.stripes() >= 3) {
+        if (nd.ok && g.ok && geometry) {
             test_observers(nd, g);
             test_merge_failure(nd, g);
         }
@@ -1379,7 +1387,8 @@ int main() {
                   r.report.counts.stripes_semantic_completed == calm.stripes());
         const std::set<size_t> none;
         check_order("empty residual: event order without residual steps", rec, 2, calm.stripes(), true, &none);
-        if (nd.ok && g.ok && calm.ok && gc.ok && nd.stripes() >= 3 && calm.stripes() >= 3) {
+        if (nd.ok && g.ok && geometry && calm.ok && gc.ok && calm.stripes() == stripe_count &&
+            (!options::compensation || g.packets.count(0) == 1)) {
             test_repetition(nd, g, calm, gc);
         }
         test_jsonl_order();

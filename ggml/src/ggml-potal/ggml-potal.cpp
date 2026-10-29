@@ -207,10 +207,11 @@ const char * potal_device_get_description(ggml_backend_dev_t dev) {
     static char description[256];
     static const int written = std::snprintf(
         description, sizeof(description),
-        "PoTal A8W8 WS Sat32 DIM%u RoCC custom-3 on hart 0: MUL_MAT I8 x I8 -> F32 (x1 carriers, M=N=16, "
-        "K=16|32); F32 x Q8_HP1 -> F32 (%s act quant, HP1 SCU carriers, potal_tiled_matmul_auto, "
+        "PoTal A8W8 WS Sat32 DIM%u RoCC custom-3 on hart 0: MUL_MAT I8 x I8 -> F32 (x1 carriers, M=N=%u, "
+        "K=%u|%u); F32 x Q8_HP1 -> F32 (%s act quant, HP1 SCU carriers, potal_tiled_matmul_auto, "
         "compensation %s)",
-        (unsigned) potal_hw_dim(), ggml::potal::options::activation_quant_name(),
+        (unsigned) potal_hw_dim(), (unsigned) potal_hw_dim(), (unsigned) potal_hw_dim(),
+        (unsigned) (2 * potal_hw_dim()), ggml::potal::options::activation_quant_name(),
         ggml::potal::options::compensation_name);
     GGML_UNUSED(written);
     return description;

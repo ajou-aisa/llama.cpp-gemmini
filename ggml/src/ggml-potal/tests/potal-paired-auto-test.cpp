@@ -52,6 +52,9 @@ using namespace potal_test;
 namespace {
 
 constexpr uint32_t PPB = 32 / PD;
+// The long-K fixture keeps one complete Main I group on either physical geometry.
+constexpr size_t MULTI_ROWS = PD == 32 ? 64 : 80;
+constexpr size_t MULTI_J_GROUPS = PD == 32 ? 3 : 2;
 
 using run_spec = std::pair<uint32_t, std::vector<uint16_t>>; // block id, block-local K
 
@@ -175,6 +178,11 @@ bool occupancy_holds(const potal_paired_tile_plan & p, const potal_paired_geomet
 
 void test_geometry() {
     const potal_paired_geometry hw = potal_paired_hw_geometry();
+    if (PD == 32) {
+        check("G DIM32 fixture uses physical banks4 x rows2048, ACC512, Scale256, Index64, DMA64",
+              hw.bank_num == 4 && hw.bank_rows == 2048 && hw.acc_rows == 512 &&
+                  hw.scale_entries == 256 && hw.index_entries == 64 && POTAL_HW_MAX_BYTES == 64);
+    }
     check("G geometry is the generated header: DIM, banks, ACC, Index and scale entries, work IDs, K32 blocks",
           hw.dim == POTAL_HW_DIM && hw.bank_num == POTAL_HW_BANK_NUM && hw.bank_rows == POTAL_HW_BANK_ROWS &&
               hw.acc_rows == POTAL_HW_ACC_ROWS && hw.index_entries == POTAL_HW_INDEX_ENTRIES &&
@@ -254,9 +262,9 @@ void test_k_limits() {
     small_scale.scale_entries = 64;
     tiny_bank.bank_rows   = 512;
     const k_case cases[] = {
-        { "real, no residual", 128, 3072, 768, 0, 0, 0, real, "main" },
-        { "real, residual", 80, 768, 768, 96, 24, 5, real, "main" },
-        { "activation bank binds through the residual", 80, 768, 768, 96, 24, 5, small_bank, "activation" },
+        { "real, no residual", PD == 32 ? 64u : 128u, PD == 32 ? 64u : 3072u, 768, 0, 0, 0, real, "main" },
+        { "real, residual", MULTI_ROWS, PD == 32 ? 64u : 768u, 768, PD == 32 ? 64u : 96u, 24, 5, real, "main" },
+        { "activation bank binds through the residual", MULTI_ROWS, PD == 32 ? 64u : 768u, 768, 96, 24, 5, small_bank, "activation" },
         { "scale cache binds through the residual window", 80, 768, 768, 16, 24, 32, small_scale, "scale" },
         { "weight bank binds", 16, 768, 768, 20, 24, 3, tiny_bank, "weight" },
     };
@@ -304,9 +312,9 @@ void test_occupancy_and_offset() {
     struct shape {
         size_t m, n, k, lane_rows, blocks, per_block;
     };
-    const shape shapes[] = { { 80, 768, 768, 96, 24, 32 }, { 16, 768, 768, 48, 24, 7 },   { 1, 768, 768, 5, 24, 32 },
+    const shape shapes[] = { { 80, 768, 768, PD == 32 ? 64u : 96u, 24, 32 }, { 16, 768, 768, 48, 24, 7 },   { 1, 768, 768, 5, 24, 32 },
                              { 48, 48, 160, 48, 5, 32 },   { 100, 160, 2048, 96, 64, 2 }, { 200, 320, 128, 6, 4, 32 },
-                             { 128, 3072, 768, 96, 24, 32 } };
+                             { 128, 3072, 768, PD == 32 ? 64u : 96u, 24, 32 } };
     bool occupancy = true, offset = true;
     for (const shape & s : shapes) {
         potal_tile_plan main;
@@ -347,14 +355,19 @@ void test_occupancy_and_offset() {
 void test_panels_and_windows() {
     const potal_paired_geometry hw = potal_paired_hw_geometry();
     potal_tile_plan             main;
-    bool                        ok = main_select(80, 160, 2048, main);
+    bool                        ok = main_select(MULTI_ROWS, 160, 2048, main);
     // Residual in blocks 0, 1, 5, 6, 23 only: runs of PD + PD/4 (two fragments, a tail), 3 and 32 K.
-    const std::vector<run_spec> runs = { { 0, first_k(PD + PD / 4) }, { 1, first_k(3) }, { 5, first_k(32) },
-                                         { 6, first_k(1) }, { 23, first_k(PD) } };
-    const residual::decoded_packet r = synth(40, 80, runs);
+    // At DIM32 a K32 run cannot split. Put the full fragment and its tail
+    // in distinct blocks, preserving both a short last fragment and fillers.
+    const std::vector<run_spec> runs = PD == 32
+        ? std::vector<run_spec>{ { 0, first_k(32) }, { 1, first_k(8) }, { 2, first_k(3) },
+                                { 5, first_k(32) }, { 6, first_k(1) }, { 23, first_k(32) } }
+        : std::vector<run_spec>{ { 0, first_k(20) }, { 1, first_k(3) }, { 5, first_k(32) },
+                                { 6, first_k(1) }, { 23, first_k(16) } };
+    const residual::decoded_packet r = synth(40, MULTI_ROWS, runs);
     potal_paired_tile_plan         p;
     std::string                    why;
-    ok = ok && potal_make_tile_plan(main, 80, 160, 2048, &r, p, &why) == potal_paired_status::ok;
+    ok = ok && potal_make_tile_plan(main, MULTI_ROWS, 160, 2048, &r, p, &why) == potal_paired_status::ok;
     print_plan("P", p);
     check("P plan with a sparse residual is accepted", ok);
     if (!ok) {
@@ -409,7 +422,7 @@ void test_panels_and_windows() {
         windows = windows && wf == panel.fragment_end;
         no_loss = no_loss && active_sum - filler_sum == panel.residual_k_compact;
     }
-    const size_t expected_fragments = (PD + PD / 4 + PD - 1) / PD + 1 + (32 + PD - 1) / PD + 1 + 1;
+    const size_t expected_fragments = PD == 32 ? 6 : 7;
     check("P panels cover the original K once, in order, in whole scale blocks of at most tile_K tiles",
           cover && next_k == 2048 && p.k_panels >= 2);
     check("P a scale block never straddles two panels; every fragment's block lies in its panel", blocks);
@@ -423,9 +436,18 @@ void test_panels_and_windows() {
               p.fragments.size() == expected_fragments && compact_seen == r.k_compact);
     // A run longer than DIM is split into DIM fragments; the tail fragment keeps the remainder.
     const potal_paired_fragment & f0 = p.fragments[0], & f1 = p.fragments[1];
-    check("W run of DIM + DIM/4 K: fragments of DIM and DIM/4, the second a non-DIM-aligned tail",
-          f0.count == PD && f0.local_begin == 0 && f1.count == PD / 4 && f1.local_begin == PD && f1.run == 0 &&
+    check("W full fragment followed by DIM/4 tail (separate K32 blocks at DIM32)",
+          f0.count == PD && f0.local_begin == 0 && f1.count == PD / 4 &&
+              f1.local_begin == (PD == 32 ? 0 : PD) && f1.run == (PD == 32 ? 1u : 0u) &&
               f1.compact_begin == PD);
+    if (PD == 32) {
+        check("P/W DIM32 physical plan: I2/J2/K30, panels 30/30/4, three windows and 60 fillers",
+              p.tile_I == 2 && p.tile_J == 2 && p.tile_K == 30 && p.k_panels == 3 && p.j_groups == 3 &&
+                  p.panels[0].k_tiles == 30 && p.panels[1].k_tiles == 30 && p.panels[2].k_tiles == 4 &&
+                  p.residual_windows == 3 && p.residual_empty_panels == 2 && p.residual_filler_slots == 60 &&
+                  p.main_a_rows == 1920 && p.residual_a_rows == 128 && p.weight_rows == 1920 &&
+                  p.scale_slots_main == 60 && p.scale_slots_residual == 4);
+    }
     // More windows than one table holds: a residual of 6 full blocks in panel 0 needs 6 * (32 / DIM) fragments.
     const residual::decoded_packet big = synth(16, 16, dense_runs(6, 32));
     potal_tile_plan                m16;
@@ -493,7 +515,7 @@ void test_real_packets() {
 void test_failures() {
     const potal_paired_geometry real = potal_paired_hw_geometry();
     potal_tile_plan             m80, m16;
-    bool                        ok = main_select(80, 768, 768, m80) && main_select(16, 768, 768, m16);
+    bool                        ok = main_select(MULTI_ROWS, 768, 768, m80) && main_select(16, 768, 768, m16);
     check("E Main plans for the refusal cases", ok);
     if (!ok) {
         return;
@@ -513,7 +535,7 @@ void test_failures() {
     const auto refused = [](const std::pair<potal_paired_status, std::string> & r, potal_paired_status want) {
         return r.first == want && !r.second.empty();
     };
-    const residual::decoded_packet good = synth(32, 80, dense_runs(4, 8));
+    const residual::decoded_packet good = synth(32, MULTI_ROWS, dense_runs(4, 8));
 
     // Inconsistent residual geometry.
     residual::decoded_packet unsorted_rows = good;
@@ -529,49 +551,50 @@ void test_failures() {
     residual::decoded_packet block_beyond = good;
     block_beyond.runs.back().block_id = 24;
     residual::decoded_packet row_beyond = good;
-    row_beyond.rows.back().source_row = 80;
+    row_beyond.rows.back().source_row = MULTI_ROWS;
     check("E residual geometry refused: rows not ascending, blocks not ascending, local K >= 32, k_compact mismatch, "
           "runs without rows, block beyond K, row beyond the stripe",
-          refused(plan_of(m80, 80, 768, 768, &unsorted_rows, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &descending_blocks, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &local_beyond, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &bad_compact, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &rows_only, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &block_beyond, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 768, &row_beyond, real), potal_paired_status::invalid_argument));
+          refused(plan_of(m80, MULTI_ROWS, 768, 768, &unsorted_rows, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &descending_blocks, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &local_beyond, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &bad_compact, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &rows_only, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &block_beyond, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 768, &row_beyond, real), potal_paired_status::invalid_argument));
 
     // Main plan / shape mismatches.
     potal_tile_plan odd_k = m80;
-    odd_k.tile_K += 1; // not a whole scale block
+    // PPB=1 has no fractional block in tile units: use K beyond the shape.
+    odd_k.tile_K = PD == 32 ? 25 : m80.tile_K + 1;
     potal_tile_plan wide_j = m80;
     wide_j.tile_J = 49; // more J tiles than N has
     potal_tile_plan wrong_ppb = m80;
     wrong_ppb.passes_per_block = PPB + 1;
-    check("E Main plan refused: K not a whole scale block, tile_J beyond N, other passes_per_block, K not a block multiple",
-          refused(plan_of(odd_k, 80, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(wide_j, 80, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(wrong_ppb, 80, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
-              refused(plan_of(m80, 80, 768, 760, nullptr, real), potal_paired_status::invalid_argument));
+    check("E Main plan refused: invalid K tiles, tile_J beyond N, other passes_per_block, K not a block multiple",
+          refused(plan_of(odd_k, MULTI_ROWS, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(wide_j, MULTI_ROWS, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(wrong_ppb, MULTI_ROWS, 768, 768, nullptr, real), potal_paired_status::invalid_argument) &&
+              refused(plan_of(m80, MULTI_ROWS, 768, 760, nullptr, real), potal_paired_status::invalid_argument));
 
     // Main output tiles beyond ACC0 of a smaller accumulator.
     potal_paired_geometry small_acc = real;
     small_acc.acc_rows        = m80.tile_I * m80.tile_J * PD; // ACC0 = half of it
     check("E Main ACC0 capacity refused (the Main tiles are not shrunk here either)",
-          refused(plan_of(m80, 80, 768, 768, nullptr, small_acc), potal_paired_status::main_acc_capacity));
+          refused(plan_of(m80, MULTI_ROWS, 768, 768, nullptr, small_acc), potal_paired_status::main_acc_capacity));
 
     // Residual lane rows beyond ACC1 with the Main I/J kept.
-    const residual::decoded_packet five_lanes = synth(5 * 80, 80, dense_runs(4, 8));
+    const residual::decoded_packet five_lanes = synth(5 * MULTI_ROWS, MULTI_ROWS, dense_runs(4, 8));
     potal_paired_tile_plan         kept;
-    const auto                     acc1 = plan_of(m80, 80, 768, 768, &five_lanes, real, &kept);
+    const auto                     acc1 = plan_of(m80, MULTI_ROWS, 768, 768, &five_lanes, real, &kept);
     check("E Residual ACC1 capacity refused with diagnostics; tile_I / tile_J stay the Main tiler's",
           refused(acc1, potal_paired_status::residual_acc_capacity) && kept.tile_I == m80.tile_I &&
-              kept.tile_J == m80.tile_J && kept.residual_lane_rows == 400 && kept.tile_K == 0);
+              kept.tile_J == m80.tile_J && kept.residual_lane_rows == 5 * MULTI_ROWS && kept.tile_K == 0);
 
     // Index Table below one DIM fragment.
     potal_paired_geometry small_index = real;
     small_index.index_entries   = PD - 1;
     check("E Index Table smaller than DIM refused",
-          refused(plan_of(m80, 80, 768, 768, &good, small_index), potal_paired_status::index_window_capacity));
+          refused(plan_of(m80, MULTI_ROWS, 768, 768, &good, small_index), potal_paired_status::index_window_capacity));
 
     // Weight bank: not even one scale block of B with tile_J fits.
     potal_paired_geometry tiny_weight = real;
@@ -609,16 +632,16 @@ void test_failures() {
           m128_ok && refused(too_many, potal_paired_status::invalid_argument) &&
               too_many.second.find("one stripe") != std::string::npos);
     // Residual rows whose digits are all zero: no fragment survives -> refused (decode_packet never yields it).
-    residual::decoded_packet zero = synth(4, 80, dense_runs(2, 8));
+    residual::decoded_packet zero = synth(4, MULTI_ROWS, dense_runs(2, 8));
     zero.digits.assign(zero.rows.size() * zero.k_compact, 0);
     check("E residual rows with every digit zero refused",
-          refused(plan_of(m80, 80, 768, 768, &zero, real), potal_paired_status::invalid_argument));
+          refused(plan_of(m80, MULTI_ROWS, 768, 768, &zero, real), potal_paired_status::invalid_argument));
 
     // Determinism: the same request twice gives the same plan.
     potal_paired_tile_plan a, b;
     std::string            why;
-    const bool             det = potal_make_tile_plan(m80, 80, 768, 768, &good, a, &why) == potal_paired_status::ok &&
-                     potal_make_tile_plan(m80, 80, 768, 768, &good, b, &why) == potal_paired_status::ok && same_plan(a, b);
+    const bool             det = potal_make_tile_plan(m80, MULTI_ROWS, 768, 768, &good, a, &why) == potal_paired_status::ok &&
+                     potal_make_tile_plan(m80, MULTI_ROWS, 768, 768, &good, b, &why) == potal_paired_status::ok && same_plan(a, b);
     check("E the same request always gives the same plan", det);
 }
 
@@ -788,11 +811,20 @@ void test_exec_multi_panel() {
     // 80 x 160 x 2048: tile_K 50 -> 3 panels (50, 50, 28 tiles), 2 J groups.
     exec_case c;
     c.has_residual = true;
-    c.residual     = synth(40, 80, dense_runs(64, 7));
-    bool ok        = build_case(c, 80, 160, 2048, 80) && exec_invariants(c);
+    c.residual     = synth(40, MULTI_ROWS, dense_runs(64, 7));
+    bool ok        = build_case(c, MULTI_ROWS, 160, 2048, MULTI_ROWS) && exec_invariants(c);
     print_exec("X3", c.exec, 60);
     check("X3 several K panels with residual: every (J group, panel) has Main then its windows; first / last once per ACC epoch",
-          ok && c.tile.k_panels == 3 && c.tile.j_groups == 2 && c.exec.residual_gemms == 2 * c.tile.residual_windows);
+          ok && c.tile.k_panels == 3 && c.tile.j_groups == MULTI_J_GROUPS &&
+              c.tile.tile_K == (PD == 32 ? 30u : 50u) &&
+              c.exec.residual_gemms == MULTI_J_GROUPS * c.tile.residual_windows);
+    if (PD == 32) {
+        check("X3 DIM32 dense-run windows 15/15/2: nine Main and 96 Residual contributions",
+              ok && c.tile.panels[0].windows.size() == 15 && c.tile.panels[1].windows.size() == 15 &&
+                  c.tile.panels[2].windows.size() == 2 && c.tile.residual_windows == 32 &&
+                  c.tile.residual_filler_slots == 800 && c.exec.main_gemms == 9 &&
+                  c.exec.residual_gemms == 96 && c.exec.index_writes == 3744);
+    }
     // Per residency: Main GEMM precedes every Residual GEMM; windows ascend.
     bool order = ok;
     for (const potal_paired_residency & r : c.exec.residencies) {
@@ -823,8 +855,8 @@ void test_exec_multi_panel() {
     // X4: residual in blocks 0 and 63 only: panel 1 has no Index transaction.
     exec_case s;
     s.has_residual = true;
-    s.residual     = synth(10, 80, { { 0, first_k(PD) }, { 63, first_k(3) } });
-    ok             = build_case(s, 80, 160, 2048, 80) && exec_invariants(s);
+    s.residual     = synth(10, MULTI_ROWS, { { 0, first_k(PD) }, { 63, first_k(3) } });
+    ok             = build_case(s, MULTI_ROWS, 160, 2048, MULTI_ROWS) && exec_invariants(s);
     print_exec("X4", s.exec, 0);
     size_t index_ops[3] = { 0, 0, 0 }, residual_ops[3] = { 0, 0, 0 };
     for (const potal_paired_op & op : s.exec.ops) {
@@ -838,7 +870,8 @@ void test_exec_multi_panel() {
     const potal_paired_op * first = ok ? find_op(s.exec, op_kind::residual_gemm, 0) : nullptr;
     const potal_paired_op * last  = ok ? find_op(s.exec, op_kind::residual_gemm, 2) : nullptr;
     check("X4 residual spanning panels 0 and 2: panel 1 has no Index transaction and no Indexed GEMM; first at panel 0, last at panel 2",
-          ok && index_ops[0] == 2 && index_ops[1] == 0 && index_ops[2] == 2 && residual_ops[1] == 0 && first != nullptr &&
+          ok && s.tile.k_panels == 3 && s.tile.j_groups == MULTI_J_GROUPS &&
+              index_ops[0] == MULTI_J_GROUPS && index_ops[1] == 0 && index_ops[2] == MULTI_J_GROUPS && residual_ops[1] == 0 && first != nullptr &&
               last != nullptr && first->first && !first->last && last->last && !last->first &&
               s.tile.residual_empty_panels == 1);
 }
@@ -847,7 +880,8 @@ void test_exec_windows() {
     // 16 x 768 x 768: tile_K 28 (weight bank) -> panels of 14 and 10 blocks; blocks 0..5 = 12 fragments = 6 windows
     // in panel 0, blocks 14..16 = 3 windows in panel 1 (pair 1).
     std::vector<run_spec> runs = dense_runs(6, 32);
-    for (uint32_t blk = 14; blk < 17; ++blk) {
+    const uint32_t second_block = PD == 32 ? 16 : 14;
+    for (uint32_t blk = second_block; blk < second_block + 3; ++blk) {
         runs.emplace_back(blk, first_k(32));
     }
     exec_case c;
@@ -855,8 +889,9 @@ void test_exec_windows() {
     c.residual     = synth(16, 16, runs);
     bool ok        = build_case(c, 16, 768, 768, 16) && exec_invariants(c);
     print_exec("X5", c.exec, 0);
-    bool chain = ok && c.tile.panels[0].windows.size() == 6;
-    for (size_t w = 1; ok && w < 6; ++w) {
+    const size_t first_windows = PD == 32 ? 3 : 6;
+    bool chain = ok && c.tile.panels[0].windows.size() == first_windows;
+    for (size_t w = 1; ok && w < first_windows; ++w) {
         const potal_paired_op * ip   = find_op(c.exec, op_kind::index_program, 0, w);
         const potal_paired_op * prev = find_op(c.exec, op_kind::residual_gemm, 0, w - 1);
         const potal_paired_op * lr   = find_op(c.exec, op_kind::load_residual_a, 0, w);
@@ -864,9 +899,10 @@ void test_exec_windows() {
                 depends(*ip, prev->id, false) && depends(*lr, prev->id, true) && ip->id > prev->id &&
                 ip->index_active_rows == 2 * PD;
     }
-    check("X5 / X10 six windows in one panel: each same-buffer Index update follows the previous Indexed GEMM "
+    check("X5 / X10 multiple windows in one panel: each same-buffer Index update follows the previous Indexed GEMM "
           "(hardware-stalled), each Residual A reload waits for its completion",
-          chain && c.tile.k_panels == 2 && c.tile.panels[1].windows.size() == 3);
+          chain && c.tile.k_panels == 2 && c.tile.tile_K == (PD == 32 ? 16u : 28u) &&
+              c.tile.j_groups == 6 && c.tile.panels[1].windows.size() == (PD == 32 ? 2u : 3u));
     // X9: the first window of residency 1 (buffer 1) does not depend on any buffer-0 gemm.
     const potal_paired_op * ip1 = ok ? find_op(c.exec, op_kind::index_program, 1, 0) : nullptr;
     bool                    cross = ok && ip1 != nullptr && ip1->index_buffer == 1 && ip1->same_buffer_predecessor == potal_paired_no_index;
@@ -885,7 +921,10 @@ void test_exec_windows() {
     // X6: tails. Runs of PD + PD/4, 3, 32, 1 K in blocks 0, 1, 2, 3 -> windows: [PD, PD/4] [3, PD] [PD, 1].
     exec_case t;
     t.has_residual = true;
-    t.residual     = synth(5, 16, { { 0, first_k(PD + PD / 4) }, { 1, first_k(3) }, { 2, first_k(32) }, { 3, first_k(1) } });
+    t.residual = synth(5, 16, PD == 32
+        ? std::vector<run_spec>{ { 0, first_k(32) }, { 1, first_k(8) }, { 2, first_k(3) },
+                                { 3, first_k(32) }, { 4, first_k(32) }, { 5, first_k(1) } }
+        : std::vector<run_spec>{ { 0, first_k(20) }, { 1, first_k(3) }, { 2, first_k(32) }, { 3, first_k(1) } });
     ok             = build_case(t, 16, 768, 768, 16) && exec_invariants(t);
     print_exec("X6", t.exec, 0);
     const potal_paired_op * w0 = ok ? find_op(t.exec, op_kind::index_program, 0, 0) : nullptr;
@@ -900,7 +939,8 @@ void test_exec_windows() {
         if (en.filler) {
             fillers++;
             tails = tails && en.compact_k == potal_paired_no_index && en.fragment == 2 && en.slot >= 3 && en.slot < PD &&
-                    en.resident_k == 32 && en.original_k == 32; // block 1's first K, a resident row
+                    en.resident_k == (PD == 32 ? 64u : 32u) &&
+                    en.original_k == (PD == 32 ? 64u : 32u); // short run's first K, a resident row
         } else {
             actives++;
             tails = tails && en.original_k - en.resident_k == 0 && en.resident_k < t.tile.panels[0].k_rows;
@@ -913,8 +953,8 @@ void test_exec_windows() {
 void test_exec_pairs() {
     exec_case c;
     c.has_residual = true;
-    c.residual     = synth(32, 80, dense_runs(64, 2));
-    bool ok        = build_case(c, 80, 160, 2048, 80) && exec_invariants(c);
+    c.residual     = synth(32, MULTI_ROWS, dense_runs(64, 2));
+    bool ok        = build_case(c, MULTI_ROWS, 160, 2048, MULTI_ROWS) && exec_invariants(c);
     print_exec("X7", c.exec, 0);
     // X7 / X8: pair r % 2; residency r (r >= 2) loads only after pair_retire(r - 2), which completes Main and every Residual GEMM of r - 2.
     bool alternate = ok, retire = ok;
@@ -949,12 +989,17 @@ void test_exec_pairs() {
     }
     check("X7 pair phases: FREE -> LOADING -> RESIDENT -> RETIRED -> LOADING ..., both pairs end RETIRED",
           phases && c.exec.pairs[0].phase == potal_paired_pair_phase::retired &&
-              c.exec.pairs[1].phase == potal_paired_pair_phase::retired && c.exec.pairs[0].residencies + c.exec.pairs[1].residencies == 6);
+              c.exec.pairs[1].phase == potal_paired_pair_phase::retired &&
+              c.exec.pairs[0].residencies + c.exec.pairs[1].residencies == 3 * MULTI_J_GROUPS);
 }
 
 void test_exec_zero_fragments() {
     // Digits known: run 0 (2 fragments) has zeros in every row for its second fragment; run 1 is nonzero.
-    residual::decoded_packet d = synth(4, 16, { { 0, first_k(PD + 2) }, { 1, first_k(2) } });
+    // DIM32 uses a whole zero run between the two live fragments; K32 never
+    // contains a fictitious local K 32 or 33.
+    residual::decoded_packet d = synth(4, 16, PD == 32
+        ? std::vector<run_spec>{ { 0, first_k(32) }, { 1, first_k(2) }, { 2, first_k(2) } }
+        : std::vector<run_spec>{ { 0, first_k(18) }, { 1, first_k(2) } });
     d.digits.assign(d.rows.size() * d.k_compact, 0);
     for (size_t row = 0; row < d.rows.size(); ++row) {
         d.digits[row * d.k_compact + 0]      = 1;            // fragment 0 of run 0
@@ -972,14 +1017,14 @@ void test_exec_zero_fragments() {
     check("X12 an all-zero fragment is left out: 2 fragments executed, one window, no entry of the zero K, counted as skipped",
           ok && c.tile.residual_zero_fragments == 1 && c.tile.fragments.size() == 2 && c.tile.residual_windows == 1 &&
               c.exec.residual_gemms == c.tile.j_groups && entries && c.exec.index_writes == c.tile.j_groups * (PD + 2) &&
-              c.tile.fragments[1].run == 1);
+              c.tile.fragments[1].run == (PD == 32 ? 2u : 1u));
 }
 
 void test_exec_scale() {
     exec_case c;
     c.has_residual = true;
-    c.residual     = synth(32, 80, dense_runs(64, 2));
-    bool ok        = build_case(c, 80, 160, 2048, 80) && exec_invariants(c);
+    c.residual     = synth(32, MULTI_ROWS, dense_runs(64, 2));
+    bool ok        = build_case(c, MULTI_ROWS, 160, 2048, MULTI_ROWS) && exec_invariants(c);
     bool gens = ok, lifetime = ok, placement = ok;
     size_t expect_gen = 1;
     std::vector<int> live(c.exec.scale_windows.size(), 0);
@@ -1023,26 +1068,35 @@ void test_exec_tails() {
     // rows 70 (pad_i 10), N 140 (9 tiles: J groups of 5 and 4 with pad_j 4), K 2048 (panels 50, 50, 28).
     exec_case c;
     c.has_residual = true;
-    c.residual     = synth(21, 70, { { 0, first_k(9) }, { 40, first_k(32) }, { 63, first_k(PD + 1) } });
-    bool ok        = build_case(c, 70, 140, 2048, 70) && exec_invariants(c);
+    const size_t rows = PD == 32 ? 54 : 70;
+    c.residual = synth(21, rows, PD == 32
+        ? std::vector<run_spec>{ { 0, first_k(9) }, { 40, first_k(32) }, { 62, first_k(32) }, { 63, first_k(1) } }
+        : std::vector<run_spec>{ { 0, first_k(9) }, { 40, first_k(32) }, { 63, first_k(17) } });
+    bool ok        = build_case(c, rows, 140, 2048, rows) && exec_invariants(c);
     print_exec("X14", c.exec, 0);
-    bool tails = ok && c.tile.j_groups == 2 && c.tile.k_panels == 3 && c.tile.pad_I == 80 - 70 && c.tile.pad_J == 144 - 140 &&
-                 c.tile.residual_pad_I == 2 * PD - 21;
+    const size_t last_group = PD == 32 ? 2 : 1, last_j = PD == 32 ? 1 : 4;
+    const size_t full_j = PD == 32 ? 2 : 5, pad_j = PD == 32 ? 20 : 4;
+    const size_t full_k = PD == 32 ? 31 : 50, last_k = PD == 32 ? 2 : 28;
+    const size_t res_i = PD == 32 ? 1 : 2;
+    bool tails = ok && c.tile.j_groups == last_group + 1 && c.tile.k_panels == 3 &&
+                 c.tile.pad_I == 10 && c.tile.pad_J == pad_j && c.tile.tile_K == full_k &&
+                 c.tile.residual_pad_I == res_i * PD - 21;
     for (const potal_paired_op & op : c.exec.ops) {
         if (op.kind == op_kind::main_gemm) {
-            tails = tails && op.pad_i == 10 && op.pad_j == (op.j_group == 1 ? 4 : 0) && op.j_tiles == (op.j_group == 1 ? 4u : 5u) &&
-                    op.k_tiles == (op.panel == 2 ? 28u : 50u) && op.b_sp_rows == op.k_tiles * op.j_tiles * PD;
+            tails = tails && op.pad_i == 10 && op.pad_j == (op.j_group == last_group ? pad_j : 0) &&
+                    op.j_tiles == (op.j_group == last_group ? last_j : full_j) &&
+                    op.k_tiles == (op.panel == 2 ? last_k : full_k) && op.b_sp_rows == op.k_tiles * op.j_tiles * PD;
         }
         if (op.kind == op_kind::residual_gemm) {
-            tails = tails && op.pad_i == 2 * PD - 21 && op.pad_j == (op.j_group == 1 ? 4 : 0) && op.i_tiles == 2 &&
-                    op.work_ids == 2 * op.j_tiles;
+            tails = tails && op.pad_i == res_i * PD - 21 && op.pad_j == (op.j_group == last_group ? pad_j : 0) &&
+                    op.i_tiles == res_i && op.work_ids == res_i * op.j_tiles;
         }
         if (op.kind == op_kind::index_program) {
-            tails = tails && op.index_j_tiles == (op.j_group == 1 ? 4u : 5u) &&
-                    op.index_source_k_rows == (op.panel == 2 ? 28u * PD : 50u * PD);
+            tails = tails && op.index_j_tiles == (op.j_group == last_group ? last_j : full_j) &&
+                    op.index_source_k_rows == (op.panel == 2 ? last_k : full_k) * PD;
         }
     }
-    check("X14 I / J / K tails: pad_i 10, last J group 4 tiles with pad_j 4, last panel 28 tiles; Residual rows padded to 2 tiles; "
+    check("X14 I / J / K tails: exact DIM-specific J groups, K panels and lane-row padding; "
           "INDEX_CONFIG per (J group, panel)",
           tails);
 }
@@ -1050,8 +1104,9 @@ void test_exec_tails() {
 void test_exec_determinism_and_mutations() {
     exec_case a, b;
     a.has_residual = b.has_residual = true;
-    a.residual = b.residual = synth(32, 80, dense_runs(64, 3));
-    bool ok = build_case(a, 80, 160, 2048, 80) && build_case(b, 80, 160, 2048, 80) && exec_invariants(a);
+    a.residual = b.residual = synth(32, MULTI_ROWS, dense_runs(64, 3));
+    bool ok = build_case(a, MULTI_ROWS, 160, 2048, MULTI_ROWS) &&
+              build_case(b, MULTI_ROWS, 160, 2048, MULTI_ROWS) && exec_invariants(a);
     bool same = ok && a.exec.ops.size() == b.exec.ops.size() && a.exec.index_entries.size() == b.exec.index_entries.size();
     for (size_t i = 0; same && i < a.exec.ops.size(); ++i) {
         same = potal_paired_op_text(a.exec.ops[i]) == potal_paired_op_text(b.exec.ops[i]);

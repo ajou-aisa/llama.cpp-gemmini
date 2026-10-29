@@ -98,7 +98,6 @@ _Static_assert(sizeof(acc_t) == 4 && (acc_t)-1 < 0, "PoTal API requires signed 3
 #define CONCURRENT_LOOPS 2u
 
 /* Validated scope of the hardware execution path. */
-#define VALIDATED_DIM      16u
 #define VALIDATED_K_TILES  2u
 
 /* Set while a paired session owns the accelerator (potal_paired_session_open);
@@ -216,7 +215,7 @@ potal_status potal_gemm_ws_check(const potal_gemm_ws *g) {
         return POTAL_ERR_CAPACITY;
     }
 
-    if (g->flags != 0 || POTAL_HW_DIM != VALIDATED_DIM ||
+    if (g->flags != 0 || (POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32) ||
         g->m != dim || g->n != dim || g->k % dim != 0 || k_tiles > VALIDATED_K_TILES) {
         return POTAL_ERR_UNSUPPORTED;
     }

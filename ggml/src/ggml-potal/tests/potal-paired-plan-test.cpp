@@ -44,7 +44,7 @@ void print_plan(const char * name, const paired_tile_plan & p) {
 
 void test_geometry() {
     const paired_sp_layout a = paired_layout(0), b = paired_layout(1);
-    check("G SP geometry from the generated header: 4 banks x 4096 rows x DIM16 = 256 KiB",
+    check("G SP geometry from the generated header preserves 256 KiB",
           paired_sp_banks == POTAL_HW_BANK_NUM && paired_sp_bank_rows == POTAL_HW_BANK_ROWS &&
               paired_sp_banks * paired_sp_bank_rows * PD == 256 * 1024);
     check("G pair 0 = banks 0/1, pair 1 = banks 2/3 (LoopMatmul loop halves)",
@@ -240,7 +240,7 @@ void test_descriptor() {
 }
 
 void test_failures() {
-    paired_fixture f(40, 48, 256, 9, [](size_t blk, size_t n) { return (int16_t) ((blk + 2 * n) % 4); });
+    paired_fixture f(2 * PD + 8, 48, 256, 9, [](size_t blk, size_t n) { return (int16_t) ((blk + 2 * n) % 4); });
     paired_tile_plan p;
     if (!f.ok || paired_frozen_plan(f.M, f.N, f.K, 2, 2, 4, p) != POTAL_OK) {
         check("E fixture", false);
@@ -333,7 +333,7 @@ void test_failures() {
         paired_fixture big(65 * PD, 16, 32, 3, [](size_t, size_t) { return (int16_t) 1; });
         paired_gemm_desc d;
         d.m = big.M, d.n = big.N, d.k = big.K, d.a = big.a.get(), d.lda = big.lda, d.weight = &big.weight;
-        d.tile_I = 65, d.tile_J = 1, d.tile_K = 2;
+        d.tile_I = 65, d.tile_J = 1, d.tile_K = PPB;
         d.stripe_rows = 65 * PD;
         auto r        = run(d, rep);
         check("E SP capacity exceeded by the frozen t_I: POTAL_ERR_CAPACITY at plan, 0 ops, output untouched",
@@ -369,8 +369,8 @@ void test_failures() {
         const potal_status   st = execute_paired_emulated(d, p, req, s, mc, rc, n, ops, w);
         return st != POTAL_OK && mc.size() == 1 && rc.size() == 1;
     };
-    const paired_schedule overlap = tamper(paired_op_kind::main_a_load, [](paired_op & op) { op.sp_a += 2048; });
-    const paired_schedule front_w = tamper(paired_op_kind::weight_load, [](paired_op & op) { op.sp_w -= 16; });
+    const paired_schedule overlap = tamper(paired_op_kind::main_a_load, [](paired_op & op) { op.sp_a += paired_partition_rows; });
+    const paired_schedule front_w = tamper(paired_op_kind::weight_load, [](paired_op & op) { op.sp_w -= PD; });
     const paired_schedule wrong_pair = tamper(paired_op_kind::main_a_load, [](paired_op & op) { op.pair ^= 1; });
     check("E Main activation moved into the Residual partition: validator and emulator refuse",
           validate_paired_schedule(p, req, overlap, nullptr, &why) != POTAL_OK && emu(overlap));

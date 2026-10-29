@@ -1,23 +1,23 @@
 /*
  * PoTal GGML backend hardware smoke test (RISC-V Linux on FireSim,
- * FireSimQuadRocketSinglePoTalD16Config: one DIM16 Sat32 PoTal on hart 0).
+ * FireSimQuadRocketSinglePoTalD16Config or D32Config: one Sat32 PoTal on hart 0).
  *
  * Every case builds a real GGML graph y = ggml_mul_mat(w, x) with I8 tensors
- * (w: weights ne = {K, 16}; x: activations ne = {K, 16}; y: F32 ne = {16, 16}),
+ * (w: weights ne = {K, DIM}; x: activations ne = {K, DIM}; y: F32 ne = {DIM, DIM}),
  * selects the POTAL device explicitly and runs the graph on it. Hardware
  * evidence comes from the backend's counters (request handed to the issuer
  * thread, potal_gemm_ws_issue() and potal_fence() returning POTAL_OK). The
- * numerical check compares all 256 outputs with an int64 golden computed here
+ * numerical check compares all DIM*DIM outputs with an int64 golden computed here
  * from the GGML definition y[m][n] = sum_k x[m][k] * w[n][k], independent of
  * the backend's packing code.
  *
- *   k16, k32  ggml_backend_graph_compute() on POTAL; patterns lcg (full signed
+ *   kDIM, k2DIM ggml_backend_graph_compute() on POTAL; patterns lcg (full signed
  *             range), transpose_probe (any swapped index changes the result),
  *             extremes (+/-128 * +/-127 products, largest sums)
  *   sched     ggml_backend_sched with POTAL + CPU: MUL_MAT placed on POTAL and
  *             run in hardware, ggml_scale(0.5) placed on CPU; exact output
  *
- * Options: --case=k16|k32|sched|all (default all), --verbose (GGML debug logs).
+ * Options: --case=k<DIM>|k<2*DIM>|sched|all (default all), --verbose (GGML debug logs).
  * Markers on stdout (GGML logs interleaved), per hardware GEMM:
  *   GGML_BACKEND=POTAL, DISPATCH=HARDWARE, POTAL_GEMM_ISSUED, POTAL_FENCE_PASS,
  *   GGML_MUL_MAT_NUMERICAL_PASS; final "POTAL_GGML_SMOKE PASS|FAIL".
@@ -28,6 +28,7 @@
  */
 #include "ggml-cpp.h"
 #include "ggml-potal.h"
+#include "potal_hw_params.h"
 
 #include <sched.h>
 #include <sys/syscall.h>
@@ -42,9 +43,9 @@
 
 namespace {
 
-constexpr int   M        = 16;
-constexpr int   N        = 16;
-constexpr float SENTINEL = -1.0e9f; // beyond any K <= 32 int8 dot product
+constexpr int   M        = POTAL_HW_DIM;
+constexpr int   N        = POTAL_HW_DIM;
+constexpr float SENTINEL = -1.0e9f; // beyond any K <= 2*DIM int8 dot product
 
 bool g_verbose  = false;
 int  g_failures = 0;
@@ -346,7 +347,7 @@ void run_sched(ggml_backend_t potal, ggml_backend_t cpu, int k, uint32_t seed) {
 }
 
 void usage(const char * argv0) {
-    std::printf("usage: %s [--case=k16|k32|sched|all] [--verbose]\n", argv0);
+    std::printf("usage: %s [--case=k%d|k%d|sched|all] [--verbose]\n", argv0, M, 2 * M);
 }
 
 } // namespace
@@ -363,7 +364,8 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (which != "k16" && which != "k32" && which != "sched" && which != "all") {
+    if (which != "k" + std::to_string(M) && which != "k" + std::to_string(2 * M) &&
+        which != "sched" && which != "all") {
         usage(argv[0]);
         return 2;
     }
@@ -391,7 +393,7 @@ int main(int argc, char ** argv) {
 
     uint32_t      seed       = 1;
     const pattern patterns[] = { pattern::lcg, pattern::transpose_probe, pattern::extremes };
-    for (int k : { 16, 32 }) {
+    for (int k : { M, 2 * M }) {
         if (which == "all" || which == "k" + std::to_string(k)) {
             for (pattern p : patterns) {
                 run_direct(potal.get(), k, p, seed++);
@@ -403,7 +405,7 @@ int main(int argc, char ** argv) {
         if (!cpu) {
             fail("CPU backend init");
         } else {
-            run_sched(potal.get(), cpu.get(), 32, seed++);
+            run_sched(potal.get(), cpu.get(), 2 * M, seed++);
         }
     }
 

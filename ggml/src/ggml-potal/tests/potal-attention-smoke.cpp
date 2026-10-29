@@ -76,6 +76,10 @@ namespace golden = potal_test::attention_golden;
 using namespace ggml::potal;
 int failures = 0;
 
+// Keep the same normalized P input as DIM16. The DIM32 interval remains
+// certified: the high-carrier microtile is bounded by 64*2^24 = 2^30.
+constexpr size_t pv_peak = 16;
+
 void check(const char * name, bool value) {
     std::printf("POTAL_ATTENTION_CHECK %s %s\n", value ? "PASS" : "FAIL", name);
     failures += !value;
@@ -121,7 +125,7 @@ bool raw_qk(ggml_tensor * output, bool witness = false, std::vector<float> * exp
     const size_t hr = size_t(input.ne[2] / weight.ne[2]);
     const size_t br = size_t(input.ne[3] / weight.ne[3]);
     potal_tile_plan stripes;
-    if (potal_tile_select(rows, n, kp, 2, &stripes) != POTAL_OK) return false;
+    if (potal_tile_select(rows, n, kp, 32 / POTAL_HW_DIM, &stripes) != POTAL_OK) return false;
     std::vector<expected_job> jobs;
     std::vector<float> final(size_t(ggml_nelements(output)));
     bool negative_high = false;
@@ -156,9 +160,10 @@ bool raw_qk(ggml_tensor * output, bool witness = false, std::vector<float> * exp
                                 job.head = h; job.batch = b; job.begin = begin;
                                 job.q_limb = q; job.k_limb = pass;
                                 job.rows = a.rows; job.n = n; job.kp = kp;
-                                if (potal_tile_select(a.rows, n, kp * 2, 2, &job.plan) != POTAL_OK) return false;
+                                if (potal_tile_select(a.rows, n, kp * 2, 32 / POTAL_HW_DIM, &job.plan) != POTAL_OK) return false;
                                 job.plan.tile_K = std::min(job.plan.tile_K, kp / POTAL_HW_DIM);
-                                while (kp / POTAL_HW_DIM % job.plan.tile_K || job.plan.tile_K % 2) --job.plan.tile_K;
+                                while (kp / POTAL_HW_DIM % job.plan.tile_K || job.plan.tile_K % (32 / POTAL_HW_DIM)) --job.plan.tile_K;
+                                if (kp == 4128 && job.plan.tile_K * POTAL_HW_DIM >= kp) return false;
                                 job.a = digits; job.b = w.limbs[pass]; job.carriers = w.carriers;
                                 job.c = golden::qk_pass(a, w, q, pass);
                                 job.actual_c.resize(job.c.size());
@@ -168,7 +173,7 @@ bool raw_qk(ggml_tensor * output, bool witness = false, std::vector<float> * exp
                                                   (job.plan.tile_J * POTAL_HW_DIM);
                                 job.commands.resize(ni * nj * (kp / (job.plan.tile_K * POTAL_HW_DIM)));
                                 if (witness && q == 1 &&
-                                    (job.c.size() != 1 || job.c[0] != (pass ? 1073872895 : INT32_MAX))) return false;
+                                    (job.c.size() != 1 || job.c[0] != (pass ? (POTAL_HW_DIM == 16 ? 1073872895 : INT32_MAX) : INT32_MAX))) return false;
                                 jobs.push_back(std::move(job));
                             }
                         }
@@ -240,7 +245,7 @@ bool raw_qk(ggml_tensor * output, bool witness = false, std::vector<float> * exp
                             l.k_tiles == kk / POTAL_HW_DIM &&
                             l.pad_i == (POTAL_HW_DIM - mi % POTAL_HW_DIM) % POTAL_HW_DIM &&
                             l.pad_j == (POTAL_HW_DIM - nj % POTAL_HW_DIM) % POTAL_HW_DIM && l.pad_k == 0 &&
-                            l.passes_per_block == 2 && l.scale_generation > 0 &&
+                            l.passes_per_block == 32 / POTAL_HW_DIM && l.scale_generation > 0 &&
                             (!previous_generation || l.scale_generation == generation);
                         previous_generation = l.scale_generation;
                         stores += r.status == POTAL_OK && l.c != nullptr;
@@ -318,8 +323,9 @@ void run_case(ggml_backend_t hardware, ggml_backend_t cpu, attention::role role,
                 for (size_t x = 0; x < k; ++x) {
                     float value = std::ldexp(j % 2 ? -1.0f : 1.0f, int((h + b + j) % 3));
                     if (cancellation) {
-                        value = x == 0 ? 1.0f : x == 16 ? -1.0f :
-                                x == 32 ? std::ldexp(1.0f, -24) : x == 48 ? -std::ldexp(1.0f, -24) : 0;
+                        value = x == 0 ? 1.0f : x == POTAL_HW_DIM ? -1.0f :
+                                x == 2*POTAL_HW_DIM ? std::ldexp(1.0f, -24) :
+                                x == 3*POTAL_HW_DIM ? -std::ldexp(1.0f, -24) : 0;
                     }
                     set(weight, x, j, h, b, value);
                 }
@@ -429,7 +435,7 @@ void qk_saturation(ggml_backend_t hardware, ggml_backend_t cpu) {
                          expected != forbidden;
     const auto low = golden::qk_pass(a, b, 1, 0), high = golden::qk_pass(a, b, 1, 1);
     check("independent QK destructive witness constants", witness && low[0] == INT32_MAX &&
-          high[0] == 1073872895 && expected[0] == 70927089860352LL && forbidden[0] == 549755813632LL);
+          high[0] == (POTAL_HW_DIM == 16 ? 1073872895 : INT32_MAX) && expected[0] == (POTAL_HW_DIM == 16 ? 70927089860352LL : 141287244103424LL) && forbidden[0] == 549755813632LL);
     if (!witness) return;
     auto * output = ggml_mul_mat(context.get(), weight, input);
     ggml_gemmini_set_attention_role(output, GGML_GEMMINI_ATTENTION_QK);
@@ -446,7 +452,7 @@ void qk_saturation(ggml_backend_t hardware, ggml_backend_t cpu) {
     const float want = float(std::ldexp(double(expected[0]), -48));
     const float wrong = float(std::ldexp(double(forbidden[0]), -48));
     check("real QK independent ACC epochs and checked Host weighting",
-          status == GGML_STATUS_SUCCESS && got == want && got != wrong && got == 0.251983642578125f);
+          status == GGML_STATUS_SUCCESS && got == want && got != wrong && got == (POTAL_HW_DIM == 16 ? 0.251983642578125f : 0.501953125f));
     check("QK saturation hardware completion and balanced Scale",
           after.attention_completed == before.attention_completed + 1 &&
           after.attention_failed == before.attention_failed &&
@@ -476,7 +482,7 @@ bool pv_range() {
     for (size_t h = 0; h < heads; ++h) {
         for (size_t x = 0; x < k; ++x) {
             set(input, x, 0, h, 0, x == 0 ? std::ldexp(1.0f, -16) :
-                                      x == 16 ? 1.0f - std::ldexp(1.0f, -16) : 0);
+                                      x == pv_peak ? 1.0f - std::ldexp(1.0f, -16) : 0);
             for (size_t j = 0; j < n; ++j) {
                 const float sign = j % 2 ? -1.0f : 1.0f;
                 set(weight, x, j, h, 0, x == 0 ? sign :
@@ -494,7 +500,7 @@ bool pv_range() {
             attention::prepare_stream(*input, h, 0, 0, 1, attention::role::pv, a) == POTAL_OK;
         if (!prepared) break;
         const auto status = attention::column_bias(w, correction);
-        prepared = a.scale == -16 && a.codes[0] == 1 && a.codes[16] == 65535 &&
+        prepared = a.scale == -16 && a.codes[0] == 1 && a.codes[pv_peak] == 65535 &&
             status == (h + 1 == heads ? POTAL_ERR_UNSUPPORTED : POTAL_OK);
         if (h + 1 == heads) {
             prepared = prepared && correction == std::vector<int32_t>{12345};
@@ -525,7 +531,8 @@ bool pv_range() {
         }
     }
     const bool commands = result.jobs == 49 && result.pv_bitplane_stripes == 1 &&
-        result.pv_bitplane_jobs == 16 && result.correction_jobs == 11 && result.bias_updates == 44 &&
+        result.pv_bitplane_jobs == 16 && result.correction_jobs == 11 &&
+        result.bias_updates == 11*(64/POTAL_HW_DIM) &&
         result.qk_limb_jobs == 0 && result.loops >= result.jobs && result.fences >= result.loops &&
         result.scale_writes > 0 && result.scale_writes == result.scale_releases;
     check("PV range exact independently calculated F32 output", exact);
@@ -544,35 +551,35 @@ bool pv_range() {
 
 void bias_saturation() {
     hp1_operands operands;
-    if (!operands.allocate({16, 16, 32})) { check("bias DMA allocation", false); return; }
-    std::unique_ptr<void, decltype(&std::free)> bias(dma_alloc(16 * sizeof(int32_t)), std::free);
+    if (!operands.allocate({POTAL_HW_DIM, POTAL_HW_DIM, 32})) { check("bias DMA allocation", false); return; }
+    std::unique_ptr<void, decltype(&std::free)> bias(dma_alloc(POTAL_HW_DIM * sizeof(int32_t)), std::free);
     if (!bias) { check("bias allocation", false); return; }
-    for (size_t i = 0; i < 16; ++i)
+    for (size_t i = 0; i < POTAL_HW_DIM; ++i)
         for (size_t k = 0; k < 32; ++k) operands.a[i * operands.lda + k] = 127;
     for (size_t k = 0; k < 32; ++k)
-        for (size_t j = 0; j < 16; ++j) operands.own.b[k * operands.ldb + j] = 1;
-    for (size_t j = 0; j < 16; ++j) {
+        for (size_t j = 0; j < POTAL_HW_DIM; ++j) operands.own.b[k * operands.ldb + j] = 1;
+    for (size_t j = 0; j < POTAL_HW_DIM; ++j) {
         operands.own.carriers[j] = 24;
         static_cast<int32_t *>(bias.get())[j] = -128;
     }
     potal_stripe_gemm_desc desc{};
-    desc.m = 16; desc.n = 16; desc.k = 32;
+    desc.m = POTAL_HW_DIM; desc.n = POTAL_HW_DIM; desc.k = 32;
     desc.a = operands.a; desc.b = operands.b; desc.c = operands.c;
     desc.lda = operands.lda; desc.ldb = operands.ldb; desc.ldc = operands.ldc;
     desc.carriers = operands.carriers; desc.carrier_stride = operands.cstride; desc.scale_block_k = 32;
-    desc.tile_i = 1; desc.tile_j = 1; desc.tile_k = 2;
+    desc.tile_i = 1; desc.tile_j = 1; desc.tile_k = 32/POTAL_HW_DIM;
     planned_result completed;
     issuer_owner owner;
     std::string why;
     potal_status status = POTAL_OK;
     const bool started = owner.start([&](const owner_runners &) {
-        completed = attention::run_corrected(desc, static_cast<const int32_t *>(bias.get()), 16);
+        completed = attention::run_corrected(desc, static_cast<const int32_t *>(bias.get()), POTAL_HW_DIM);
         return consume_outcome{completed.fatal, completed.status, completed.stage};
     }, why, status);
     owner.join();
     bool exact = started && completed.ok;
-    for (size_t i = 0; i < 16; ++i)
-        for (size_t j = 0; j < 16; ++j) exact = exact && operands.c[i * operands.ldc + j] == INT32_MAX - 128;
+    for (size_t i = 0; i < POTAL_HW_DIM; ++i)
+        for (size_t j = 0; j < POTAL_HW_DIM; ++j) exact = exact && operands.c[i * operands.ldc + j] == INT32_MAX - 128;
     check("real SCU saturation then one final negative INT32 bias", exact);
     if (completed.fatal) { operands.abandon(); (void)bias.release(); }
 }
@@ -601,11 +608,11 @@ int main(int argc, char ** argv) {
         run_case(hardware.get(), cpu.get(), attention::role::qk, 65, 17, GGML_TYPE_F32, true, true);
         for (size_t k : {size_t(17), size_t(33), size_t(65)})
             run_case(hardware.get(), cpu.get(), attention::role::pv, k, k == 33 ? 4 : 1, GGML_TYPE_F16, true, k == 33);
-        run_case(hardware.get(), cpu.get(), attention::role::pv, 64, 1, GGML_TYPE_F32, true, false, true);
+        run_case(hardware.get(), cpu.get(), attention::role::pv, 4*POTAL_HW_DIM, 1, GGML_TYPE_F32, true, false, true);
         qk_saturation(hardware.get(), cpu.get());
         bias_saturation();
     }
-    // Three frozen K panels per stationary limb exercise actual later-panel
+    // Multiple frozen K panels per stationary limb exercise actual later-panel
     // accumulation and a final-only readback, including a one-element K tail.
     run_case(hardware.get(), cpu.get(), attention::role::qk, 4097, 1, GGML_TYPE_F32, true, false);
     std::printf("POTAL_ATTENTION_SMOKE %s\n", failures ? "FAIL" : "PASS");

@@ -30,6 +30,10 @@ using attention::stationary;
 using attention::stream;
 using namespace ggml::potal;
 
+// Preserve the historical normalized P input for both dimensions. Even when
+// DIM32 shares this microtile, the certified bound is 64*2^24 = 2^30.
+constexpr size_t pv_peak = 16;
+
 int failures = 0;
 
 bool check(const std::string & name, bool ok) {
@@ -169,7 +173,8 @@ void test_reference() {
     }
 
     // Independent passes saturate before radix weighting. High uses Delta,
-    // not Delta+8; the obsolete shared recurrence finishes at INT32_MIN.
+    // not Delta+8; the obsolete shared recurrence finishes at INT32_MIN
+    // for two DIM16 partials, or -1 for one DIM32 partial.
     a = make_stream(1, 32, std::vector<int32_t>(32, 127), role::qk, 1);
     b = make_weight(32, 1, std::vector<int32_t>(32, -129), role::qk, 20);
     std::vector<int64_t> shared, split;
@@ -179,7 +184,8 @@ void test_reference() {
     check("QK independent and legacy witnesses evaluate", golden::evaluate(a,b,role::qk,shared) &&
           golden::evaluate(a,b,role::qk,split,true));
     check("QK independent passes reject old shared result",
-          shared == std::vector<int64_t>{-547608330241LL} && split == std::vector<int64_t>{INT32_MIN});
+          shared == std::vector<int64_t>{-547608330241LL} &&
+          split == std::vector<int64_t>{POTAL_HW_DIM == 16 ? INT32_MIN : -1} && shared != split);
     compare_reference("QK complete low/high passes at original Delta", a,b,role::qk);
     auto corrupted = a;
     corrupted.limbs[0].assign(corrupted.codes.size(),0);
@@ -238,18 +244,19 @@ void test_reference() {
 
     // The low ACC saturates negative and positive in consecutive microtiles.
     // The exact bias is zero, but that does not undo low-ACC saturation.
-    a = make_stream(1,32,std::vector<int32_t>(32,0),role::pv,1);
-    vcodes.assign(32,0); vcodes[0] = 1; vcodes[16] = -1;
-    b = make_weight(32,1,vcodes,role::pv,24);
+    a = make_stream(1,2*POTAL_HW_DIM,std::vector<int32_t>(2*POTAL_HW_DIM,0),role::pv,1);
+    vcodes.assign(2*POTAL_HW_DIM,0); vcodes[0] = 1; vcodes[POTAL_HW_DIM] = -1;
+    b = make_weight(2*POTAL_HW_DIM,1,vcodes,role::pv,24);
     check("PV mixed saturation independent expected minus one",
           golden::evaluate(a,b,role::pv,shared) && shared == std::vector<int64_t>{-1});
     compare_reference("PV mixed saturation signs",a,b,role::pv);
-    std::swap(b.limbs[0][0],b.limbs[0][16]);
+    std::swap(b.limbs[0][0],b.limbs[0][POTAL_HW_DIM]);
     compare_reference("PV reversed mixed saturation signs",a,b,role::pv);
-    a = make_stream(1,64,std::vector<int32_t>(64,0),role::pv,1);
-    vcodes.assign(64,0);
-    vcodes[0] = vcodes[16] = 1; vcodes[32] = vcodes[48] = -1;
-    b = make_weight(64,1,vcodes,role::pv,24);
+    a = make_stream(1,4*POTAL_HW_DIM,std::vector<int32_t>(4*POTAL_HW_DIM,0),role::pv,1);
+    vcodes.assign(4*POTAL_HW_DIM,0);
+    vcodes[0] = vcodes[POTAL_HW_DIM] = 1;
+    vcodes[2*POTAL_HW_DIM] = vcodes[3*POTAL_HW_DIM] = -1;
+    b = make_weight(4*POTAL_HW_DIM,1,vcodes,role::pv,24);
     check("PV repeated mixed signs expose fixed microtile order",
           golden::evaluate(a,b,role::pv,shared) && shared == std::vector<int64_t>{INT32_MAX-1});
     compare_reference("PV two negative then two positive partials",a,b,role::pv);
@@ -280,15 +287,15 @@ void test_reference() {
     // A fifth-limb contribution and a fourth-limb contribution have the same
     // sign here. Both completed ACCs are large positive values; reconstruction
     // overflows only after the complete fifth limb is added.
-    a = make_stream(1, 64, std::vector<int32_t>(64, 0), role::qk);
+    a = make_stream(1, 4*POTAL_HW_DIM, std::vector<int32_t>(4*POTAL_HW_DIM, 0), role::qk);
     a.codes[0] = INT32_MAX;
-    a.codes[16] = 0x7f000000;
-    a.codes[32] = 0x7f000000;
-    for (size_t x = 0; x < 64; ++x) {
+    a.codes[POTAL_HW_DIM] = 0x7f000000;
+    a.codes[2*POTAL_HW_DIM] = 0x7f000000;
+    for (size_t x = 0; x < a.k; ++x) {
         const auto d = golden::digits(a.codes[x]);
         for (size_t l = 0; l < 5; ++l) a.limbs[l][x] = d[l];
     }
-    b = make_weight(64, 1, std::vector<int32_t>(64, 1), role::qk, 31);
+    b = make_weight(a.k, 1, std::vector<int32_t>(a.k, 1), role::qk, 31);
     std::vector<int64_t> got = {778899};
     check("independent completed-limb reconstruction overflows", !golden::evaluate(a,b,role::qk,shared));
     check("reference rejects INT64 overflow", attention::reference(a,b,role::qk,got) != POTAL_OK);
@@ -494,14 +501,16 @@ struct emu_runner {
         panels_ok = panels_ok && d.k == logical_k && d.lda >= logical_k &&
                     d.scale_block_k == 32 && !emu.in_flight;
         potal_tile_plan frozen;
-        const auto selected = potal_tile_select(d.m,d.n,2*logical_k,2,&frozen);
+        const auto selected = potal_tile_select(d.m,d.n,2*logical_k,32/POTAL_HW_DIM,&frozen);
         panels_ok = panels_ok && selected == POTAL_OK;
         if (selected == POTAL_OK) {
             frozen.tile_K = std::min(frozen.tile_K,logical_k/POTAL_HW_DIM);
-            while (frozen.tile_K && (logical_k/POTAL_HW_DIM % frozen.tile_K || frozen.tile_K % 2))
+            while (frozen.tile_K && (logical_k/POTAL_HW_DIM % frozen.tile_K || frozen.tile_K % (32/POTAL_HW_DIM)))
                 --frozen.tile_K;
             panels_ok = panels_ok && d.tile_i == frozen.tile_I && d.tile_j == frozen.tile_J &&
                         d.tile_k == frozen.tile_K;
+            if (logical_k == 4128)
+                panels_ok = panels_ok && frozen.tile_K * POTAL_HW_DIM < logical_k;
         }
         if (d.k == logical_k && d.carriers && d.b && d.a) {
             std::vector<int8_t> activation;
@@ -666,15 +675,19 @@ void test_execute() {
     auto a = make_stream(1,64,std::vector<int32_t>(64,16384),role::qk,2);
     auto b = make_weight(64,1,codes,role::qk);
     b.base[0] = -34; b.carriers = {20,0};
+    // Q limb 1 is 64, with reconstruction weight 256. DIM16 high ACC:
+    // Sat32(-1024*2^20) + Sat32(3136*2^20) + 131072 = 1073872895.
+    // DIM32 merges that first block: Sat32(2112*2^20) = INT32_MAX;
+    // adding 131072 stays saturated. Low is INT32_MAX in both cases.
     std::vector<int64_t> expected, forbidden;
     if (check("QK execute saturation witness fits",
               golden::evaluate(a,b,role::qk,expected) && golden::evaluate(a,b,role::qk,forbidden,true))) {
         check("QK execute exact independent and obsolete shared witnesses",
-              expected == std::vector<int64_t>{70927089860352LL} &&
+              expected == std::vector<int64_t>{(POTAL_HW_DIM == 16 ? 70927089860352LL : 141287244103424LL)} &&
               forbidden == std::vector<int64_t>{549755813632LL});
         check("QK execute independent active-limb raw ACC witnesses",
               golden::qk_pass(a,b,1,0) == std::vector<int32_t>{INT32_MAX} &&
-              golden::qk_pass(a,b,1,1) == std::vector<int32_t>{1073872895});
+              golden::qk_pass(a,b,1,1) == std::vector<int32_t>{(POTAL_HW_DIM == 16 ? 1073872895 : INT32_MAX)});
         emu_runner e(64);
         std::vector<std::vector<int32_t>> raw_passes;
         const auto result = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) {
@@ -689,7 +702,7 @@ void test_execute() {
         });
         const float want = static_cast<float>(std::ldexp(static_cast<double>(expected[0]),-48));
         check("QK execute independent-pass saturation result",
-              result.status == POTAL_OK && want == 0.251983642578125f && g.out.get(0,0) == want);
+              result.status == POTAL_OK && want == (POTAL_HW_DIM == 16 ? 0.251983642578125f : 0.501953125f) && g.out.get(0,0) == want);
         bool raw_exact = raw_passes.size() == 2*a.limb_count;
         for (size_t pass = 0; raw_exact && pass < raw_passes.size(); ++pass)
             raw_exact = raw_passes[pass] == golden::qk_pass(a,b,pass/2,pass%2);
@@ -847,7 +860,7 @@ void test_pv_bitplane_reference() {
     // New acceptance is triggered by column bias, never by a normal PV job.
     for (int sign : {-1,1}) {
         auto a = make_stream(1,64,std::vector<int32_t>(64,0),role::pv);
-        a.codes[0] = 1; a.codes[16] = 65535;
+        a.codes[0] = 1; a.codes[pv_peak] = 65535;
         std::vector<int32_t> v(64,0);
         v[0] = sign*64; v[32] = sign*64;
         auto b = make_weight(64,1,v,role::pv,24);
@@ -924,21 +937,23 @@ void test_pv_bitplane_reference() {
     a.codes[0] = 1; a.codes[1] = 0;
     v[0] = 127; v[1] = -127; v[2] = 127;
     b = make_weight(32,1,v,role::pv,24);
-    b.limbs[0][16] = 1; // Outside-INT32 bias; mixed signs in first DIM16.
+    b.limbs[0][16] = 1; // Outside-INT32 bias; mixed signs in first physical microtile.
     pv_plane_reference("PV mixed-sign interval SCU refusal",a,b,false);
-    a = make_stream(1,64,std::vector<int32_t>(64,1),role::pv);
-    v.assign(64,0); v[0] = 127; v[16] = 127; v[32] = -127;
-    b = make_weight(64,1,v,role::pv,24);
+    a = make_stream(1,4*POTAL_HW_DIM,std::vector<int32_t>(4*POTAL_HW_DIM,1),role::pv);
+    v.assign(4*POTAL_HW_DIM,0);
+    v[0] = 127; v[POTAL_HW_DIM] = 127; v[2*POTAL_HW_DIM] = -127;
+    b = make_weight(4*POTAL_HW_DIM,1,v,role::pv,24);
     pv_plane_reference("PV ascending K prefix ACC refusal",a,b,false);
     // Large carriers are safe only for proven-zero intervals.
     a.codes.assign(a.codes.size(),0);
-    b.carriers = {200,199};
+    b.carriers.assign(b.carriers.size(),199);
+    b.carriers[0] = 200;
     pv_plane_reference("PV large carriers proven zero",a,b,true);
     std::vector<golden::wide> exact;
     check("PV large carrier exact zero has no undefined shift",golden::pv_exact(a,b,exact) && exact[0] == 0);
     a.codes[0] = 1;
     pv_plane_reference("PV large nonzero carrier refuses",a,b,false);
-    b.carriers.assign(2,POTAL_CARRIER_ZERO);
+    b.carriers.assign(b.carriers.size(),POTAL_CARRIER_ZERO);
     compare_reference("PV ZERO carriers retain biased path",a,b,role::pv);
     golden::pv_planes zero;
     check("PV ZERO raw plane outputs",golden::pv_bitplanes(a,b,zero) &&
@@ -995,9 +1010,9 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
         }
         for (size_t i = 0; i < m; ++i) {
             g.a.set(0,i,std::ldexp(1.0f,reject ? -15 : -16),h);
-            // Moving the maximum into V's nonzero DIM16 creates an unsafe
+            // Moving the maximum into V's nonzero physical microtile creates an unsafe
             // unsigned-plane contribution, before any command may be issued.
-            g.a.set(reject ? 1 : 16,i,1.0f-std::ldexp(1.0f,reject ? -15 : -16),h);
+            g.a.set(reject ? 1 : pv_peak,i,1.0f-std::ldexp(1.0f,reject ? -15 : -16),h);
         }
     }
     struct job {
@@ -1011,13 +1026,13 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
     std::vector<float> expected(heads*m*n);
     size_t selected_stripes = 0, selected_jobs = 0, old_stripes = 0;
     potal_tile_plan stripes;
-    if (!check("PV fixture stripe selection",potal_tile_select(m,n,(k+31)/32*32,2,&stripes) == POTAL_OK)) return;
+    if (!check("PV fixture stripe selection",potal_tile_select(m,n,(k+31)/32*32,32/POTAL_HW_DIM,&stripes) == POTAL_OK)) return;
     for (size_t h = 0; h < heads; ++h) {
         stationary b;
         if (!check("PV real V preparation",attention::prepare_stationary(g.w.t,h,0,role::pv,b) == POTAL_OK)) return;
-        for (size_t begin = 0; begin < m; begin += stripes.tile_I*16) {
+        for (size_t begin = 0; begin < m; begin += stripes.tile_I*POTAL_HW_DIM) {
             stream a;
-            const size_t rows = std::min(m-begin,stripes.tile_I*16);
+            const size_t rows = std::min(m-begin,stripes.tile_I*POTAL_HW_DIM);
             if (!check("PV real P preparation",attention::prepare_stream(g.a.t,h,0,begin,rows,role::pv,a) == POTAL_OK)) return;
             std::vector<int32_t> bias;
             const auto bias_status = attention::column_bias(b,bias);
@@ -1045,7 +1060,7 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
                 selected_jobs += planes.raw.size();
                 if (k > 32) {
                     check("PV normalized guard fixture constants",
-                          a.scale == -16 && a.codes[0] == 1 && a.codes[16] == 65535 &&
+                          a.scale == -16 && a.codes[0] == 1 && a.codes[pv_peak] == 65535 &&
                           b.base[0] == -30 && b.carriers[0] == 24 &&
                           b.carriers[b.n] == 0 && b.limbs[0][0] == 64 &&
                           b.limbs[0][32*b.n] == 64);
@@ -1090,13 +1105,13 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
             descriptors = descriptors && !emu.in_flight && d.k == a.kp && d.m == a.rows && d.n == b.n &&
                           d.work_kind == (job.plane == 0 ? POTAL_STRIPE_WORK_MAIN : POTAL_STRIPE_WORK_RESIDUAL);
             potal_tile_plan plan;
-            if (potal_tile_select(a.rows,b.n,a.kp,2,&plan) != POTAL_OK) descriptors = false;
+            if (potal_tile_select(a.rows,b.n,a.kp,32/POTAL_HW_DIM,&plan) != POTAL_OK) descriptors = false;
             else {
-                plan.tile_K = std::min(plan.tile_K,a.kp/16);
+                plan.tile_K = std::min(plan.tile_K,a.kp/POTAL_HW_DIM);
                 if (job.bitplane)
                     plan.tile_K = std::min(plan.tile_K,size_t(POTAL_HW_BANK_ROWS)/
-                                          (std::max(plan.tile_I,plan.tile_J)*16));
-                while (plan.tile_K && (a.kp/16 % plan.tile_K || plan.tile_K%2)) --plan.tile_K;
+                                          (std::max(plan.tile_I,plan.tile_J)*POTAL_HW_DIM));
+                while (plan.tile_K && (a.kp/POTAL_HW_DIM % plan.tile_K || plan.tile_K%(32/POTAL_HW_DIM))) --plan.tile_K;
                 descriptors = descriptors && d.tile_i == plan.tile_I && d.tile_j == plan.tile_J &&
                               d.tile_k == plan.tile_K;
             }
@@ -1174,7 +1189,7 @@ void test_pv_bitplane_execute() {
         g.w.fill(0); g.a.fill(0);
         g.w.set(0,0,1); g.w.set(32,0,std::ldexp(1.0f,-24));
         g.a.set(0,0,std::ldexp(1.0f,-16));
-        g.a.set(16,0,1.0f-std::ldexp(1.0f,-16));
+        g.a.set(pv_peak,0,1.0f-std::ldexp(1.0f,-16));
         const auto before = g.out.storage;
         potal_test::emulator emu;
         auto ops = emu.ops();
@@ -1281,7 +1296,7 @@ int main() {
     const ggml_init_params params = {1u << 20,nullptr,true};
     ggml_context * context = ggml_init(params);
     if (!check("GGML initialization",context != nullptr)) return 1;
-    if (!check("DIM16 attention contract",POTAL_HW_DIM == 16)) {
+    if (!check("DIM16/DIM32 attention contract",POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32)) {
         ggml_free(context);
         return 1;
     }

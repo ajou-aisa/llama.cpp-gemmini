@@ -363,13 +363,20 @@ void test_staging() {
     potal_tile_plan main;
     bool            ok = f.ok && main_select_ok(f, main);
     std::vector<res_entry> entries;
-    for (size_t k = 0; k < PD + PD / 4 && k < 32; ++k) {
+    for (size_t k = 0; k < (PD == 32 ? 32u : 20u); ++k) {
         entries.push_back({ 0, k, (int32_t) (k + 1) });
     }
-    for (size_t k = 32; k < 35; ++k) {
+    if (PD == 32) {
+        // A K32 block holds exactly one DIM32 fragment. A separate block
+        // supplies the 8-K tail; the next short block must produce fillers.
+        for (size_t k = 32; k < 40; ++k) entries.push_back({ 0, k, 7 });
+    }
+    const size_t short_begin = PD == 32 ? 64 : 32;
+    for (size_t k = short_begin; k < short_begin + 3; ++k) {
         entries.push_back({ 3, k, (int32_t) -5 });
     }
-    for (size_t k = 64; k < 96; ++k) {
+    const size_t full_begin = PD == 32 ? 96 : 64;
+    for (size_t k = full_begin; k < full_begin + 32; ++k) {
         entries.push_back({ 5, k, (int32_t) (300 + k) }); // two lanes
     }
     const grmd::StripePacketHandle packet = ok ? make_packet(0, 0, 16, f.K, f.N, entries) : nullptr;
@@ -417,6 +424,13 @@ void test_staging() {
     }
     check("P every window column = the digits of its Index slot, filler and tail columns zero, DMA-aligned rows",
           columns && fillers == tile.residual_filler_slots && packed + fillers == plan.index_writes / tile.j_groups && fillers > 0);
+    if (PD == 32) {
+        check("P DIM32 staging: four legal K32 runs, windows 40/64 active rows, 24/0 pad, 29 filler columns",
+              tile.fragments.size() == 4 && tile.k_panels == 1 && tile.residual_windows == 2 &&
+                  tile.panels[0].windows[0].active_rows == 40 && tile.panels[0].windows[0].pad_k == 24 &&
+                  tile.panels[0].windows[1].active_rows == 64 && tile.panels[0].windows[1].pad_k == 0 &&
+                  fillers == 29 && packed == 75);
+    }
     // The executor on this packet computes the reference as well.
     paired_inputs in;
     in.packets = { packet };
@@ -433,10 +447,10 @@ void test_staging() {
 void test_numerics() {
     const case_spec cases[] = {
         { "N single panel, no residual", 48, 48, 160, 1, nullptr },
-        { "N single panel, one window", 48, 48, 160, 2, dense_entries(7, 40, 100) },
+        { "N single panel, one window", 48, 48, 160, 2, dense_entries(7, 4096, 100) },
         { "N several panels (K 2048), several J groups, residual spanning panels", 80, 160, 2048, 3, dense_entries(9, 61, 150) },
         { "N many windows per panel (dense residual)", 16, 96, 768, 4, dense_entries(1, 1, 60) },
-        { "N tails: rows 70, N 140, K 2048", 70, 140, 2048, 6, dense_entries(11, 97, 120) },
+        { "N tails: I/J/K padding", PD == 32 ? 54u : 70u, 140, 2048, 6, dense_entries(11, 97, 120) },
         { "N large residual values (two lanes, saturation range)", 32, 64, 256, 7, dense_entries(2, 3, 30000) },
         { "N decode shape M = 1", 1, 768, 768, 8, dense_entries(1, 5, 90) },
     };
@@ -445,23 +459,49 @@ void test_numerics() {
         run_result  r;
         const bool  ok = run_case(c, true, why, &r);
         check(std::string(c.name) + ": Main INT32, Residual INT32, radix INT64, final F32 == serialized reference (" + why + ")", ok);
-        // Geometry the case name claims, hard-coded from the Main tiler at DIM16 (not taken from the plan under test).
+        // Geometry the case name claims: explicit DIM-specific constants,
+        // never expectations copied from the plan under test.
         const std::string name = c.name;
+        if (name == "N single panel, one window") {
+            check("N one panel and one window actually execute",
+                  ok && r.report.tile.k_panels == 1 && r.report.tile.j_groups == 1 &&
+                      r.report.tile.residual_windows == 1 && r.report.counts.main_loop_ws == 1 &&
+                      r.report.counts.residual_loop_ws == 1);
+        }
         if (PD == 16 && name.rfind("N several panels", 0) == 0) {
             check("N several panels: 3 K panels x 2 J groups = exactly 6 Main LOOP_WS, more than one window",
                   ok && r.report.tile.k_panels == 3 && r.report.tile.j_groups == 2 && r.report.counts.main_loop_ws == 6 &&
                       r.report.tile.residual_windows > 1);
         }
-        if (PD == 16 && name.rfind("N many windows", 0) == 0) {
+        if (PD == 32 && name.rfind("N several panels", 0) == 0) {
+            check("N DIM32 several panels: I2/J2/K31, panels 31/31/2, three J groups, nine Main LOOP_WS",
+                  ok && r.report.tile.tile_I == 2 && r.report.tile.tile_J == 2 && r.report.tile.tile_K == 31 &&
+                      r.report.tile.k_panels == 3 && r.report.tile.j_groups == 3 &&
+                      r.report.tile.panels[2].k_tiles == 2 && r.report.counts.main_loop_ws == 9 &&
+                      r.report.tile.residual_windows > 1);
+        }
+        if (name.rfind("N many windows", 0) == 0) {
             size_t most = 0;
             for (const potal_paired_k_panel & p : r.report.tile.panels) {
                 most = std::max(most, p.windows.size());
             }
             check("N many windows: one panel holds several Index Windows", ok && most > 2);
+            if (PD == 32) {
+                check("N DIM32 dense windows: I1/J3/K21, panels 21/3, windows 11/2",
+                      ok && r.report.tile.tile_I == 1 && r.report.tile.tile_J == 3 && r.report.tile.tile_K == 21 &&
+                          r.report.tile.k_panels == 2 && r.report.tile.panels[0].windows.size() == 11 &&
+                          r.report.tile.panels[1].windows.size() == 2 && r.report.tile.residual_windows == 13);
+            }
         }
         if (PD == 16 && name.rfind("N tails", 0) == 0) {
             check("N tails: J groups of 5 and 4 tiles (pad_j 4), I tail pad 10",
                   ok && r.report.tile.j_groups == 2 && r.report.tile.pad_J == 4 && r.report.tile.pad_I == 10);
+        }
+        if (PD == 32 && name.rfind("N tails", 0) == 0) {
+            check("N DIM32 tails: I pad10, J groups 2/2/1 pad20, K panels 31/31/2",
+                  ok && r.report.tile.tile_I == 2 && r.report.tile.tile_J == 2 && r.report.tile.tile_K == 31 &&
+                      r.report.tile.j_groups == 3 && r.report.tile.pad_J == 20 && r.report.tile.pad_I == 10 &&
+                      r.report.tile.k_panels == 3 && r.report.tile.panels[2].k_tiles == 2);
         }
     }
     // Zero residual fragments: a packet whose digits are nonzero only in one K of a run of 20.
@@ -498,8 +538,9 @@ void test_pairs_and_generations() {
     h2_emulator             emu;
     run_result              r = run_paired(f, main, in, emu, true, 250); // generation near the 8-bit wrap
     print_report("G", r);
-    const bool first_ok = ok && r.status == potal_paired_status::ok && emu.errors.empty() && compare_stripe(f, in, ref, r, 80).empty();
-    check("G three panels x two J groups across both pairs, generations wrapping at 255: executor == reference", first_ok);
+    const size_t rows = PD == 32 ? 64 : 80;
+    const bool first_ok = ok && r.status == potal_paired_status::ok && emu.errors.empty() && compare_stripe(f, in, ref, r, rows).empty();
+    check("G three panels across both pairs, generations wrapping at 255: executor == reference", first_ok);
     bool pairs = first_ok;
     size_t loops = 0;
     for (const potal_paired_cmd_record & rec : emu.records) {
@@ -508,12 +549,13 @@ void test_pairs_and_generations() {
             pairs = pairs && ((rec.rs1 >> 16) & 3) == (residency % 2) + 1 && ((rec.rs1 >> 18) & 3) == (residency % 2) + 1;
         }
     }
-    check("G Main LOOP_WS r selects pair r % 2 (selectors pair + 1); " + std::to_string(loops) + " residencies", pairs && loops == 6);
+    check("G Main LOOP_WS r selects pair r % 2 (selectors pair + 1); " + std::to_string(loops) + " residencies",
+          pairs && loops == (PD == 32 ? 9u : 6u));
     // A second stripe on the same emulator state (B of both pairs still resident): the generations continue.
     const uint32_t gen_after = r.generation;
     run_result     r2        = run_paired(f, main, in, emu, true, gen_after);
     check("G a second call after the first (counter continues, pairs reused after drains): executor == reference",
-          r2.status == potal_paired_status::ok && emu.errors.empty() && compare_stripe(f, in, ref, r2, 80).empty() &&
+          r2.status == potal_paired_status::ok && emu.errors.empty() && compare_stripe(f, in, ref, r2, rows).empty() &&
               r2.generation != gen_after);
 }
 
@@ -713,17 +755,19 @@ void test_review_followups() {
     // golden computed over every fragment.
     residual::decoded_packet d;
     d.rows = { { 0, 0 }, { 0, 3 }, { 1, 3 } };
-    residual::run r0, r2;
+    residual::run r0, zero, r2;
     r0.block_id = 0;
-    for (uint16_t k = 0; k < 20; ++k) r0.local_k.push_back(k);
+    for (uint16_t k = 0; k < (PD == 32 ? 32u : 20u); ++k) r0.local_k.push_back(k);
+    zero.block_id = 1;
+    zero.local_k = { 0, 1, 2, 3 };
     r2.block_id = 2;
     r2.local_k  = { 1, 5, 9 };
-    d.runs      = { r0, r2 };
-    d.k_compact = 23;
+    d.runs      = PD == 32 ? std::vector<residual::run>{ r0, zero, r2 } : std::vector<residual::run>{ r0, r2 };
+    d.k_compact = PD + 7;
     d.digits.assign(d.rows.size() * d.k_compact, 0);
     for (size_t i = 0; i < d.rows.size(); ++i) {
         for (size_t c = 0; c < d.k_compact; ++c) {
-            d.digits[i * d.k_compact + c] = (c >= 16 && c < 20) ? 0 : (int8_t) ((int) (i * 37 + c * 11) % 255 - 127);
+            d.digits[i * d.k_compact + c] = (c >= PD && c < PD + 4) ? 0 : (int8_t) ((int) (i * 37 + c * 11) % 255 - 127);
         }
     }
     h2_emulator      emu;
@@ -731,7 +775,8 @@ void test_review_followups() {
     const direct_golden g = golden_direct(f, 16, d);
     check("X zero fragment: skipped (1 of 3), only its 4 K missing from the Index writes, Main and Residual == golden",
           run.status == potal_paired_status::ok && emu.errors.empty() && run.report.tile.residual_zero_fragments == 1 &&
-              run.report.counts.index_writes == run.report.tile.j_groups * (16 + 3) && run.main_c == g.main_c &&
+              run.report.tile.fragments.size() == 2 &&
+              run.report.counts.index_writes == run.report.tile.j_groups * (PD + 3) && run.main_c == g.main_c &&
               run.residual_c == g.residual_c);
 
     // The caller's plan is executed as is (no re-planning); a plan of another request is refused before any command.
@@ -754,10 +799,10 @@ void test_review_followups() {
 
     // More rows than one Main I group: refused before any command (never truncated).
     potal_tile_plan small = main;
-    small.tile_I = 1; // 16 rows per group
-    paired_fixture  f32(32, 64, 128, 78, [](size_t blk, size_t n) { return (int16_t) ((blk + n) % 2); });
+    small.tile_I = 1; // DIM rows per group
+    paired_fixture  f32(2 * PD, 64, 128, 78, [](size_t blk, size_t n) { return (int16_t) ((blk + n) % 2); });
     h2_emulator     emu4;
-    const direct_run multi = f32.ok ? run_direct(f32, small, 32, nullptr, emu4) : direct_run{};
+    const direct_run multi = f32.ok ? run_direct(f32, small, 2 * PD, nullptr, emu4) : direct_run{};
     check("X rows beyond the Main plan's I group refused (planner), no command",
           multi.status == potal_paired_status::invalid_argument && emu4.records.empty());
 
@@ -886,7 +931,7 @@ void test_index16_plan() {
 
     const potal_paired_geometry physical = potal_paired_hw_geometry();
     potal_paired_geometry single = physical;
-    single.index_entries = 16;
+    single.index_entries = PD;
     potal_paired_tile_plan default_tile, physical_tile, single_tile;
     potal_paired_execution_plan default_plan, physical_plan, single_plan;
     std::string why;
@@ -894,8 +939,8 @@ void test_index16_plan() {
         potal_paired_plan_stripe(main, 16, f.N, f.K, &d, default_tile, default_plan, &why) == potal_paired_status::ok &&
         potal_paired_plan_stripe(main, 16, f.N, f.K, &d, physical_tile, physical_plan, &why, physical) == potal_paired_status::ok &&
         potal_paired_plan_stripe(main, 16, f.N, f.K, &d, single_tile, single_plan, &why, single) == potal_paired_status::ok;
-    check("I16 plans from unchanged physical geometry and a local Index16 copy (" + why + ")", planned &&
-          physical.index_entries == 32 && POTAL_HW_INDEX_ENTRIES == 32 && single.index_entries == 16);
+    check("Index plans from physical two-fragment geometry and a local one-fragment copy (" + why + ")", planned &&
+          physical.index_entries == 2 * PD && POTAL_HW_INDEX_ENTRIES == 2 * PD && single.index_entries == PD);
     if (!planned) return;
 
     bool unchanged = default_plan.ops.size() == physical_plan.ops.size() &&
@@ -908,7 +953,7 @@ void test_index16_plan() {
         unchanged = a.slot == b.slot && a.fragment == b.fragment && a.original_k == b.original_k &&
                     a.resident_k == b.resident_k && a.compact_k == b.compact_k && a.filler == b.filler;
     }
-    check("I16 default Index32 plan stays unchanged; diagnostic preserves Main I/J/K", unchanged &&
+    check("Index default physical plan stays unchanged; one-fragment plan preserves Main I/J/K", unchanged &&
           default_tile.fragments_per_window == 2 && single_tile.fragments_per_window == 1 &&
           default_tile.tile_I == single_tile.tile_I && default_tile.tile_J == single_tile.tile_J &&
           default_tile.tile_K == single_tile.tile_K && single_tile.residual_windows == single_tile.fragments.size());
@@ -924,8 +969,8 @@ void test_index16_plan() {
         const auto & fragment = single_tile.fragments[window.fragment_begin];
         const auto & run = d.runs[fragment.run];
         packed = packed && window.fragment_end == window.fragment_begin + 1 && window.k_tiles == 1 &&
-                 window.active_rows == fragment.count && window.active_rows <= 16 &&
-                 window.pad_k == 16 - window.active_rows && op.entry_end - op.entry_begin == fragment.count;
+                 window.active_rows == fragment.count && window.active_rows <= PD &&
+                 window.pad_k == PD - window.active_rows && op.entry_end - op.entry_begin == fragment.count;
         size_t sw = 0;
         while (sw < staging.windows.size() &&
                (staging.windows[sw].panel != op.panel || staging.windows[sw].index != op.window)) ++sw;
@@ -941,7 +986,7 @@ void test_index16_plan() {
                 packed = packed && staging.a(sw)[row * staging.windows[sw].lda + x] ==
                                    d.digits[row * d.k_compact + fragment.compact_begin + x];
         }
-        for (size_t x = fragment.count; x < 16; ++x)
+        for (size_t x = fragment.count; x < PD; ++x)
             for (size_t row = 0; row < d.rows.size(); ++row)
                 packed = packed && staging.a(sw)[row * staging.windows[sw].lda + x] == 0;
         ++windows;
@@ -951,7 +996,7 @@ void test_index16_plan() {
 
     h2_emulator emu;
     direct_run result;
-    const std::string log = capture_index_diag("16", "1", [&] {
+    const std::string log = capture_window_diag("1", [&] {
         result = run_direct(f, main, 16, &d, emu, &single_plan, &single);
     });
     const direct_golden golden = golden_direct(f, 16, d);
@@ -964,9 +1009,9 @@ void test_index16_plan() {
     size_t indexed_loops = 0, residual_scales = 0;
     for (const auto & record : emu.records) {
         if (record.funct == POTAL_FUNCT_INDEX_CONFIG)
-            checked = checked && (record.rs2 >> 32) <= 16;
+            checked = checked && (record.rs2 >> 32) <= PD;
         if (record.funct == POTAL_FUNCT_INDEX_WRITE)
-            checked = checked && record.rs1 < 16 && record.rs1 < physical.index_entries;
+            checked = checked && record.rs1 < PD && record.rs1 < physical.index_entries;
         if (record.funct == POTAL_FUNCT_LOOP_WS && ((record.rs1 >> 62) & 1) != 0) {
             checked = checked && ((record.rs1 >> 45) & 0xFFFF) == 1;
             ++indexed_loops;
@@ -987,8 +1032,15 @@ void test_index16_plan() {
             ++residual_scales;
         }
     }
-    check("I16 checked C11 commands stay within virtual16/physical32, ppb1, one original block carrier", checked &&
+    check("Index checked C11 commands stay within one-fragment/physical table bounds, ppb1, original block carrier", checked &&
           scales && residual_scales > 0 && indexed_loops == single_tile.residual_windows * single_tile.j_groups);
+    if (PD == 32) {
+        check("Index DIM32 physical64 versus local32: two fragments, one versus two windows",
+              default_tile.fragments.size() == 2 && default_tile.residual_windows == 1 &&
+                  single_tile.residual_windows == 2 && single_tile.residual_filler_slots == 0 &&
+                  default_tile.residual_filler_slots == 1 && single_tile.panels[0].windows[0].active_rows == 31 &&
+                  single_tile.panels[0].windows[1].active_rows == 3);
+    }
 
     potal_paired_geometry wrong = single;
     wrong.index_entries = 8;
@@ -1512,6 +1564,29 @@ void test_index16_pipeline() {
     pipe_node nd(16, 32, 64, 121, 60.0f, 1, 4);
     check("I16 pipeline fixture", nd.ok);
     if (!nd.ok) return;
+    if (PD == 32) {
+        // This environment option deliberately remains DIM16-only in stripe.cpp.
+        // DIM32 still runs the default physical64 pipeline; requesting Index16
+        // must fail before a command rather than silently select another table.
+        pipe_result normal, serial;
+        capture_index_diag(nullptr, nullptr, [&] {
+            normal = run_pipe(nd, 1, 4);
+            serial = run_pipe(nd, 1, 0);
+        });
+        check("I16 DIM32 control: physical64 paired pipeline runs and equals Serial",
+              normal.report.ok && serial.report.ok && normal.paired_calls == 1 &&
+                  normal.h2_errors.empty() && normal.out == serial.out && normal.h2_residual > 0);
+        for (const char * entries : { "16", "32", "16x", "" }) {
+            pipe_result rejected;
+            capture_index_diag(entries, "1", [&] { rejected = run_pipe(nd, 1, 4); });
+            check(std::string("I16 DIM32 rejects unsupported diagnostic entries before commands: ") + entries,
+                  !rejected.report.ok && rejected.report.stage != nullptr &&
+                      std::string(rejected.report.stage) == "paired_plan" && !rejected.report.fatal &&
+                      rejected.untouched && rejected.paired_calls == 0 && rejected.h2_main == 0 &&
+                      rejected.h2_residual == 0 && rejected.planned_commands.empty());
+        }
+        return;
+    }
     pipe_result normal, diagnostic;
     potal_paired_tile_plan normal_tile;
     bool normal_geometry = true, same_geometry = true;

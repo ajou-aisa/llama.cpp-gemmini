@@ -368,7 +368,7 @@ unsigned pv_bitplanes(const stream & activation, const stationary & weight,
             throw;
         }
     }
-    require(POTAL_HW_DIM == 16, POTAL_ERR_UNSUPPORTED);
+    require(POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32, POTAL_ERR_UNSUPPORTED);
     require(activation.codes.size() == product(activation.rows, activation.kp));
     uint32_t maximum = 0;
     for (size_t i = 0; i < activation.rows; ++i) {
@@ -383,7 +383,7 @@ unsigned pv_bitplanes(const stream & activation, const stationary & weight,
         ++planes;
     }
     const size_t tiles = activation.kp / POTAL_HW_DIM;
-    // [negative sum, positive sum] for each physical DIM16 V microtile.
+    // [negative sum, positive sum] for each physical DIM16 or DIM32 V microtile.
     std::vector<std::array<int32_t, 2>> sums(product(tiles, weight.n));
     for (size_t t = 0; t < tiles; ++t) {
         for (size_t j = 0; j < weight.n; ++j) {

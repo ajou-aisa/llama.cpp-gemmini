@@ -25,7 +25,8 @@ namespace {
 namespace act = ggml::gemmini::quants::act;
 
 constexpr size_t HW_DIM = POTAL_HW_DIM; // not DIM: <gemmini_params.h> defines that macro
-constexpr size_t ALIGN  = POTAL_HW_MAX_BYTES;
+constexpr size_t ALIGN  = POTAL_HW_MAX_BYTES > HW_DIM * sizeof(int32_t)
+                             ? POTAL_HW_MAX_BYTES : HW_DIM * sizeof(int32_t);
 
 bool is_2d(const ggml_tensor * t) {
     return t->ne[2] == 1 && t->ne[3] == 1;

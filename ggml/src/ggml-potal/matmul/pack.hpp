@@ -1,6 +1,6 @@
 #pragma once
 
-// GGML MUL_MAT <-> PoTal WS GEMM contract for the validated DIM16 scope.
+// GGML MUL_MAT <-> PoTal WS GEMM contract for DIM16 and DIM32.
 //
 //   GGML  dst[m][n] = sum_k src1[m][k] * src0[n][k]
 //         src0 (weights)     I8,  ne = {K, N}: row n holds K values
@@ -10,18 +10,19 @@
 //         A = src1 (int8 [M][K]), B = src0 transposed (int8 [K][N]),
 //         C = dst before the INT32 -> F32 conversion (int32 [M][N])
 //
-// With every scale carrier x1 and |sum| <= 32 * 128 * 128 the INT32 result is
+// With every scale carrier x1 and |sum| <= 2 * DIM * 128 * 128 the INT32 result is
 // exact and exactly representable in F32.
 
 #include "ggml.h"
 #include "ggml-potal.h"
+#include "potal_hw_params.h"
 
 #include <cstdint>
 
 namespace ggml::potal {
 
-constexpr int64_t TILE  = 16;       // M = N = DIM
-constexpr int64_t K_MAX = 2 * TILE; // K = 16 or 32
+constexpr int64_t TILE  = POTAL_HW_DIM; // M = N = DIM
+constexpr int64_t K_MAX = 2 * TILE;     // K = DIM or 2*DIM
 
 struct mul_mat_shape {
     int64_t m;

@@ -1,6 +1,6 @@
 #pragma once
 
-// Independent DIM16 attention arithmetic. No production reference, SCU helper,
+// Independent physical-DIM attention arithmetic. No production reference, SCU helper,
 // quantizer, or emulator arithmetic is used to calculate expected results.
 #include "matmul/attention.hpp"
 
@@ -76,9 +76,9 @@ inline std::vector<int32_t> qk_pass(const stream & a, const stationary & b,
     for (size_t i = 0; i < a.rows; ++i) {
         for (size_t j = 0; j < b.n; ++j) {
             int32_t acc = 0;
-            for (size_t begin = 0; begin < a.kp; begin += 16) {
+            for (size_t begin = 0; begin < a.kp; begin += POTAL_HW_DIM) {
                 wide dot = 0;
-                for (size_t k = begin; k < begin + 16 && k < a.k; ++k)
+                for (size_t k = begin; k < begin + POTAL_HW_DIM && k < a.k; ++k)
                     dot += wide{digits(a.codes[i * a.kp + k])[q_limb]} *
                            b.limbs[k_limb][k * b.n + j];
                 const auto carrier = b.carriers[(begin / 32) * b.n + j];
@@ -123,9 +123,9 @@ inline bool evaluate(const stream & a, const stationary & b, role operation,
                 int32_t acc = 0;
                 const size_t passes = operation == role::qk ? 2 : 1;
                 for (size_t panel = 0; panel < passes; ++panel) {
-                    for (size_t begin = 0; begin < a.kp; begin += 16) {
+                    for (size_t begin = 0; begin < a.kp; begin += POTAL_HW_DIM) {
                         wide dot = 0;
-                        for (size_t k = begin; k < begin + 16; ++k) {
+                        for (size_t k = begin; k < begin + POTAL_HW_DIM; ++k) {
                             if (k >= a.k) continue;
                             const auto d = digits(a.codes[i * a.kp + k], operation == role::pv);
                             const int x = d[limb];
@@ -259,10 +259,10 @@ inline bool pv_bitplanes(const stream & a, const stationary & b, pv_planes & out
             for (size_t j = 0; j < b.n; ++j) {
                 int32_t acc = 0;
                 wide prefix_low = 0, prefix_high = 0;
-                for (size_t begin = 0; begin < a.kp; begin += 16) {
+                for (size_t begin = 0; begin < a.kp; begin += POTAL_HW_DIM) {
                     int low = 1, high = 0;
                     wide positive = 0, negative = 0, dot = 0;
-                    for (size_t k = begin; k < begin+16; ++k) {
+                    for (size_t k = begin; k < begin+POTAL_HW_DIM; ++k) {
                         const int digit = result.digits[p][i*a.kp+k];
                         const int v = b.limbs[0][k*b.n+j];
                         dot += digit * v;

@@ -128,9 +128,9 @@ if (POTAL_E4C2_0_TESTS)
     endif()
 endif()
 
-# Hardware smoke test: RISC-V only, and only for the validated DIM16 GEMM path.
+# Hardware smoke test: RISC-V only, for the bounded DIM16/DIM32 GEMM path.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
-    if (POTAL_HW_DIM EQUAL 16)
+    if (POTAL_HW_DIM EQUAL 16 OR POTAL_HW_DIM EQUAL 32)
         add_executable(potal-api-smoke tests/potal-api-smoke.c)
         target_link_libraries(potal-api-smoke PRIVATE potal-api)
         set_target_properties(potal-api-smoke PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
@@ -152,7 +152,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
             message(FATAL_ERROR "POTAL_ENABLE_OPENMP=ON needs a Linux target (potal-multicore-smoke)")
         endif()
     else()
-        message(STATUS "potal-api-smoke not built: GEMM execution is validated for DIM16 only (header DIM=${POTAL_HW_DIM})")
+        message(STATUS "potal-api-smoke not built: bounded GEMM execution requires DIM16 or DIM32 (header DIM=${POTAL_HW_DIM})")
     endif()
 endif()
 
@@ -162,8 +162,8 @@ endif()
 
 # ---- GGML backend (GGML_POTAL=ON) -------------------------------------------
 
-if (NOT POTAL_HW_DIM EQUAL 16)
-    message(FATAL_ERROR "GGML_POTAL: MUL_MAT offload is validated for DIM16 only (header DIM=${POTAL_HW_DIM})")
+if (NOT POTAL_HW_DIM EQUAL 16 AND NOT POTAL_HW_DIM EQUAL 32)
+    message(FATAL_ERROR "GGML_POTAL: MUL_MAT offload requires DIM16 or DIM32 (header DIM=${POTAL_HW_DIM})")
 endif()
 if (GGML_BACKEND_DL)
     message(FATAL_ERROR "GGML_POTAL supports static backend registration only (GGML_BACKEND_DL=OFF)")
@@ -605,6 +605,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
         "-Wl,--wrap=potal_loop_ws_issue" "-Wl,--wrap=potal_gemm_ws_issue")
 
     add_executable(potal-ggml-smoke tests/potal-ggml-smoke.cpp)
+    target_include_directories(potal-ggml-smoke PRIVATE ${POTAL_HW_GENERATED_DIR})
     target_link_libraries(potal-ggml-smoke PRIVATE ggml)
 
     # FireSim: F32 x Q8_HP1 MUL_MAT graphs through the routed, tiled PoTal path,

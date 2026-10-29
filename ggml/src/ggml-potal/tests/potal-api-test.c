@@ -98,8 +98,8 @@ static void test_carrier(void) {
 static potal_gemm_ws k32_gemm(void) {
     potal_gemm_ws g = {
         .a = FAKE_A, .b = FAKE_B, .c = FAKE_C,
-        .lda = 32, .ldb = 16, .ldc = 16,
-        .m = 16, .n = 16, .k = 32,
+        .lda = 2 * POTAL_HW_DIM, .ldb = POTAL_HW_DIM, .ldc = POTAL_HW_DIM,
+        .m = POTAL_HW_DIM, .n = POTAL_HW_DIM, .k = 2 * POTAL_HW_DIM,
         .scale_base = 200, .scale_generation = 0xAB, .passes_per_block = 2,
         .flags = 0,
     };
@@ -192,6 +192,71 @@ static void test_gemm_encode_d16(void) {
     g.k = 48; g.lda = 48; g.passes_per_block = 1;
     check_status("K=48 unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
 }
+#elif POTAL_HW_DIM == 32
+static void test_gemm_encode_d16(void) {
+    potal_gemm_ws g = k32_gemm();
+    potal_gemm_ws_program p;
+    check_status("encode DIM32 K64 ppb2", potal_gemm_ws_encode(&g, &p), POTAL_OK);
+    /* CONFIG_LD block stride 32 @16, repeats 1 @8, state @3. */
+    check_u64("d32 config_ld_a rs1", p.config_ld_a.rs1, 0x0000000000200101ull);
+    check_u64("d32 config_ld_b rs1", p.config_ld_b.rs1, 0x0000000000200109ull);
+    check_u64("d32 config_ld_a rs2", p.config_ld_a.rs2, 64);
+    check_u64("d32 config_ld_b rs2", p.config_ld_b.rs2, 32);
+    check_u64("d32 config_ex rs1", p.config_ex.rs1, 0x0000000000010004ull);
+    check_u64("d32 config_ex rs2", p.config_ex.rs2, 0x0001000000000000ull);
+    check_u64("d32 config_st rs1", p.config_st.rs1, 2);
+    check_u64("d32 config_st rs2", p.config_st.rs2, 128);
+    check_u64("d32 bounds rs1", p.bounds.rs1, 0);
+    check_u64("d32 bounds rs2", p.bounds.rs2, 0x0000000200010001ull);
+    check_u64("d32 addrs_ab rs1", p.addrs_ab.rs1, 0x10000);
+    check_u64("d32 addrs_ab rs2", p.addrs_ab.rs2, 0x20000);
+    check_u64("d32 addrs_dc rs1", p.addrs_dc.rs1, 0);
+    check_u64("d32 addrs_dc rs2", p.addrs_dc.rs2, 0x30000);
+    check_u64("d32 strides_ab rs1", p.strides_ab.rs1, 64);
+    check_u64("d32 strides_ab rs2", p.strides_ab.rs2, 32);
+    check_u64("d32 strides_dc rs1", p.strides_dc.rs1, 0);
+    check_u64("d32 strides_dc rs2", p.strides_dc.rs2, 32);
+    check_u64("d32 loop_ws rs1 ppb2", p.loop_ws.rs1, 0x0000556019100002ull);
+    check_u64("d32 loop_ws rs2", p.loop_ws.rs2, 0);
+    g.k = g.lda = 32;
+    g.scale_base = 0; g.scale_generation = 1; g.passes_per_block = 1;
+    check_status("encode DIM32 K32", potal_gemm_ws_encode(&g, &p), POTAL_OK);
+    check_u64("d32 K32 bounds", p.bounds.rs2, 0x0000000100010001ull);
+    check_u64("d32 K32 loop_ws", p.loop_ws.rs1, 0x0000202000100002ull);
+    uint32_t slot = 0;
+    g = k32_gemm(); g.scale_base = 8; g.passes_per_block = 1;
+    check_status("d32 block1 slot", potal_gemm_ws_scale_slot(&g, 1, 0, &slot), POTAL_OK);
+    check_u64("d32 block1 slot value", slot, 9);
+    check_status("d32 block2 refused", potal_gemm_ws_scale_slot(&g, 2, 0, &slot), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("d32 J1 refused", potal_gemm_ws_scale_slot(&g, 0, 1, &slot), POTAL_ERR_INVALID_ARGUMENT);
+    g.passes_per_block = 2;
+    check_status("d32 shared block1 refused", potal_gemm_ws_scale_slot(&g, 1, 0, &slot), POTAL_ERR_INVALID_ARGUMENT);
+    g.scale_base = 255;
+    check_status("d32 final Scale slot fits", potal_gemm_ws_check(&g), POTAL_OK);
+    g.passes_per_block = 1;
+    check_status("d32 two Scale slots overflow", potal_gemm_ws_check(&g), POTAL_ERR_CAPACITY);
+    g.scale_base = 256;
+    check_status("d32 Scale base overflow", potal_gemm_ws_check(&g), POTAL_ERR_CAPACITY);
+    g = k32_gemm(); g.n = g.ldb = g.ldc = 64; g.scale_base = 255;
+    check_status("d32 J2 Scale overflow", potal_gemm_ws_check(&g), POTAL_ERR_CAPACITY);
+    /* ACC half holds 8 DIM32 tiles: a 3x3 output needs 9. */
+    g = k32_gemm(); g.m = g.n = g.ldb = g.ldc = 96; g.scale_base = 0;
+    check_status("d32 ACC 9 tiles overflow", potal_gemm_ws_check(&g), POTAL_ERR_CAPACITY);
+    /* SPAD half has 4096 rows: (64+64)*32 fits; (66+66)*32 does not. */
+    g = k32_gemm(); g.k = g.lda = 32 * 66; g.scale_base = 0;
+    g.b = (const int8_t *)(uintptr_t)0x100000; g.c = (int32_t *)(uintptr_t)0x200000;
+    check_status("d32 SPAD 66 K tiles overflow", potal_gemm_ws_check(&g), POTAL_ERR_CAPACITY);
+    g.k = g.lda = 32 * 64;
+    check_status("d32 SPAD edge then unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
+    g = k32_gemm(); g.m = 64;
+    check_status("d32 M64 unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
+    g = k32_gemm(); g.m = 16;
+    check_status("d32 M16 padded unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
+    g = k32_gemm(); g.k = 48; g.passes_per_block = 1;
+    check_status("d32 K48 padded unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
+    g = k32_gemm(); g.k = g.lda = 96; g.passes_per_block = 1;
+    check_status("d32 K96 unvalidated", potal_gemm_ws_check(&g), POTAL_ERR_UNSUPPORTED);
+}
 #else
 static void test_gemm_invalid(void) {
 }
@@ -204,7 +269,7 @@ static void test_gemm_encode_d16(void) {
 }
 #endif
 
-#if POTAL_HW_DIM == 16
+#if POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32
 static void test_gemm_invalid(void) {
     potal_gemm_ws g;
 
@@ -216,6 +281,8 @@ static void test_gemm_invalid(void) {
     check_status("A null (DRAM addr 0 skips load)", potal_gemm_ws_check(&g), POTAL_ERR_INVALID_ARGUMENT);
     g = k32_gemm(); g.b = (const int8_t *)(uintptr_t)0x20001;
     check_status("B misaligned", potal_gemm_ws_check(&g), POTAL_ERR_INVALID_ARGUMENT);
+    g = k32_gemm(); g.c = (int32_t *)(uintptr_t)(0x30000 + POTAL_HW_DIM);
+    check_status("C requires DIM int32 alignment", potal_gemm_ws_check(&g), POTAL_ERR_INVALID_ARGUMENT);
     g = k32_gemm(); g.k = 0;
     check_status("K=0", potal_gemm_ws_check(&g), POTAL_ERR_INVALID_ARGUMENT);
     g = k32_gemm(); g.m = 0;
@@ -326,7 +393,7 @@ static void test_loop_ws(void) {
     check_status("loop transpose unsupported", potal_loop_ws_check(&l), POTAL_ERR_UNSUPPORTED);
     check_status("loop null", potal_loop_ws_check(NULL), POTAL_ERR_INVALID_ARGUMENT);
 
-#if POTAL_HW_DIM == 16
+#if POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32
     /* The validated GEMM and its single-invocation loop encode identically. */
     potal_gemm_ws_program pg;
     potal_gemm_ws g = k32_gemm();
@@ -360,7 +427,7 @@ static void test_host_has_no_hardware(void) {
     check_status("host tlb flush", potal_tlb_flush(), POTAL_ERR_NO_HARDWARE);
     g.a = NULL;
     check_status("host issue invalid", potal_gemm_ws_issue(&g), POTAL_ERR_INVALID_ARGUMENT);
-#if POTAL_HW_DIM == 16
+#if POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32
     g = k32_gemm();
     check_status("host issue valid", potal_gemm_ws_issue(&g), POTAL_ERR_NO_HARDWARE);
 #endif

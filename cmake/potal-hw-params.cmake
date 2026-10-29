@@ -98,6 +98,17 @@ function(potal_configure_hw_params out_dir)
     # file(READ) aborts configure if the file cannot be read.
     file(READ "${source}" content)
     file(SHA256 "${source}" sha256)
+    if(DEFINED POTAL_TARGET_PARAMS)
+        if(NOT IS_ABSOLUTE "${POTAL_TARGET_PARAMS}" OR NOT EXISTS "${POTAL_TARGET_PARAMS}" OR
+           IS_DIRECTORY "${POTAL_TARGET_PARAMS}")
+            message(FATAL_ERROR "PoTal: POTAL_TARGET_PARAMS must name the target's generated parameter header")
+        endif()
+        file(SHA256 "${POTAL_TARGET_PARAMS}" target_sha256)
+        if(NOT sha256 STREQUAL target_sha256)
+            message(FATAL_ERROR "PoTal: target parameter mismatch: selected ${source} does not match ${POTAL_TARGET_PARAMS}")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${POTAL_TARGET_PARAMS}")
+    endif()
     # Wrap every line as "\n<line>\n" and mask `;` (a CMake list separator).
     string(REPLACE "\n" "\n\n" content "\n${content}\n")
     string(REPLACE ";" "<SEMICOLON>" content "${content}")
@@ -122,6 +133,19 @@ function(potal_configure_hw_params out_dir)
     endif()
     if(NOT DIM EQUAL POTAL_EXPECTED_DIM)
         message(FATAL_ERROR "PoTal: DIM mismatch: header reports ${DIM}, POTAL_EXPECTED_DIM=${POTAL_EXPECTED_DIM}")
+    endif()
+    if(DEFINED GGML_GEMMINI_DIM AND NOT "${GGML_GEMMINI_DIM}" STREQUAL "${DIM}")
+        message(FATAL_ERROR "PoTal: DIM mismatch: header reports ${DIM}, GGML_GEMMINI_DIM=${GGML_GEMMINI_DIM}")
+    endif()
+    if(DEFINED POTAL_TARGET_DIM)
+        if(NOT POTAL_TARGET_DIM MATCHES "^(16|32)$" OR NOT "${POTAL_TARGET_DIM}" STREQUAL "${DIM}")
+            message(FATAL_ERROR "PoTal: target DIM mismatch: header reports ${DIM}, POTAL_TARGET_DIM=${POTAL_TARGET_DIM}")
+        endif()
+    endif()
+    if(POTAL_HW_CONFIG MATCHES "^FireSimQuadRocketSinglePoTalD(16|32)Config$")
+        if(NOT "${CMAKE_MATCH_1}" STREQUAL "${DIM}")
+            message(FATAL_ERROR "PoTal: config DIM mismatch: ${POTAL_HW_CONFIG}, header reports ${DIM}")
+        endif()
     endif()
     # LocalAddr and PRELOAD/COMPUTE rs fields are 32 bits wide.
     if(NOT ADDR_LEN EQUAL 32)
@@ -196,6 +220,10 @@ potal_hw_params=${POTAL_HW_PARAMS}
 potal_hw_params_realpath=${source}
 potal_hw_params_sha256=${sha256}
 potal_expected_dim=${POTAL_EXPECTED_DIM}
+potal_target_dim=${POTAL_TARGET_DIM}
+potal_target_params=${POTAL_TARGET_PARAMS}
+target_params_sha256=${target_sha256}
+ggml_gemmini_dim=${GGML_GEMMINI_DIM}
 dim=${DIM}
 xcustom_acc=${XCUSTOM_ACC}
 addr_len=${ADDR_LEN}

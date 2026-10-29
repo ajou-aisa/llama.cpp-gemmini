@@ -1,11 +1,12 @@
 /*
- * PoTal API hardware smoke test (RISC-V Linux or bare-metal, DIM16 Sat32 SoC).
+ * PoTal API hardware smoke test (RISC-V Linux or bare-metal, DIM16/32 Sat32 SoC).
  *
  * Sections follow the passing bare-metal references in
  * generators/potal/software/gemmini-rocc-tests/bareMetalC:
  *   A. scale control  (potal_scale_control.c)
- *   B. DIM16 K16 GEMM (potal_gemm_d16.c, non-identity A, SCU saturation)
- *   C. DIM16 K32 GEMM (potal_gemm_k32.c / potal_sat32_d16.c), passesPerBlock 1 and 2
+ *   B. One-DIM GEMM (potal_gemm_d16.c pattern, non-identity A, SCU saturation)
+ *   C. Two-DIM GEMM (potal_gemm_k32.c / potal_sat32_d16.c patterns), passesPerBlock 1 and 2
+ *   D. Checked Main/Indexed Residual LOOP_WS, full Index window, ACC0/1 readback and drain
  *
  * Golden model: per K pass, SCU = sat32(raw << shift) (0 for the zero carrier,
  * +/-INT32 saturation for shift >= 32 when raw != 0), then ACC = sat32(ACC + SCU),
@@ -22,17 +23,17 @@
 #include "potal_hw_params.h"
 #include "potal_rocc.h"
 
-#if POTAL_HW_DIM != 16
-#error "potal-api-smoke validates the DIM16 GEMM path only"
+#if POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32
+#error "potal-api-smoke requires DIM16 or DIM32"
 #endif
 
-#define DIM      16
+#define DIM      POTAL_HW_DIM
 #define K_MAX    (2 * DIM)
 #define SENTINEL (-9999)
 
 static int8_t  A[DIM][K_MAX] __attribute__((aligned(POTAL_HW_MAX_BYTES)));
 static int8_t  B[K_MAX][DIM] __attribute__((aligned(POTAL_HW_MAX_BYTES)));
-static int32_t C[DIM][DIM]   __attribute__((aligned(POTAL_HW_MAX_BYTES)));
+static int32_t C[DIM][DIM]   __attribute__((aligned(DIM * sizeof(int32_t))));
 
 static void fail(const char *step, int detail) {
     printf("FAIL %s (%d)\n", step, detail);
@@ -64,7 +65,7 @@ static uint64_t key(uint64_t slot, uint64_t generation, uint64_t column) {
 
 static void test_scale_control(void) {
     expect("A write shift carrier", potal_scale_write(3, 7, 0, 3), POTAL_OK);
-    expect("A write zero carrier", potal_scale_write(3, 7, 15, POTAL_CARRIER_ZERO), POTAL_OK);
+    expect("A write zero carrier", potal_scale_write(3, 7, DIM - 1, POTAL_CARRIER_ZERO), POTAL_OK);
     expect("A duplicate write", potal_scale_write(3, 8, 0, 4), POTAL_HW_SCALE_CONFLICT);
     expect("A wrong generation release", potal_scale_release(3, 8, 0), POTAL_HW_RELEASE_MISS);
     expect("A release never written", potal_scale_release(5, 1, 0), POTAL_HW_RELEASE_MISS);
@@ -78,7 +79,7 @@ static void test_scale_control(void) {
 
     /* Hardware checks on raw encodings, priority per PoTalScaleCommandIngress. */
     expect("A hw invalid carrier", raw_write(key(4, 1, 0), 0xffffffffu), POTAL_HW_INVALID_SCALE);
-    /* DIM16 has four column bits; column 16 sets a reserved encoding bit. */
+    /* DIM16/32 have four/five column bits; column DIM sets a reserved bit. */
     expect("A hw invalid column", raw_write(key(6, 1, DIM), 1), POTAL_HW_INVALID_ENCODING);
     expect("A hw reserved rs1 bit", raw_write(key(5, 1, 0) | (1ull << 22), 1), POTAL_HW_INVALID_ENCODING);
     expect("A hw nonzero rs2 high", raw_write(key(5, 1, 0), 1ull << 32), POTAL_HW_INVALID_ENCODING);
@@ -90,7 +91,7 @@ static void test_scale_control(void) {
 
     expect("A fence", potal_fence(), POTAL_OK);
     expect("A release reused slot", potal_scale_release(3, 9, 0), POTAL_OK);
-    expect("A release zero carrier", potal_scale_release(3, 7, 15), POTAL_OK);
+    expect("A release zero carrier", potal_scale_release(3, 7, DIM - 1), POTAL_OK);
     expect("A final fence", potal_fence(), POTAL_OK);
 }
 
@@ -120,11 +121,11 @@ static int32_t raw_partial(int pass, int row, int col) {
 
 /* Per-column carriers covering x1, small shifts, zero, SCU saturation, >= 32. */
 static uint32_t carrier_for(int block, int col) {
-    static const uint32_t carriers[DIM] = {
+    static const uint32_t carriers[16] = {
         0, 1, POTAL_CARRIER_ZERO, 2, 5, 13, 20, 31,
         32, 32767, 3, POTAL_CARRIER_ZERO, 7, 0, 1, 4,
     };
-    return carriers[(col + 5 * block) % DIM];
+    return carriers[(col + 5 * block) % 16];
 }
 
 static void fill_inputs(int k, int seed) {
@@ -159,7 +160,7 @@ static void run_gemm(const char *name, int k, uint32_t base, uint32_t generation
         .flags = 0,
     };
 
-    printf("%s: K=%d passesPerBlock=%u base=%u gen=%u\n", name, k, (unsigned)passes,
+    printf("%s: M=%d N=%d K=%d passesPerBlock=%u base=%u gen=%u\n", name, DIM, DIM, k, (unsigned)passes,
            (unsigned)base, (unsigned)generation);
     fill_inputs(k, (int)base + k);
 
@@ -213,6 +214,106 @@ static void run_gemm(const char *name, int k, uint32_t base, uint32_t generation
     printf("PASS %s release\n", name);
 }
 
+/* Exercise the actual Index ISA before higher-level paired numerical gates.
+ * Main establishes resident B in pair 0; Index uses that exact rear placement.
+ * No test-only resident API or software sink is used.
+ */
+static void test_loop_index(void) {
+    potal_paired_session *session = NULL;
+    expect("D session open", potal_paired_session_open(NULL, &session), POTAL_OK);
+    expect("D TLB flush", potal_paired_tlb_flush(session), POTAL_OK);
+    expect("D initial drain", potal_paired_fence(session), POTAL_OK);
+    fill_inputs(K_MAX, 61);
+    for (uint32_t block = 0; block < 2; ++block) {
+        for (uint32_t col = 0; col < DIM; ++col) {
+            expect("D Scale Write", potal_paired_scale_write(session, 80 + block, 17, col, 0), POTAL_OK);
+        }
+    }
+    potal_paired_loop_ws main = {0};
+    main.loop.a = &A[0][0];
+    main.loop.b = &B[0][0];
+    main.loop.lda = K_MAX;
+    main.loop.ldb = DIM;
+    main.loop.i_tiles = main.loop.j_tiles = 1;
+    main.loop.k_tiles = 2;
+    main.loop.scale_base = 80;
+    main.loop.scale_generation = 17;
+    main.loop.passes_per_block = 1;
+    main.path = POTAL_PAIRED_MAIN;
+    expect("D Main LOOP_WS", potal_paired_loop_ws_issue(session, &main), POTAL_OK);
+    expect("D Main drain", potal_paired_fence(session), POTAL_OK);
+
+    const potal_index_config index = {
+        .pair = 0,
+        .b_sp_base = 2 * POTAL_HW_BANK_ROWS - 2 * DIM,
+        .j_tiles = 1,
+        .source_k_rows = K_MAX,
+        .active_rows = K_MAX,
+    };
+    expect("D Index Config", potal_paired_index_config(session, &index), POTAL_OK);
+    for (uint32_t slot = 0; slot < K_MAX; ++slot) {
+        const potal_index_write entry = {.slot = slot, .resident_k = K_MAX - 1 - slot};
+        expect("D Index Write", potal_paired_index_write(session, &entry), POTAL_OK);
+    }
+    const potal_paired_session_status indexed = potal_paired_session_query(session);
+    if (indexed.index_transaction_open || !indexed.pair[0].index_valid) {
+        fail("D complete Index window", 0);
+    }
+    const potal_acc_readback output = {
+        .acc_bank = 0, .i_tiles = 1, .j_tiles = 1,
+        .pad_i = 0, .pad_j = 0, .c = &C[0][0], .ldc = DIM,
+    };
+    expect("D ACC0 readback", potal_paired_acc_readback_issue(session, &output), POTAL_OK);
+    expect("D readback drain", potal_paired_fence(session), POTAL_OK);
+    for (int row = 0; row < DIM; ++row) {
+        for (int col = 0; col < DIM; ++col) {
+            const int32_t golden = sat32((int64_t)raw_partial(0, row, col) + raw_partial(1, row, col));
+            if (C[row][col] != golden) {
+                fail("D independent Main numerical Golden", row * DIM + col);
+            }
+        }
+    }
+    printf("POTAL_API_MAIN_GOLDEN PASS dim=%u\n", (unsigned)DIM);
+    potal_paired_loop_ws residual = main;
+    residual.loop.b = NULL;
+    residual.loop.ldb = 0;
+    residual.path = POTAL_PAIRED_RESIDUAL;
+    residual.resident_b = 1;
+    residual.indexed = 1;
+    residual.a_offset_tiles = 2; /* Main A occupies one I tile times two K tiles. */
+    expect("D Indexed Residual LOOP_WS", potal_paired_loop_ws_issue(session, &residual), POTAL_OK);
+    expect("D Residual drain", potal_paired_fence(session), POTAL_OK);
+    potal_acc_readback residual_output = output;
+    residual_output.acc_bank = 1;
+    expect("D ACC1 readback", potal_paired_acc_readback_issue(session, &residual_output), POTAL_OK);
+    expect("D Residual readback drain", potal_paired_fence(session), POTAL_OK);
+    for (int row = 0; row < DIM; ++row) {
+        for (int col = 0; col < DIM; ++col) {
+            int64_t golden = 0;
+            for (int k = 0; k < K_MAX; ++k) {
+                golden += (int64_t)A[row][k] * B[K_MAX - 1 - k][col];
+            }
+            if (C[row][col] != sat32(golden)) {
+                fail("D independent Indexed Residual numerical Golden", row * DIM + col);
+            }
+        }
+    }
+    printf("POTAL_API_INDEXED_RESIDUAL_GOLDEN PASS dim=%u\n", (unsigned)DIM);
+    for (uint32_t block = 0; block < 2; ++block) {
+        for (uint32_t col = 0; col < DIM; ++col) {
+            expect("D Scale Release", potal_paired_scale_release(session, 80 + block, 17, col), POTAL_OK);
+        }
+    }
+    expect("D final drain", potal_paired_fence(session), POTAL_OK);
+    const potal_paired_session_status final = potal_paired_session_query(session);
+    if (final.outstanding_loops || final.outstanding_readbacks || final.live_scale_slots || final.failed) {
+        fail("D balanced completed session", 0);
+    }
+    expect("D session close", potal_paired_session_close(session), POTAL_OK);
+    printf("POTAL_API_LOOP_INDEX PASS dim=%u main_loops=1 residual_loops=1 index_config=1 index_writes=%u scale_write=%u scale_release=%u\n",
+           (unsigned)DIM, (unsigned)K_MAX, (unsigned)(2 * DIM), (unsigned)(2 * DIM));
+}
+
 int main(void) {
     printf("POTAL_API_SMOKE starting DIM=%u params_sha256=%s\n",
            (unsigned)potal_hw_dim(), potal_hw_params_sha256());
@@ -225,10 +326,11 @@ int main(void) {
 
     test_scale_control();
     printf("PASS A scale control\n");
+    test_loop_index();
 
-    run_gemm("B DIM16 K16", DIM, 0, 1, 1);
-    run_gemm("C DIM16 K32 ppb1", 2 * DIM, 8, 7, 1);
-    run_gemm("C DIM16 K32 ppb2", 2 * DIM, 40, 9, 2);
+    run_gemm("B one K tile", DIM, 0, 1, 1);
+    run_gemm("C two K tiles ppb1", 2 * DIM, 8, 7, 1);
+    run_gemm("C two K tiles ppb2", 2 * DIM, 40, 9, 2);
 
     printf("POTAL_API_SMOKE PASS\n");
     return 0;

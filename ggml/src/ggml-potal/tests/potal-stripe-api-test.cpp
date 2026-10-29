@@ -91,17 +91,17 @@ void test_c_caller() {
     check("A C and C++ see the same descriptor/report layout", same);
 }
 
-#if POTAL_HW_DIM == 16 // B..F use the DIM16 HP1 layout: scale_block_k 32 = 2 passes of DIM
+static_assert(D == 16 || D == 32, "stripe fixtures require DIM16 or DIM32");
 
 size_t up(size_t v, size_t to) {
     return (v + to - 1) / to * to;
 }
 
-// One zeroed, 64-byte aligned buffer (the DMA layout of the backend).
+// One zeroed buffer, aligned for both DMA and a full INT32 accumulator row.
 template <class T> class buffer {
   public:
-    explicit buffer(size_t count) : bytes_(up(std::max<size_t>(count, 1) * sizeof(T), 64)) {
-        p_ = static_cast<T *>(std::aligned_alloc(64, bytes_));
+    explicit buffer(size_t count) : bytes_(up(std::max<size_t>(count, 1) * sizeof(T), std::max<size_t>(64, D * 4))) {
+        p_ = static_cast<T *>(std::aligned_alloc(std::max<size_t>(64, D * 4), bytes_));
         std::memset(p_, 0, bytes_);
     }
     ~buffer() { std::free(p_); }
@@ -343,15 +343,15 @@ void test_frozen_plans() {
     run_stripes("K chunks", 48, 160, 4096, 0, true);
     run_stripes("residual-shaped (K32 runs)", 37, 40, 96, 2, false);
 
-    // 16x16x32 with a whole plan goes through the validated potal_gemm_ws_issue path.
-    problem                      p(16, 16, 32, 5, 0);
+    // DIM x DIM x K32 with a whole plan takes the validated single-GEMM path.
+    problem                      p(D, D, 32, 5, 0);
     potal_tile_plan              plan;
     emu_session                  es;
-    const bool                   planned = potal_tile_select(16, 16, 32, 2, &plan) == POTAL_OK;
-    const potal_stripe_gemm_desc d       = p.stripe(0, 16, plan);
+    const bool                   planned = potal_tile_select(D, D, 32, 32 / D, &plan) == POTAL_OK;
+    const potal_stripe_gemm_desc d       = p.stripe(0, D, plan);
     potal_stripe_gemm_report     r;
     const potal_status           st = planned ? potal_tiled_matmul_stripe(&es.session, &d, &r) : POTAL_ERR_UNSUPPORTED;
-    check("B validated 16x16x32 stripe through potal_gemm_ws_issue",
+    check("B validated DIM x DIM x K32 stripe through potal_gemm_ws_issue",
           st == POTAL_OK && r.validated_gemms == 1 && es.emu.gemms == 1 && p.equals(p.reference()));
 }
 
@@ -360,7 +360,7 @@ void test_frozen_plans() {
 void test_rejections() {
     problem         p(40, 48, 96, 9, 0);
     potal_tile_plan plan;
-    (void) potal_tile_select(40, 48, 96, 2, &plan);
+    (void) potal_tile_select(40, 48, 96, 32 / D, &plan);
     struct mutation {
         const char * name;
         void (*apply)(potal_stripe_gemm_desc &, problem &);
@@ -390,7 +390,8 @@ void test_rejections() {
         { "tile_k 0", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 0; } },
         { "tile_j beyond N", [](potal_stripe_gemm_desc & d, problem &) { d.tile_j = 4; } },
         { "tile_k beyond K", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 8; } },
-        { "tile_k not whole scale blocks", [](potal_stripe_gemm_desc & d, problem &) { d.tile_k = 3; } },
+        { "tile_k not whole scale blocks",
+          [](potal_stripe_gemm_desc & d, problem &) { d.scale_block_k = 2 * D; d.k = 4 * D; d.tile_k = 3; } },
         { "invalid carrier value",
           [](potal_stripe_gemm_desc & d, problem & p) {
               p.carriers.get()[(d.k / 32 - 1) * d.carrier_stride + d.n - 1] = 40000;
@@ -411,9 +412,9 @@ void test_rejections() {
         // A, B and C copied to chosen offsets of one buffer: exact overlap and
         // adjacency, and an over-limit operand placed above the other two, so
         // that each refusal can only come from the check its case names.
-        problem         q(40, 48, 128, 41, 0); // A extent 5120, B 8176, C 7680 bytes
+        problem         q(40, 48, 128, 41, 0); // A/B extents unchanged; C has a DIM-padded stride.
         potal_tile_plan qp;
-        (void) potal_tile_select(40, 48, 128, 2, &qp);
+        (void) potal_tile_select(40, 48, 128, 32 / D, &qp);
         buffer<int8_t>             mem(1 << 16);
         const std::vector<int32_t> want = q.reference();
         const auto place = [&](size_t a_at, size_t b_at, size_t c_at) {
@@ -435,12 +436,14 @@ void test_rejections() {
             return (uintptr_t) x + xb <= (uintptr_t) y || (uintptr_t) y + yb <= (uintptr_t) x;
         };
         // Accepted: C right behind A's last byte and right before B's first.
-        const potal_stripe_gemm_desc adjacent = place(0, 12800, 5120);
-        bool                         runs     = disjoint(adjacent.a, 5120, adjacent.c, 7680) &&
+        const size_t c_bytes = bytes(q.m, q.n, q.ldc, sizeof(int32_t));
+        const potal_stripe_gemm_desc adjacent = place(0, 5120 + c_bytes, 5120);
+        bool                         runs     = c_bytes == (D == 32 ? 10176u : 7680u) &&
+                            disjoint(adjacent.a, 5120, adjacent.c, c_bytes) &&
                             (uintptr_t) adjacent.a + 5120 == (uintptr_t) adjacent.c &&
-                            (uintptr_t) adjacent.c + 7680 == (uintptr_t) adjacent.b;
+                            (uintptr_t) adjacent.c + c_bytes == (uintptr_t) adjacent.b;
         for (const bool owner_step : { false, true }) {
-            std::memset((void *) adjacent.c, 0, 7680);
+            std::memset((void *) adjacent.c, 0, c_bytes);
             emu_session es;
             potal_stripe_gemm_report r;
             const bool ok = owner_step ? run_planned_stripe_gemm(es.session, adjacent).ok
@@ -454,17 +457,17 @@ void test_rejections() {
         }
         check("C accepted: C adjacent to the end of A and the start of B (disjoint) runs == reference, both entry points",
               runs);
-        const potal_stripe_gemm_desc in_a = place(0, 32768, 5120 - 64);
-        const potal_stripe_gemm_desc in_b = place(0, 12800 - 64, 5120);
+        const potal_stripe_gemm_desc in_a = place(0, 32768, 5120 - D * sizeof(int32_t));
+        const potal_stripe_gemm_desc in_b = place(0, 5120 + c_bytes - 64, 5120);
         std::string                  stage_a, stage_b;
         check("C refused without a command (C API and owner step): C starts inside A's last row",
-              !disjoint(in_a.a, 5120, in_a.c, 7680) && disjoint(in_a.b, 8176, in_a.c, 7680) &&
+              !disjoint(in_a.a, 5120, in_a.c, c_bytes) && disjoint(in_a.b, 8176, in_a.c, c_bytes) &&
                   refused_by_both(in_a, &stage_a) && stage_a == "operands");
         check("C refused without a command (C API and owner step): C ends inside B's first row",
-              !disjoint(in_b.b, 8176, in_b.c, 7680) && disjoint(in_b.a, 5120, in_b.c, 7680) &&
+              !disjoint(in_b.b, 8176, in_b.c, c_bytes) && disjoint(in_b.a, 5120, in_b.c, c_bytes) &&
                   refused_by_both(in_b, &stage_b) && stage_b == "operands");
         // Over the 32-bit DRAM offset, placed above the other operands (no overlap).
-        potal_stripe_gemm_desc big_a = place(40960, 8192, 0);
+        potal_stripe_gemm_desc big_a = place(40960, 16384, 0);
         big_a.lda                    = (size_t) 1 << 30;
         potal_stripe_gemm_desc big_b = place(0, 40960, 8192);
         big_b.ldb                    = (size_t) 1 << 30;
@@ -477,8 +480,9 @@ void test_rejections() {
             const potal_stripe_gemm_desc & d;
             bool                           apart; // no overlap: only the DRAM-offset limit can refuse it
         } over[] = {
-            { "A", big_a, a_big > ((uint64_t) 1 << 32) && disjoint(big_a.a, a_big, big_a.c, 7680) },
-            { "B", big_b, b_big > ((uint64_t) 1 << 32) && disjoint(big_b.b, b_big, big_b.c, 7680) },
+            { "A", big_a, a_big > ((uint64_t) 1 << 32) && disjoint(big_a.a, a_big, big_a.c, c_bytes) &&
+                              disjoint(big_a.b, 8176, big_a.c, c_bytes) },
+            { "B", big_b, b_big > ((uint64_t) 1 << 32) && disjoint(big_b.b, b_big, big_b.c, c_bytes) },
             { "C", big_c, c_big > ((uint64_t) 1 << 32) && disjoint(big_c.c, c_big, big_c.a, 5120) &&
                               disjoint(big_c.c, c_big, big_c.b, 8176) },
         };
@@ -491,42 +495,78 @@ void test_rejections() {
     }
     {
         // Per-invocation capacity (potal_frozen_plan): POTAL_ERR_CAPACITY at
-        // "tiles", from each limit alone.
-        // SPAD: 1 x 1 x 258 tiles = (258 + 258) * 16 rows > the 8192-row half.
-        problem         spad(16, 16, 4128, 23, 0);
+        // "tiles". DIM16 isolates each limit. DIM32 cannot isolate Scale:
+        // for I,J,K >= 1, (I+J)*K*32 <= 4096 implies K*J < 128,
+        // hence (K/ppb)*J < 128 < 256 for every admitted ppb >= 1.
+        // Keep actual generated geometry and test that dominance explicitly.
+        const size_t spad_k = D == 32 ? 65 : 258;
+        problem         spad(D, D, spad_k * D, 23, 0);
         potal_tile_plan t = plan;
         t.tile_I = t.tile_J = 1;
-        t.tile_K            = 258;
-        const potal_stripe_gemm_desc d_spad = spad.stripe(0, 16, t);
-        // ACC: 8 x 8 output tiles need 1024 ACC rows (over the 512-row half).
-        problem         acc(128, 128, 64, 17, 0);
+        t.tile_K            = spad_k;
+        const potal_stripe_gemm_desc d_spad = spad.stripe(0, D, t);
+        // ACC: DIM16 8x8 needs 1024 rows > 512; DIM32 3x3 needs 288 > 256.
+        const size_t acc_ij = D == 32 ? 3 : 8;
+        problem         acc(acc_ij * D, acc_ij * D, 64, 17, 0);
         potal_tile_plan wide = plan;
-        wide.tile_I = wide.tile_J = 8;
+        wide.tile_I = wide.tile_J = acc_ij;
         wide.tile_K               = 2;
-        const potal_stripe_gemm_desc d_acc = acc.stripe(0, 128, wide);
-        // Scale window: 16-wide scale blocks (1 pass each), 1 x 2 x 130 tiles
-        // fit SPAD (6240 rows) and ACC but need 2 * 130 = 260 > 256 slots.
-        problem          window(16, 32, 2080, 29, 0);
-        buffer<uint32_t> narrow(2080 / 16 * window.cstride);
-        potal_tile_plan  u = plan;
-        u.tile_I = 1;
-        u.tile_J = 2;
-        u.tile_K = 130;
-        potal_stripe_gemm_desc d_window = window.stripe(0, 16, u);
-        d_window.carriers               = narrow.get();
-        d_window.scale_block_k          = 16;
+        const potal_stripe_gemm_desc d_acc = acc.stripe(0, acc_ij * D, wide);
         for (const auto & c : { std::make_pair("scratchpad half (SPAD)", d_spad),
-                                std::make_pair("accumulator half (ACC)", d_acc),
-                                std::make_pair("ScaleMemory window", d_window) }) {
+                                std::make_pair("accumulator half (ACC)", d_acc) }) {
             const both_runs b = run_both(c.second);
             check(std::string("C refused without a command (C API and owner step): tiles beyond the ") + c.first,
                   refused_by_both(c.second) && b.api_status == POTAL_ERR_CAPACITY && std::string(b.api.stage) == "tiles");
         }
-        // The same tiles with 32-wide blocks (2 passes per block) need 130
-        // slots: they fit and run, so the refusal above is the window's.
-        const both_runs fit_b = run_both(window.stripe(0, 16, u));
-        check("C control: the same tiles with 32-wide scale blocks fit the window (130 slots) and run",
-              fit_b.api_status == POTAL_OK && fit_b.owner.ok);
+        if (D == 32) {
+            const size_t half = (size_t) POTAL_HW_BANK_NUM * POTAL_HW_BANK_ROWS / 2;
+            check("C DIM32 physical SPAD strictly dominates Scale for every positive tile shape and ppb",
+                  half == 4096 && POTAL_HW_SCALE_ENTRIES == 256 &&
+                      half / D <= POTAL_HW_SCALE_ENTRIES &&
+                      2 * spad_k * D > half && spad_k < POTAL_HW_SCALE_ENTRIES &&
+                      acc_ij * acc_ij * D > POTAL_HW_ACC_ROWS / 2 &&
+                      acc_ij * acc_ij <= POTAL_WORK_IDS_PER_LOOP && 2 * acc_ij * 2 * D <= half &&
+                      2 * acc_ij <= POTAL_HW_SCALE_ENTRIES);
+            // At I=J=1, K64 exactly fills SPAD; K65 exceeds it alone.
+            t.tile_K = 64;
+            problem edge(D, D, 2048, 29, 0);
+            const auto edge_desc = edge.stripe(0, D, t);
+            const both_runs fit = run_both(edge_desc);
+            check("C DIM32 SPAD boundary control: I1/J1/K64 uses 4096 rows and 64 Scale slots, runs exactly",
+                  fit.api_status == POTAL_OK && fit.owner.ok && edge.equals(edge.reference()) &&
+                      fit.api.scale_writes == 64 * D && fit.api.scale_releases == 64 * D);
+            // A real Scale-overflow descriptor is still refused, but SPAD
+            // must also overflow; do not mislabel this as an isolated check.
+            problem over(D, 2 * D, 130 * D, 30, 0);
+            t.tile_J = 2;
+            t.tile_K = 130;
+            const auto over_desc = over.stripe(0, D, t);
+            const both_runs over_run = run_both(over_desc);
+            check("C DIM32 260 Scale slots necessarily exceed SPAD too; both entry points refuse without commands",
+                  130 * 2 > POTAL_HW_SCALE_ENTRIES && (1 + 2) * 130 * D > half &&
+                      refused_by_both(over_desc) && over_run.api_status == POTAL_ERR_CAPACITY &&
+                      std::string(over_run.api.stage) == "tiles");
+        } else {
+            // Scale window: 16-wide scale blocks (1 pass each), 1 x 2 x 130 tiles
+            // fit SPAD (6240 rows) and ACC but need 2 * 130 = 260 > 256 slots.
+            problem          window(16, 32, 2080, 29, 0);
+            buffer<uint32_t> narrow(2080 / 16 * window.cstride);
+            potal_tile_plan  u = plan;
+            u.tile_I = 1;
+            u.tile_J = 2;
+            u.tile_K = 130;
+            potal_stripe_gemm_desc d_window = window.stripe(0, 16, u);
+            d_window.carriers               = narrow.get();
+            d_window.scale_block_k          = 16;
+            const both_runs b = run_both(d_window);
+            check("C DIM16 isolated ScaleMemory overflow refused without a command",
+                  refused_by_both(d_window) && b.api_status == POTAL_ERR_CAPACITY && std::string(b.api.stage) == "tiles");
+            // The same tiles with 32-wide blocks (2 passes per block) need 130
+            // slots: they fit and run, so the refusal above is the window's.
+            const both_runs fit_b = run_both(window.stripe(0, 16, u));
+            check("C control: the same tiles with 32-wide scale blocks fit the window (130 slots) and run",
+                  fit_b.api_status == POTAL_OK && fit_b.owner.ok);
+        }
     }
     emu_session              es;
     potal_stripe_gemm_desc   d = p.stripe(0, 40, plan);
@@ -567,15 +607,15 @@ void test_rejections() {
 // ---- D ------------------------------------------------------------------------
 
 void test_generation_wrap() {
-    problem         p(16, 16, 32, 11, 0);
+    problem         p(D, D, 32, 11, 0);
     potal_tile_plan plan;
-    (void) potal_tile_select(16, 16, 32, 2, &plan);
+    (void) potal_tile_select(D, D, 32, 32 / D, &plan);
     emu_session es;
     bool        sequence = true;
     uint32_t    previous = 0;
     const int   calls    = 2 * (int) POTAL_GENERATION_MAX + 7;
     for (int i = 0; i < calls && sequence; ++i) {
-        const potal_stripe_gemm_desc d = p.stripe(0, 16, plan);
+        const potal_stripe_gemm_desc d = p.stripe(0, D, plan);
         potal_stripe_gemm_report     r;
         sequence = potal_tiled_matmul_stripe(&es.session, &d, &r) == POTAL_OK && r.loop_ws == 1 &&
                    r.last_generation == (uint32_t) (i % (int) POTAL_GENERATION_MAX) + 1 &&
@@ -592,13 +632,13 @@ void test_generation_wrap() {
 
     // One call of exactly 255 invocations ends on the generation it started
     // from: its report still names the last invocation's generation, not 0.
-    problem         wide(16, 4080, 32, 19, 0);
+    problem         wide(D, POTAL_GENERATION_MAX * D, 32, 19, 0);
     potal_tile_plan one_tile = plan;
     one_tile.tile_I = one_tile.tile_J = 1;
-    one_tile.tile_K                   = 2;
+    one_tile.tile_K                   = 32 / D;
     emu_session                  es255;
-    const potal_stripe_gemm_desc d0 = p.stripe(0, 16, plan);
-    const potal_stripe_gemm_desc d1 = wide.stripe(0, 16, one_tile);
+    const potal_stripe_gemm_desc d0 = p.stripe(0, D, plan);
+    const potal_stripe_gemm_desc d1 = wide.stripe(0, D, one_tile);
     potal_stripe_gemm_report     r0, r1;
     const bool ran = potal_tiled_matmul_stripe(&es255.session, &d0, &r0) == POTAL_OK &&
                      potal_tiled_matmul_stripe(&es255.session, &d1, &r1) == POTAL_OK;
@@ -613,7 +653,7 @@ void test_generation_wrap() {
 void test_session() {
     problem         p(40, 48, 96, 13, 0);
     potal_tile_plan plan;
-    (void) potal_tile_select(40, 48, 96, 2, &plan);
+    (void) potal_tile_select(40, 48, 96, 32 / D, &plan);
 
     emu_session es;
     es.emu.fail_fence              = true;
@@ -650,10 +690,10 @@ void test_hardware_session() {
 #if !defined(__riscv)
     potal_stripe_session * s = nullptr;
     const bool             created = potal_stripe_session_create(&s) == POTAL_OK && s != nullptr;
-    problem                p(16, 16, 32, 3, 0);
+    problem                p(D, D, 32, 3, 0);
     potal_tile_plan        plan;
-    (void) potal_tile_select(16, 16, 32, 2, &plan);
-    const potal_stripe_gemm_desc d = p.stripe(0, 16, plan);
+    (void) potal_tile_select(D, D, 32, 32 / D, &plan);
+    const potal_stripe_gemm_desc d = p.stripe(0, D, plan);
     potal_stripe_gemm_report     r;
     const potal_status           st = created ? potal_tiled_matmul_stripe(s, &d, &r) : POTAL_OK;
     check("F host build: a valid stripe GEMM stops at its first hardware command (NO_HARDWARE)",
@@ -739,11 +779,11 @@ void test_owner_step() {
     owner_matches_api("saturating carriers", 77, 48, 256, 77, 2);
     owner_matches_api("K chunks", 48, 160, 4096, 48, 0);
     owner_matches_api("zero carriers, one stripe", 150, 40, 256, 150, 1);
-    owner_matches_api("validated 16x16x32", 16, 16, 32, 16, 0);
+    owner_matches_api("validated DIM x DIM x K32", D, D, 32, D, 0);
 
     problem         p(40, 48, 96, 31, 0);
     potal_tile_plan plan;
-    (void) potal_tile_select(40, 48, 96, 2, &plan);
+    (void) potal_tile_select(40, 48, 96, 32 / D, &plan);
     const potal_stripe_gemm_desc d = p.stripe(0, 40, plan);
     {
         emu_session es;
@@ -816,11 +856,11 @@ void test_owner_step() {
     }
     {
         // Generation wrap through the owner step: 2 * 255 + 7 calls of one invocation each.
-        problem         q(16, 16, 32, 37, 0);
+        problem         q(D, D, 32, 37, 0);
         potal_tile_plan one;
-        (void) potal_tile_select(16, 16, 32, 2, &one);
+        (void) potal_tile_select(D, D, 32, 32 / D, &one);
         emu_session                  es;
-        const potal_stripe_gemm_desc g     = q.stripe(0, 16, one);
+        const potal_stripe_gemm_desc g     = q.stripe(0, D, one);
         const int                    calls = 2 * (int) POTAL_GENERATION_MAX + 7;
         bool                         ok    = true;
         for (int i = 0; i < calls && ok; ++i) {
@@ -838,23 +878,17 @@ void test_owner_step() {
     }
 }
 
-#endif // POTAL_HW_DIM == 16
-
 } // namespace
 
 int main() {
     std::printf("potal-stripe-api-test DIM=%u backend=EMULATED (no hardware)\n", (unsigned) POTAL_HW_DIM);
     test_c_caller();
-#if POTAL_HW_DIM == 16
     test_frozen_plans();
     test_rejections();
     test_generation_wrap();
     test_session();
     test_hardware_session();
     test_owner_step();
-#else
-    std::printf("[SKIP] B-F: the planned GEMM cases use the DIM16 HP1 layout (scale_block_k 32 = 2 passes)\n");
-#endif
     if (failures != 0) {
         std::printf("POTAL_STRIPE_API_TEST FAIL (%d)\n", failures);
         return 1;

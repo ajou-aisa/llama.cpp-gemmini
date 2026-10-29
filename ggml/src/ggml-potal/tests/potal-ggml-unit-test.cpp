@@ -4,7 +4,7 @@
  *   A registry   POTAL reg/device found by name, one ACCEL device, enumerated
  *                once and before CPU, no GEMMINI device in this build
  *   B backend    name, GUID distinct from Gemmini and CPU, host buffer type, props
- *   C contract   supports_op accepts I8 M=N=16 K=16|32 and rejects other shapes,
+ *   C contract   supports_op accepts I8 M=N=DIM K=DIM|2*DIM and rejects other shapes,
  *                types, layouts, ops and tags with the expected reason; counters
  *   D packing    pack_a/pack_b/unpack_c against the GGML storage order, and the
  *                packed product against a CPU-backend F32 MUL_MAT golden
@@ -137,7 +137,8 @@ void test_registry() {
     std::printf("  description: %s\n", desc.c_str());
     check("A description states the hardware format",
           desc.find("A8W8") != std::string::npos && desc.find("Sat32") != std::string::npos &&
-              desc.find("DIM16") != std::string::npos && desc.find("I8 x I8 -> F32") != std::string::npos,
+              desc.find("DIM" + std::to_string(TILE)) != std::string::npos &&
+              desc.find("I8 x I8 -> F32") != std::string::npos,
           desc);
 
     int    potal_seen  = 0;
@@ -213,10 +214,10 @@ void test_contract(ggml_backend_t potal) {
         return ggml_mul_mat(c, matrix(wt, k, n), matrix(xt, k, m));
     };
 
-    ggml_tensor * w16  = matrix(GGML_TYPE_I8, 16, 16);
-    ggml_tensor * x16  = matrix(GGML_TYPE_I8, 16, 16);
-    ggml_tensor * wide = matrix(GGML_TYPE_I8, 32, 16); // rows of 32: a 16-wide view is strided
-    ggml_tensor * tall = matrix(GGML_TYPE_I8, 16, 32); // rows 16..31 form a contiguous view
+    ggml_tensor * w16  = matrix(GGML_TYPE_I8, TILE, TILE);
+    ggml_tensor * x16  = matrix(GGML_TYPE_I8, TILE, TILE);
+    ggml_tensor * wide = matrix(GGML_TYPE_I8, 2 * TILE, TILE); // rows of 2*DIM: a DIM-wide view is strided
+    ggml_tensor * tall = matrix(GGML_TYPE_I8, TILE, 2 * TILE); // second DIM rows form a contiguous view
 
     ggml_tensor * tagged = mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 16, 16, 16);
     tagged->op_params[1] = 0x5054514b; // GGML_GEMMINI_ATTENTION_QK
@@ -235,19 +236,19 @@ void test_contract(ggml_backend_t potal) {
     };
 
     const contract_case cases[] = {
-        { "I8 M16 N16 K16", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 16, 16, 16), GGML_POTAL_REJECT_NONE },
-        { "I8 M16 N16 K32", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 32, 16, 16), GGML_POTAL_REJECT_NONE },
+        { "I8 one physical K tile", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, TILE, TILE, TILE), GGML_POTAL_REJECT_NONE },
+        { "I8 two physical K tiles", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 2 * TILE, TILE, TILE), GGML_POTAL_REJECT_NONE },
         { "contiguous src1 view at an offset",
-          ggml_mul_mat(c, w16, ggml_view_2d(c, tall, 16, 16, tall->nb[1], 16 * tall->nb[1])),
+          ggml_mul_mat(c, w16, ggml_view_2d(c, tall, TILE, TILE, tall->nb[1], TILE * tall->nb[1])),
           GGML_POTAL_REJECT_NONE },
         { "VIEW of host data", ggml_view_2d(c, tall, 16, 8, tall->nb[1], 0), GGML_POTAL_REJECT_NONE },
-        { "RESHAPE of host data", ggml_reshape_2d(c, x16, 32, 8), GGML_POTAL_REJECT_NONE },
-        { "M8", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 16, 16, 8), GGML_POTAL_REJECT_SHAPE },
-        { "M32", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 16, 16, 32), GGML_POTAL_REJECT_SHAPE },
-        { "N32", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 16, 32, 16), GGML_POTAL_REJECT_SHAPE },
-        { "K48", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 48, 16, 16), GGML_POTAL_REJECT_SHAPE },
-        { "K8", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 8, 16, 16), GGML_POTAL_REJECT_SHAPE },
-        { "batched src1 (ne2=2)", ggml_mul_mat(c, w16, ggml_new_tensor_3d(c, GGML_TYPE_I8, 16, 16, 2)),
+        { "RESHAPE of host data", ggml_reshape_2d(c, x16, 2 * TILE, TILE / 2), GGML_POTAL_REJECT_NONE },
+        { "M half tile", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, TILE, TILE, TILE / 2), GGML_POTAL_REJECT_SHAPE },
+        { "M two tiles", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, TILE, TILE, 2 * TILE), GGML_POTAL_REJECT_SHAPE },
+        { "N two tiles", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, TILE, 2 * TILE, TILE), GGML_POTAL_REJECT_SHAPE },
+        { "K three tiles", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, 3 * TILE, TILE, TILE), GGML_POTAL_REJECT_SHAPE },
+        { "K half tile", mul_mat(GGML_TYPE_I8, GGML_TYPE_I8, TILE / 2, TILE, TILE), GGML_POTAL_REJECT_SHAPE },
+        { "batched src1 (ne2=2)", ggml_mul_mat(c, w16, ggml_new_tensor_3d(c, GGML_TYPE_I8, TILE, TILE, 2)),
           GGML_POTAL_REJECT_SHAPE },
         { "F32 x F32", mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, 16), GGML_POTAL_REJECT_TYPE },
         { "F16 weights", mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, 16), GGML_POTAL_REJECT_TYPE },
@@ -255,14 +256,14 @@ void test_contract(ggml_backend_t potal) {
         { "I8 weights, F32 activations", mul_mat(GGML_TYPE_I8, GGML_TYPE_F32, 16, 16, 16), GGML_POTAL_REJECT_TYPE },
         { "Q4_0 weights", mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 16, 16), GGML_POTAL_REJECT_TYPE },
         { "Q8_0 weights", mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 16, 16), GGML_POTAL_REJECT_TYPE },
-        { "transposed src1", ggml_mul_mat(c, w16, ggml_transpose(c, matrix(GGML_TYPE_I8, 16, 16))),
+        { "transposed src1", ggml_mul_mat(c, w16, ggml_transpose(c, matrix(GGML_TYPE_I8, TILE, TILE))),
           GGML_POTAL_REJECT_LAYOUT },
-        { "permuted src1", ggml_mul_mat(c, w16, ggml_permute(c, matrix(GGML_TYPE_I8, 16, 16), 1, 0, 2, 3)),
+        { "permuted src1", ggml_mul_mat(c, w16, ggml_permute(c, matrix(GGML_TYPE_I8, TILE, TILE), 1, 0, 2, 3)),
           GGML_POTAL_REJECT_LAYOUT },
-        { "strided src1 view (nb1=32)", ggml_mul_mat(c, w16, ggml_view_2d(c, wide, 16, 16, wide->nb[1], 0)),
+        { "strided src1 view", ggml_mul_mat(c, w16, ggml_view_2d(c, wide, TILE, TILE, wide->nb[1], 0)),
           GGML_POTAL_REJECT_LAYOUT },
-        { "strided src0 view (nb1=32)",
-          ggml_mul_mat(c, ggml_view_2d(c, matrix(GGML_TYPE_I8, 32, 16), 16, 16, wide->nb[1], 0), x16),
+        { "strided src0 view",
+          ggml_mul_mat(c, ggml_view_2d(c, matrix(GGML_TYPE_I8, 2 * TILE, TILE), TILE, TILE, wide->nb[1], 0), x16),
           GGML_POTAL_REJECT_LAYOUT },
         { "attention role rejects I8 operand types", tagged, GGML_POTAL_REJECT_TYPE },
         { "bias ADD", ggml_add(c, matrix(GGML_TYPE_F32, 16, 16), matrix(GGML_TYPE_F32, 16, 1)),
@@ -301,13 +302,13 @@ void test_contract(ggml_backend_t potal) {
 
     // Compute-time contract: everything above was unallocated.
     ggml_context_ptr data_ctx = make_context(true);
-    ggml_tensor *    y = ggml_mul_mat(data_ctx.get(), ggml_new_tensor_2d(data_ctx.get(), GGML_TYPE_I8, 16, 16),
-                                      ggml_new_tensor_2d(data_ctx.get(), GGML_TYPE_I8, 16, 16));
+    ggml_tensor *    y = ggml_mul_mat(data_ctx.get(), ggml_new_tensor_2d(data_ctx.get(), GGML_TYPE_I8, TILE, TILE),
+                                      ggml_new_tensor_2d(data_ctx.get(), GGML_TYPE_I8, TILE, TILE));
     mul_mat_shape    s = {};
     check("C compute contract refuses unallocated tensors",
           ggml::potal::check_mul_mat(cases[0].op, true, &s) == GGML_POTAL_REJECT_MEMORY);
     check("C compute contract accepts allocated tensors",
-          ggml::potal::check_mul_mat(y, true, &s) == GGML_POTAL_REJECT_NONE && s.m == 16 && s.n == 16 && s.k == 16);
+          ggml::potal::check_mul_mat(y, true, &s) == GGML_POTAL_REJECT_NONE && s.m == TILE && s.n == TILE && s.k == TILE);
 }
 
 // ---- D. packing ------------------------------------------------------------
@@ -404,21 +405,21 @@ void test_unpack_extremes() {
 void test_view_packing() {
     ggml_context_ptr ctx  = make_context(true);
     ggml_context *   c    = ctx.get();
-    ggml_tensor *    tall = ggml_new_tensor_2d(c, GGML_TYPE_I8, 16, 2 * TILE);
-    ggml_tensor *    w    = ggml_new_tensor_2d(c, GGML_TYPE_I8, 16, TILE);
+    ggml_tensor *    tall = ggml_new_tensor_2d(c, GGML_TYPE_I8, TILE, 2 * TILE);
+    ggml_tensor *    w    = ggml_new_tensor_2d(c, GGML_TYPE_I8, TILE, TILE);
     fill<int8_t>(tall, act_at);
     fill<int8_t>(w, wt_at);
-    ggml_tensor * rows = ggml_view_2d(c, tall, 16, TILE, tall->nb[1], TILE * tall->nb[1]); // rows 16..31
+    ggml_tensor * rows = ggml_view_2d(c, tall, TILE, TILE, tall->nb[1], TILE * tall->nb[1]); // second DIM rows
     ggml_tensor * y    = ggml_mul_mat(c, w, rows);
 
     mul_mat_shape s = {};
     check("D contiguous view at an offset accepted", ggml::potal::check_mul_mat(y, true, &s) == GGML_POTAL_REJECT_NONE);
-    std::vector<int8_t> a(TILE * 16);
+    std::vector<int8_t> a(TILE * TILE);
     ggml::potal::pack_a(rows, s, a.data());
     bool ok = true;
     for (int64_t m = 0; m < TILE; ++m) {
-        for (int64_t kk = 0; kk < 16; ++kk) {
-            ok = ok && a[m * 16 + kk] == act_at(m + TILE, kk);
+        for (int64_t kk = 0; kk < TILE; ++kk) {
+            ok = ok && a[m * TILE + kk] == act_at(m + TILE, kk);
         }
     }
     check("D pack_a reads the view's own rows", ok);
@@ -463,8 +464,8 @@ void test_refusal(ggml_backend_t potal) {
     {
         ggml_context_ptr ctx = make_context(true);
         ggml_context *   c   = ctx.get();
-        ggml_tensor *    w   = ggml_new_tensor_2d(c, GGML_TYPE_I8, 16, TILE);
-        ggml_tensor *    x   = ggml_new_tensor_2d(c, GGML_TYPE_I8, 16, TILE);
+        ggml_tensor *    w   = ggml_new_tensor_2d(c, GGML_TYPE_I8, TILE, TILE);
+        ggml_tensor *    x   = ggml_new_tensor_2d(c, GGML_TYPE_I8, TILE, TILE);
         fill<int8_t>(w, wt_at);
         fill<int8_t>(x, act_at);
         ggml_tensor * y = ggml_mul_mat(c, w, x);
@@ -495,8 +496,8 @@ void test_scheduler(ggml_backend_t potal, ggml_backend_t cpu) {
 
     {
         ggml_context_ptr        inputs = make_context(false);
-        ggml_tensor *           w      = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_I8, 16, TILE);
-        ggml_tensor *           x      = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_I8, 16, TILE);
+        ggml_tensor *           w      = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_I8, TILE, TILE);
+        ggml_tensor *           x      = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_I8, TILE, TILE);
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(inputs.get(), cpu));
         ggml_context_ptr        graph = make_context(false);
         ggml_tensor *           y     = ggml_mul_mat(graph.get(), w, x);
@@ -762,8 +763,8 @@ int main() {
 
     test_backend(potal.get(), cpu.get());
     test_contract(potal.get());
-    test_packing(16, cpu.get());
-    test_packing(32, cpu.get());
+    test_packing(TILE, cpu.get());
+    test_packing(2 * TILE, cpu.get());
     test_unpack_extremes();
     test_view_packing();
     test_refusal(potal.get());

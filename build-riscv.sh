@@ -9,6 +9,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
   printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*, POTAL_*.'
+  printf '%s\n' 'PoTal FireSim H3-7C profiles: bash build-potal-firesim.sh functional|performance 16|32 [--dry-run].'
   printf '%s\n' '  RISCV_LIBGOMP=/target/libgomp.so.1 overrides automatic OpenMP runtime discovery (ELF/ABI validated).'
   printf '%s\n' 'Default: GGML PoTal backend (GGML_GEMMINI=OFF, GGML_POTAL=ON, GGML_BACKEND_DL=OFF,'
   printf '%s\n' '  POTAL_EXPECTED_DIM=16, POTAL_HW_PARAMS=<potal>/software/gemmini-rocc-tests/include/gemmini_potal_params.h).'
@@ -16,6 +17,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, potal-stripe-api-test,'
   printf '%s\n' '  potal-residual-unit-test, potal-stripe-pipeline-test, potal-stripe-smoke,'
   printf '%s\n' '  potal-paired-auto-test, potal-paired-execution-test, potal-paired-smoke,'
+  printf '%s\n' '  potal-attention-api-test, potal-attention-test and potal-attention-smoke,'
   printf '%s\n' '  then llama-cli and llama-perplexity.'
   printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>] selects another header.'
   printf '%s\n' '  Defaults here: GGML_GEMMINI_ACTIVATION_QUANT=TENSOR, GGML_GEMMINI_ENABLE_RMD=OFF (compensation),'
@@ -26,7 +28,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' '  8-bit activations/weights and block size 32 are required.'
   printf '%s\n' '  Q8_HP1 models: llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1 (host build).'
   printf '%s\n' 'PoTal API only: -DGGML_POTAL=OFF -DPOTAL_API_ONLY=ON [-DPOTAL_EXPECTED_DIM=16|32|64]'
-  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
+  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16/32) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
   printf '%s\n' '  -DPOTAL_ENABLE_OPENMP=ON adds --mode=openmp to potal-multicore-smoke (needs libgomp.so.1 on target).'
   printf '%s\n' 'Gemmini backend: -DGGML_POTAL=OFF -DGGML_GEMMINI=ON -DGEMMINI_SW_PATH=/abs/gemmini/include/tree'
   printf '%s\n' '  (no default header location); GGML_GEMMINI_DIM=16|32|64 must match that header.'
@@ -105,7 +107,7 @@ GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT=${GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFA
 GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT:-2}
 GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT=${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT:-ON}
 # Error compensation is a selectable path; the HP1 validation runs it OFF.
-# PoTal executes the CPU (cpu_direct) residual backend only.
+# FULL uses the CPU (cpu_direct) residual; STRIPE_PIPELINE uses the PoTal WS residual.
 GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-OFF}
 GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-CPU}
 
@@ -153,6 +155,7 @@ elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
     potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke \
     potal-stripe-api-test potal-residual-unit-test potal-stripe-pipeline-test potal-stripe-smoke \
     potal-paired-auto-test potal-paired-execution-test potal-paired-smoke \
+    potal-attention-api-test potal-attention-test potal-attention-smoke \
     -j"${BUILD_JOBS_DEFAULT}"
   cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
 else

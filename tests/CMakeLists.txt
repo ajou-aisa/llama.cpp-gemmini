@@ -326,6 +326,9 @@ add_test(NAME test-im2p-cache-build-scripts
         -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
         -DTEST_IM2P_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../../IM2P.sim
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-im2p-cache-build-scripts.cmake)
+add_test(NAME test-potal-target-profile
+    COMMAND ${CMAKE_COMMAND} -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-potal-target-profile.cmake)
 
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)

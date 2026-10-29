@@ -181,8 +181,11 @@ elseif (GGML_POTAL)
     if (GGML_GEMMINI)
         message(FATAL_ERROR "GGML_POTAL=ON requires GGML_GEMMINI=OFF: both backends drive the same RoCC custom-3 accelerator")
     endif()
-elseif (DEFINED POTAL_HW_PARAMS OR DEFINED POTAL_EXPECTED_DIM)
-    message(FATAL_ERROR "POTAL_HW_PARAMS/POTAL_EXPECTED_DIM are used only with POTAL_API_ONLY=ON or GGML_POTAL=ON")
+    # Backend tests are added by ggml before the ordinary llama test directory.
+    enable_testing()
+elseif (DEFINED POTAL_HW_PARAMS OR DEFINED POTAL_EXPECTED_DIM OR
+        DEFINED POTAL_TARGET_DIM OR DEFINED POTAL_TARGET_PARAMS)
+    message(FATAL_ERROR "PoTal hardware/target parameters are used only with POTAL_API_ONLY=ON or GGML_POTAL=ON")
 endif()
 
 set(_GGML_GEMMINI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")

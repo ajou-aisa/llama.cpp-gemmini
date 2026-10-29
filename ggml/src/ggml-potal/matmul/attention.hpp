@@ -49,7 +49,7 @@ potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batc
 // and reconstruct with the corrected low result in checked Host INT64, as
 // explicitly selected for H3-7B. Bias outside INT32 is rejected, not clipped.
 // H3-7C extends only a rejected PV bias: unchanged unsigned P codes run as
-// radix-2 INT8 planes if every DIM16 SCU and ACC prefix is proven nonsaturating.
+// radix-2 INT8 planes if every DIM16/DIM32 SCU and ACC prefix is proven nonsaturating.
 // Those completed jobs reconstruct the exact quantized dot in checked INT64.
 // Inputs that cannot be certified remain unsupported; column_bias stays strict.
 potal_status reference(const stream & activation, const stationary & weight,

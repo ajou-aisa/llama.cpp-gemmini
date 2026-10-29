@@ -26,13 +26,13 @@ struct potal_paired_request;
 struct potal_paired_report;
 enum class potal_paired_status : uint8_t;
 
-// One DIM16 GEMM with every scale carrier x1:
-// C[16][16] = A[16][k] * B[k][16], k = 16 or 32.
+// One DIM16 or DIM32 GEMM with every scale carrier x1:
+// C[DIM][DIM] = A[DIM][k] * B[k][DIM], k = DIM or 2*DIM.
 struct gemm_job {
-    const int8_t * a; // [16][k], row stride k
-    const int8_t * b; // [k][16], row stride 16
+    const int8_t * a; // [DIM][k], row stride k
+    const int8_t * b; // [k][DIM], row stride DIM
     uint32_t       k;
-    int32_t *      c; // [16][16], row stride 16; written only when the report is ok
+    int32_t *      c; // [DIM][DIM], row stride DIM; written only when the report is ok
 };
 
 struct gemm_report {

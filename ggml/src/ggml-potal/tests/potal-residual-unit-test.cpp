@@ -572,12 +572,14 @@ void test_runs() {
     run_case("A/B/D non-consecutive K and rows, lanes 0..4", f, 24, 12, lanes, -20);
 
     std::vector<entry> dense;
-    for (size_t row = 0; row < 12; ++row) {
+    // Both radix lanes cross an output-tile boundary, including DIM32.
+    // D+1 source rows produce 2*(D+1) lane rows: three padded I tiles.
+    for (size_t row = 0; row < D + 1; ++row) {
         for (size_t k = 0; k < 64; ++k) {
             dense.push_back({ row, k, (row + k) % 2 ? -300 : 255 });
         }
     }
-    run_case("A/B/D dense two-run multi-lane rows", f, 24, 12, dense, -12);
+    run_case("A/B/D dense two-run multi-lane rows across DIM boundary", f, 0, D + 1, dense, -12);
 }
 
 void test_carriers() {
