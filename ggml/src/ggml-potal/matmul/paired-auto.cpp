@@ -1649,6 +1649,8 @@ struct executor {
     size_t                        window_fences = 0, window_readbacks = 0, window_readback_tiles = 0;
 
     bool profile = false;
+    bool early_trace = false;
+    bool residual_trace = false;
     exec_clock::time_point plan_start;
     double plan_s = 0, pack_s = 0, scale_write_s = 0, scale_release_s = 0;
     double index_s = 0, main_issue_s = 0, residual_issue_s = 0, readback_s = 0;
@@ -1659,11 +1661,22 @@ struct executor {
         std::fprintf(stderr,
                      "[POTAL_PROFILE] run_id=%" PRIu64 " stripe=%zu status=%s plan_ms=%.6f pack_ms=%.6f "
                      "scale_write_ms=%.6f scale_release_ms=%.6f index_ms=%.6f main_issue_ms=%.6f "
-                     "residual_issue_ms=%.6f residual_prefetch_issue_ms=%.6f readback_ms=%.6f fence_ms=%.6f\n",
+                     "residual_issue_ms=%.6f residual_prefetch_issue_ms=%.6f readback_ms=%.6f fence_ms=%.6f "
+                     "main_prefetch_issue_ms=%.6f\n",
                      req.run_id, req.stripe_id, potal_paired_status_name(report.status), plan_s * 1e3, pack_s * 1e3,
                      scale_write_s * 1e3, scale_release_s * 1e3, index_s * 1e3, main_issue_s * 1e3,
                      residual_issue_s * 1e3, report.counts.residual_prefetch_issue_s * 1e3,
-                     readback_s * 1e3, report.counts.fence_s * 1e3);
+                     readback_s * 1e3, report.counts.fence_s * 1e3, report.counts.main_prefetch_issue_s * 1e3);
+        if (req.next_k_prefetch) {
+            const auto q = potal_paired_h2_query(session);
+            std::fprintf(stderr,
+                         "[POTAL_COMPLETION] run_id=%" PRIu64 " stripe=%zu enabled=%u "
+                         "calls=%" PRIu64 " reused=%" PRIu64 " bookkeeping=%" PRIu64
+                         " cpu_fences=%" PRIu64 " raw_commands=%" PRIu64 "\n",
+                         req.run_id, req.stripe_id, q.completion_reuse, q.completion_calls,
+                         q.completion_reuses, q.completion_bookkeeping,
+                         q.completion_cpu_fences, q.core.commands);
+        }
     }
 
     executor(const potal_paired_request & r, potal_paired_session * s, potal_paired_report & rep,
@@ -1803,7 +1816,15 @@ struct executor {
         panels.resize(report.plan.residencies.size());
         const potal_h2_weight weight{req.weight->b, req.k, req.n, req.weight->ldb, bytes};
         const potal_status st = potal_paired_h2_begin(session, &weight);
-        return st == POTAL_OK ? potal_paired_status::ok : hw_fail("h2_begin", st, nullptr);
+        if (st != POTAL_OK) return hw_fail("h2_begin", st, nullptr);
+        if (req.early_k_prefetch) {
+            const potal_status enabled = potal_paired_h2_early_enable(session, req.early_counter);
+            if (enabled != POTAL_OK) return hw_fail("h2_early_capability", enabled, nullptr);
+            const char * trace = std::getenv("POTAL_EARLY_TRACE");
+            early_trace = trace && std::strcmp(trace, "1") == 0;
+            residual_trace = trace && std::strcmp(trace, "2") == 0;
+        }
+        return potal_paired_status::ok;
     }
 
     potal_paired_status declare_panel(size_t residency, const potal_paired_op & op) {
@@ -1830,7 +1851,9 @@ struct executor {
         const potal_status st = potal_paired_h2_panel_prefetch(session, panels[next].reference);
         report.issued = true;
         // Fresh session, exclusive prefetch ownership: cumulative attempts.
-        report.counts.prefetch_mvins = potal_paired_h2_query(session).attempted_b_mvins;
+        const auto state = potal_paired_h2_query(session);
+        report.counts.prefetch_mvins = state.attempted_b_mvins;
+        report.counts.prefetch_ldb_only = state.attempted_ldb_only;
         if (st != POTAL_OK) return hw_fail("b_prefetch", st, &op);
         panels[next].prefetched = true;
         report.counts.prefetch_loads++;
@@ -2072,8 +2095,10 @@ struct executor {
     }
 
     potal_paired_status issue_loop(const potal_paired_loop_ws & l, const char * stage, const potal_paired_op & op) {
-        const bool combined = req.next_k_prefetch && op.kind == potal_paired_op_kind::residual_gemm &&
-            op.id == report.plan.residencies[op.residency].last_residual_op &&
+        const bool combined = req.next_k_prefetch &&
+            (req.early_k_prefetch ? op.kind == potal_paired_op_kind::main_gemm :
+             op.kind == potal_paired_op_kind::residual_gemm &&
+             op.id == report.plan.residencies[op.residency].last_residual_op) &&
             op.panel + 1 < report.tile.k_panels;
         if (combined) {
             const auto & current = report.plan.residencies[op.residency];
@@ -2088,6 +2113,22 @@ struct executor {
             const auto prepared = declare_panel(next, op);
             if (prepared != potal_paired_status::ok) return prepared;
         }
+        const bool trace_residual = residual_trace && req.early_k_prefetch &&
+                                    op.kind == potal_paired_op_kind::residual_gemm;
+        const bool trace_main = req.early_k_prefetch &&
+            ((early_trace && op.kind == potal_paired_op_kind::main_gemm) || trace_residual);
+        if (trace_residual) {
+            // Separate diagnostic pass: isolate this Residual without changing
+            // primary timing or Main-to-prefetch issue order.
+            const potal_status drained = potal_paired_fence(session);
+            if (drained != POTAL_OK) return hw_fail("h2_residual_trace_fence", drained, &op);
+            report.counts.fences++;
+            report.counts.drains++;
+        }
+        if (trace_main) {
+            const potal_status trace = potal_paired_h2_early_trace_begin(session);
+            if (trace != POTAL_OK) return hw_fail("h2_early_trace_begin", trace, &op);
+        }
         const auto         t  = exec_clock::now();
         const uint32_t reader = op.kind == potal_paired_op_kind::main_gemm ? 0 : uint32_t(op.window + 1);
         const potal_status st = req.next_k_prefetch ?
@@ -2096,17 +2137,65 @@ struct executor {
         report.issued = true;
         if (st != POTAL_OK && req.next_k_prefetch) return hw_fail(stage, st, &op);
         potal_paired_status prefetched = potal_paired_status::ok;
-        if (st == POTAL_OK && op.kind == potal_paired_op_kind::residual_gemm) {
-            report.counts.residual_loop_ws++;
+        if (st == POTAL_OK) {
+            if (op.kind == potal_paired_op_kind::residual_gemm) report.counts.residual_loop_ws++;
             // CLOCK_MONOTONIC's RISC-V VDSO uses CPU fences, which Rocket
             // stalls on RoCC busy. Keep all clock reads outside this pair.
             if (combined) prefetched = prefetch_next(op);
+            if (combined && req.early_k_prefetch && prefetched == potal_paired_status::ok) {
+                const potal_status drained = potal_paired_fence(session);
+                if (drained != POTAL_OK) return hw_fail("h2_early_fence", drained, &op);
+                report.counts.fences++;
+                report.counts.drains++;
+                // Publish the future B without replacing any existing manifest
+                // drain boundary. Keep drained_upto unchanged deliberately.
+            }
+            if (trace_main && !combined) {
+                // Diagnostic-only final-panel snapshot. Primary timing never
+                // enables this extra Fence or any trace command.
+                const potal_status drained = potal_paired_fence(session);
+                if (drained != POTAL_OK) return hw_fail("h2_trace_fence", drained, &op);
+                report.counts.fences++;
+                report.counts.drains++;
+            }
         }
         if (prefetched != potal_paired_status::ok && report.fatal) return prefetched;
         const double elapsed = seconds_since(t);
         report.counts.issue_s += elapsed;
-        if (combined) report.counts.residual_prefetch_issue_s += elapsed;
+        if (combined && req.early_k_prefetch) report.counts.main_prefetch_issue_s += elapsed;
+        else if (combined) report.counts.residual_prefetch_issue_s += elapsed;
         else if (profile) (op.kind == potal_paired_op_kind::main_gemm ? main_issue_s : residual_issue_s) += elapsed;
+        if (trace_main && prefetched == potal_paired_status::ok) {
+            uint64_t values[POTAL_LDB_ONLY_TRACE_FIELDS];
+            const potal_status trace = potal_paired_h2_early_trace_end(session, values);
+            if (trace != POTAL_OK) return hw_fail("h2_early_trace_end", trace, &op);
+            const uint32_t current_pair = uint32_t(op.pair);
+            std::fprintf(stderr,
+                "[%s] run_id=%" PRIu64 " stripe=%zu panel=%zu current_pair=%u "
+                "generation=%" PRIu64 " flags=%" PRIu64 " start_clock=%" PRIu64
+                " end_clock=%" PRIu64 " current_mac_first=%" PRIu64 " current_mac_last=%" PRIu64
+                " mac_active_cycles=%" PRIu64 " window=%zu\n",
+                trace_residual ? "POTAL_EARLY_RESIDUAL" : "POTAL_EARLY_MAIN",
+                req.run_id, req.stripe_id, op.panel, current_pair,
+                panels[op.residency].reference.generation, values[0], values[22], values[23],
+                values[current_pair ? 9 : 7], values[current_pair ? 10 : 8],
+                values[current_pair ? 14 : 13], op.window);
+            if (!combined) return st == POTAL_OK ? prefetched : hw_fail(stage, st, &op);
+            const auto & next = panels[op.residency + 1].reference;
+            const uint32_t target = next.pair;
+            std::fprintf(stderr,
+                "[POTAL_EARLY_TRACE] run_id=%" PRIu64 " stripe=%zu panel=%zu current_pair=%u "
+                "next_pair=%u generation=%" PRIu64 " flags=%" PRIu64 " start_clock=%" PRIu64
+                " end_clock=%" PRIu64 " scheduler_admission=%" PRIu64 " current_mac_first=%" PRIu64
+                " current_mac_last=%" PRIu64 " next_b_first=%" PRIu64 " next_b_last=%" PRIu64
+                " cross_pair_cycles=%" PRIu64 " fence_request=%" PRIu64 " fence_accept=%" PRIu64
+                " next_dma_request_first=%" PRIu64 " next_dma_request_last=%" PRIu64 "\n",
+                req.run_id, req.stripe_id, op.panel, current_pair, target, next.generation, values[0],
+                values[22], values[23], values[2], values[current_pair ? 9 : 7],
+                values[current_pair ? 10 : 8], values[target ? 5 : 3], values[target ? 6 : 4],
+                values[current_pair ? 16 : 15], values[18], values[19],
+                values[target ? 26 : 24], values[target ? 27 : 25]);
+        }
         return st == POTAL_OK ? prefetched : hw_fail(stage, st, &op);
     }
 
@@ -2471,6 +2560,10 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         if (req.next_k_prefetch && !req.ktile_scale_reuse) {
             return ex.fail(potal_paired_status::invalid_argument, "prefetch",
                            "Next-K prefetch requires K-tile Scale reuse", POTAL_ERR_UNSUPPORTED);
+        }
+        if (req.early_k_prefetch && !req.next_k_prefetch) {
+            return ex.fail(potal_paired_status::invalid_argument, "early_prefetch",
+                           "Early LdB prefetch requires checked next-K prefetch", POTAL_ERR_UNSUPPORTED);
         }
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)

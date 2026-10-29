@@ -621,9 +621,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         counts_.paired_drains += n.paired_drains;
         counts_.paired_prefetch_loads += n.paired_prefetch_loads;
         counts_.paired_prefetch_mvins += n.paired_prefetch_mvins;
+        counts_.paired_prefetch_ldb_only += n.paired_prefetch_ldb_only;
         counts_.paired_prefetch_bytes_declared += n.paired_prefetch_bytes_declared;
         counts_.paired_resident_main_loop_ws += n.paired_resident_main_loop_ws;
         counts_.paired_residual_prefetch_issue_s += n.paired_residual_prefetch_issue_s;
+        counts_.paired_main_prefetch_issue_s += n.paired_main_prefetch_issue_s;
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
@@ -788,6 +790,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             pq.conservative_fences = cfg_.paired_conservative_fences;
             pq.ktile_scale_reuse = cfg_.paired_ktile_scale_reuse;
             pq.next_k_prefetch = cfg_.paired_next_k_prefetch;
+            pq.early_k_prefetch = cfg_.paired_early_k_prefetch;
             emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
             const potal_paired_status pst = runners.paired(pq, paired);
             gemm_fatal                    = gemm_fatal || paired.fatal;
@@ -805,9 +808,11 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             n.paired_drains += pc.drains;
             n.paired_prefetch_loads += pc.prefetch_loads;
             n.paired_prefetch_mvins += pc.prefetch_mvins;
+            n.paired_prefetch_ldb_only += pc.prefetch_ldb_only;
             n.paired_prefetch_bytes_declared += pc.prefetch_bytes_declared;
             n.paired_resident_main_loop_ws += pc.resident_main_loop_ws;
             n.paired_residual_prefetch_issue_s += pc.residual_prefetch_issue_s;
+            n.paired_main_prefetch_issue_s += pc.main_prefetch_issue_s;
             n.scale_writes += pc.scale_writes;
             n.scale_releases += pc.scale_releases;
             n.tlb_flushes += pc.tlb_flushes;
@@ -1206,6 +1211,9 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     }
     if (cfg.paired_next_k_prefetch && !cfg.paired_ktile_scale_reuse) {
         return refuse("options", "Next-K prefetch requires K-tile Scale reuse");
+    }
+    if (cfg.paired_early_k_prefetch && !cfg.paired_next_k_prefetch) {
+        return refuse("options", "Early LdB prefetch requires checked next-K prefetch");
     }
 
     std::shared_ptr<stripe_run> run;

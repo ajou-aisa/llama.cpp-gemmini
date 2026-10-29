@@ -119,6 +119,12 @@ static inline uint64_t potal_rocc_resident_view(uint64_t rs1, uint64_t rs2) {
     return rd;
 }
 
+static inline uint64_t potal_rocc_ldb_only(uint64_t rs1, uint64_t rs2) {
+    uint64_t rd;
+    POTAL_ROCC_R_R_R(POTAL_FUNCT_LDB_ONLY, rd, rs1, rs2);
+    return rd;
+}
+
 /* Counter responses are arbitrary uint64_t values, NOT status codes. */
 static inline uint64_t potal_rocc_counter(uint64_t rs1, uint64_t rs2) {
     uint64_t rd;

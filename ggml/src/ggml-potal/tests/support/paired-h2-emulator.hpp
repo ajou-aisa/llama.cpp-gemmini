@@ -46,11 +46,13 @@ struct h2_emulator {
     uint64_t              ld_stride[2] = { 0, 0 }, st_stride = 0;
     uint64_t              ld_config[2] = { 0, 0 };
     uint64_t              bounds_rs1 = 0, bounds_rs2 = 0, a_dram = 0, b_dram = 0, d_dram = 0, c_dram = 0,
-                          a_stride = 0, b_stride = 0, c_stride_elems = 0;
+                          a_stride = 0, b_stride = 0, d_stride = 0, c_stride_elems = 0;
     // Counters and records.
     uint64_t    main_loops = 0, residual_loops = 0, index_configs = 0, index_writes = 0, scale_writes = 0,
                 scale_releases = 0, mvouts = 0, fences = 0, flushes = 0, b_loads = 0;
     uint64_t    raw_b_mvins = 0, raw_b_bytes = 0, resident_main_loops = 0;
+    uint64_t    ldb_only_loads = 0, ldb_only_bytes = 0;
+    uint64_t    ldb_only_capability = D == 32 ? POTAL_LDB_ONLY_CAPABILITY : 0;
     std::vector<potal_paired_cmd_record> records;
     std::string                          errors;      // contract violations seen (empty: none)
     bool                                 scale_miss = false;
@@ -68,6 +70,18 @@ struct h2_emulator {
         return static_cast<h2_emulator *>(ctx)->command(*rec);
     }
 
+    static potal_status on_counter(void * ctx, const potal_paired_cmd_record * rec, uint64_t * value) {
+        auto & e = *static_cast<h2_emulator *>(ctx);
+        e.records.push_back(*rec);
+        if (rec->funct != POTAL_FUNCT_COUNTER || rec->xd != 1 || rec->rs2 ||
+            (rec->rs1 != UINT64_C(0xA) && rec->rs1 != POTAL_LDB_ONLY_TAG)) {
+            e.err("LdB-only capability query");
+            return POTAL_HW_BAD_COMMAND;
+        }
+        *value = rec->rs1 == POTAL_LDB_ONLY_TAG ? e.ldb_only_capability : 0;
+        return POTAL_OK;
+    }
+
     potal_status command(const potal_paired_cmd_record & r) {
         records.push_back(r);
         if (r.funct == fail_funct) {
@@ -80,8 +94,9 @@ struct h2_emulator {
             case POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB: a_dram = r.rs1; b_dram = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC: d_dram = r.rs1; c_dram = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB: a_stride = r.rs1; b_stride = r.rs2; return POTAL_OK;
-            case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: c_stride_elems = r.rs2; return POTAL_OK;
+            case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: d_stride = r.rs1; c_stride_elems = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS: return loop_ws(r.rs1, r.rs2);
+            case POTAL_FUNCT_LDB_ONLY: return ldb_only(r);
             case POTAL_FUNCT_MVIN: return mvin_b(r.rs1, r.rs2);
             case POTAL_FUNCT_MVOUT: return mvout(r.rs1, r.rs2);
             case POTAL_FUNCT_SCALE_WRITE: return scale_write(r.rs1, r.rs2);
@@ -106,6 +121,40 @@ struct h2_emulator {
             case 2: st_stride = rs2; break;                 // CONFIG_ST: row bytes
             default: break;                                 // CONFIG_EX
         }
+        return POTAL_OK;
+    }
+
+    // Independent LOAD2-only mapping. Admission is synchronous in this software
+    // double; neither copied bytes nor its response are a completion certificate.
+    // No A, ACC, Execute, Scale or Index operation participates.
+    potal_status ldb_only(const potal_paired_cmd_record & command) {
+        const uint32_t pair = command.rs1 & 1;
+        const uint32_t I = bounds_rs2 & 0xFFFF, J = (bounds_rs2 >> 16) & 0xFFFF;
+        const uint32_t K = (bounds_rs2 >> 32) & 0xFFFF;
+        const uint32_t pad_j = (bounds_rs1 >> 16) & 0xFFFF;
+        const uint64_t rows = uint64_t(K) * D, columns = uint64_t(J) * D;
+        const uint64_t footprint = rows * J;
+        const uint64_t canonical_ld = (uint64_t(D) << 16) | UINT64_C(0x109);
+        if (D != 32 || command.xd != 1 || command.rs1 != (UINT64_C(0x10) | pair) || command.rs2 ||
+            I != 1 || !J || !K || bounds_rs2 >> 48 || bounds_rs1 != uint64_t(pad_j) << 16 ||
+            pad_j >= D || a_dram || d_dram || c_dram || a_stride || d_stride || c_stride_elems ||
+            !b_dram || b_dram % D || b_stride < columns - pad_j ||
+            footprint > POTAL_HW_BANK_ROWS || ld_config[1] != canonical_ld || ld_stride[1] != b_stride) {
+            err("LdB-only fields, LOAD2 configuration or bank extent");
+            return POTAL_HW_INVALID_ENCODING;
+        }
+        const size_t bank_end = (2 * size_t(pair) + 2) * POTAL_HW_BANK_ROWS;
+        const size_t start = bank_end - size_t(footprint);
+        const auto * source = reinterpret_cast<const int8_t *>(uintptr_t(b_dram));
+        for (size_t k = 0; k < rows; ++k) {
+            for (size_t j = 0; j < columns; ++j) {
+                const size_t local_row = start + (k / D * J + j / D) * D + k % D;
+                sp[local_row * D + j % D] = j < columns - pad_j ? source[k * b_stride + j] : 0;
+                sp_written[local_row] |= uint64_t(1) << (j % D);
+            }
+        }
+        ++ldb_only_loads;
+        ldb_only_bytes += rows * (columns - pad_j); // logical bytes, not measured DMA traffic
         return POTAL_OK;
     }
 

@@ -29,6 +29,7 @@
 #include "matmul/stripe.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -61,7 +62,8 @@ struct run_result {
 run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in, h2_emulator & emu,
                       bool with_sink = true, uint32_t generation = 0, bool conservative = false,
                       const potal_paired_sink * override_sink = nullptr, int scale_reuse = -1,
-                      const potal_paired_execution_plan * plan = nullptr, bool prefetch = false) {
+                      const potal_paired_execution_plan * plan = nullptr, bool prefetch = false,
+                      bool early = false, potal_observation_counter_fn early_counter = nullptr) {
     run_result   r;
     const size_t rows = std::min(main.tile_I * PD, f.M);
     residual::decoded_packet d;
@@ -94,6 +96,8 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
     if (scale_reuse >= 0) q.ktile_scale_reuse = scale_reuse != 0;
     q.plan = plan;
     q.next_k_prefetch = prefetch;
+    q.early_k_prefetch = early;
+    q.early_counter = early ? (early_counter ? early_counter : h2_emulator::on_counter) : nullptr;
     r.status       = potal_paired_matmul_auto(q, s, r.report);
     r.session      = potal_paired_session_query(s);
     if (r.status == potal_paired_status::ok) {
@@ -220,6 +224,9 @@ struct case_spec {
     entries_fn   entries; // nullptr: no residual
 };
 
+void test_early_case(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in,
+                     const potal_paired_execution_plan & plan);
+
 // Entries of `fn` whose K lies inside the fixture's K.
 entries_fn within_k(const entries_fn & fn, size_t K) {
     return [=](size_t s, size_t rows) {
@@ -250,7 +257,7 @@ entries_fn dense_entries(size_t row_step, size_t k_step, int32_t amplitude) {
 }
 
 bool run_case(const case_spec & c, bool verbose, std::string & why, run_result * keep = nullptr, h2_emulator * keep_emu = nullptr,
-              bool conservative = false) {
+              bool conservative = false, bool early_compare = false) {
     paired_fixture f(c.M, c.N, c.K, c.seed, [](size_t blk, size_t n) { return (int16_t) ((blk * 7 + n) % 4); });
     potal_tile_plan main;
     if (!f.ok || !main_select_ok(f, main)) {
@@ -279,6 +286,7 @@ bool run_case(const case_spec & c, bool verbose, std::string & why, run_result *
     }
     const size_t rows = std::min(main.tile_I * PD, f.M);
     why               = compare_stripe(f, in, ref, r, rows);
+    if (early_compare && PD == 32 && why.empty()) test_early_case(f, main, in, r.report.plan);
     if (keep != nullptr) {
         *keep = std::move(r);
     }
@@ -462,11 +470,13 @@ void test_numerics() {
         { "N tails: I/J/K padding", PD == 32 ? 54u : 70u, 140, 2048, 6, dense_entries(11, 97, 120) },
         { "N large residual values (two lanes, saturation range)", 32, 64, 256, 7, dense_entries(2, 3, 30000) },
         { "N decode shape M = 1", 1, 768, 768, 8, dense_entries(1, 5, 90) },
+        { "N multi-panel without Residual", 65, 97, 2080, 129, nullptr },
+        { "N sparse first panel, later panels without Residual", 80, 160, 2048, 3, dense_entries(9, 4096, 150) },
     };
     for (const case_spec & c : cases) {
         std::string why;
         run_result  r;
-        const bool  ok = run_case(c, true, why, &r);
+        const bool  ok = run_case(c, true, why, &r, nullptr, false, true);
         check(std::string(c.name) + ": Main INT32, Residual INT32, radix INT64, final F32 == serialized reference (" + why + ")", ok);
         // Geometry the case name claims: explicit DIM-specific constants,
         // never expectations copied from the plan under test.
@@ -532,6 +542,365 @@ void test_numerics() {
         print_report("N sparse", r);
         check("N sparse packet (single K in a block): executor == reference",
               ok && in.packets[0] != nullptr && r.status == potal_paired_status::ok && compare_stripe(f, in, ref, r, 16).empty());
+    }
+}
+
+void test_early_case(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in,
+                     const potal_paired_execution_plan & plan) {
+    // Same immutable manifest, generations, tensors and independently computed
+    // goldens. No expected result comes from the paired planner or lowering.
+    const golden_result golden = golden_of(f, main.tile_I * PD, in);
+    serialized_result expected;
+    expected.main_ok = expected.legacy_ok = golden.ok;
+    expected.main_c = golden.main_c;
+    expected.legacy = golden.legacy;
+    expected.correction = golden.correction;
+    expected.rows.resize(in.theta.size());
+    expected.residual_c.resize(in.theta.size());
+    for (const auto & row : golden.residual[0]) {
+        expected.rows[0].push_back({row.lane, row.row});
+        expected.residual_c[0].insert(expected.residual_c[0].end(), row.c.begin(), row.c.end());
+    }
+    h2_emulator baseline_emu, early_emu;
+    const run_result baseline = run_paired(f, main, in, baseline_emu, true, 250, false, nullptr, 1, &plan);
+    const run_result early = run_paired(f, main, in, early_emu, true, 250, false, nullptr, 1, &plan, true, true);
+    const bool ok = golden.ok && baseline.status == potal_paired_status::ok && early.status == potal_paired_status::ok;
+    check("G baseline and early execute same manifest (" + std::to_string(f.M) + "x" +
+          std::to_string(f.N) + "x" + std::to_string(f.K) + ")", ok);
+    if (!ok) {
+        print_report("G baseline", baseline);
+        print_report("G early", early);
+        return;
+    }
+    const size_t rows = std::min(main.tile_I * PD, f.M);
+    check("G exact raw Main/Residual INT32, radix INT64 and merged F32 equal independent goldens",
+          compare_stripe(f, in, expected, baseline, rows).empty() &&
+          compare_stripe(f, in, expected, early, rows).empty() &&
+          same_bits(baseline.main_c, early.main_c) && same_bits(baseline.residual_c, early.residual_c));
+    const size_t admissions = early.report.tile.j_groups * (early.report.tile.k_panels - 1);
+    const auto & b = baseline.report.counts;
+    const auto & e = early.report.counts;
+    check("G counts are CPU admissions, never raw MVINs or duplicate B transfers",
+          e.prefetch_loads == admissions && e.prefetch_ldb_only == admissions &&
+          early_emu.ldb_only_loads == admissions && e.resident_main_loop_ws == admissions &&
+          early_emu.resident_main_loops == admissions && early_emu.raw_b_mvins == 0 && e.prefetch_mvins == 0 &&
+          early_emu.b_loads + admissions == early_emu.main_loops &&
+          early_emu.b_loads == early.report.tile.j_groups &&
+          early_emu.ldb_only_bytes == e.prefetch_bytes_declared);
+    check("G retains old Scale releases, windows, generations, drains and final readbacks",
+          b.scale_writes == e.scale_writes && b.scale_releases == e.scale_releases &&
+          b.scale_reused_windows == e.scale_reused_windows && b.scale_reused_columns == e.scale_reused_columns &&
+          b.main_loop_ws == e.main_loop_ws && b.residual_loop_ws == e.residual_loop_ws &&
+          b.index_configs == e.index_configs && b.index_writes == e.index_writes &&
+          b.readbacks == e.readbacks && b.readback_tiles == e.readback_tiles &&
+          e.fences == b.fences + admissions && e.drains == b.drains + admissions &&
+          early.session.drains == baseline.session.drains + admissions &&
+          early.generation == baseline.generation && e.ops == b.ops);
+    // No wall-clock thresholds: the combined interval is included in issue_s,
+    // not added again to fence_s or the old Residual combined interval.
+    check("G combined Main interval is included once, not in Residual interval",
+          e.main_prefetch_issue_s >= 0 && e.main_prefetch_issue_s <= e.issue_s &&
+          e.residual_prefetch_issue_s == 0 && b.main_prefetch_issue_s == 0);
+
+    bool order = true, pair_seen[2] = {false, false};
+    size_t main_ordinal = 0, seen_admissions = 0;
+    for (size_t i = 0; i < early_emu.records.size(); ++i) {
+        const auto & command = early_emu.records[i];
+        if (command.funct != POTAL_FUNCT_LOOP_WS || (command.rs1 >> 62 & 1)) continue;
+        const size_t panel_index = main_ordinal % early.report.tile.k_panels;
+        const size_t group = main_ordinal++ / early.report.tile.k_panels;
+        if (panel_index + 1 == early.report.tile.k_panels) continue;
+        if (i + 7 >= early_emu.records.size()) { order = false; break; }
+        const auto & next = early.report.tile.panels[panel_index + 1];
+        const uint64_t pair = ((command.rs1 >> 16) & 3) == 1 ? 1 : 0;
+        pair_seen[pair] = true;
+        const uint64_t j_begin = group * early.report.tile.tile_J * PD;
+        const uint64_t columns = std::min(early.report.tile.tile_J * PD, f.N - j_begin);
+        const uint64_t J = (columns + PD - 1) / PD, pad_j = J * PD - columns;
+        const potal_paired_cmd_record words[] = {
+            {9, 0, pad_j << 16, (uint64_t(next.k_tiles) << 32) | (J << 16) | 1},
+            {10, 0, 0, reinterpret_cast<uintptr_t>(f.weight.b) + next.k_begin * f.weight.ldb + j_begin},
+            {11, 0, 0, 0}, {12, 0, 0, f.weight.ldb}, {13, 0, 0, 0},
+            {29, 1, UINT64_C(0x10) | pair, 0}, {POTAL_FUNCT_FENCE, 1, 0, 0},
+        };
+        for (size_t w = 0; w < 7; ++w) {
+            const auto & got = early_emu.records[i + 1 + w];
+            order = order && got.funct == words[w].funct && got.xd == words[w].xd &&
+                    got.rs1 == words[w].rs1 && got.rs2 == words[w].rs2;
+        }
+        ++seen_admissions;
+    }
+    check("G Main immediately followed by exact next-B words and checked Fence before consumers",
+          order && seen_admissions == admissions && main_ordinal == e.main_loop_ws);
+    if (early.report.tile.k_panels > 2)
+        check("G multi-K admission uses both opposite pairs", pair_seen[0] && pair_seen[1]);
+
+    // Remove only the proven extra descriptor/Fence; relocate owned DMA
+    // buffers and restore the already-checked suppressed Main B address.
+    // Every old Fence/Release and Main/Residual word must remain in order.
+    const auto canonical = [&](const h2_emulator & emulator, const run_result & result, bool enabled) {
+        std::vector<potal_paired_cmd_record> records;
+        uint64_t staging = UINT64_MAX;
+        for (size_t i = 0; i + 4 < emulator.records.size(); ++i)
+            if (emulator.records[i].funct == POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB &&
+                emulator.records[i + 4].funct == POTAL_FUNCT_LOOP_WS &&
+                (emulator.records[i + 4].rs1 >> 62 & 1))
+                staging = std::min(staging, emulator.records[i].rs1);
+        const uint64_t cm = reinterpret_cast<uintptr_t>(result.c_main.get());
+        const uint64_t cr = reinterpret_cast<uintptr_t>(result.c_res.get());
+        const uint64_t main_bytes = align_up(rows, PD) * align_up(f.N, PD) * sizeof(int32_t);
+        size_t main_index = 0;
+        for (size_t i = 0; i < emulator.records.size(); ++i) {
+            auto record = emulator.records[i];
+            if (record.funct == POTAL_FUNCT_COUNTER) continue;
+            if (enabled && i + 6 < emulator.records.size() &&
+                record.funct == POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS &&
+                emulator.records[i + 5].funct == POTAL_FUNCT_LDB_ONLY) {
+                i += 6;
+                continue;
+            }
+            if (record.funct == POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB && i + 4 < emulator.records.size() &&
+                emulator.records[i + 4].funct == POTAL_FUNCT_LOOP_WS) {
+                if (emulator.records[i + 4].rs1 >> 62 & 1) record.rs1 -= staging;
+                else {
+                    const size_t panel = main_index % result.report.tile.k_panels;
+                    const size_t group = main_index++ / result.report.tile.k_panels;
+                    const uint64_t real_b = reinterpret_cast<uintptr_t>(f.weight.b) +
+                        result.report.tile.panels[panel].k_begin * f.weight.ldb +
+                        group * result.report.tile.tile_J * PD;
+                    order = order && record.rs2 == (enabled && panel ? 0 : real_b);
+                    record.rs2 = real_b;
+                }
+            }
+            if (record.funct == POTAL_FUNCT_MVOUT)
+                record.rs1 = record.rs1 >= cm && record.rs1 < cm + main_bytes ?
+                             record.rs1 - cm : (UINT64_C(1) << 63) | (record.rs1 - cr);
+            records.push_back(record);
+        }
+        return records;
+    };
+    const auto old_words = canonical(baseline_emu, baseline, false);
+    const auto new_words = canonical(early_emu, early, true);
+    bool identical = old_words.size() == new_words.size();
+    for (size_t i = 0; identical && i < old_words.size(); ++i)
+        identical = old_words[i].funct == new_words[i].funct && old_words[i].xd == new_words[i].xd &&
+                    old_words[i].rs1 == new_words[i].rs1 && old_words[i].rs2 == new_words[i].rs2;
+    check("G every old command retained, original Main order and exact real/resident B identity", order && identical);
+    check("G software-only emulator has no Scale misses or unknown commands; session ends idle",
+          early_emu.errors.empty() && baseline_emu.errors.empty() && !early_emu.scale_miss &&
+          !baseline_emu.scale_miss && !early.session.failed && !early.session.live_scale_slots &&
+          !early.session.outstanding_loops && !early.session.outstanding_readbacks &&
+          !early.session.index_transaction_open && !early.report.fatal);
+}
+
+void test_early_emulator() {
+    if (PD != 32) return;
+    for (uint32_t pair : {0u, 1u}) {
+        h2_emulator e;
+        const uint32_t K = pair ? 1 : 2, J = 2, pad_j = 5;
+        const size_t stride = 3 * PD;
+        std::unique_ptr<int8_t, dma_deleter> source(static_cast<int8_t *>(dma_alloc(2 * PD * stride)));
+        check("G emulator source allocation", source != nullptr);
+        if (!source) return;
+        for (size_t i = 0; i < 2 * PD * stride; ++i) source.get()[i] = int8_t(int(i % 251) - 125);
+        std::fill(e.sp.begin(), e.sp.end(), int8_t(91));
+        std::fill(e.acc.begin(), e.acc.end(), -1234567);
+        e.scales[3][2] = {true, 9, 17};
+        e.tables[0].configured = true;
+        e.tables[0].b_base = 123;
+        e.tables[0].entry = {2, 7};
+        e.tables[0].valid = {1, 1};
+        e.selected_table = 1;
+        e.ld_config[1] = (uint64_t(PD) << 16) | UINT64_C(0x109);
+        e.ld_stride[1] = stride;
+        const auto old_sp = e.sp;
+        const auto old_acc = e.acc;
+        const potal_paired_cmd_record words[] = {
+            {9, 0, uint64_t(pad_j) << 16, (uint64_t(K) << 32) | (uint64_t(J) << 16) | 1},
+            {10, 0, 0, reinterpret_cast<uintptr_t>(source.get())},
+            {11, 0, 0, 0}, {12, 0, 0, stride}, {13, 0, 0, 0},
+            {29, 1, UINT64_C(0x10) | pair, 0},
+        };
+        bool accepted = true;
+        for (const auto & word : words) accepted = accepted && e.command(word) == POTAL_OK;
+        const size_t first = (2 * pair + 2) * POTAL_HW_BANK_ROWS - K * J * PD;
+        bool bytes = accepted;
+        for (size_t row = 0; row < h2_emulator::sp_rows; ++row) for (size_t col = 0; col < PD; ++col) {
+            int8_t want = old_sp[row * PD + col];
+            const bool loaded = row >= first && row < first + K * J * PD;
+            if (loaded) {
+                const size_t tile = (row - first) / PD;
+                const size_t k = tile / J * PD + (row - first) % PD;
+                const size_t j = tile % J * PD + col;
+                want = j < J * PD - pad_j ? source.get()[k * stride + j] : 0;
+            }
+            bytes = bytes && e.sp[row * PD + col] == want &&
+                    e.sp_written[row] == (loaded ? UINT64_C(0xffffffff) : 0);
+        }
+        bool metadata = e.tables[0].configured && e.tables[0].b_base == 123 &&
+                        e.tables[0].entry == std::vector<uint32_t>({2, 7}) &&
+                        e.tables[0].valid == std::vector<uint8_t>({1, 1}) &&
+                        !e.tables[1].configured && e.selected_table == 1;
+        for (size_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) for (size_t col = 0; col < PD; ++col) {
+            const auto & scale = e.scales[slot][col];
+            metadata = metadata && scale.valid == (slot == 3 && col == 2);
+            if (scale.valid) metadata = metadata && scale.generation == 9 && scale.carrier == 17;
+        }
+        check("G emulator both pairs and K/J tails copy only independently addressed B", bytes);
+        check("G load-only has no A/ACC/Execute/Scale/Index effects",
+              e.acc == old_acc && metadata && !e.main_loops && !e.residual_loops &&
+              !e.index_configs && !e.index_writes && !e.scale_writes && !e.scale_releases &&
+              !e.mvouts && !e.raw_b_mvins && !e.b_loads && e.ldb_only_loads == 1 &&
+              e.ld_config[0] == 0 && e.ld_stride[0] == 0 && e.st_stride == 0 && e.errors.empty());
+    }
+}
+
+struct early_failure_sink {
+    h2_emulator emulator;
+    size_t position = 0, seen = 0, failed_at = 0;
+    bool armed = false;
+
+    static potal_status counter(void *ctx, const potal_paired_cmd_record *record, uint64_t *value) {
+        return h2_emulator::on_counter(&static_cast<early_failure_sink *>(ctx)->emulator, record, value);
+    }
+    static potal_status command(void *ctx, const potal_paired_cmd_record *record) {
+        auto & s = *static_cast<early_failure_sink *>(ctx);
+        if (s.armed && ++s.seen == s.position) {
+            s.armed = false;
+            s.failed_at = s.emulator.records.size();
+            s.emulator.records.push_back(*record);
+            return POTAL_HW_INVALID_ADDRESS;
+        }
+        const auto status = s.emulator.command(*record);
+        if (record->funct == POTAL_FUNCT_LOOP_WS && !(record->rs1 >> 62 & 1)) s.armed = true;
+        return status;
+    }
+};
+
+void early_execution_failure(size_t position) {
+    const int before = g_failures;
+    paired_fixture f(65, 97, 2080, 129, [](size_t, size_t n) { return int16_t(n % 3); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool fixture = f.ok && potal_frozen_plan(f.M, f.N, f.K, 2, 2, 4, PPB, &main) == POTAL_OK &&
+                         make_inputs(f, main.tile_I * PD, within_k(dense_entries(11, 97, 120), f.K), in);
+    check("G execution failure fixture", fixture);
+    if (!fixture) return;
+    early_failure_sink failure;
+    failure.position = position;
+    const potal_paired_sink sink = {early_failure_sink::command, &failure};
+    const run_result r = run_paired(f, main, in, failure.emulator, true, 250, false, &sink, 1,
+                                   nullptr, true, true, early_failure_sink::counter);
+    const auto & records = failure.emulator.records;
+    check("G answered early failure stops executor before future compute without fallback",
+          r.status == potal_paired_status::execution_failed && r.report.hw_status == POTAL_HW_INVALID_ADDRESS &&
+          failure.emulator.main_loops == 1 && failure.emulator.residual_loops == 0 &&
+          r.main_c.empty() && r.residual_c.empty());
+    check("G reports descriptor admissions separately from zero raw MVIN attempts",
+          r.report.counts.prefetch_mvins == 0 && r.report.counts.prefetch_ldb_only == (position >= 6 ? 1u : 0u));
+    if (position < 7) {
+        check("G partial staging/run gets exactly one cleanup Fence then actual live Releases",
+              r.report.cleaned && !r.report.fatal && r.session.failed &&
+              !r.session.outstanding_loops && !r.session.live_scale_slots &&
+              failure.failed_at + 1 < records.size() &&
+              records[failure.failed_at + 1].funct == POTAL_FUNCT_FENCE &&
+              std::count_if(records.begin() + failure.failed_at + 1, records.end(),
+                  [](const potal_paired_cmd_record & record) { return record.funct == POTAL_FUNCT_FENCE; }) == 1);
+    } else {
+        check("G failed extra Fence quarantines with no cleanup or retried Fence",
+              r.report.fatal && !r.report.cleaned && r.session.failed &&
+              failure.failed_at + 1 == records.size() && records.back().funct == POTAL_FUNCT_FENCE);
+        potal_paired_session *other = nullptr;
+        check("G failed extra Fence retains global owner", potal_paired_session_open(&sink, &other) == POTAL_ERR_BUSY);
+        std::fflush(nullptr);
+        _exit(g_failures == before ? 0 : 1); // Borrowed A/B and sink remain alive through process exit.
+    }
+}
+
+void test_early_execution_failures() {
+    if (PD != 32) return;
+    for (size_t position = 1; position <= 6; ++position) early_execution_failure(position);
+    // Unknown completion is terminal. Keep its immutable tensors and session
+    // alive until process exit, never poison the suite's next issuer.
+    std::fflush(nullptr);
+    const int before = g_failures;
+    const pid_t child = fork();
+    if (child == 0) {
+        early_execution_failure(7);
+        std::fflush(nullptr);
+        _exit(g_failures == before ? 0 : 1);
+    }
+    check("G extra Fence failure forked", child >= 0);
+    if (child >= 0) {
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+        check("G extra Fence failure isolated", result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+}
+
+void test_early_saturation() {
+    if (PD != 32) return;
+    // Four shifted positive/negative DIM partials saturate repeatedly.
+    // The last unshifted block reverses sign after a K-panel boundary.
+    paired_fixture f(33, 35, 160, 137,
+        [](size_t block, size_t) { return int16_t(block < 4 ? 16 : 0); },
+        [](size_t k, size_t, std::mt19937 &) { return int8_t(k < 128 ? 127 : -1); },
+        [](size_t row, size_t, std::mt19937 &) { return int8_t(row == 0 ? 127 : -128); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const entries_fn entries = [](size_t, size_t rows) {
+        std::vector<res_entry> result;
+        for (size_t k = 0; k < 160; ++k) {
+            result.push_back({0, k, 127});
+            if (rows > 1) result.push_back({rows - 1, k, -128});
+        }
+        return result;
+    };
+    const bool fixture = f.ok && potal_frozen_plan(f.M, f.N, f.K, 2, 2, 2, PPB, &main) == POTAL_OK &&
+                         make_inputs(f, main.tile_I * PD, entries, in);
+    check("G saturation/reversal fixture with I/J/K tails", fixture);
+    if (!fixture) return;
+    const auto golden = golden_of(f, main.tile_I * PD, in);
+    check("G independent signed saturation reverses at final panel",
+          golden.ok && golden.main_c[0] == INT32_MAX - 4064 &&
+          golden.main_c[32 * f.N] == INT32_MIN + 4096 &&
+          golden.residual[0].size() == 2 &&
+          golden.residual[0][0].c[0] == INT32_MAX - 4064 &&
+          golden.residual[0][1].c[0] == INT32_MIN + 4096);
+    h2_emulator emulator;
+    const auto baseline = run_paired(f, main, in, emulator);
+    check("G saturation manifest keeps three K panels", baseline.status == potal_paired_status::ok &&
+          baseline.report.tile.k_panels == 3 && baseline.report.tile.panels.back().k_tiles == 1);
+    if (baseline.status == potal_paired_status::ok) test_early_case(f, main, in, baseline.report.plan);
+}
+
+void test_early_request_refusals() {
+    paired_fixture f(1, 32, 64, 141, [](size_t, size_t) { return int16_t(0); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool fixture = f.ok && main_select_ok(f, main) && make_inputs(f, main.tile_I * PD, {}, in);
+    check("G early request refusal fixture", fixture);
+    if (!fixture) return;
+    for (uint32_t kind = 0; kind < 3; ++kind) {
+        h2_emulator emulator;
+        emulator.ldb_only_capability = 0; // Ordinary old image, not a new instruction response.
+        const auto result = run_paired(f, main, in, emulator, true, 0, false, nullptr,
+                                       kind == 1 ? 0 : 1, nullptr, kind != 0, true);
+        if (kind == 2 && PD == 32) {
+            check("G executor old-image refusal before new op or compute",
+                  result.status == potal_paired_status::execution_failed &&
+                  result.report.hw_status == POTAL_ERR_UNSUPPORTED && !result.report.fatal &&
+                  count_funct(emulator, POTAL_FUNCT_COUNTER) == 2 &&
+                  count_funct(emulator, POTAL_FUNCT_LDB_ONLY) == 0 &&
+                  count_funct(emulator, POTAL_FUNCT_LOOP_WS) == 0 &&
+                  emulator.raw_b_mvins == 0);
+        } else {
+            check("G early requires DIM32, next-K and Ktile before commands",
+                  result.status == potal_paired_status::invalid_argument &&
+                  result.report.hw_status == POTAL_ERR_UNSUPPORTED && !result.report.issued &&
+                  !result.report.fatal && emulator.records.empty());
+        }
     }
 }
 
@@ -655,6 +1024,7 @@ void test_ktile_scale_reuse() {
               prefetched.report.counts.scale_writes == reused.report.counts.scale_writes &&
               prefetched.report.counts.scale_releases == reused.report.counts.scale_releases &&
               prefetched.session.drains == reused.session.drains);
+        test_early_case(f, main, in, plan);
 
 #if !defined(__riscv)
         potal_paired_request unavailable;
@@ -1628,7 +1998,7 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 // 4 paired with conservative fences.
 pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
                      const std::function<void(const potal_paired_request &)> & inspect = {}, bool ktile = false,
-                     bool prefetch = false) {
+                     bool prefetch = false, bool early = false) {
     pipe_result         r;
     ggml_gemmini_args_t args;
     if (!nd.args_for(args)) {
@@ -1646,6 +2016,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
     cfg.paired_conservative_fences = mode == 4;
     cfg.paired_ktile_scale_reuse = ktile;
     cfg.paired_next_k_prefetch = prefetch;
+    cfg.paired_early_k_prefetch = early;
     cfg.layer        = "paired-pipeline-test";
     cfg.backend      = "EMULATED";
     cfg.observer     = [&](const stripe_event & ev) {
@@ -1671,6 +2042,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
             }
             potal_paired_request q = req;
             q.generation           = &generation;
+            if (q.early_k_prefetch) q.early_counter = h2_emulator::on_counter;
             fences_seen            = fences_seen || q.conservative_fences;
             const potal_paired_sink sink = h2.sink();
             return potal_paired_run_session(q, &sink, rep);
@@ -1777,6 +2149,28 @@ void test_ktile_pipeline() {
     }
     if (had_prefetch) setenv("GGML_POTAL_PAIRED_PREFETCH", saved_prefetch.c_str(), 1);
     else unsetenv("GGML_POTAL_PAIRED_PREFETCH");
+    check("G early request, callback and pipeline default off",
+          !potal_paired_request{}.early_k_prefetch && potal_paired_request{}.early_counter == nullptr &&
+          !pipeline_config{}.paired_early_k_prefetch);
+    const char * previous_early = std::getenv("GGML_POTAL_PAIRED_EARLY_PREFETCH");
+    const bool had_early = previous_early != nullptr;
+    const std::string saved_early = had_early ? previous_early : "";
+    unsetenv("GGML_POTAL_PAIRED_EARLY_PREFETCH");
+    invalid = true;
+    check("G unset early prefetch stays off and clears invalid",
+          !options::paired_early_prefetch_requested(&invalid) && !invalid);
+    for (const char * value : {"ON", "on", "On", "1", "OFF", "off", "OfF", "0", "", "true", "ONx", "2", " ON"}) {
+        setenv("GGML_POTAL_PAIRED_EARLY_PREFETCH", value, 1);
+        invalid = true;
+        const bool enabled = options::paired_early_prefetch_requested(&invalid);
+        const bool expected = std::strcmp(value, "ON") == 0 || std::strcmp(value, "on") == 0 ||
+                              std::strcmp(value, "On") == 0 || std::strcmp(value, "1") == 0;
+        const bool bad = std::strcmp(value, "true") == 0 || std::strcmp(value, "ONx") == 0 ||
+                         std::strcmp(value, "2") == 0 || std::strcmp(value, " ON") == 0;
+        check(std::string("G early prefetch parser '") + value + "'", enabled == expected && invalid == bad);
+    }
+    if (had_early) setenv("GGML_POTAL_PAIRED_EARLY_PREFETCH", saved_early.c_str(), 1);
+    else unsetenv("GGML_POTAL_PAIRED_EARLY_PREFETCH");
     if (!options::compensation || options::activation_quant != options::ActivationQuantAlgo::EXSIA) {
         std::printf("  R pipeline skipped: needs EXSIA and RMD\n");
         return;
@@ -1795,6 +2189,12 @@ void test_ktile_pipeline() {
           no_commands(run_pipe(nd, 1, 1, {}, false, true)));
     check("D2 prefetch without paired refuses before commands",
           no_commands(run_pipe(nd, 1, 0, {}, true, true)));
+    check("G early without next-K prefetch refuses before commands",
+          no_commands(run_pipe(nd, 1, 1, {}, true, false, true)));
+    check("G early without Ktile refuses before commands",
+          no_commands(run_pipe(nd, 1, 1, {}, false, true, true)));
+    check("G early without paired refuses before commands",
+          no_commands(run_pipe(nd, 1, 0, {}, true, true, true)));
     bool propagated = true;
     const pipe_result opt = run_pipe(nd, 1, 1, [&](const potal_paired_request & q) {
         propagated = propagated && q.ktile_scale_reuse;
@@ -1802,11 +2202,12 @@ void test_ktile_pipeline() {
     if (PD == 16) {
         check("R DIM16 Ktile pipeline refuses before commands", no_commands(opt));
         check("D2 DIM16 prefetch refuses without fallback", no_commands(run_pipe(nd, 1, 1, {}, true, true)));
+        check("G DIM16 early refuses without fallback", no_commands(run_pipe(nd, 1, 1, {}, true, true, true)));
         return;
     }
     bool default_off = true;
     const pipe_result normal = run_pipe(nd, 1, 1, [&](const potal_paired_request & q) {
-        default_off = default_off && !q.ktile_scale_reuse;
+        default_off = default_off && !q.ktile_scale_reuse && !q.early_k_prefetch && q.early_counter == nullptr;
     });
     check("R pipeline propagates opt only, preserves output and never falls back",
           propagated && default_off && normal.report.ok && opt.report.ok &&
@@ -1820,6 +2221,30 @@ void test_ktile_pipeline() {
           prefetch_propagated && prefetched.report.ok && prefetched.h2_errors.empty() &&
           prefetched.paired_calls == nd.stripes() && prefetched.out == opt.out &&
           prefetched.report.counts.paired_fallback_stripes == 0 && prefetched.planned_commands.empty());
+    pipe_node early_node(65, 97, 2080, 129, 60.0f, 4, 1);
+    check("G multi-K pipeline fixture", early_node.ok);
+    if (!early_node.ok) return;
+    const pipe_result early_baseline = run_pipe(early_node, 1, 1, {}, true);
+    bool early_propagated = true;
+    const pipe_result early = run_pipe(early_node, 1, 1, [&](const potal_paired_request & q) {
+        early_propagated = early_propagated && q.ktile_scale_reuse && q.next_k_prefetch &&
+                           q.early_k_prefetch && q.early_counter == nullptr;
+    }, true, true, true);
+    check("G pipeline propagates early only, preserves exact F32, never falls back",
+          early_propagated && early_baseline.report.ok && early.report.ok && early.h2_errors.empty() &&
+          early.paired_calls == early_node.stripes() && same_bits(early.out, early_baseline.out) &&
+          early.report.counts.paired_fallback_stripes == 0 && early.planned_commands.empty());
+    check("G pipeline aggregates CPU admissions, zero raw MVINs and only extra checked drains",
+          early.report.counts.paired_prefetch_loads > 0 &&
+          early.report.counts.paired_prefetch_ldb_only == early.report.counts.paired_prefetch_loads &&
+          early.report.counts.paired_prefetch_mvins == 0 &&
+          early.report.counts.paired_fences == early_baseline.report.counts.paired_fences +
+              early.report.counts.paired_prefetch_ldb_only &&
+          early.report.counts.paired_drains == early_baseline.report.counts.paired_drains +
+              early.report.counts.paired_prefetch_ldb_only &&
+          early.report.counts.paired_main_prefetch_issue_s >= 0 &&
+          early.report.counts.paired_main_prefetch_issue_s <= early.report.counts.issue_s &&
+          early.report.counts.paired_residual_prefetch_issue_s == 0);
     pipe_node dense(96, 96, 256, 43, 3000.0f, 1, 6);
     check("R Ktile capacity fixture", dense.ok);
     if (dense.ok) {
@@ -2069,6 +2494,10 @@ int main() {
     test_translation();
     test_staging();
     test_numerics();
+    test_early_emulator();
+    test_early_execution_failures();
+    test_early_saturation();
+    test_early_request_refusals();
     test_pairs_and_generations();
     test_ktile_scale_reuse();
     test_failures();

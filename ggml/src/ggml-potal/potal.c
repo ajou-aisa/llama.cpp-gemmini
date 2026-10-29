@@ -1022,6 +1022,9 @@ typedef struct h2_state {
     potal_h2_status status;
     uint64_t owner, sequence;
     int in_call, started, program_pending;
+    int completion_certified;        /* no managed effect since successful reconciliation */
+    uint64_t completion_start_drains;
+    int early_trace_active;
     uint32_t acc_written;            /* ACC contents survive panel retirement */
     h2_panel_state panel[POTAL_PAIRS];
 } h2_state;
@@ -1032,6 +1035,7 @@ struct potal_paired_session {
     h2_state         *h2;                  /* mutually exclusive managed DIM32 mode */
     potal_observation_counter_fn observation_counter;
     int observation_active, observation_in_call;
+    uint64_t observation_b0_base;          /* retained across the early capability counter0 probe */
     int               failed;
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
@@ -1061,6 +1065,7 @@ static potal_status h2_cleanup(potal_paired_session *s);
 static int h2_pending(const potal_paired_session *s);
 
 static potal_status paired_fail(potal_paired_session *s, potal_status status, const char *stage) {
+    if (s->h2) s->h2->completion_certified = 0;
     if (!s->failed) {
         s->failed = 1;
         s->error = status;
@@ -1088,6 +1093,12 @@ static int paired_can_issue(const potal_paired_session *s) {
  * hardware. xd commands return the hardware status; the others POTAL_OK.
  */
 static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct, uint64_t rs1, uint64_t rs2, int xd) {
+    /* Invalidate BEFORE dispatch, including partially issued/failed commands.
+     * A Release still checks its own live generation and hardware response;
+     * its live-bit clear does not change the H2 publication/readers state.
+     * Fence and Release never create a certificate until successful drain. */
+    if (s->h2 && funct != POTAL_FUNCT_FENCE && funct != POTAL_FUNCT_SCALE_RELEASE)
+        s->h2->completion_certified = 0;
     s->commands++;
     if (s->sink.cmd != NULL) {
         const potal_paired_cmd_record rec = { funct, (uint32_t)xd, rs1, rs2 };
@@ -1108,6 +1119,7 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
             if (xd) return hw_status(potal_rocc_resident_loop_ws(rs1, rs2));
             potal_rocc_loop_ws(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_RESIDENT_VIEW:             return hw_status(potal_rocc_resident_view(rs1, rs2));
+        case POTAL_FUNCT_LDB_ONLY:                  return hw_status(potal_rocc_ldb_only(rs1, rs2));
         case POTAL_FUNCT_MVOUT:                     potal_rocc_mvout(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_MVIN:                      potal_rocc_mvin(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_FLUSH:                     potal_rocc_flush(rs1, rs2); return POTAL_OK;
@@ -1728,6 +1740,12 @@ static void h2_completed(potal_paired_session *s) {
 #if defined(__riscv)
     potal_cpu_fence_rw();
 #endif
+    /* Keep every CPU visibility fence, even when only host stores repeat.
+     * Failure/cleanup cannot reuse a healthy publication certificate. */
+    if (h->status.completion_reuse && h->completion_certified && !s->failed) {
+        h->status.completion_reuses++;
+        return;
+    }
     for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair) {
         h2_panel_state *p = &h->panel[pair];
         if (p->status.loading) {
@@ -1749,6 +1767,7 @@ static void h2_completed(potal_paired_session *s) {
     h->status.control_pending = 0;
     h->status.last_drain = POTAL_OK;
     h->program_pending = 0;
+    h->completion_certified = !s->failed;
 }
 
 potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weight *w) {
@@ -1774,6 +1793,9 @@ potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weigh
     h2_state *h = calloc(1, sizeof(*h));
     if (!h) return POTAL_ERR_CAPACITY;
     h->weight = *w;
+    h->completion_start_drains = s->drains;
+    const char *completion_reuse = getenv("POTAL_H2_COMPLETION_REUSE");
+    h->status.completion_reuse = completion_reuse && strcmp(completion_reuse, "1") == 0;
 #if defined(__riscv)
     /* Publish the entire immutable borrowed B allocation while idle.
      * Rocket stalls a CPU fence on RoCC busy; repeating it at prefetch
@@ -1852,6 +1874,36 @@ static potal_status h2_issue_prefetch(potal_paired_session *s, h2_panel_state *p
     return POTAL_OK;
 }
 
+static potal_status h2_early_check(const potal_paired_session *s, const potal_h2_panel *d) {
+    const h2_panel_state *current = &s->h2->panel[1 - d->pair];
+    if (!current->status.declared || current->status.readers_issued != 1 ||
+        s->pair[1 - d->pair].outstanding != 1)
+        return POTAL_ERR_BUSY;
+    const potal_h2_panel *c = &current->declaration;
+    if (d->j_begin != c->j_begin || d->j_tiles != c->j_tiles || d->pad_j != c->pad_j ||
+        d->k_begin != c->k_begin + (uint64_t)c->k_tiles * POTAL_HW_DIM)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    return POTAL_OK;
+}
+
+static potal_status h2_issue_ldb_only(potal_paired_session *s, h2_panel_state *p) {
+    h2_state *h = s->h2;
+    const potal_h2_panel *d = &p->declaration;
+    p->status.prefetched = 1;
+    p->status.loading = 1;
+    h->status.pending_b = 1; /* Own every staging word, not just accepted admission. */
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS, (uint64_t)d->pad_j << 16,
+        ((uint64_t)d->k_tiles << 32) | ((uint64_t)d->j_tiles << 16) | 1, 0, "h2_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB, 0, (uintptr_t)p->source, 0, "h2_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC, 0, 0, 0, "h2_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB, 0, h->weight.ldb, 0, "h2_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC, 0, 0, 0, "h2_ldb_only");
+    h->status.attempted_ldb_only++;
+    PAIRED_RAW(s, POTAL_FUNCT_LDB_ONLY, UINT64_C(0x10) | d->pair, 0, 1, "h2_ldb_only");
+    p->load_issued = 1; /* Admission is not publication; Fence/Release still owns it. */
+    return POTAL_OK;
+}
+
 potal_status potal_paired_h2_panel_begin(potal_paired_session *s,
     const potal_h2_panel *d, uint32_t prefetch, potal_h2_ref *reference) {
     potal_status status = h2_ready(s);
@@ -1874,7 +1926,13 @@ potal_status potal_paired_h2_panel_begin(potal_paired_session *s,
             UINT64_MAX - (uint64_t)d->k_tiles * d->j_tiles))
         return POTAL_ERR_CAPACITY;
     if (prefetch && !paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    if (prefetch && h->status.early_prefetch) {
+        status = h2_early_check(s, d);
+        if (status != POTAL_OK) return status;
+        if (h->status.attempted_ldb_only == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    }
     h2_panel_state *p = &h->panel[d->pair];
+    h->completion_certified = 0; /* a fresh software generation, even without DMA */
     memset(p, 0, sizeof(*p));
     p->declaration = *d;
     p->source = source;
@@ -1886,7 +1944,7 @@ potal_status potal_paired_h2_panel_begin(potal_paired_session *s,
     h->started = 1;
     *reference = p->status.ref; /* Even an interrupted load has an owned identity. */
     if (!prefetch) return POTAL_OK;
-    return h2_issue_prefetch(s, p);
+    return h->status.early_prefetch ? h2_issue_ldb_only(s, p) : h2_issue_prefetch(s, p);
 }
 
 potal_status potal_paired_h2_panel_prefetch(potal_paired_session *s, potal_h2_ref reference) {
@@ -1902,6 +1960,12 @@ potal_status potal_paired_h2_panel_prefetch(potal_paired_session *s, potal_h2_re
     if (h->status.attempted_b_mvins >
         UINT64_MAX - (uint64_t)p->declaration.k_tiles * p->declaration.j_tiles)
         return POTAL_ERR_CAPACITY;
+    if (h->status.early_prefetch) {
+        const potal_status early = h2_early_check(s, &p->declaration);
+        if (early != POTAL_OK) return early;
+        if (h->status.attempted_ldb_only == UINT64_MAX) return POTAL_ERR_CAPACITY;
+        return h2_issue_ldb_only(s, p);
+    }
     return h2_issue_prefetch(s, p);
 }
 
@@ -1995,6 +2059,7 @@ potal_status potal_paired_h2_panel_retire(potal_paired_session *s, potal_h2_ref 
         p->status.readers_completed != p->declaration.readers || h2_pending(s) ||
         s->index_open || h2_live_scales(s))
         return POTAL_ERR_BUSY;
+    s->h2->completion_certified = 0; /* retirement changes publication identity */
     memset(&s->pair[reference.pair], 0, sizeof(s->pair[reference.pair]));
     memset(p, 0, sizeof(*p)); /* No ACC clear: the caller owns the accumulator manifest. */
     return POTAL_OK;
@@ -2007,6 +2072,11 @@ potal_h2_status potal_paired_h2_query(const potal_paired_session *s) {
     if (s && s->h2) {
         q = s->h2->status;
         q.core = potal_paired_session_query(s);
+        q.completion_calls = q.core.drains - s->h2->completion_start_drains;
+        q.completion_bookkeeping = q.completion_calls - q.completion_reuses;
+#if defined(__riscv)
+        q.completion_cpu_fences = q.completion_calls;
+#endif
         for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair) {
             q.panel[pair] = s->h2->panel[pair].status;
             q.source_pending |= q.panel[pair].loading;
@@ -2108,6 +2178,70 @@ static potal_status observation_counter(potal_paired_session *s, uint64_t rs1, u
     return status == POTAL_OK ? status : paired_fail(s, status, "observation_counter");
 }
 
+potal_status potal_paired_h2_early_enable(potal_paired_session *s,
+    potal_observation_counter_fn counter) {
+    potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    if (s->h2->started || s->h2->status.early_prefetch || h2_pending(s) ||
+        s->index_open || h2_live_scales(s))
+        return POTAL_ERR_BUSY;
+    if (!!s->sink.cmd != !!counter) return POTAL_ERR_INVALID_ARGUMENT;
+    s->observation_counter = counter;
+    uint64_t value = 0;
+    if (s->observation_active) {
+        status = observation_counter(s, 0, &value);
+        if (status != POTAL_OK) return status;
+        s->observation_b0_base += value;
+    }
+    status = observation_counter(s, UINT64_C(0xA), &value);
+    if (status == POTAL_OK) status = observation_counter(s, POTAL_LDB_ONLY_TAG, &value);
+    if (status != POTAL_OK) return status;
+    const uint64_t capability = value;
+    if (s->observation_active) {
+        /* The safe legacy probe resets counter0 and selects event NONE.
+         * No work is outstanding here; restore the owned B0 event and retain
+         * its measured prefix even when the new capability is unsupported. */
+        status = observation_counter(s, (UINT64_C(45) << 12) | 8, &value);
+        if (status != POTAL_OK) return status;
+    }
+    if (capability != POTAL_LDB_ONLY_CAPABILITY) return POTAL_ERR_UNSUPPORTED;
+    s->h2->completion_certified = 0;
+    s->h2->status.early_prefetch = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_h2_early_trace_begin(potal_paired_session *s) {
+    potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!s->h2->status.early_prefetch) return POTAL_ERR_UNSUPPORTED;
+    if (s->h2->early_trace_active || h2_pending(s) || s->index_open) return POTAL_ERR_BUSY;
+    uint64_t accepted = 0;
+    status = observation_counter(s, POTAL_LDB_ONLY_TRACE_RESET, &accepted);
+    if (status != POTAL_OK) return status;
+    if (accepted == 0) return POTAL_ERR_BUSY;
+    if (accepted != 1) return paired_fail(s, POTAL_ERR_BAD_RESPONSE, "h2_early_trace");
+    s->h2->early_trace_active = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_h2_early_trace_end(potal_paired_session *s,
+    uint64_t values[POTAL_LDB_ONLY_TRACE_FIELDS]) {
+    potal_status status = h2_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!values || !s->h2->early_trace_active) return POTAL_ERR_INVALID_ARGUMENT;
+    if (h2_pending(s)) return POTAL_ERR_BUSY;
+    uint64_t snapshot[POTAL_LDB_ONLY_TRACE_FIELDS];
+    for (uint32_t i = 0; i < POTAL_LDB_ONLY_TRACE_FIELDS; ++i) {
+        status = observation_counter(s, POTAL_LDB_ONLY_TRACE_READ + i, &snapshot[i]);
+        if (status != POTAL_OK) return status;
+    }
+    if ((snapshot[0] & 3) || !(snapshot[0] & (UINT64_C(1) << 14)))
+        return paired_fail(s, POTAL_ERR_BAD_RESPONSE, "h2_early_trace");
+    memcpy(values, snapshot, sizeof(snapshot));
+    s->h2->early_trace_active = 0;
+    return POTAL_OK;
+}
+
 potal_status potal_paired_observation_begin(potal_paired_session *s,
     potal_observation_counter_fn counter) {
     potal_status status = paired_ready(s);
@@ -2127,7 +2261,10 @@ potal_status potal_paired_observation_begin(potal_paired_session *s,
         if (status != POTAL_OK) return status;
     }
     status = observation_counter(s, 1, &value);
-    if (status == POTAL_OK) s->observation_active = 1;
+    if (status == POTAL_OK) {
+        s->observation_b0_base = 0;
+        s->observation_active = 1;
+    }
     return status;
 }
 
@@ -2143,6 +2280,7 @@ potal_status potal_paired_observation_end(potal_paired_session *s, uint64_t cycl
         status = observation_counter(s, i << 4, &values[i]);
     if (status == POTAL_OK) status = observation_counter(s, 2, &ignored);
     if (status != POTAL_OK) return status;
+    values[0] += s->observation_b0_base; /* same unsigned wrap semantics as the hardware counter */
     memcpy(cycles, values, sizeof(values));
     s->observation_active = 0;
     return POTAL_OK;

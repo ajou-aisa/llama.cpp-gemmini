@@ -11,6 +11,7 @@
  */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__unix__)
 #include <errno.h>
@@ -1031,6 +1032,8 @@ typedef struct managed_sink_state {
     potal_paired_session *session;
     uint32_t fail_at;               /* absolute command number; also injects CONFIG failures */
     uint32_t reenter, pending_seen, readback_seen, control_seen, mvins, completed_mvins;
+    uint64_t early_capability;
+    uint32_t early_probes, early_words, early_target, early_trace_reads;
 } managed_sink_state;
 
 static potal_status managed_sink(void *ctx, const potal_paired_cmd_record *record) {
@@ -1041,6 +1044,18 @@ static potal_status managed_sink(void *ctx, const potal_paired_cmd_record *recor
     st->readback_seen |= q.core.outstanding_readbacks != 0;
     st->control_seen |= q.control_pending;
     if (record->funct == POTAL_FUNCT_MVIN) st->mvins++;
+    if (st->early_words) {
+        const potal_h2_panel_status *p = &q.panel[st->early_target];
+        check_u64("early ownership before every staging and run word",
+            q.pending_b && q.source_bound && q.source_pending &&
+            p->declared && p->prefetched && p->loading && !p->readable, 1);
+        check_u64("early admission has no reader or ACC work",
+            p->readers_issued | p->readers_completed | q.core.outstanding_readbacks |
+            q.core.outstanding_acc_updates, 0);
+        check_u64("early admission retains exactly current Main",
+            q.core.outstanding_loops, 1);
+        st->early_words--;
+    }
     if (st->reenter) {
         st->reenter = 0;
         potal_h2_ref ref = {0};
@@ -1068,6 +1083,36 @@ static potal_status managed_sink(void *ctx, const potal_paired_cmd_record *recor
         return POTAL_HW_INVALID_ADDRESS;
     }
     return result;
+}
+
+static potal_status managed_early_counter(void *ctx, const potal_paired_cmd_record *record,
+    uint64_t *value) {
+    managed_sink_state *st = ctx; /* The same borrowed context as managed_sink. */
+    check_u64("early probe uses bound session context",
+        potal_paired_h2_query(st->session).active, 1);
+    check_u64("early probe COUNTER126 xd1 rs2zero",
+        record->funct == POTAL_FUNCT_COUNTER && record->xd == 1 && !record->rs2, 1);
+    if (record->rs1 == POTAL_LDB_ONLY_TRACE_RESET ||
+        (record->rs1 >= POTAL_LDB_ONLY_TRACE_READ &&
+         record->rs1 < POTAL_LDB_ONLY_TRACE_READ + POTAL_LDB_ONLY_TRACE_FIELDS)) {
+        const potal_status status = sink_cmd(&st->trace, record);
+        if (record->rs1 == POTAL_LDB_ONLY_TRACE_RESET) *value = 1;
+        else {
+            const uint64_t field = record->rs1 - POTAL_LDB_ONLY_TRACE_READ;
+            /* Literal full-width callback data: protocol validation only,
+             * never native hardware timestamps or simulated physical events. */
+            *value = field ? UINT64_C(0x100000000) + field : UINT64_C(1) << 14;
+            st->early_trace_reads++;
+        }
+        return status;
+    }
+    check_u64("early safe setup then exact tagged query", record->rs1,
+        st->early_probes++ ? UINT64_C(0x504f4c4400000000) : UINT64_C(0xA));
+    check_status("early counter mutation excluded",
+        potal_paired_h2_early_enable(st->session, managed_early_counter), POTAL_ERR_BUSY);
+    const potal_status status = sink_cmd(&st->trace, record);
+    *value = record->rs1 == UINT64_C(0x504f4c4400000000) ? st->early_capability : 0;
+    return status;
 }
 
 static potal_h2_panel managed_panel(uint32_t pair, uint32_t readers) {
@@ -1145,6 +1190,73 @@ static void managed_program_equal(const sink_state *trace, uint32_t start,
         check_u64("managed only B address differs", got->funct == functs[i] && got->xd == 0 &&
             got->rs1 == expected[i].rs1 && got->rs2 == (suppress && i == 5 ? 0 : expected[i].rs2), 1);
     }
+}
+
+static void test_managed_completion(void) {
+    managed_sink_state st;
+    potal_paired_session *s = NULL;
+    memset(&st, 0, sizeof(st));
+    const potal_paired_sink sink = {managed_sink, &st};
+    const potal_h2_weight weight = managed_weight();
+    check_status("completion session open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+    check_status("completion older legacy drain", potal_paired_fence(s), POTAL_OK);
+    check_status("completion managed begin", potal_paired_h2_begin(s, &weight), POTAL_OK);
+    check_u64("completion excludes legacy drain", potal_paired_h2_query(s).completion_calls, 0);
+    st.trace.count = 0;
+    const char *requested = getenv("POTAL_H2_COMPLETION_REUSE");
+    const uint32_t reuse = requested && strcmp(requested, "1") == 0;
+    check_u64("completion mode matches independent requested value",
+        potal_paired_h2_query(s).completion_reuse, reuse);
+    check_status("completion initial certificate", potal_paired_fence(s), POTAL_OK);
+    check_status("completion repeated checked Fence", potal_paired_fence(s), POTAL_OK);
+    check_u64("completion unchanged reconciliation reused",
+        potal_paired_h2_query(s).completion_reuses, reuse);
+    check_status("completion Scale effect", potal_paired_scale_write(s, 20, 7, 0, 0), POTAL_OK);
+    check_status("completion second live column", potal_paired_scale_write(s, 20, 7, 1, 0), POTAL_OK);
+    check_status("completion Scale effect needs reconciliation", potal_paired_fence(s), POTAL_OK);
+    check_u64("completion Scale Write invalidates certificate",
+        potal_paired_h2_query(s).completion_reuses, reuse);
+    check_status("completion first checked Release", potal_paired_scale_release(s, 20, 7, 0), POTAL_OK);
+    check_status("completion second checked Release", potal_paired_scale_release(s, 20, 7, 1), POTAL_OK);
+    check_u64("completion both real Releases may reuse host state",
+        potal_paired_h2_query(s).completion_reuses, 3 * reuse);
+    check_status("completion new Scale generation", potal_paired_scale_write(s, 20, 8, 0, 0), POTAL_OK);
+    check_status("completion generation effect needs reconciliation", potal_paired_fence(s), POTAL_OK);
+    check_u64("completion new generation invalidates certificate",
+        potal_paired_h2_query(s).completion_reuses, 3 * reuse);
+    const uint32_t before = st.trace.count;
+    check_status("completion stale Release still rejected",
+        potal_paired_scale_release(s, 20, 7, 0), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("completion stale Release has no effects", st.trace.count, before);
+    check_status("completion matching Release", potal_paired_scale_release(s, 20, 8, 0), POTAL_OK);
+    check_status("completion final checked Fence", potal_paired_fence(s), POTAL_OK);
+    const potal_h2_status q = potal_paired_h2_query(s);
+    check_u64("completion all eight managed drain responses retained", q.completion_calls, 8);
+    check_u64("completion core also retains legacy drain", q.core.drains, 9);
+    check_u64("completion five redundant reconciliations", q.completion_reuses, 5 * reuse);
+    check_u64("completion bookkeeping count", q.completion_bookkeeping, 8 - 5 * reuse);
+#if defined(__riscv)
+    check_u64("completion CPU fences all retained", q.completion_cpu_fences, 8);
+#else
+    check_u64("completion native reports no CPU fences", q.completion_cpu_fences, 0);
+#endif
+    const uint32_t expected[] = {POTAL_FUNCT_FENCE, POTAL_FUNCT_FENCE,
+        POTAL_FUNCT_SCALE_WRITE, POTAL_FUNCT_SCALE_WRITE, POTAL_FUNCT_FENCE,
+        POTAL_FUNCT_SCALE_RELEASE, POTAL_FUNCT_SCALE_RELEASE, POTAL_FUNCT_SCALE_WRITE,
+        POTAL_FUNCT_FENCE, POTAL_FUNCT_SCALE_RELEASE, POTAL_FUNCT_FENCE};
+    check_u64("completion all eleven raw commands retained", st.trace.count, 11);
+    for (uint32_t i = 0; i < st.trace.count && i < 11; ++i) {
+        const uint32_t generation = i >= 7 ? 8 : 7;
+        const uint32_t column = i == 3 || i == 6;
+        const uint64_t key = 20 | ((uint64_t)generation << 8) | ((uint64_t)column << 16);
+        check_u64("completion raw opcode", st.trace.records[i].funct, expected[i]);
+        check_u64("completion raw response requested", st.trace.records[i].xd, 1);
+        check_u64("completion raw key",
+            st.trace.records[i].rs1, expected[i] == POTAL_FUNCT_FENCE ? 0 : key);
+        check_u64("completion raw payload", st.trace.records[i].rs2, 0);
+    }
+    check_status("completion safe close", potal_paired_h2_close(&s), POTAL_OK);
 }
 
 static void test_managed_h2(void) {
@@ -1496,6 +1608,332 @@ static void test_managed_quarantine(void) {
 #endif
     }
 }
+
+static void early_prepare(managed_sink_state *st, potal_paired_session **s, uint32_t current_pair,
+    uint32_t readers, potal_h2_panel *current, potal_h2_panel *next,
+    potal_h2_ref *current_ref, potal_h2_ref *next_ref) {
+    managed_open(st, s);
+    st->early_capability = UINT64_C(0x504f4c4401200001);
+    check_status("early exact capability enables",
+        potal_paired_h2_early_enable(*s, managed_early_counter), POTAL_OK);
+    *current = managed_panel(0, readers);
+    *next = managed_panel(1, 1);
+    current->pair = current_pair;
+    next->pair = 1 - current_pair;
+    check_status("early current declaration", potal_paired_h2_panel_begin(*s, current, 0, current_ref), POTAL_OK);
+    check_status("early successor prepared before Main", potal_paired_h2_panel_begin(*s, next, 0, next_ref), POTAL_OK);
+    const uint32_t before = st->trace.count;
+    check_status("early cannot load before current Main", potal_paired_h2_panel_prefetch(*s, *next_ref), POTAL_ERR_BUSY);
+    check_u64("early pre-Main refusal has no effects", st->trace.count, before);
+    const potal_paired_loop_ws main = managed_main(current);
+    check_status("early current scales", managed_scales(*s, &main, 0), POTAL_OK);
+    check_status("early current Main", potal_paired_h2_loop_issue(*s, *current_ref, 0, &main), POTAL_OK);
+}
+
+static void test_early_trace(void) {
+    managed_sink_state st;
+    potal_paired_session *s = NULL;
+    managed_open(&st, &s);
+    check_status("early trace requires enabled capability",
+        potal_paired_h2_early_trace_begin(s), POTAL_ERR_UNSUPPORTED);
+    st.early_capability = POTAL_LDB_ONLY_CAPABILITY;
+    check_status("early trace capability", potal_paired_h2_early_enable(s, managed_early_counter), POTAL_OK);
+    check_status("early trace reset at idle", potal_paired_h2_early_trace_begin(s), POTAL_OK);
+    check_status("early trace duplicate reset refused", potal_paired_h2_early_trace_begin(s), POTAL_ERR_BUSY);
+    const potal_h2_panel panel = managed_panel(0, 1);
+    const potal_paired_loop_ws main = managed_main(&panel);
+    potal_h2_ref ref = {0};
+    check_status("early trace declaration", potal_paired_h2_panel_begin(s, &panel, 0, &ref), POTAL_OK);
+    check_status("early trace scales", managed_scales(s, &main, 0), POTAL_OK);
+    check_status("early trace Main", potal_paired_h2_loop_issue(s, ref, 0, &main), POTAL_OK);
+    uint64_t values[POTAL_LDB_ONLY_TRACE_FIELDS] = {0};
+    check_status("early trace cannot snapshot pending Main", potal_paired_h2_early_trace_end(s, values), POTAL_ERR_BUSY);
+    check_u64("early trace pending snapshot issues no reads", st.early_trace_reads, 0);
+    check_status("early trace real checked Fence retained", potal_paired_fence(s), POTAL_OK);
+    check_status("early trace frozen snapshot", potal_paired_h2_early_trace_end(s, values), POTAL_OK);
+    for (uint32_t i = 0; i < POTAL_LDB_ONLY_TRACE_FIELDS; ++i)
+        check_u64("early trace preserves each full-width field", values[i],
+            i ? UINT64_C(0x100000000) + i : UINT64_C(1) << 14);
+    check_u64("early trace reads exactly declared fields", st.early_trace_reads, 28);
+    check_status("early trace consumed snapshot cannot repeat", potal_paired_h2_early_trace_end(s, values), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("early trace actual scales released", managed_scales(s, &main, 1), POTAL_OK);
+    check_status("early trace actual panel retired", potal_paired_h2_panel_retire(s, ref), POTAL_OK);
+    check_status("early trace safe close", potal_paired_h2_close(&s), POTAL_OK);
+}
+
+static void test_early_capability(void) {
+    check_u64("early exact tag", POTAL_LDB_ONLY_TAG, UINT64_C(0x504f4c4400000000));
+    check_u64("early exact capability", POTAL_LDB_ONLY_CAPABILITY, UINT64_C(0x504f4c4401200001));
+    check_u64("early exact opcode", POTAL_FUNCT_LDB_ONLY, 29);
+    const uint64_t refused[] = {0, POTAL_RESIDENT_WS_CAPABILITY, POTAL_PREFETCH_OBSERVATION_CAPABILITY,
+        UINT64_C(0x504f4c4401200000), UINT64_C(0x504f4c4401100001), UINT64_C(0x504f4c4401200003)};
+    for (uint32_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        managed_sink_state st;
+        potal_paired_session *s = NULL;
+        managed_open(&st, &s);
+        check_u64("early managed default off", potal_paired_h2_query(s).early_prefetch, 0);
+        check_status("early sink requires wide callback",
+            potal_paired_h2_early_enable(s, NULL), POTAL_ERR_INVALID_ARGUMENT);
+        check_u64("early missing callback issues nothing", st.trace.count, 0);
+        st.early_capability = refused[i];
+        check_status("early old or mismatched image refused",
+            potal_paired_h2_early_enable(s, managed_early_counter), POTAL_ERR_UNSUPPORTED);
+        check_u64("early refusal only two safe COUNTER commands", st.trace.count, 2);
+        check_u64("early refusal no new opcode", sink_has(&st.trace, POTAL_FUNCT_LDB_ONLY), 0);
+        const potal_h2_status q = potal_paired_h2_query(s);
+        check_u64("early refusal has no pending work or sticky failure",
+            q.early_prefetch | q.pending_b | q.source_pending | q.core.failed | q.attempted_ldb_only, 0);
+        check_status("early refusal safe close", potal_paired_h2_close(&s), POTAL_OK);
+    }
+}
+
+static void test_early_h2(void) {
+    potal_h2_ref old = {0};
+    for (uint32_t target = 0; target < 2; ++target) {
+        managed_sink_state st;
+        potal_paired_session *s = NULL;
+        potal_h2_panel current, next;
+        potal_h2_ref cr = {0}, nr = {0};
+        early_prepare(&st, &s, 1 - target, 1, &current, &next, &cr, &nr);
+        potal_paired_loop_ws nm = managed_main(&next);
+        uint32_t before = st.trace.count;
+        check_status("early enabling twice or after declaration refused",
+            potal_paired_h2_early_enable(s, managed_early_counter), POTAL_ERR_BUSY);
+        potal_h2_ref stale = nr; stale.generation++;
+        check_status("early stale prefetch refused", potal_paired_h2_panel_prefetch(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+        stale = nr; stale.owner++;
+        check_status("early foreign owner prefetch refused", potal_paired_h2_panel_prefetch(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+        stale = nr; stale.pair = 1 - target;
+        check_status("early wrong pair prefetch refused", potal_paired_h2_panel_prefetch(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+        check_status("early current panel cannot be target", potal_paired_h2_panel_prefetch(s, cr), POTAL_ERR_BUSY);
+        check_status("early prepared close retains", potal_paired_h2_close(&s), POTAL_ERR_BUSY);
+        check_u64("early refusals emit no command", st.trace.count, before);
+        st.early_target = target;
+        st.early_words = 6;
+        st.reenter = 1;
+        check_status("early prepared admission", potal_paired_h2_panel_prefetch(s, nr), POTAL_OK);
+        check_u64("early all six callbacks owned", st.early_words, 0);
+        const potal_paired_cmd_record expected[] = {
+            {9, 0, UINT64_C(5) << 16, UINT64_C(0x0000000200020001)},
+            {10, 0, 0, UINT64_C(0x20000) + UINT64_C(96) * 128 + 32},
+            {11, 0, 0, 0}, {12, 0, 0, 128}, {13, 0, 0, 0},
+            {29, 1, UINT64_C(0x10) | target, 0},
+        };
+        check_u64("early exactly five words and one status run", st.trace.count - before, 6);
+        for (uint32_t i = 0; i < 6; ++i) {
+            const potal_paired_cmd_record *got = &st.trace.records[before + i];
+            check_u64("early exact command and status fields",
+                got->funct == expected[i].funct && got->xd == expected[i].xd &&
+                got->rs1 == expected[i].rs1 && got->rs2 == expected[i].rs2, 1);
+        }
+        potal_h2_status q = potal_paired_h2_query(s);
+        check_u64("early descriptor is admission, not raw tile MVINs",
+            q.attempted_ldb_only == 1 && !q.attempted_b_mvins && !st.mvins, 1);
+        check_status("early acknowledgement cannot publish", potal_paired_h2_panel_get(s, nr), POTAL_ERR_BUSY);
+        check_u64("early status query cannot complete readers", q.panel[cr.pair].readers_completed, 0);
+        check_status("early pending Main refused", potal_paired_h2_loop_issue(s, nr, 0, &nm), POTAL_ERR_BUSY);
+        check_status("early pending Scale refused", potal_paired_scale_write(s, 20, 1, 0, 0), POTAL_ERR_BUSY);
+        const potal_index_config index = managed_index(&current);
+        check_status("early pending Index refused", potal_paired_index_config(s, &index), POTAL_ERR_BUSY);
+        check_status("early pending retire refused", potal_paired_h2_panel_retire(s, nr), POTAL_ERR_BUSY);
+        check_status("early pending close refused", potal_paired_h2_close(&s), POTAL_ERR_BUSY);
+        check_status("early stale Release cannot publish", potal_paired_scale_release(s, 0, 8, 0), POTAL_ERR_INVALID_ARGUMENT);
+        check_u64("early rejected Release leaves pending", potal_paired_h2_query(s).pending_b, 1);
+        /* Exercise both global publication paths without weakening Release. */
+        if (target) check_status("early successful global Fence", potal_paired_fence(s), POTAL_OK);
+        else check_status("early successful global Release", potal_paired_scale_release(s, 0, 7, 0), POTAL_OK);
+        q = potal_paired_h2_query(s);
+        check_u64("early successful certificate publishes only load and issued reader",
+            q.panel[target].readable && !q.pending_b && !q.source_pending &&
+            q.panel[cr.pair].readers_completed == 1 && !q.panel[target].readers_completed, 1);
+        check_u64("early rear resident identity",
+            q.core.pair[target].b_sp_base, (2 * target + 2) * POTAL_HW_BANK_ROWS - 128);
+        check_u64("early exact resident J and K",
+            q.core.pair[target].b_j_tiles == 2 && q.core.pair[target].b_k_rows == 64, 1);
+        check_status("early published get", potal_paired_h2_panel_get(s, nr), POTAL_OK);
+        check_status("early duplicate prefetch refused", potal_paired_h2_panel_prefetch(s, nr), POTAL_ERR_BUSY);
+        for (uint32_t j = 0; j < 2; ++j) for (uint32_t col = 0; col < (j ? 27u : 32u); ++col) {
+            if (!target && !j && !col) continue;
+            check_status("early current scales released", potal_paired_scale_release(s, j, 7, col), POTAL_OK);
+        }
+        check_status("early retire current", potal_paired_h2_panel_retire(s, cr), POTAL_OK);
+        check_status("early stale retired get", potal_paired_h2_panel_get(s, cr), POTAL_ERR_INVALID_ARGUMENT);
+        check_status("early next scales", managed_scales(s, &nm, 0), POTAL_OK);
+        potal_paired_loop_ws bad = nm; bad.loop.b = NULL;
+        check_status("early resident still needs real B", potal_paired_h2_loop_issue(s, nr, 0, &bad), POTAL_ERR_INVALID_ARGUMENT);
+        bad = nm; bad.loop.b = FAKE_B;
+        check_status("early resident rejects wrong B", potal_paired_h2_loop_issue(s, nr, 0, &bad), POTAL_ERR_INVALID_ARGUMENT);
+        bad = nm; bad.loop.ldb = 96;
+        check_status("early resident rejects wrong stride", potal_paired_h2_loop_issue(s, nr, 0, &bad), POTAL_ERR_INVALID_ARGUMENT);
+        potal_gemm_ws_program program;
+        check_status("early ordinary Main encoding", potal_paired_loop_ws_encode(&nm, &program), POTAL_OK);
+        before = st.trace.count;
+        check_status("early resident Main", potal_paired_h2_loop_issue(s, nr, 0, &nm), POTAL_OK);
+        managed_program_equal(&st.trace, before, &program, 1);
+        check_status("early next Release", managed_scales(s, &nm, 1), POTAL_OK);
+        check_status("early next retirement", potal_paired_h2_panel_retire(s, nr), POTAL_OK);
+        /* Reuse a physical pair, but never a software generation. */
+        next.residency_index++;
+        potal_h2_ref newer = {0};
+        check_status("early next generation declared", potal_paired_h2_panel_begin(s, &next, 0, &newer), POTAL_OK);
+        check_u64("early generation increases", newer.generation > nr.generation, 1);
+        check_status("early prior generation cannot prefetch", potal_paired_h2_panel_prefetch(s, nr), POTAL_ERR_INVALID_ARGUMENT);
+        check_status("early prior generation cannot retire", potal_paired_h2_panel_retire(s, nr), POTAL_ERR_INVALID_ARGUMENT);
+        if (old.owner) check_status("early prior session cannot get new B", potal_paired_h2_panel_get(s, old), POTAL_ERR_INVALID_ARGUMENT);
+        check_status("early new generation scales", managed_scales(s, &nm, 0), POTAL_OK);
+        check_status("early new generation normal Main", potal_paired_h2_loop_issue(s, newer, 0, &nm), POTAL_OK);
+        check_status("early new generation Release", managed_scales(s, &nm, 1), POTAL_OK);
+        check_status("early new generation retire", potal_paired_h2_panel_retire(s, newer), POTAL_OK);
+        old = newer;
+        check_status("early safe close consumes", potal_paired_h2_close(&s), POTAL_OK);
+        check_u64("early close consumed pointer", s == NULL, 1);
+    }
+}
+
+static void test_early_guards(void) {
+    for (uint32_t kind = 0; kind < 6; ++kind) {
+        managed_sink_state st;
+        potal_paired_session *s = NULL;
+        managed_open(&st, &s);
+        st.early_capability = POTAL_LDB_ONLY_CAPABILITY;
+        check_status("early guard enable", potal_paired_h2_early_enable(s, managed_early_counter), POTAL_OK);
+        potal_h2_panel current = managed_panel(0, kind == 4 ? 2 : 1), next = managed_panel(1, 1);
+        potal_h2_ref cr = {0}, nr = {0};
+        const potal_paired_loop_ws cm = managed_main(&current), residual = managed_residual(&current);
+        check_status("early guard declare current", potal_paired_h2_panel_begin(s, &current, 0, &cr), POTAL_OK);
+        check_status("early guard scales", managed_scales(s, &cm, 0), POTAL_OK);
+        check_status("early guard Main", potal_paired_h2_loop_issue(s, cr, 0, &cm), POTAL_OK);
+        if (kind == 4) {
+            check_status("early guard Residual scales", managed_scales(s, &residual, 0), POTAL_OK);
+            const potal_index_config index = managed_index(&current);
+            check_status("early guard Index", potal_paired_index_config(s, &index), POTAL_OK);
+            for (uint32_t i = 0; i < index.active_rows; ++i) {
+                const potal_index_write w = {i, i};
+                check_status("early guard Index slot", potal_paired_index_write(s, &w), POTAL_OK);
+            }
+            check_status("early guard Residual issued", potal_paired_h2_loop_issue(s, cr, 1, &residual), POTAL_OK);
+        }
+        potal_h2_panel bad = next;
+        if (kind == 0) bad.k_begin -= 32;
+        if (kind == 1) bad.j_begin = 0;
+        if (kind == 2) bad.pad_j++;
+        if (kind == 5) bad.j_tiles = 1;
+        if (kind == 3) check_status("early guard Main already completed", potal_paired_fence(s), POTAL_OK);
+        const uint32_t before = st.trace.count;
+        check_status("early nonadjacent, different J, completed or Residual refusal",
+            potal_paired_h2_panel_begin(s, &bad, 1, &nr),
+            kind < 3 || kind == 5 ? POTAL_ERR_INVALID_ARGUMENT : POTAL_ERR_BUSY);
+        check_u64("early guard rejection has no effects", st.trace.count, before);
+        check_u64("early guard rejection reserves no target", potal_paired_h2_query(s).panel[1].declared, 0);
+        check_status("early guard release Main", managed_scales(s, &cm, 1), POTAL_OK);
+        if (kind == 4) check_status("early guard release Residual", managed_scales(s, &residual, 1), POTAL_OK);
+        check_status("early guard retire", potal_paired_h2_panel_retire(s, cr), POTAL_OK);
+        check_status("early guard close", potal_paired_h2_close(&s), POTAL_OK);
+    }
+}
+
+static void test_early_recovery(void) {
+    for (uint32_t position = 1; position <= 6; ++position) {
+        managed_sink_state st;
+        potal_paired_session *s = NULL;
+        potal_h2_panel current, next;
+        potal_h2_ref cr = {0}, nr = {0};
+        early_prepare(&st, &s, position % 2, 1, &current, &next, &cr, &nr);
+        st.early_target = nr.pair;
+        st.early_words = position;
+        st.fail_at = st.trace.count + position;
+        check_status("early injected staging or run failure",
+            potal_paired_h2_panel_prefetch(s, nr), POTAL_HW_INVALID_ADDRESS);
+        potal_h2_status q = potal_paired_h2_query(s);
+        check_u64("early partial load retains pending and source",
+            q.pending_b && q.source_pending && q.panel[nr.pair].loading && !q.panel[nr.pair].readable, 1);
+        check_u64("early run attempted only at sixth word", q.attempted_ldb_only, position == 6);
+        check_u64("early partial staging has no raw MVIN", q.attempted_b_mvins, 0);
+        check_status("early failed get sticky", potal_paired_h2_panel_get(s, nr), POTAL_HW_INVALID_ADDRESS);
+        check_status("early failed Fence is not cleanup", potal_paired_fence(s), POTAL_HW_INVALID_ADDRESS);
+        check_status("early failed close retains ownership", potal_paired_h2_close(&s), POTAL_HW_INVALID_ADDRESS);
+        const uint32_t before = st.trace.count;
+        check_status("early one recoverable cleanup", potal_paired_session_cleanup(s), POTAL_OK);
+        uint32_t fences = 0;
+        for (uint32_t i = before; i < st.trace.count; ++i) fences += st.trace.records[i].funct == POTAL_FUNCT_FENCE;
+        check_u64("early cleanup begins with one Fence",
+            st.trace.records[before].funct == POTAL_FUNCT_FENCE && fences == 1, 1);
+        q = potal_paired_h2_query(s);
+        check_u64("early cleanup never publishes failed load",
+            q.pending_b | q.source_pending | q.panel[0].declared | q.panel[1].declared |
+            q.core.outstanding_loops | q.core.live_scale_slots, 0);
+        check_status("early cleanup preserves first status", q.core.error, POTAL_HW_INVALID_ADDRESS);
+        check_u64("early cleanup retains immutable allocation until close", q.cleaned && q.source_bound, 1);
+        const uint32_t after = st.trace.count;
+        check_status("early cleanup is not retried", potal_paired_session_cleanup(s), POTAL_OK);
+        check_u64("early cleanup repeat has no commands", st.trace.count, after);
+        check_status("early cleaned close returns sticky error", potal_paired_h2_close(&s), POTAL_HW_INVALID_ADDRESS);
+        check_u64("early cleaned close consumes handle", s == NULL, 1);
+    }
+}
+
+static void early_fatal_case(uint32_t kind) {
+    managed_sink_state st;
+    potal_paired_session *s = NULL;
+    potal_h2_panel current, next;
+    potal_h2_ref cr = {0}, nr = {0};
+    early_prepare(&st, &s, 0, 1, &current, &next, &cr, &nr);
+    if (kind == 1) st.fail_at = st.trace.count + 3;
+    if (kind == 2) {
+        st.trace.fail_funct = POTAL_FUNCT_LDB_ONLY;
+        st.trace.fail_status = POTAL_ERR_BAD_RESPONSE;
+    }
+    const potal_status first = kind == 1 ? POTAL_HW_INVALID_ADDRESS : POTAL_ERR_BAD_RESPONSE;
+    check_status("early fatal admission", potal_paired_h2_panel_prefetch(s, nr),
+        kind == 1 ? POTAL_HW_INVALID_ADDRESS : kind == 2 ? POTAL_ERR_BAD_RESPONSE : POTAL_OK);
+    if (kind != 2) {
+        st.trace.fail_funct = kind == 3 ? POTAL_FUNCT_SCALE_RELEASE : POTAL_FUNCT_FENCE;
+        st.trace.fail_status = POTAL_ERR_BAD_RESPONSE;
+        if (kind == 1) check_status("early failed cleanup drain", potal_paired_session_cleanup(s), POTAL_ERR_BAD_RESPONSE);
+        else if (kind == 3) check_status("early unknown Release", potal_paired_scale_release(s, 0, 7, 0), POTAL_ERR_BAD_RESPONSE);
+        else check_status("early unknown Fence", potal_paired_fence(s), POTAL_ERR_BAD_RESPONSE);
+    }
+    const potal_h2_status q = potal_paired_h2_query(s);
+    check_u64("early unknown completion quarantines borrowed source",
+        q.unknown_completion && q.quarantined && q.source_bound && q.source_pending &&
+        !q.panel[nr.pair].readable, 1);
+    check_status("early quarantine preserves first error", q.core.error, first);
+    const uint32_t before = st.trace.count;
+    check_status("early quarantine cleanup cannot retry", potal_paired_session_cleanup(s), first);
+    check_status("early quarantine Fence cannot retry", potal_paired_fence(s), first);
+    check_status("early quarantine cannot replace B", potal_paired_h2_panel_prefetch(s, nr), first);
+    check_status("early quarantine cannot retire B", potal_paired_h2_panel_retire(s, nr), first);
+    check_status("early quarantine cannot close", potal_paired_h2_close(&s), first);
+    check_u64("early quarantine retains session without effects", s != NULL && st.trace.count == before, 1);
+    const potal_paired_sink sink = {managed_sink, &st};
+    potal_paired_session *other = NULL;
+    check_status("early quarantine retains global owner", potal_paired_session_open(&sink, &other), POTAL_ERR_BUSY);
+}
+
+static void test_early_quarantine(void) {
+    for (uint32_t kind = 0; kind < 4; ++kind) {
+#if defined(__unix__)
+        fflush(NULL);
+        const int before = failures;
+        const pid_t child = fork();
+        if (child == 0) {
+            early_fatal_case(kind);
+            fflush(NULL);
+            _exit(failures == before ? 0 : 1);
+        }
+        check_u64("early terminal poison isolated by fork", child >= 0, 1);
+        if (child < 0) continue;
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+        check_u64("early isolated quarantine case", result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
+#else
+        check_u64("early quarantine requires fork support, not skipped", 0, 1);
+        (void)kind;
+        (void)early_fatal_case;
+#endif
+    }
+}
 #endif
 
 static void test_managed_admission(void) {
@@ -1546,6 +1984,9 @@ typedef struct observation_test_state {
     potal_paired_session *session;
     uint64_t capability;
     uint32_t calls;
+    int preserve_b0, early_supported;
+    uint32_t b0_event;
+    uint64_t b0_value;
 } observation_test_state;
 
 static potal_status observation_test_counter(void *ctx, const potal_paired_cmd_record *record,
@@ -1556,6 +1997,23 @@ static potal_status observation_test_counter(void *ctx, const potal_paired_cmd_r
     st->calls++;
     check_u64("observation only COUNTER126 xd1 rs2zero",
         record->funct == POTAL_FUNCT_COUNTER && record->xd == 1 && record->rs2 == 0, 1);
+    if (st->preserve_b0) {
+        if (record->rs1 == POTAL_PREFETCH_OBSERVATION_TAG) *value = st->capability;
+        else if (record->rs1 == POTAL_LDB_ONLY_TAG)
+            *value = st->early_supported ? POTAL_LDB_ONLY_CAPABILITY : 0;
+        else if (record->rs1 & 8) {
+            if (((record->rs1 >> 4) & 7) == 0) {
+                st->b0_event = (uint32_t)(record->rs1 >> 12);
+                st->b0_value = 0; /* CounterFile resets a counter on configuration writes. */
+            }
+            *value = 0;
+        } else if (record->rs1 == 1) {
+            st->b0_value = 0;
+            *value = 0;
+        } else *value = record->rs1 == 0 ? st->b0_value :
+            UINT64_C(0x100000000) + (record->rs1 >> 4);
+        return POTAL_OK;
+    }
     if (st->calls == 1) check_u64("observation clears unsupported counter0 before probe", record->rs1, 0xA);
     if (st->calls == 2) check_u64("observation exact tagged query", record->rs1, POTAL_PREFETCH_OBSERVATION_TAG);
     if (st->calls >= 3 && st->calls <= 9)
@@ -1602,6 +2060,34 @@ static void test_observation(void) {
     check_u64("observation DIM16 no command", st.calls, 0);
 #endif
     check_status("observation close", potal_paired_session_close(s), POTAL_OK);
+#if POTAL_HW_DIM == 32
+    for (int supported = 0; supported < 2; ++supported) {
+        memset(&st, 0, sizeof(st));
+        st.capability = POTAL_PREFETCH_OBSERVATION_CAPABILITY;
+        st.preserve_b0 = 1;
+        st.early_supported = supported;
+        check_status("observation early session", potal_paired_session_open(&sink, &s), POTAL_OK);
+        st.session = s;
+        check_status("observation before early probe",
+            potal_paired_observation_begin(s, observation_test_counter), POTAL_OK);
+        const potal_h2_weight weight = managed_weight();
+        check_status("observation managed begin", potal_paired_h2_begin(s, &weight), POTAL_OK);
+        st.b0_value = UINT64_C(0x100000011);
+        check_status("observation early probe",
+            potal_paired_h2_early_enable(s, observation_test_counter),
+            supported ? POTAL_OK : POTAL_ERR_UNSUPPORTED);
+        check_u64("early probe restores B0 event", st.b0_event, 45);
+        if (st.b0_event == 45) st.b0_value += 9;
+        uint64_t measured[7] = {0};
+        check_status("observation after early probe",
+            potal_paired_observation_end(s, measured), POTAL_OK);
+        check_u64("early probe retains full-width B0 prefix and later events",
+            measured[0], UINT64_C(0x10000001a));
+        for (uint32_t i = 1; i < 7; ++i)
+            check_u64("early probe leaves other counters unchanged", measured[i], UINT64_C(0x100000000) + i);
+        check_status("observation early close", potal_paired_h2_close(&s), POTAL_OK);
+    }
+#endif
 }
 
 int main(void) {
@@ -1624,9 +2110,16 @@ int main(void) {
     test_managed_admission();
     test_observation();
 #if POTAL_HW_DIM == 32
+    test_managed_completion();
     test_managed_h2();
     test_managed_recovery();
     test_managed_quarantine();
+    test_early_trace();
+    test_early_capability();
+    test_early_h2();
+    test_early_guards();
+    test_early_recovery();
+    test_early_quarantine();
 #endif
     /* Legacy terminal poison remains last, after every managed case. */
     test_paired_session();

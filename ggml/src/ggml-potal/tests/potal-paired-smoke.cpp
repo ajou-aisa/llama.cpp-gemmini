@@ -160,26 +160,34 @@ struct route_run {
     ggml_backend_potal_stats before = {}, after = {};
 };
 
-enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL, ROUTE_KTILE, ROUTE_PREFETCH };
+enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL, ROUTE_KTILE, ROUTE_PREFETCH,
+                  ROUTE_COMPLETION, ROUTE_EARLY };
 
 const char * route_name(route_kind k) {
     if (k == ROUTE_KTILE) return "ktile";
     if (k == ROUTE_PREFETCH) return "prefetch";
+    if (k == ROUTE_COMPLETION) return "completion";
+    if (k == ROUTE_EARLY) return "early_ldb";
     return k == ROUTE_PAIRED ? "paired" : k == ROUTE_PAIRED_CONSERVATIVE ? "paired_conservative" : "serial";
 }
 
 void select_route(route_kind k) {
     setenv("GGML_POTAL_PAIRED_AUTO", k == ROUTE_SERIAL ? "OFF" : "ON", 1);
     setenv("GGML_POTAL_PAIRED_FENCES", k == ROUTE_PAIRED_CONSERVATIVE ? "CONSERVATIVE" : "RTL", 1);
-    setenv("GGML_POTAL_PAIRED_KTILE", k == ROUTE_KTILE || k == ROUTE_PREFETCH ? "ON" : "OFF", 1);
-    setenv("GGML_POTAL_PAIRED_PREFETCH", k == ROUTE_PREFETCH ? "ON" : "OFF", 1);
+    const bool prefetch = k == ROUTE_PREFETCH || k == ROUTE_COMPLETION || k == ROUTE_EARLY;
+    setenv("GGML_POTAL_PAIRED_KTILE", k == ROUTE_KTILE || prefetch ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_PREFETCH", prefetch ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_EARLY_PREFETCH", k == ROUTE_EARLY ? "ON" : "OFF", 1);
 }
 
 route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, ggml_cgraph * g, ggml_tensor * y,
-                    const ggml_tensor * expected, const golden_result & gold, bool print_case = true) {
+                    const ggml_tensor * expected, const golden_result & gold, bool print_case = true,
+                    bool compare_completion = false) {
     route_run  r;
     const bool paired = kind != ROUTE_SERIAL;
     select_route(kind);
+    if (compare_completion)
+        setenv("POTAL_H2_COMPLETION_REUSE", kind == ROUTE_COMPLETION || kind == ROUTE_EARLY ? "1" : "0", 1);
     std::memset(y->data, 0xff, ggml_nbytes(y)); // NaN pattern: a stale dst never matches
     const ggml_backend_potal_stats b      = stats_of(potal);
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
@@ -227,6 +235,12 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
     }
     if (kind == ROUTE_PAIRED_CONSERVATIVE) {
         ok = ok && (pstripes == 0 || p_fence > pstripes); // the extra fences really ran
+    }
+    if (kind == ROUTE_COMPLETION || kind == ROUTE_EARLY) {
+        ok = ok && fallback == 0 && a.paired_prefetch_loads > b.paired_prefetch_loads;
+        if (kind == ROUTE_EARLY)
+            ok = ok && a.paired_prefetch_ldb_only > b.paired_prefetch_ldb_only &&
+                 a.paired_prefetch_mvins == b.paired_prefetch_mvins;
     }
     r.ok       = ok;
     r.paired   = pstripes;
@@ -299,6 +313,7 @@ constexpr bench_case bench_cases[] = {
     { "gpt2_ffn_up_16x3072x768", 16, 3072, 768, 400.0f, 2, 2 },
     { "dense_fallback_160x320x512", 160, 320, 512, 30000.0f, 6, 1 },
     { "repeat_48x96x256", 48, 96, 256, 60.0f, 1, 4 },
+    { "tail_63x129x544", 63, 129, 544, 400.0f, 2, 2 },
 };
 
 double median(std::vector<double> v) {
@@ -342,15 +357,18 @@ void print_stats(const char * name, const char * phase, route_kind route, int it
     COUNT_FIELD(paired_readbacks); COUNT_FIELD(paired_readback_tiles);
     COUNT_FIELD(paired_fences); COUNT_FIELD(paired_drains); COUNT_FIELD(paired_fallback_stripes);
     COUNT_FIELD(paired_prefetch_loads); COUNT_FIELD(paired_prefetch_mvins);
+    COUNT_FIELD(paired_prefetch_ldb_only);
     COUNT_FIELD(paired_prefetch_bytes_declared); COUNT_FIELD(paired_resident_main_loop_ws);
     TIME_FIELD(paired_residual_prefetch_issue_s);
+    TIME_FIELD(paired_main_prefetch_issue_s);
     COUNT_FIELD(stripes_semantic_completed);
     std::printf("\n");
 #undef TIME_FIELD
 #undef COUNT_FIELD
 }
 
-void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool compare_ktile, bool compare_prefetch) {
+void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool compare_ktile, bool compare_prefetch,
+               bool compare_early) {
     std::mt19937 rng(20261023); // one fixed tensor pair for every route and repeat
     ggml_init_params ip = { (size_t) (4 * (c.n * c.k + 2 * c.m * c.n + c.m * c.k) + 64 * 1024 * 1024), nullptr, false };
     ggml_context_ptr ctx(ggml_init(ip));
@@ -381,18 +399,20 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool comp
     ggml_tensor * y = ggml_mul_mat(ctx.get(), cached_w, x);
     ggml_cgraph * g = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(g, y);
-    const route_kind routes[] = { compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL,
-                                  compare_prefetch ? ROUTE_KTILE : ROUTE_PAIRED,
-                                  compare_prefetch ? ROUTE_PREFETCH :
-                                  compare_ktile ? ROUTE_KTILE : ROUTE_PAIRED_CONSERVATIVE };
-    std::array<std::vector<route_run>, 5> cold, steady;
+    const std::vector<route_kind> routes = compare_early ?
+        std::vector<route_kind>{ROUTE_PAIRED, ROUTE_KTILE, ROUTE_PREFETCH, ROUTE_COMPLETION, ROUTE_EARLY} :
+        std::vector<route_kind>{compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL,
+                               compare_prefetch ? ROUTE_KTILE : ROUTE_PAIRED,
+                               compare_prefetch ? ROUTE_PREFETCH :
+                               compare_ktile ? ROUTE_KTILE : ROUTE_PAIRED_CONSERVATIVE};
+    std::array<std::vector<route_run>, 7> cold, steady;
     // Untimed route warmups initialize the issuer and route code; each output is checked.
-    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false);
+    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false, compare_early);
     for (int i = 0; i < repeat; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            const route_kind route = routes[(i + (i % 2 ? 2 - j : j)) % 3];
+        for (size_t j = 0; j < routes.size(); ++j) {
+            const route_kind route = routes[(i + (i % 2 ? routes.size() - 1 - j : j)) % routes.size()];
             ggml_backend_potal_clear_weight_cache(potal);
-            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false);
+            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false, compare_early);
             cold[(int) route].push_back(r);
             const auto & b = r.before;
             const auto & a = r.after;
@@ -407,11 +427,11 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool comp
         }
     }
     // All steady samples reuse the same prepared weight. Order rotates and reverses.
-    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false);
+    for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false, compare_early);
     for (int i = 0; i < repeat; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            const route_kind route = routes[(i + (i % 2 ? 2 - j : j)) % 3];
-            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false);
+        for (size_t j = 0; j < routes.size(); ++j) {
+            const route_kind route = routes[(i + (i % 2 ? routes.size() - 1 - j : j)) % routes.size()];
+            route_run r = run_route(potal, c.name, route, g, y, expected, gold, false, compare_early);
             steady[(int) route].push_back(r);
             const auto & b = r.before;
             const auto & a = r.after;
@@ -429,12 +449,12 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool comp
         summary(c.name, "cold", route, cold[(int) route]);
         summary(c.name, "steady", route, steady[(int) route]);
     }
-    const route_kind reference = compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL;
+    const route_kind reference = compare_prefetch || compare_early ? ROUTE_PAIRED : ROUTE_SERIAL;
     const double reference_ms = median([&] { std::vector<double> v; for (const auto & r : steady[reference]) v.push_back(r.compute_ms); return v; }());
     for (route_kind route : routes) {
         if (route == reference) continue;
         std::vector<double> v; for (const auto & r : steady[(int) route]) v.push_back(r.compute_ms);
-        if (compare_prefetch)
+        if (compare_prefetch || compare_early)
             std::printf("POTAL_PREFETCH_RATIO case=%s route=%s h2_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
         else
             std::printf("POTAL_BENCH_RATIO case=%s route=%s serial_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
@@ -512,7 +532,7 @@ bool select_pipeline_mode() {
     return why == nullptr;
 }
 
-bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
+bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool early = false, bool bench_raw = false) {
     if (POTAL_HW_DIM != 32) return false;
     uint32_t observation_generation = 0;
     const auto saturate = [](int64_t x) {
@@ -523,7 +543,7 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
         if (carrier >= 32) return x < 0 ? INT32_MIN : INT32_MAX;
         return saturate(x * (INT64_C(1) << carrier));
     };
-    for (int fixture = 0; fixture < (observe ? 3 : 2); ++fixture) {
+    for (int fixture = bench_raw ? 2 : 0; fixture < (observe || bench_raw ? 3 : 2); ++fixture) {
         const bool gapped = fixture == 1;
         const bool full_rows = fixture == 2;
         potal_test::paired_fixture f(full_rows ? 63 : 17, full_rows ? 129 : 65,
@@ -583,8 +603,15 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
                 residual_expected[row * f.N + column] = acc;
             }
         }
-        for (int mode = 0; mode < (with_prefetch ? 3 : 2); ++mode) {
+        std::array<std::vector<double>, 5> raw_samples;
+        for (int sample = 0; sample < (bench_raw ? 40 : (with_prefetch ? 3 : 2)); ++sample) {
+            const int iteration = sample / 5;
+            const int mode = bench_raw ?
+                (iteration + (iteration % 2 ? 4 - sample % 5 : sample % 5)) % 5 : sample;
             const bool reuse = mode != 0;
+            const bool prefetch = bench_raw ? mode >= 2 : mode == 2;
+            const bool use_early = bench_raw ? mode == 4 : early && mode == 2;
+            if (bench_raw) setenv("POTAL_H2_COMPLETION_REUSE", mode >= 3 ? "1" : "0", 1);
             potal_paired_request request;
             request.rows = f.M; request.n = f.N; request.k = f.K;
             request.main_plan = &plan; request.a = f.a.get(); request.lda = f.lda;
@@ -592,17 +619,22 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
             request.c_main = main_output.get(); request.ldc_main = ldc;
             request.c_residual = residual_output.get(); request.ldc_residual = ldc;
             request.ktile_scale_reuse = reuse;
-            request.next_k_prefetch = mode == 2;
-            if (observe) request.generation = &observation_generation;
+            request.next_k_prefetch = prefetch;
+            request.early_k_prefetch = use_early;
+            if (observe || bench_raw) request.generation = &observation_generation;
             potal_paired_report report;
             issuer_owner owner;
             std::string why;
             potal_status status = POTAL_OK;
             uint64_t cycles[7] = {};
             potal_status observation = POTAL_OK;
+            double raw_ms = 0;
             const bool started = owner.start([&](const owner_runners & runners) {
                 if (!observe) {
+                    const auto begin = std::chrono::steady_clock::now();
                     runners.paired(request, report);
+                    raw_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - begin).count();
                 } else {
                     // This callback runs on the existing single issuer's hart.
                     potal_paired_session *session = nullptr;
@@ -641,14 +673,19 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
                     exact = exact && residual_output.get()[row * ldc + column] == residual_expected[row * f.N + column];
             exact = exact && report.counts.scale_writes == report.counts.scale_releases &&
                     (report.counts.scale_reused_windows > 0) == (reuse && !gapped) &&
-                    (report.counts.prefetch_loads > 0) == (mode == 2);
+                    (report.counts.prefetch_loads > 0) == prefetch;
+            if (use_early)
+                exact = exact && report.counts.prefetch_ldb_only == report.counts.prefetch_loads &&
+                        report.counts.prefetch_mvins == 0;
             std::printf("POTAL_KTILE_RAW_GOLDEN %s gapped=%d reuse=%d prefetch=%d main_i32=%zu residual_i32=%zu "
-                        "reused_windows=%llu scale_writes=%llu scale_releases=%llu prefetch_loads=%llu resident_main=%llu\n",
-                        exact ? "PASS" : "FAIL", int(gapped), int(reuse), int(mode == 2), main_expected.size(), residual_expected.size(),
+                        "reused_windows=%llu scale_writes=%llu scale_releases=%llu prefetch_loads=%llu resident_main=%llu "
+                        "early=%d ldb_only=%llu\n",
+                        exact ? "PASS" : "FAIL", int(gapped), int(reuse), int(prefetch), main_expected.size(), residual_expected.size(),
                         (unsigned long long)report.counts.scale_reused_windows,
                         (unsigned long long)report.counts.scale_writes, (unsigned long long)report.counts.scale_releases,
                         (unsigned long long)report.counts.prefetch_loads,
-                        (unsigned long long)report.counts.resident_main_loop_ws);
+                        (unsigned long long)report.counts.resident_main_loop_ws, int(use_early),
+                        (unsigned long long)report.counts.prefetch_ldb_only);
             if (observe) {
                 std::printf("POTAL_PREFETCH_OBSERVATION mode=%d gapped=%d status=%d fixture=%d rows=%zu columns=%zu "
                     "b0_write_cycles=%llu b1_write_cycles=%llu mac0_cycles=%llu mac1_cycles=%llu "
@@ -663,6 +700,20 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
                 f.a.release(); f.weight.abandon(); main_output.release(); residual_output.release();
             }
             if (!exact) return false;
+            if (bench_raw && iteration > 0) {
+                raw_samples[mode].push_back(raw_ms);
+                std::printf("POTAL_RAW_BENCH_SAMPLE route=%d iteration=%d ms=%.6f exact=1 M=63 N=129 K=544\n",
+                    mode, iteration, raw_ms);
+            }
+        }
+        if (bench_raw) {
+            for (int mode = 0; mode < 5; ++mode) {
+                const double med = median(raw_samples[mode]);
+                std::vector<double> dev;
+                for (double v : raw_samples[mode]) dev.push_back(std::abs(v - med));
+                std::printf("POTAL_RAW_BENCH_SUMMARY route=%d repeats=%zu median_ms=%.6f mad_ms=%.6f\n",
+                    mode, raw_samples[mode].size(), med, median(dev));
+            }
         }
     }
     return true;
@@ -671,16 +722,26 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--bench-raw-early") == 0) {
+        if (std::getenv("POTAL_EARLY_TRACE") || std::getenv("POTAL_RAW_TRACE") ||
+            std::getenv("POTAL_PAIRED_PROFILE")) return 2;
+        return ktile_raw_golden(true, false, true, true) ? 0 : 1;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--ktile-golden") == 0)
         return ktile_raw_golden() ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--prefetch-golden") == 0)
         return ktile_raw_golden(true) ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--prefetch-observe") == 0)
         return ktile_raw_golden(true, true) ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--early-prefetch-observe") == 0)
+        return ktile_raw_golden(true, true, true) ? 0 : 1;
     const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
     const bool compare_ktile = argc > 1 && std::strcmp(argv[1], "--bench-ktile") == 0;
     const bool compare_prefetch = argc > 1 && std::strcmp(argv[1], "--bench-prefetch") == 0;
-    const bool bench = compare_ktile || compare_prefetch || (argc > 1 && std::strcmp(argv[1], "--bench") == 0);
+    const bool observe_early = argc > 1 && std::strcmp(argv[1], "--observe-early") == 0;
+    const bool compare_early = observe_early || (argc > 1 && std::strcmp(argv[1], "--bench-early") == 0);
+    const bool bench = compare_ktile || compare_prefetch || compare_early ||
+                       (argc > 1 && std::strcmp(argv[1], "--bench") == 0);
     const char * case_name = nullptr;
     int repeat = 7;
     if (bench) {
@@ -715,12 +776,16 @@ int main(int argc, char ** argv) {
         // Diagnostic modes inject fences, readbacks, or tracing into measured work.
         if (std::getenv("POTAL_PAIRED_PROBE") || std::getenv("POTAL_PAIRED_WINDOW_DIAG") ||
             std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES") || std::getenv("POTAL_PAIRED_STAGE_DIAG") ||
-            std::getenv("POTAL_RAW_TRACE")) {
+            std::getenv("POTAL_RAW_TRACE") || (!observe_early && std::getenv("POTAL_EARLY_TRACE"))) {
             std::fprintf(stderr, "POTAL_BENCH_FAIL diagnostics enabled\n"); return 2;
+        }
+        if (observe_early) {
+            if (!std::getenv("POTAL_EARLY_TRACE")) setenv("POTAL_EARLY_TRACE", "1", 1);
+            std::printf("POTAL_EARLY_DIAGNOSTIC case=%s timing_is_not_performance=1\n", case_name);
         }
         for (const bench_case & c : bench_cases) {
             if (std::strcmp(c.name, case_name) == 0) {
-                bench_one(potal.get(), c, repeat, compare_ktile, compare_prefetch);
+                bench_one(potal.get(), c, repeat, compare_ktile, compare_prefetch, compare_early);
                 std::printf("POTAL_BENCH %s case=%s failures=%d\n", failures ? "FAIL" : "PASS", case_name, failures);
                 return failures ? 1 : 0;
             }

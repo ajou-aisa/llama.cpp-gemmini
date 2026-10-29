@@ -371,6 +371,7 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const pota
 #define POTAL_FUNCT_INDEX_WRITE               26
 #define POTAL_FUNCT_INDEX_CONFIG              27
 #define POTAL_FUNCT_RESIDENT_VIEW             28
+#define POTAL_FUNCT_LDB_ONLY                  29
 #define POTAL_FUNCT_COUNTER                  126
 
 /* ---- H2 paired / indexed execution (potal_paired_*) ---------------------- */
@@ -712,6 +713,13 @@ typedef struct potal_h2_status {
     potal_status last_drain, cleanup_status;
     uint64_t attempted_b_mvins;
     potal_h2_panel_status panel[POTAL_PAIRS];
+    /* POTAL_H2_COMPLETION_REUSE=1, sampled at managed begin; default off.
+     * Reuse skips only unchanged host reconciliation, never a command or CPU
+     * fence. Counters describe successful checked drains, not hardware time. */
+    uint32_t completion_reuse;
+    uint64_t completion_calls, completion_reuses, completion_bookkeeping, completion_cpu_fences;
+    uint32_t early_prefetch;
+    uint64_t attempted_ldb_only;
 } potal_h2_status;
 
 potal_status potal_paired_h2_begin(potal_paired_session *session, const potal_h2_weight *weight);
@@ -735,6 +743,30 @@ potal_status potal_paired_h2_close(potal_paired_session **session);
 #define POTAL_PREFETCH_OBSERVATION_CAPABILITY UINT64_C(0x504f425301200007)
 typedef potal_status (*potal_observation_counter_fn)(void *ctx,
     const potal_paired_cmd_record *record, uint64_t *value);
+/* Opt-in scheduler-owned LOAD2, never raw MVIN or future compute. Enable only
+ * on a new idle H2 session after an exact capability probe. The existing
+ * panel_prefetch then requires the adjacent same-J next-K panel, an issued
+ * Main on the other pair, and a later checked global drain before consumers.
+ * Its status response acknowledges admission only. No CPU fence is omitted. */
+#define POTAL_LDB_ONLY_TAG UINT64_C(0x504f4c4400000000)
+#define POTAL_LDB_ONLY_CAPABILITY UINT64_C(0x504f4c4401200001)
+#define POTAL_LDB_ONLY_TRACE_RESET (POTAL_LDB_ONLY_TAG | UINT64_C(0x100))
+#define POTAL_LDB_ONLY_TRACE_READ (POTAL_LDB_ONLY_TAG | UINT64_C(0x200))
+#define POTAL_LDB_ONLY_TRACE_FIELDS 28
+potal_status potal_paired_h2_early_enable(potal_paired_session *session,
+    potal_observation_counter_fn counter);
+/* Diagnostic only: reset while globally drained, before Main; snapshot only
+ * after the added checked Fence. Frozen target-clock events are not DMA
+ * request timestamps, completion certificates, or performance samples.
+ * Fields: flags, elapsed, scheduler admission; first/last B0, B1, MAC0,
+ * MAC1; seven physical cycle counts; Fence request/accept; first/last busy;
+ * absolute start/end; first/last accepted DMA requests for pair0 and pair1
+ * (LoadController -> Scratchpad, not TileLink issue or DRAM completion).
+ * Flags: active bit0, overflow bit1, seen bits8..17
+ * (admission,B0,B1,MAC0,MAC1,Fence request,Fence accept,busy,DMA0,DMA1), pair bit20. */
+potal_status potal_paired_h2_early_trace_begin(potal_paired_session *session);
+potal_status potal_paired_h2_early_trace_end(potal_paired_session *session,
+    uint64_t values[POTAL_LDB_ONLY_TRACE_FIELDS]);
 potal_status potal_paired_observation_begin(potal_paired_session *session,
     potal_observation_counter_fn counter);
 potal_status potal_paired_observation_end(potal_paired_session *session, uint64_t cycles[7]);

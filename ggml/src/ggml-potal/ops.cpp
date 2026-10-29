@@ -255,6 +255,18 @@ bool options::paired_prefetch_requested(bool * invalid) {
     return false;
 }
 
+bool options::paired_early_prefetch_requested(bool * invalid) {
+    *invalid = false;
+    const char * value = std::getenv("GGML_POTAL_PAIRED_EARLY_PREFETCH");
+    if (value == nullptr || *value == '\0') return false;
+    std::string v(value);
+    for (char & ch : v) ch = (char) std::toupper((unsigned char) ch);
+    if (v == "ON" || v == "1") return true;
+    if (v == "OFF" || v == "0") return false;
+    *invalid = true;
+    return false;
+}
+
 namespace {
 
 ggml_status hp1_fail(ggml_backend_potal_stats & st, ggml_tensor * node, const std::string & layer, const char * stage,
@@ -280,10 +292,12 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     // serial route; an invalid request fails the node (an options failure, like the
     // matmul options: before the node counts as a pipelined node), never picks a route.
     bool       paired_invalid = false, fences_invalid = false, ktile_invalid = false, prefetch_invalid = false;
+    bool       early_invalid = false;
     const bool paired_request = options::paired_auto_requested(&paired_invalid);
     const bool conservative   = options::paired_fences_conservative(&fences_invalid);
     const bool ktile          = options::paired_ktile_requested(&ktile_invalid);
     const bool prefetch       = options::paired_prefetch_requested(&prefetch_invalid);
+    const bool early          = options::paired_early_prefetch_requested(&early_invalid);
     if (paired_invalid) {
         return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_AUTO must be ON, OFF, 1 or 0");
     }
@@ -298,6 +312,10 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
         return hp1_fail(st, node, layer, "options",
                         "GGML_POTAL_PAIRED_PREFETCH must be ON/OFF/1/0; ON requires K-tile Scale reuse");
     }
+    if (early_invalid || (early && !prefetch)) {
+        return hp1_fail(st, node, layer, "options",
+                        "GGML_POTAL_PAIRED_EARLY_PREFETCH must be ON/OFF/1/0; ON requires checked next-K prefetch");
+    }
     st.stripe_pipeline_nodes++;
 
     pipeline_config cfg;
@@ -307,6 +325,7 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     cfg.paired_conservative_fences = cfg.paired && conservative;
     cfg.paired_ktile_scale_reuse = ktile;
     cfg.paired_next_k_prefetch = prefetch;
+    cfg.paired_early_k_prefetch = early;
     cfg.layer        = layer;
     issuer_owner owner;
     const uint64_t c0 = gcycle::read();
@@ -339,9 +358,11 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.paired_drains += c.paired_drains;
     st.paired_prefetch_loads += c.paired_prefetch_loads;
     st.paired_prefetch_mvins += c.paired_prefetch_mvins;
+    st.paired_prefetch_ldb_only += c.paired_prefetch_ldb_only;
     st.paired_prefetch_bytes_declared += c.paired_prefetch_bytes_declared;
     st.paired_resident_main_loop_ws += c.paired_resident_main_loop_ws;
     st.paired_residual_prefetch_issue_s += c.paired_residual_prefetch_issue_s;
+    st.paired_main_prefetch_issue_s += c.paired_main_prefetch_issue_s;
     st.act_quant_s += c.act_quant_s;
     st.scale_s += c.scale_s;
     st.issue_s += c.issue_s;

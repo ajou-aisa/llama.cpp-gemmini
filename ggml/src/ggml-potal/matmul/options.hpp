@@ -103,6 +103,7 @@ bool paired_fences_conservative(bool * invalid);
 // Explicit, default-OFF DIM32 optimization; never enables the resident extension.
 bool paired_ktile_requested(bool * invalid);
 bool paired_prefetch_requested(bool * invalid);
+bool paired_early_prefetch_requested(bool * invalid);
 
 // nullptr when PoTal executes the resolved mode, residual backend and stripe
 // job capacity with the configured activation algorithm, else why not.

@@ -201,6 +201,7 @@ struct pipeline_config {
     bool            paired_conservative_fences = false;
     bool            paired_ktile_scale_reuse = false; // explicit DIM32-only Scale specialization
     bool            paired_next_k_prefetch = false;
+    bool            paired_early_k_prefetch = false;
     // Optional; called on the thread of each step after its record, holding no
     // lock of the run (it may query or abort the run). Order across threads:
     // stripe_event::sequence.
@@ -263,8 +264,10 @@ struct pipeline_counts {
     uint64_t paired_fences              = 0;
     uint64_t paired_drains              = 0; // fences + released scale windows (each is a drain point)
     uint64_t paired_prefetch_loads = 0, paired_prefetch_mvins = 0, paired_prefetch_bytes_declared = 0;
+    uint64_t paired_prefetch_ldb_only = 0;
     uint64_t paired_resident_main_loop_ws = 0;
     double paired_residual_prefetch_issue_s = 0;
+    double paired_main_prefetch_issue_s = 0;
     double   act_quant_s                = 0; // ExSIA quantize_activation call, including producer capacity waits
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;

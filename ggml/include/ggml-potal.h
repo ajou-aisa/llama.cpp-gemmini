@@ -187,9 +187,11 @@ struct ggml_backend_potal_stats {
     uint64_t paired_drains;               // drain points: fences + released scale windows
     uint64_t paired_prefetch_loads;        // fully submitted standalone B panels
     uint64_t paired_prefetch_mvins;        // checked raw MVIN submissions
+    uint64_t paired_prefetch_ldb_only;     // checked LdB-only admissions, not internal LOAD2 count
     uint64_t paired_prefetch_bytes_declared; // command payload extent, not measured bus traffic
     uint64_t paired_resident_main_loop_ws; // Main submissions whose B DMA was suppressed
     double paired_residual_prefetch_issue_s; // Combined CPU API interval, not hardware DMA time
+    double paired_main_prefetch_issue_s;   // Main + early admission + extra Fence CPU interval
 
     // Tagged QK/PV attention, separate from Q8_HP1 weighted MatMul and CPU ops.
     // All MatMul partials use PoTal WS; Host preparation/reconstruction is not
