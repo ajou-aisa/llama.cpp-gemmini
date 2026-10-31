@@ -911,8 +911,21 @@ int main(int argc, char ** argv) {
 #endif
     perf::reset();
     perf::set_npu_frequency(npu_hz);
+    // Optional outer latency evidence without enabling per-node cycle logging.
+    // Buffer token boundaries and print only after inference has completed.
+    const char * latency_option = std::getenv("POTAL_REQUEST_LATENCY");
+    const bool request_latency = latency_option && std::strcmp(latency_option, "1") == 0;
+    if (request_latency && (params.interactive || params.interactive_first ||
+                            params.n_predict <= 0 || embd_inp.empty())) {
+        LOG_ERR("POTAL_REQUEST_LATENCY requires a noninteractive prompt and positive n_predict\n");
+        return 1;
+    }
+    struct latency_sample { uint64_t timestamp; llama_token token; };
+    std::vector<latency_sample> latency_samples;
+    if (request_latency) latency_samples.reserve(params.n_predict);
+    const uint64_t request_start_ns = embd_inp.empty() ? 0 : performance_now_ns();
     if (!embd_inp.empty()) {
-        perf::start_request(performance_now_ns());
+        perf::start_request(request_start_ns);
     }
     perf::Phase inference_phase = perf::Phase::prefill;
 
@@ -1131,6 +1144,7 @@ int main(int argc, char ** argv) {
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
             const uint64_t token_ready_ns = sampling.finish(true);
             perf::token_ready(token_ready_ns, id);
+            if (request_latency) latency_samples.push_back({token_ready_ns, id});
             inference_phase = perf::Phase::decode;
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
@@ -1398,7 +1412,19 @@ int main(int argc, char ** argv) {
         }
     }
 
-    perf::finish_request(performance_now_ns());
+    const uint64_t request_end_ns = performance_now_ns();
+    perf::finish_request(request_end_ns);
+    if (request_latency) {
+        std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"request_start\",\"timestamp_ns\":%llu,"
+            "\"clock\":\"steady_clock\",\"boundary\":\"tokenized_prompt_before_inference\"}\n",
+            (unsigned long long) request_start_ns);
+        for (size_t i = 0; i < latency_samples.size(); ++i)
+            std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"token_ready\",\"timestamp_ns\":%llu,"
+                "\"token_index\":%zu,\"token_id\":%d,\"boundary\":\"sampling_and_accept_complete\"}\n",
+                (unsigned long long) latency_samples[i].timestamp, i, int(latency_samples[i].token));
+        std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"request_end\",\"timestamp_ns\":%llu}\n",
+            (unsigned long long) request_end_ns);
+    }
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
