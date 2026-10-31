@@ -35,6 +35,23 @@
 #include <mutex>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+#include <chrono>
+
+static thread_local const bool * stream_clock_active = nullptr;
+static thread_local uint64_t stream_clock_reads = 0;
+
+// Wrap the actual libstdc++ entry, including builds that call syscall directly
+// instead of libc clock_gettime. The real clock implementation remains intact.
+extern "C" {
+std::chrono::steady_clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv() noexcept;
+std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() noexcept;
+}
+extern "C" std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() noexcept {
+    if (stream_clock_active && *stream_clock_active) ++stream_clock_reads;
+    return __real__ZNSt6chrono3_V212steady_clock3nowEv();
+}
+#endif
 
 using namespace ggml::potal;
 using namespace potal_test;
@@ -56,6 +73,7 @@ struct run_result {
     std::unique_ptr<int32_t, dma_deleter> c_main, c_res;
     potal_paired_session_status      session;
     uint32_t                         generation = 0;
+    uint64_t                         hot_clock_reads = 0;
 };
 
 // One stripe (stripe 0, rows = min(stripe_rows, M)) of a fixture through the new executor.
@@ -63,7 +81,10 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
                       bool with_sink = true, uint32_t generation = 0, bool conservative = false,
                       const potal_paired_sink * override_sink = nullptr, int scale_reuse = -1,
                       const potal_paired_execution_plan * plan = nullptr, bool prefetch = false,
-                      bool early = false, potal_observation_counter_fn early_counter = nullptr) {
+                      bool early = false, potal_observation_counter_fn early_counter = nullptr,
+                      potal_paired_stream_mode stream = potal_paired_stream_mode::off,
+                      potal_observation_counter_fn stream_counter = nullptr,
+                      const potal_paired_geometry * hw = nullptr) {
     run_result   r;
     const size_t rows = std::min(main.tile_I * PD, f.M);
     residual::decoded_packet d;
@@ -95,10 +116,22 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
     q.conservative_fences = conservative;
     if (scale_reuse >= 0) q.ktile_scale_reuse = scale_reuse != 0;
     q.plan = plan;
+    q.hw = hw;
     q.next_k_prefetch = prefetch;
     q.early_k_prefetch = early;
     q.early_counter = early ? (early_counter ? early_counter : h2_emulator::on_counter) : nullptr;
+    q.stream = stream;
+    q.stream_counter = stream != potal_paired_stream_mode::off ?
+        (stream_counter ? stream_counter : h2_emulator::on_counter) : nullptr;
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+    stream_clock_reads = 0;
+    stream_clock_active = &emu.stream_active;
+#endif
     r.status       = potal_paired_matmul_auto(q, s, r.report);
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+    r.hot_clock_reads = stream_clock_reads;
+    stream_clock_active = nullptr;
+#endif
     r.session      = potal_paired_session_query(s);
     if (r.status == potal_paired_status::ok) {
         r.main_c.resize(rows * f.N);
@@ -116,7 +149,7 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
         r.c_res.release();
         // Test housekeeping only: the emulator answers the next FENCE, so the leaked state can be drained
         // and the accelerator handed to the next case (production disables the issuer instead).
-        if (!prefetch) {
+        if (!prefetch && stream == potal_paired_stream_mode::off) {
             emu.fail_funct = 0xFFFFFFFFu;
             (void) potal_paired_fence(s);
         }
@@ -226,6 +259,8 @@ struct case_spec {
 
 void test_early_case(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in,
                      const potal_paired_execution_plan & plan);
+void test_stream_case(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in,
+                      const potal_paired_execution_plan & plan, const potal_paired_geometry * hw = nullptr);
 
 // Entries of `fn` whose K lies inside the fixture's K.
 entries_fn within_k(const entries_fn & fn, size_t K) {
@@ -286,7 +321,10 @@ bool run_case(const case_spec & c, bool verbose, std::string & why, run_result *
     }
     const size_t rows = std::min(main.tile_I * PD, f.M);
     why               = compare_stripe(f, in, ref, r, rows);
-    if (early_compare && PD == 32 && why.empty()) test_early_case(f, main, in, r.report.plan);
+    if (early_compare && PD == 32 && why.empty()) {
+        test_early_case(f, main, in, r.report.plan);
+        test_stream_case(f, main, in, r.report.plan);
+    }
     if (keep != nullptr) {
         *keep = std::move(r);
     }
@@ -441,6 +479,25 @@ void test_staging() {
     }
     check("P every window column = the digits of its Index slot, filler and tail columns zero, DMA-aligned rows",
           columns && fillers == tile.residual_filler_slots && packed + fillers == plan.index_writes / tile.j_groups && fillers > 0);
+    potal_paired_staging fixed;
+    const auto fixed_status = potal_paired_pack_residual(plan, d, fixed, &why, potal_paired_hw_geometry(), true);
+    size_t pitch = 0;
+    for (const auto & window : st.windows) pitch = std::max(pitch, window.lda);
+    bool fixed_ok = fixed_status == potal_paired_status::ok && fixed.rows == st.rows &&
+                    fixed.windows.size() == st.windows.size();
+    for (size_t w = 0; fixed_ok && w < st.windows.size(); ++w) {
+        const auto & old = st.windows[w];
+        const auto & now = fixed.windows[w];
+        fixed_ok = now.panel == old.panel && now.index == old.index && now.cols == old.cols &&
+                   now.lda == pitch && now.lda % POTAL_HW_MAX_BYTES == 0;
+        for (size_t row = 0; row < fixed.rows; ++row) {
+            for (size_t col = 0; col < pitch; ++col) {
+                const int8_t want = col < old.cols ? st.a(w)[row * old.lda + col] : 0;
+                fixed_ok = fixed_ok && fixed.a(w)[row * pitch + col] == want;
+            }
+        }
+    }
+    check("H SOFTWARE-ONLY fixed pitch preserves compact digits/order and zeros every padding byte", fixed_ok);
     if (PD == 32) {
         check("P DIM32 staging: four legal K32 runs, windows 40/64 active rows, 24/0 pad, 29 filler columns",
               tile.fragments.size() == 4 && tile.k_panels == 1 && tile.residual_windows == 2 &&
@@ -472,12 +529,22 @@ void test_numerics() {
         { "N decode shape M = 1", 1, 768, 768, 8, dense_entries(1, 5, 90) },
         { "N multi-panel without Residual", 65, 97, 2080, 129, nullptr },
         { "N sparse first panel, later panels without Residual", 80, 160, 2048, 3, dense_entries(9, 4096, 150) },
+        { "N full Main ACC half without Residual", 256, 32, 256, 229, nullptr },
+        { "N full resident B bank without Residual", 1, 32, 2048, 233, nullptr },
+        { "N full Residual ACC half", 128, 32, 64, 239, dense_entries(1, 1, 30000) },
     };
     for (const case_spec & c : cases) {
         std::string why;
         run_result  r;
         const bool  ok = run_case(c, true, why, &r, nullptr, false, true);
         check(std::string(c.name) + ": Main INT32, Residual INT32, radix INT64, final F32 == serialized reference (" + why + ")", ok);
+        if (PD == 32 && c.seed == 229)
+            check("H Main ACC half capacity reached exactly", r.report.tile.main_acc_rows == POTAL_HW_ACC_ROWS / 2);
+        if (PD == 32 && c.seed == 233)
+            check("H full Main A and B banks reached exactly",
+                  r.report.tile.main_a_rows == POTAL_HW_BANK_ROWS && r.report.tile.weight_rows == POTAL_HW_BANK_ROWS);
+        if (PD == 32 && c.seed == 239)
+            check("H Residual ACC half capacity reached exactly", r.report.tile.residual_acc_rows == POTAL_HW_ACC_ROWS / 2);
         // Geometry the case name claims: explicit DIM-specific constants,
         // never expectations copied from the plan under test.
         const std::string name = c.name;
@@ -693,10 +760,485 @@ void test_early_case(const paired_fixture & f, const potal_tile_plan & main, con
           !early.session.index_transaction_open && !early.report.fatal);
 }
 
+void test_stream_case(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in,
+                      const potal_paired_execution_plan & plan, const potal_paired_geometry * hw) {
+    if (PD != 32) return;
+    const auto golden = golden_of(f, main.tile_I * PD, in);
+    serialized_result expected;
+    expected.main_ok = expected.legacy_ok = golden.ok;
+    expected.main_c = golden.main_c;
+    expected.legacy = golden.legacy;
+    expected.correction = golden.correction;
+    expected.rows.resize(in.theta.size());
+    expected.residual_c.resize(in.theta.size());
+    for (const auto & row : golden.residual[0]) {
+        expected.rows[0].push_back({row.lane, row.row});
+        expected.residual_c[0].insert(expected.residual_c[0].end(), row.c.begin(), row.c.end());
+    }
+    h2_emulator old_emu;
+    const auto old = run_paired(f, main, in, old_emu, true, 250, false, nullptr, 1, &plan,
+                                false, false, nullptr, potal_paired_stream_mode::off, nullptr, hw);
+    check("H SOFTWARE-ONLY old Ktile matches independent golden",
+          golden.ok && old.status == potal_paired_status::ok &&
+          compare_stripe(f, in, expected, old, std::min(main.tile_I * PD, f.M)).empty());
+    std::vector<potal_paired_cmd_record> continuous_order;
+    uint64_t continuous_waits = 0;
+    for (auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                      potal_paired_stream_mode::continuous_early}) {
+        h2_emulator emu;
+        const auto result = run_paired(f, main, in, emu, true, 250, false, nullptr, 1, &plan,
+                                       false, false, nullptr, mode, nullptr, hw);
+        const bool ok = result.status == potal_paired_status::ok;
+        check("H SOFTWARE-ONLY stream executes unchanged manifest", ok);
+        if (!ok) { print_report("H stream", result); continue; }
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+        check("H actual issuer clock calls absent between stream BEGIN and END", result.hot_clock_reads == 0);
+#endif
+        check("H exact raw Main/Residual INT32, host radix INT64 and final F32",
+              golden.ok && compare_stripe(f, in, expected, result, std::min(main.tile_I * PD, f.M)).empty() &&
+              result.main_c == old.main_c && result.residual_c == old.residual_c &&
+              emu.errors.empty() && !emu.scale_miss);
+        const auto & tile = result.report.tile;
+        const auto & counts = result.report.counts;
+        check("H capacity handling never changes Main I/J/K or planned windows",
+              tile.tile_I == plan.tile.tile_I && tile.tile_J == plan.tile.tile_J &&
+              tile.tile_K == plan.tile.tile_K && tile.k_panels == plan.tile.k_panels &&
+              tile.residual_windows == plan.tile.residual_windows && tile.j_groups == plan.tile.j_groups &&
+              counts.main_loop_ws == old.report.counts.main_loop_ws &&
+              counts.residual_loop_ws == old.report.counts.residual_loop_ws);
+        bool descriptors = true, config_outside = true;
+        size_t loops = 0;
+        bool hot = false;
+        for (size_t i = 0; i < emu.records.size(); ++i) {
+            const auto & record = emu.records[i];
+            if (record.funct == POTAL_FUNCT_CONFIG && hot)
+                config_outside = config_outside && (record.rs1 & 3) == 2 &&
+                                 i + 1 < emu.records.size() && emu.records[i + 1].funct == POTAL_FUNCT_MVOUT;
+            if (record.funct != POTAL_FUNCT_LOOP_WS) continue;
+            hot = true;
+            ++loops;
+            if (i < 5) { descriptors = false; continue; }
+            for (size_t word = 0; word < 5; ++word) {
+                const auto & config = emu.records[i - 5 + word];
+                descriptors = descriptors && config.funct == POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS + word &&
+                              config.xd == 0;
+            }
+        }
+        check("H hot LOOP_WS has exactly five descriptor words and no ordinary CONFIG",
+              descriptors && config_outside && loops == counts.main_loop_ws + counts.residual_loop_ws);
+        // Compare arithmetic, Scale and Index words, not relocated A staging
+        // pointers. B-only adds no compute, metadata or retirement operation.
+        std::vector<potal_paired_cmd_record> order;
+        for (const auto & record : emu.records)
+            if (record.funct == POTAL_FUNCT_LOOP_WS || record.funct == POTAL_FUNCT_SCALE_WRITE ||
+                record.funct == POTAL_FUNCT_INDEX_CONFIG || record.funct == POTAL_FUNCT_INDEX_WRITE ||
+                record.funct == POTAL_FUNCT_SCALE_RELEASE ||
+                (record.funct == POTAL_FUNCT_STREAM && (record.rs1 & 15) == 5))
+                order.push_back(record);
+        if (mode == potal_paired_stream_mode::continuous) {
+            continuous_order = order;
+            continuous_waits = emu.stream_waits;
+        }
+        if (mode == potal_paired_stream_mode::continuous_early) {
+            bool unchanged_order = order.size() == continuous_order.size();
+            for (size_t i = 0; unchanged_order && i < order.size(); ++i)
+                unchanged_order = order[i].funct == continuous_order[i].funct &&
+                                  order[i].xd == continuous_order[i].xd &&
+                                  order[i].rs1 == continuous_order[i].rs1 &&
+                                  order[i].rs2 == continuous_order[i].rs2;
+            bool placement = true, identity = true, checked_begin = false;
+            size_t main_seen = 0, producers = 0;
+            for (size_t i = 0; i < emu.records.size(); ++i) {
+                const auto & record = emu.records[i];
+                if (record.funct == POTAL_FUNCT_STREAM && record.rs1 == 6)
+                    checked_begin = record.xd == 1 && record.rs2 == 0;
+                if (record.funct == POTAL_FUNCT_LOOP_WS && !(record.rs1 >> 62 & 1)) ++main_seen;
+                if (record.funct != POTAL_FUNCT_LDB_ONLY) continue;
+                ++producers;
+                // Only five B staging words may intervene: no forced wait,
+                // global drain, Scale/Index programming or future compute.
+                if (i < 6 || !main_seen || main_seen >= plan.residencies.size()) {
+                    placement = identity = false;
+                    continue;
+                }
+                const auto & current = plan.residencies[main_seen - 1];
+                const auto & next = plan.residencies[main_seen];
+                const auto & panel = tile.panels[next.panel];
+                placement = placement && emu.records[i - 6].funct == POTAL_FUNCT_LOOP_WS &&
+                            !(emu.records[i - 6].rs1 >> 62 & 1) &&
+                            current.j_group == next.j_group && next.panel == current.panel + 1 &&
+                            next.pair != current.pair;
+                for (size_t word = 0; word < 5; ++word)
+                    placement = placement &&
+                        emu.records[i - 5 + word].funct == POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS + word &&
+                        emu.records[i - 5 + word].xd == 0;
+                const size_t pad_j = next.j_tiles * PD - next.cols;
+                const auto source = reinterpret_cast<uintptr_t>(f.weight.b +
+                    panel.k_begin * f.weight.ldb + next.j_group * tile.tile_J * PD);
+                identity = identity && record.xd == 1 && record.rs1 == (UINT64_C(0x10) | next.pair) &&
+                    record.rs2 == 0 &&
+                    emu.records[i - 5].rs1 == uint64_t(pad_j) << 16 &&
+                    emu.records[i - 5].rs2 ==
+                        ((uint64_t(panel.k_tiles) << 32) | (uint64_t(next.j_tiles) << 16) | 1) &&
+                    emu.records[i - 4].rs1 == 0 && emu.records[i - 4].rs2 == source &&
+                    emu.records[i - 3].rs1 == 0 && emu.records[i - 3].rs2 == 0 &&
+                    emu.records[i - 2].rs1 == 0 && emu.records[i - 2].rs2 == f.weight.ldb &&
+                    emu.records[i - 1].rs1 == 0 && emu.records[i - 1].rs2 == 0;
+            }
+            check("H Early command_declared B-only immediately follows adjacent same-J Main before Residual",
+                  placement && identity && checked_begin &&
+                  producers == emu.ldb_only_loads &&
+                  (tile.k_panels == 1 ? producers == 0 : producers >= tile.j_groups) &&
+                  (counts.stream_capacity_boundaries != 0 ||
+                   producers == (tile.k_panels > 1 ? tile.j_groups : 0)));
+            check("H Early logical B loaded exactly once without fake compute or metadata counts",
+                  unchanged_order && emu.b_loads + emu.ldb_only_loads == counts.main_loop_ws &&
+                  emu.resident_main_loops == emu.ldb_only_loads && !emu.raw_b_mvins &&
+                  emu.main_loops == counts.main_loop_ws && emu.residual_loops == counts.residual_loop_ws &&
+                  counts.prefetch_loads == emu.ldb_only_loads &&
+                  counts.prefetch_ldb_only == emu.ldb_only_loads && counts.prefetch_mvins == 0 &&
+                  counts.prefetch_bytes_declared == emu.ldb_only_bytes &&
+                  emu.stream_waits == continuous_waits + emu.ldb_only_loads &&
+                  count_funct(emu, POTAL_FUNCT_COUNTER) == 3);
+        } else {
+            check("H legacy streaming emits no B-only producer or resident Main",
+                  !emu.ldb_only_loads && !emu.resident_main_loops &&
+                  emu.b_loads == counts.main_loop_ws && count_funct(emu, POTAL_FUNCT_COUNTER) == 2);
+        }
+        check("H bounded retains global RELEASE; continuous uses only scoped release",
+              (count_funct(emu, POTAL_FUNCT_SCALE_RELEASE) > 0) ==
+                  (mode == potal_paired_stream_mode::bounded));
+        size_t window_boundaries = 0;
+        size_t max_pitch = 0, packed_columns = 0, logical_columns = 0, load_columns = 0;
+        for (const auto & panel : tile.panels) {
+            if (!panel.windows.empty()) window_boundaries += panel.windows.size() - 1;
+            for (const auto & window : panel.windows) {
+                max_pitch = std::max(max_pitch, align_up(window.k_tiles * PD, POTAL_HW_MAX_BYTES));
+                logical_columns += window.k_tiles * PD;
+                load_columns += window.active_rows;
+            }
+        }
+        for (const auto & fragment : tile.fragments) packed_columns += fragment.count;
+        const size_t expected_fences = mode != potal_paired_stream_mode::bounded ? 2 * tile.j_groups :
+            2 * tile.j_groups + ((tile.k_panels - 1) / 2 + window_boundaries) * tile.j_groups +
+            counts.stream_capacity_boundaries;
+        check("H only exact declared epoch/bounded/window Fence boundaries",
+              counts.stream_batches > 0 && counts.fences == emu.fences && counts.fences == expected_fences);
+        check("H logical staging/padding/valid/load bytes independent of DMA timing",
+              counts.residual_staging_bytes == tile.residual_lane_rows * max_pitch * tile.residual_windows &&
+              counts.residual_pitch_padding_bytes ==
+                  tile.residual_lane_rows * (max_pitch * tile.residual_windows - logical_columns) &&
+              counts.residual_valid_bytes == tile.residual_lane_rows * packed_columns &&
+              counts.residual_load_bytes_declared == tile.residual_lane_rows * load_columns * tile.j_groups);
+        check("H real LOAD3 arithmetic and local release/wait observations match report",
+              emu.load3_loops == counts.residual_loop_ws && emu.stream_waits == counts.stream_pair_waits &&
+              emu.stream_releases == counts.stream_local_releases &&
+              emu.stream_releases + emu.scale_releases == emu.scale_writes && !emu.stream_active);
+        if (tile.k_panels > 2)
+            check("H both physical pairs reused with completed incarnations",
+                  emu.stream_pairs[0].incarnation > 1 && emu.stream_pairs[1].incarnation > 0 &&
+                  emu.stream_pairs[0].submitted == emu.stream_pairs[0].completed &&
+                  emu.stream_pairs[1].submitted == emu.stream_pairs[1].completed);
+        if (tile.k_panels == 260 && f.N == 1) {
+            std::vector<uint32_t> generations;
+            for (const auto & record : emu.records)
+                if (record.funct == POTAL_FUNCT_SCALE_WRITE) generations.push_back((record.rs1 >> 8) & 255);
+            check("H more than 255 actual allocations wrap only after old generation release",
+                  generations.size() == 260 && generations[0] == generations[255] &&
+                  generations[0] != 0 && emu.stream_releases + emu.scale_releases == 260 &&
+                  emu.stream_pairs[0].incarnation == 130 && emu.stream_pairs[1].incarnation == 130);
+        }
+        check("H stream closes idle with no outstanding work or live Scale entries",
+              !result.report.fatal && !result.session.failed && !result.session.live_scale_slots &&
+              !result.session.outstanding_loops && !result.session.outstanding_readbacks &&
+              !result.session.index_transaction_open);
+    }
+}
+
+void test_stream_generation_wrap() {
+    if (PD != 32) return;
+    // 260 separate allocations, not merely starting the counter near 255.
+    paired_fixture f(1, 1, 260 * PD, 193, [](size_t, size_t) { return int16_t(0); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool ok = f.ok && potal_frozen_plan(f.M, f.N, f.K, 1, 1, 1, PPB, &main) == POTAL_OK &&
+                    make_inputs(f, PD, {}, in);
+    check("H wrap fixture has 260 allocations and repeated pair reuse", ok);
+    if (!ok) return;
+    h2_emulator emu;
+    const auto old = run_paired(f, main, in, emu, true, 0, false, nullptr, 1);
+    check("H wrap manifest retains 260 one-tile panels", old.status == potal_paired_status::ok &&
+          old.report.tile.k_panels == 260 && old.report.tile.tile_K == 1);
+    if (old.status == potal_paired_status::ok) test_stream_case(f, main, in, old.report.plan);
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+    if (old.status == potal_paired_status::ok) {
+        const char * previous = std::getenv("POTAL_STREAM_ADMISSION_PROFILE");
+        const bool had_previous = previous != nullptr;
+        const std::string saved = previous ? previous : "";
+        setenv("POTAL_STREAM_ADMISSION_PROFILE", "1", 1);
+        h2_emulator observed;
+        const auto profiled = run_paired(f, main, in, observed, true, 0, false, nullptr, 1,
+            &old.report.plan, false, false, nullptr, potal_paired_stream_mode::continuous_early);
+        if (had_previous) setenv("POTAL_STREAM_ADMISSION_PROFILE", saved.c_str(), 1);
+        else unsetenv("POTAL_STREAM_ADMISSION_PROFILE");
+        check("H explicit CPU API diagnostic preserves software-only numerical results",
+              profiled.status == potal_paired_status::ok && profiled.main_c == old.main_c &&
+              profiled.residual_c == old.residual_c && observed.errors.empty());
+        check("H explicit CPU API diagnostic reads clocks only around B-only calls",
+              profiled.report.counts.prefetch_loads > 0 &&
+              profiled.hot_clock_reads == 2 * profiled.report.counts.prefetch_loads);
+    }
+#endif
+}
+
+void test_stream_request_refusals() {
+    check("H Early appends stream value three without changing legacy values",
+          static_cast<unsigned>(potal_paired_stream_mode::off) == 0 &&
+          static_cast<unsigned>(potal_paired_stream_mode::bounded) == 1 &&
+          static_cast<unsigned>(potal_paired_stream_mode::continuous) == 2 &&
+          static_cast<unsigned>(potal_paired_stream_mode::continuous_early) == 3);
+    check("H stream request defaults off without callback",
+          potal_paired_request{}.stream == potal_paired_stream_mode::off &&
+          potal_paired_request{}.stream_counter == nullptr);
+    paired_fixture f(1, 32, 64, 197, [](size_t, size_t) { return int16_t(0); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool ok = f.ok && main_select_ok(f, main) && make_inputs(f, main.tile_I * PD, {}, in);
+    check("H refusal fixture", ok);
+    if (!ok) return;
+    if (PD == 32) {
+        h2_emulator unavailable;
+        unavailable.stream_capability = 0;
+        const auto r = run_paired(f, main, in, unavailable, true, 0, false, nullptr, 1,
+                                  nullptr, false, false, nullptr, potal_paired_stream_mode::continuous);
+        check("H unsupported capability refuses before stream opcode or compute without fallback",
+              r.status == potal_paired_status::execution_failed && r.report.hw_status == POTAL_ERR_UNSUPPORTED &&
+              !r.report.fatal && count_funct(unavailable, POTAL_FUNCT_COUNTER) == 2 &&
+              !count_funct(unavailable, POTAL_FUNCT_STREAM) && !unavailable.main_loops &&
+              !unavailable.residual_loops && r.main_c.empty() && r.residual_c.empty());
+        for (uint64_t capability : {UINT64_C(0), POTAL_STREAM_CAPABILITY,
+                                    POTAL_STREAM_EARLY_CAPABILITY ^ UINT64_C(1)}) {
+            h2_emulator early;
+            early.stream_early_capability = capability;
+            const auto refused = run_paired(f, main, in, early, true, 0, false, nullptr, 1,
+                nullptr, false, false, nullptr, potal_paired_stream_mode::continuous_early);
+            check("H Early requires exact capability before stream CONFIG or compute without fallback",
+                  refused.status == potal_paired_status::execution_failed &&
+                  refused.report.hw_status == POTAL_ERR_UNSUPPORTED && !refused.report.fatal &&
+                  count_funct(early, POTAL_FUNCT_COUNTER) == 3 &&
+                  !count_funct(early, POTAL_FUNCT_STREAM) && !count_funct(early, POTAL_FUNCT_CONFIG) &&
+                  !early.main_loops && !early.residual_loops && !early.ldb_only_loads &&
+                  refused.main_c.empty() && refused.residual_c.empty());
+        }
+    }
+    for (auto requested : {potal_paired_stream_mode::continuous, potal_paired_stream_mode::continuous_early})
+    for (unsigned kind = 0; kind < 5; ++kind) {
+        h2_emulator emu;
+        const auto mode = kind == 4 ? static_cast<potal_paired_stream_mode>(255) :
+                                     requested;
+        const auto r = run_paired(f, main, in, emu, true, 0, kind == 1, nullptr, kind == 0 ? 0 : 1,
+                                  nullptr, kind == 2, kind == 3, nullptr, mode);
+        check("H malformed stream combination refuses before any compute without fallback",
+              r.status == potal_paired_status::invalid_argument && !r.report.issued && !r.report.fatal &&
+              emu.records.empty() && r.main_c.empty() && r.residual_c.empty());
+    }
+}
+
+void test_stream_capacity() {
+    if (PD != 32) return;
+    {
+        paired_fixture f(1, 1, 2048, 227, [](size_t, size_t) { return int16_t(0); });
+        potal_tile_plan main;
+        paired_inputs in;
+        const entries_fn entries = [](size_t, size_t) {
+            std::vector<res_entry> out;
+            for (size_t block = 0; block < 64; block += 2) out.push_back({0, block * 32 + 3, 7});
+            return out;
+        };
+        auto hw = potal_paired_hw_geometry();
+        hw.scale_entries = 60; // One 48-slot panel fits, two do not.
+        // K32 leaves room for Residual A beside Main A in the same 64-tile bank.
+        const bool ok = f.ok && potal_frozen_plan(f.M, f.N, f.K, 1, 1, 32, PPB, &main) == POTAL_OK &&
+                        make_inputs(f, PD, entries, in);
+        check("H bounded live-set splitting fixture", ok);
+        if (ok) {
+            h2_emulator baseline;
+            const auto old = run_paired(f, main, in, baseline, true, 0, false, nullptr, 1, nullptr,
+                false, false, nullptr, potal_paired_stream_mode::off, nullptr, &hw);
+            check("H capacity split retains two K32 panels", old.status == potal_paired_status::ok &&
+                  old.report.tile.tile_K == 32 && old.report.tile.k_panels == 2);
+            if (old.status == potal_paired_status::ok) {
+                test_stream_case(f, main, in, old.report.plan, &hw);
+                for (auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                                  potal_paired_stream_mode::continuous_early}) {
+                    h2_emulator emu;
+                    const auto split = run_paired(f, main, in, emu, true, 0, false, nullptr, 1, &old.report.plan,
+                        false, false, nullptr, mode, nullptr, &hw);
+                    check("H safe metadata boundary instead of hidden retiling",
+                          split.status == potal_paired_status::ok && split.report.counts.stream_capacity_boundaries == 1 &&
+                          split.main_c == old.main_c && split.residual_c == old.residual_c);
+                }
+            }
+        }
+    }
+    paired_fixture f(1, 1, 512, 223, [](size_t, size_t) { return int16_t(0); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const entries_fn entries = [](size_t, size_t) {
+        std::vector<res_entry> out;
+        for (size_t block = 0; block < 16; block += 2) out.push_back({0, block * 32 + 3, 7});
+        return out;
+    };
+    const bool ok = f.ok && potal_frozen_plan(f.M, f.N, f.K, 1, 1, 16, PPB, &main) == POTAL_OK &&
+                    make_inputs(f, PD, entries, in);
+    check("H capacity fixture has discontinuous nonaliasing windows", ok);
+    if (!ok) return;
+    auto hw = potal_paired_hw_geometry();
+    hw.scale_entries = 20; // Main 16 + one Residual 2 fits; Main + all four windows 24 does not.
+    h2_emulator old_emu;
+    const auto old = run_paired(f, main, in, old_emu, true, 0, false, nullptr, 1, nullptr,
+                                false, false, nullptr, potal_paired_stream_mode::off, nullptr, &hw);
+    check("H old schedule fits twenty slots without retiling",
+          old.status == potal_paired_status::ok && old.report.tile.tile_K == 16 &&
+          old.report.tile.k_panels == 1 && old.report.tile.residual_windows == 4);
+    if (old.status != potal_paired_status::ok) return;
+    for (auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                      potal_paired_stream_mode::continuous_early}) {
+        h2_emulator emu;
+        const auto result = run_paired(f, main, in, emu, true, 0, false, nullptr, 1, &old.report.plan,
+                                       false, false, nullptr, mode, nullptr, &hw);
+        check("H oversized panel live set refuses before issue, never silently retiles",
+              result.status == potal_paired_status::scale_window_capacity && !result.report.issued &&
+              !result.report.fatal && result.report.tile.tile_K == 16 && emu.records.empty());
+    }
+}
+
+void test_stream_emulator_lifetimes() {
+    if (PD != 32) return;
+    h2_emulator e;
+    check("H emulator continuous begin", e.command({POTAL_FUNCT_STREAM, 1, 2, 0}) == POTAL_OK);
+    int8_t sources[2][4] = {{1, 2, 3, 4}, {-1, -2, -3, -4}};
+    for (uint32_t pair = 0; pair < 2; ++pair) {
+        e.stream_pairs[pair].scheduled = true;
+        e.stream_pairs[pair].submitted = 1;
+        e.borrow(pair, reinterpret_cast<uintptr_t>(sources[pair]), 1, 4, 4);
+        e.scales[pair][0] = {true, pair + 1, 0};
+        e.scale_pairs[pair] = 1u << pair;
+    }
+    check("H scheduled B is not an observed completion",
+          !e.stream_pairs[0].dma_done && !e.stream_pairs[1].dma_done);
+    check("H pair-local wait leaves opposite pair pending",
+          e.command({POTAL_FUNCT_STREAM, 1, 4, 0}) == POTAL_OK &&
+          e.stream_pairs[0].dma_done && e.stream_pairs[0].completed == 1 &&
+          !e.stream_pairs[1].dma_done && e.stream_pairs[1].completed == 0 && e.fences == 0);
+    check("H local generation release preserves other pair allocation",
+          e.command({POTAL_FUNCT_STREAM, 1, 5, UINT64_C(1) << 8}) == POTAL_OK &&
+          !e.scales[0][0].valid && e.scales[1][0].valid && !e.scale_pairs[0] && e.scale_pairs[1] == 2);
+    check("H global Fence observes all scheduled work",
+          e.command({POTAL_FUNCT_FENCE, 1, 0, 0}) == POTAL_OK &&
+          e.stream_pairs[1].dma_done && e.stream_pairs[1].completed == 1);
+    check("H remaining generation released and end closes stream",
+          e.command({POTAL_FUNCT_STREAM, 1, 5, (UINT64_C(2) << 8) | 1}) == POTAL_OK &&
+          e.command({POTAL_FUNCT_STREAM, 1, 3, 0}) == POTAL_OK && !e.stream_active && e.errors.empty());
+    h2_emulator changed;
+    check("H source immutability setup", changed.command({POTAL_FUNCT_STREAM, 1, 2, 0}) == POTAL_OK);
+    changed.stream_pairs[0].scheduled = true;
+    changed.stream_pairs[0].submitted = 1;
+    changed.borrow(0, reinterpret_cast<uintptr_t>(sources[0]), 1, 4, 4);
+    (void) changed.command({POTAL_FUNCT_STREAM, 1, 4, 0});
+    sources[0][0] = 99; // Successful local completion does not end borrowed-source lifetime.
+    (void) changed.command({POTAL_FUNCT_STREAM, 1, 3, 0});
+    check("H emulator detects mutation even after local wait before stream end", !changed.errors.empty());
+}
+
+struct stream_failure_sink {
+    h2_emulator emulator;
+    size_t position = 0, seen = 0, failed_at = SIZE_MAX;
+    bool lose_response = false, armed = false;
+
+    static potal_status counter(void * ctx, const potal_paired_cmd_record * command, uint64_t * value) {
+        return h2_emulator::on_counter(&static_cast<stream_failure_sink *>(ctx)->emulator, command, value);
+    }
+    static potal_status command(void * ctx, const potal_paired_cmd_record * command) {
+        auto & self = *static_cast<stream_failure_sink *>(ctx);
+        if (command->funct == POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS && !self.seen) self.armed = true;
+        if (self.armed && ++self.seen == self.position) {
+            self.armed = false;
+            self.failed_at = self.emulator.records.size();
+            if (self.lose_response) {
+                // Execute the command, then lose its response: cannot infer
+                // safety from a sink error or synchronous test arithmetic.
+                (void) self.emulator.command(*command);
+                return POTAL_ERR_NO_HARDWARE;
+            }
+            self.emulator.records.push_back(*command);
+            return POTAL_HW_INVALID_ADDRESS;
+        }
+        return self.emulator.command(*command);
+    }
+};
+
+void test_stream_execution_failures() {
+    if (PD != 32) return;
+    for (size_t position = 1; position <= 6; ++position) {
+        // Quarantine intentionally retains issuer and DMA buffers. Isolate
+        // every fault, including a lost accepted LOOP_WS response.
+        std::fflush(nullptr);
+        const pid_t child = fork();
+        if (child == 0) {
+            const int before = g_failures;
+            paired_fixture f(1, 32, 160, 211, [](size_t, size_t) { return int16_t(0); });
+            potal_tile_plan main;
+            paired_inputs in;
+            const bool ok = f.ok && potal_frozen_plan(f.M, f.N, f.K, 1, 1, 2, PPB, &main) == POTAL_OK &&
+                            make_inputs(f, PD, {}, in);
+            check("H fault fixture", ok);
+            if (ok) {
+                stream_failure_sink failure;
+                failure.position = position;
+                failure.lose_response = position == 6;
+                const potal_paired_sink sink{stream_failure_sink::command, &failure};
+                const auto r = run_paired(f, main, in, failure.emulator, true, 0, false, &sink, 1,
+                    nullptr, false, false, nullptr, potal_paired_stream_mode::continuous,
+                    stream_failure_sink::counter);
+                check("H partial descriptor or response loss fails without fallback",
+                      failure.failed_at != SIZE_MAX && r.status == potal_paired_status::execution_failed &&
+                      r.report.hw_status == (position == 6 ? POTAL_ERR_NO_HARDWARE : POTAL_HW_INVALID_ADDRESS) &&
+                      r.main_c.empty() && r.residual_c.empty() &&
+                      failure.emulator.main_loops == (position == 6 ? 1u : 0u) &&
+                      !failure.emulator.residual_loops && failure.emulator.errors.empty());
+                check("H unknown stream effects quarantine with no later commands",
+                      r.report.fatal && !r.report.cleaned && r.session.failed &&
+                      failure.failed_at + 1 == failure.emulator.records.size());
+                potal_paired_session * other = nullptr;
+                check("H quarantined stream retains exclusive owner",
+                      potal_paired_session_open(&sink, &other) == POTAL_ERR_BUSY);
+            }
+            std::fflush(nullptr);
+            _exit(g_failures == before ? 0 : 1);
+        }
+        check("H fault process created", child >= 0);
+        if (child >= 0) {
+            int status = 0;
+            pid_t result;
+            do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+            check("H partial issue and lost response ownership isolated",
+                  result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+}
+
 void test_early_emulator() {
     if (PD != 32) return;
+    for (uint32_t mode : {0u, 1u, 2u, 6u})
     for (uint32_t pair : {0u, 1u}) {
         h2_emulator e;
+        if (mode) {
+            check("H SOFTWARE-ONLY emulator accepts legacy or Early stream begin",
+                  e.command({POTAL_FUNCT_STREAM, 1, mode, 0}) == POTAL_OK);
+            e.stream_pairs[1 - pair].scheduled = true;
+            e.stream_pairs[1 - pair].submitted = 1;
+        }
         const uint32_t K = pair ? 1 : 2, J = 2, pad_j = 5;
         const size_t stride = 3 * PD;
         std::unique_ptr<int8_t, dma_deleter> source(static_cast<int8_t *>(dma_alloc(2 * PD * stride)));
@@ -723,6 +1265,13 @@ void test_early_emulator() {
         };
         bool accepted = true;
         for (const auto & word : words) accepted = accepted && e.command(word) == POTAL_OK;
+        if (mode == 1 || mode == 2) {
+            check("H legacy stream modes reject B-only without data or compute effects",
+                  !accepted && !e.errors.empty() && e.sp == old_sp && e.acc == old_acc &&
+                  !e.ldb_only_loads && !e.main_loops && !e.residual_loops &&
+                  !e.stream_pairs[pair].producer && !e.stream_pairs[pair].submitted);
+            continue;
+        }
         const size_t first = (2 * pair + 2) * POTAL_HW_BANK_ROWS - K * J * PD;
         bool bytes = accepted;
         for (size_t row = 0; row < h2_emulator::sp_rows; ++row) for (size_t col = 0; col < PD; ++col) {
@@ -752,6 +1301,39 @@ void test_early_emulator() {
               !e.index_configs && !e.index_writes && !e.scale_writes && !e.scale_releases &&
               !e.mvouts && !e.raw_b_mvins && !e.b_loads && e.ldb_only_loads == 1 &&
               e.ld_config[0] == 0 && e.ld_stride[0] == 0 && e.st_stride == 0 && e.errors.empty());
+        if (mode == 6) {
+            const auto & producer = e.stream_pairs[pair];
+            check("H Early admission owns B but creates zero logical compute readers",
+                  producer.producer && !producer.scheduled && !producer.dma_done &&
+                  producer.submitted == 0 && producer.completed == 0 &&
+                  producer.borrowed.size() == 1 && e.stream_waits == 0 && e.fences == 0);
+            {
+                h2_emulator pending = e;
+                pending.scales[3][2].valid = false;
+                check("H producer-only pending epoch prevents emulator stream end with zero pending readers",
+                      pending.command({POTAL_FUNCT_STREAM, 1, 4 | (uint64_t(1 - pair) << 4), 0}) == POTAL_OK &&
+                      pending.command({POTAL_FUNCT_STREAM, 1, 3, 0}) == POTAL_HW_BAD_COMMAND &&
+                      pending.stream_active && pending.stream_pairs[pair].submitted == 0 &&
+                      !pending.stream_pairs[pair].dma_done);
+                check("H global drain reconciles accepted producer without inventing compute completion",
+                      pending.command({POTAL_FUNCT_FENCE, 1, 0, 0}) == POTAL_OK &&
+                      pending.stream_pairs[pair].dma_done &&
+                      pending.stream_pairs[pair].submitted == 0 && pending.stream_pairs[pair].completed == 0 &&
+                      !pending.main_loops && !pending.residual_loops && pending.fences == 1 &&
+                      pending.command({POTAL_FUNCT_STREAM, 1, 3, 0}) == POTAL_OK && pending.errors.empty());
+            }
+            check("H pair-local producer wait completes B without completing opposite Main",
+                  e.command({POTAL_FUNCT_STREAM, 1, 4 | (uint64_t(pair) << 4), 0}) == POTAL_OK &&
+                  producer.dma_done && producer.submitted == 0 && producer.completed == 0 &&
+                  producer.borrowed.empty() && !e.stream_pairs[1 - pair].dma_done &&
+                  e.stream_pairs[1 - pair].completed == 0 && !e.main_loops && !e.residual_loops &&
+                  e.stream_waits == 1 && e.fences == 0);
+            e.scales[3][2].valid = false; // Remove this test's sentinel, not a command-owned allocation.
+            check("H stream end clears Early permission after all producers and readers complete",
+                  e.command({POTAL_FUNCT_STREAM, 1, 4 | (uint64_t(1 - pair) << 4), 0}) == POTAL_OK &&
+                  e.command({POTAL_FUNCT_STREAM, 1, 3, 0}) == POTAL_OK &&
+                  !e.stream_active && !e.stream_early && !e.stream_continuous && e.errors.empty());
+        }
     }
 }
 
@@ -872,7 +1454,10 @@ void test_early_saturation() {
     const auto baseline = run_paired(f, main, in, emulator);
     check("G saturation manifest keeps three K panels", baseline.status == potal_paired_status::ok &&
           baseline.report.tile.k_panels == 3 && baseline.report.tile.panels.back().k_tiles == 1);
-    if (baseline.status == potal_paired_status::ok) test_early_case(f, main, in, baseline.report.plan);
+    if (baseline.status == potal_paired_status::ok) {
+        test_early_case(f, main, in, baseline.report.plan);
+        test_stream_case(f, main, in, baseline.report.plan);
+    }
 }
 
 void test_early_request_refusals() {
@@ -1025,6 +1610,7 @@ void test_ktile_scale_reuse() {
               prefetched.report.counts.scale_releases == reused.report.counts.scale_releases &&
               prefetched.session.drains == reused.session.drains);
         test_early_case(f, main, in, plan);
+        test_stream_case(f, main, in, plan);
 
 #if !defined(__riscv)
         potal_paired_request unavailable;
@@ -1998,7 +2584,8 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 // 4 paired with conservative fences.
 pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
                      const std::function<void(const potal_paired_request &)> & inspect = {}, bool ktile = false,
-                     bool prefetch = false, bool early = false) {
+                     bool prefetch = false, bool early = false,
+                     potal_paired_stream_mode stream = potal_paired_stream_mode::off) {
     pipe_result         r;
     ggml_gemmini_args_t args;
     if (!nd.args_for(args)) {
@@ -2017,6 +2604,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
     cfg.paired_ktile_scale_reuse = ktile;
     cfg.paired_next_k_prefetch = prefetch;
     cfg.paired_early_k_prefetch = early;
+    cfg.paired_stream = stream;
     cfg.layer        = "paired-pipeline-test";
     cfg.backend      = "EMULATED";
     cfg.observer     = [&](const stripe_event & ev) {
@@ -2043,6 +2631,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
             potal_paired_request q = req;
             q.generation           = &generation;
             if (q.early_k_prefetch) q.early_counter = h2_emulator::on_counter;
+            if (q.stream != potal_paired_stream_mode::off) q.stream_counter = h2_emulator::on_counter;
             fences_seen            = fences_seen || q.conservative_fences;
             const potal_paired_sink sink = h2.sink();
             return potal_paired_run_session(q, &sink, rep);
@@ -2105,6 +2694,74 @@ void print_pipe(const char * name, const pipe_result & r) {
                 (unsigned long long) c.paired_fences, (unsigned long long) c.paired_drains, r.paired_calls,
                 r.planned_commands.size(), (unsigned long long) r.h2_main, (unsigned long long) r.h2_residual,
                 (unsigned long long) r.h2_index, (unsigned long long) r.decode_calls, r.report.detail.c_str());
+}
+
+void test_stream_pipeline() {
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+    const bool observing = true;
+    stream_clock_reads = 0;
+    stream_clock_active = &observing;
+    (void) std::chrono::steady_clock::now();
+    stream_clock_active = nullptr;
+    check("H clock observer detects actual steady_clock calls", stream_clock_reads == 1);
+#endif
+    const char * previous = std::getenv("GGML_POTAL_PAIRED_STREAM");
+    const bool had = previous != nullptr;
+    const std::string saved = had ? previous : "";
+    unsetenv("GGML_POTAL_PAIRED_STREAM");
+    bool invalid = true;
+    check("H unset stream option defaults off",
+          options::paired_stream_requested(&invalid) == potal_paired_stream_mode::off && !invalid);
+    const std::pair<const char *, potal_paired_stream_mode> valid[] = {
+        {"OFF", potal_paired_stream_mode::off},
+        {"BOUNDED", potal_paired_stream_mode::bounded},
+        {"CONTINUOUS", potal_paired_stream_mode::continuous},
+        {"CONTINUOUS_EARLY", potal_paired_stream_mode::continuous_early},
+    };
+    for (const auto & option : valid) {
+        setenv("GGML_POTAL_PAIRED_STREAM", option.first, 1);
+        check("H valid stream option", options::paired_stream_requested(&invalid) == option.second && !invalid);
+    }
+    for (const char * value : {"ON", "1", "0", "CONTINUOUSx", " BOUNDED", "BOUNDED ",
+                              "CONTINUOUS_EARLYx", " CONTINUOUS_EARLY", "CONTINUOUS_EARLY "}) {
+        setenv("GGML_POTAL_PAIRED_STREAM", value, 1);
+        (void) options::paired_stream_requested(&invalid);
+        check("H malformed stream flag rejected", invalid);
+    }
+    if (had) setenv("GGML_POTAL_PAIRED_STREAM", saved.c_str(), 1);
+    else unsetenv("GGML_POTAL_PAIRED_STREAM");
+    if (!options::compensation || options::activation_quant != options::ActivationQuantAlgo::EXSIA) return;
+    pipe_node nd(33, 35, 160, 199, 60.0f, 2, 1);
+    check("H pipeline fixture", nd.ok);
+    if (!nd.ok) return;
+    const auto no_commands = [](const pipe_result & r) {
+        return !r.report.ok && !r.report.fatal && r.untouched && r.paired_calls == 0 &&
+               !r.h2_main && !r.h2_residual && r.planned_commands.empty() &&
+               !r.report.counts.paired_fallback_stripes;
+    };
+    for (auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                      potal_paired_stream_mode::continuous_early}) {
+        check("H stream without explicit paired refuses", no_commands(run_pipe(nd, 1, 0, {}, true, false, false, mode)));
+        check("H stream without explicit Ktile refuses", no_commands(run_pipe(nd, 1, 1, {}, false, false, false, mode)));
+        check("H stream with legacy prefetch refuses", no_commands(run_pipe(nd, 1, 1, {}, true, true, false, mode)));
+        check("H stream with early prefetch refuses", no_commands(run_pipe(nd, 1, 1, {}, true, true, true, mode)));
+        check("H stream with conservative fences refuses", no_commands(run_pipe(nd, 1, 4, {}, true, false, false, mode)));
+        if (PD != 32) {
+            check("H stream DIM16 refuses", no_commands(run_pipe(nd, 1, 1, {}, true, false, false, mode)));
+            continue;
+        }
+        bool propagated = true;
+        const auto baseline = run_pipe(nd, 1, 1, {}, true);
+        const auto streamed = run_pipe(nd, 1, 1, [&](const potal_paired_request & q) {
+            propagated = propagated && q.stream == mode && q.stream_counter == nullptr &&
+                         q.ktile_scale_reuse && !q.next_k_prefetch && !q.early_k_prefetch &&
+                         !q.conservative_fences;
+        }, true, false, false, mode);
+        check("H pipeline propagates stream and computes exact old-Ktile output without fallback",
+              baseline.report.ok && streamed.report.ok && propagated && streamed.paired_calls > 0 &&
+              streamed.out == baseline.out && streamed.h2_errors.empty() &&
+              streamed.planned_commands.empty() && !streamed.report.counts.paired_fallback_stripes);
+    }
 }
 
 void test_ktile_pipeline() {
@@ -2498,6 +3155,11 @@ int main() {
     test_early_execution_failures();
     test_early_saturation();
     test_early_request_refusals();
+    test_stream_generation_wrap();
+    test_stream_request_refusals();
+    test_stream_capacity();
+    test_stream_emulator_lifetimes();
+    test_stream_execution_failures();
     test_pairs_and_generations();
     test_ktile_scale_reuse();
     test_failures();
@@ -2507,6 +3169,7 @@ int main() {
     test_index16_plan();
     test_pipeline();
     test_ktile_pipeline();
+    test_stream_pipeline();
     test_index16_pipeline();
     test_close_keeps_owner_with_live_entries(); // last: leaves the accelerator owned
     std::printf("%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

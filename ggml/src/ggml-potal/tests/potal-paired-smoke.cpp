@@ -161,13 +161,16 @@ struct route_run {
 };
 
 enum route_kind { ROUTE_PAIRED, ROUTE_PAIRED_CONSERVATIVE, ROUTE_SERIAL, ROUTE_KTILE, ROUTE_PREFETCH,
-                  ROUTE_COMPLETION, ROUTE_EARLY };
+                  ROUTE_COMPLETION, ROUTE_EARLY, ROUTE_STREAM_BOUNDED, ROUTE_STREAM_CONTINUOUS, ROUTE_STREAM_EARLY };
 
 const char * route_name(route_kind k) {
     if (k == ROUTE_KTILE) return "ktile";
     if (k == ROUTE_PREFETCH) return "prefetch";
     if (k == ROUTE_COMPLETION) return "completion";
     if (k == ROUTE_EARLY) return "early_ldb";
+    if (k == ROUTE_STREAM_BOUNDED) return "stream_bounded";
+    if (k == ROUTE_STREAM_CONTINUOUS) return "stream_continuous";
+    if (k == ROUTE_STREAM_EARLY) return "stream_early";
     return k == ROUTE_PAIRED ? "paired" : k == ROUTE_PAIRED_CONSERVATIVE ? "paired_conservative" : "serial";
 }
 
@@ -175,9 +178,13 @@ void select_route(route_kind k) {
     setenv("GGML_POTAL_PAIRED_AUTO", k == ROUTE_SERIAL ? "OFF" : "ON", 1);
     setenv("GGML_POTAL_PAIRED_FENCES", k == ROUTE_PAIRED_CONSERVATIVE ? "CONSERVATIVE" : "RTL", 1);
     const bool prefetch = k == ROUTE_PREFETCH || k == ROUTE_COMPLETION || k == ROUTE_EARLY;
-    setenv("GGML_POTAL_PAIRED_KTILE", k == ROUTE_KTILE || prefetch ? "ON" : "OFF", 1);
+    const bool stream = k == ROUTE_STREAM_BOUNDED || k == ROUTE_STREAM_CONTINUOUS || k == ROUTE_STREAM_EARLY;
+    setenv("GGML_POTAL_PAIRED_KTILE", k == ROUTE_KTILE || prefetch || stream ? "ON" : "OFF", 1);
     setenv("GGML_POTAL_PAIRED_PREFETCH", prefetch ? "ON" : "OFF", 1);
     setenv("GGML_POTAL_PAIRED_EARLY_PREFETCH", k == ROUTE_EARLY ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_STREAM", k == ROUTE_STREAM_BOUNDED ? "BOUNDED" :
+                                     k == ROUTE_STREAM_CONTINUOUS ? "CONTINUOUS" :
+                                     k == ROUTE_STREAM_EARLY ? "CONTINUOUS_EARLY" : "OFF", 1);
 }
 
 route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, ggml_cgraph * g, ggml_tensor * y,
@@ -242,6 +249,10 @@ route_run run_route(ggml_backend_t potal, const char * name, route_kind kind, gg
             ok = ok && a.paired_prefetch_ldb_only > b.paired_prefetch_ldb_only &&
                  a.paired_prefetch_mvins == b.paired_prefetch_mvins;
     }
+    const uint64_t stream_loops = a.paired_stream_loops - b.paired_stream_loops;
+    if (kind == ROUTE_STREAM_BOUNDED || kind == ROUTE_STREAM_CONTINUOUS || kind == ROUTE_STREAM_EARLY)
+        ok = ok && fallback == 0 && stream_loops > 0 && stream_loops == p_main + p_res;
+    else ok = ok && stream_loops == 0;
     r.ok       = ok;
     r.paired   = pstripes;
     r.fallback = fallback;
@@ -361,20 +372,50 @@ void print_stats(const char * name, const char * phase, route_kind route, int it
     COUNT_FIELD(paired_prefetch_bytes_declared); COUNT_FIELD(paired_resident_main_loop_ws);
     TIME_FIELD(paired_residual_prefetch_issue_s);
     TIME_FIELD(paired_main_prefetch_issue_s);
+    COUNT_FIELD(paired_stream_loops); COUNT_FIELD(paired_stream_pair_waits);
+    COUNT_FIELD(paired_stream_local_releases); COUNT_FIELD(paired_stream_batches);
+    COUNT_FIELD(paired_stream_capacity_boundaries);
+    COUNT_FIELD(paired_residual_staging_bytes); COUNT_FIELD(paired_residual_pitch_padding_bytes);
+    COUNT_FIELD(paired_residual_valid_bytes); COUNT_FIELD(paired_residual_load_bytes_declared);
     COUNT_FIELD(stripes_semantic_completed);
+    if (r.ok && r.paired && !r.fallback) {
+        const uint64_t main_tiles = a.paired_main_loop_ws - b.paired_main_loop_ws;
+        const uint64_t residual_tiles = a.paired_residual_loop_ws - b.paired_residual_loop_ws;
+        const uint64_t resident_main = a.paired_resident_main_loop_ws - b.paired_resident_main_loop_ws;
+        const uint64_t prefetch_tiles = a.paired_prefetch_loads - b.paired_prefetch_loads;
+        // Whole LOOP_WS/operand Tiles, not DIM operations or measured DMA bytes.
+        std::printf(" gemm_tiles_issued=%llu activation_tiles_command_declared=%llu"
+                    " weight_tiles_command_declared=%llu separate_b_prefetch_tiles_command_declared=%llu",
+                    (unsigned long long)(main_tiles + residual_tiles),
+                    (unsigned long long)(main_tiles + residual_tiles),
+                    (unsigned long long)(main_tiles - resident_main + prefetch_tiles),
+                    (unsigned long long)prefetch_tiles);
+    }
     std::printf("\n");
 #undef TIME_FIELD
 #undef COUNT_FIELD
 }
 
 void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool compare_ktile, bool compare_prefetch,
-               bool compare_early) {
+               bool compare_early, bool compare_stream, bool compare_stream_early) {
     std::mt19937 rng(20261023); // one fixed tensor pair for every route and repeat
     ggml_init_params ip = { (size_t) (4 * (c.n * c.k + 2 * c.m * c.n + c.m * c.k) + 64 * 1024 * 1024), nullptr, false };
     ggml_context_ptr ctx(ggml_init(ip));
     ggml_tensor * w = hp1_weight_tensor(ctx.get(), c.k, c.n, rng);
     ggml_tensor * x = activations(ctx.get(), c.k, c.m, rng, c.outlier, c.blocks, c.step);
     ggml_tensor * expected = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n, c.m);
+    if (compare_stream) {
+        uint64_t fingerprint = UINT64_C(14695981039346656037);
+        for (const ggml_tensor * tensor : {w, x}) {
+            const auto * bytes = static_cast<const uint8_t *>(tensor->data);
+            for (size_t i = 0; i < ggml_nbytes(tensor); ++i)
+                fingerprint = (fingerprint ^ bytes[i]) * UINT64_C(1099511628211);
+        }
+        std::printf("POTAL_STREAM_INPUT case=%s M=%lld N=%lld K=%lld seed=20261023 "
+                    "fnv1a64=%016llx internal_pair_timers=0 stage_zero_is_unmeasured=1\n",
+                    c.name, (long long)c.m, (long long)c.n, (long long)c.k,
+                    (unsigned long long)fingerprint);
+    }
     const golden_result gold = golden(w, x, expected);
     if (!gold.ok) {
         std::fprintf(stderr, "POTAL_BENCH_FAIL case=%s stage=golden\n", c.name);
@@ -399,13 +440,17 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool comp
     ggml_tensor * y = ggml_mul_mat(ctx.get(), cached_w, x);
     ggml_cgraph * g = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(g, y);
-    const std::vector<route_kind> routes = compare_early ?
+    std::vector<route_kind> routes = compare_stream ?
+        std::vector<route_kind>{ROUTE_PAIRED, ROUTE_KTILE, ROUTE_PREFETCH, ROUTE_EARLY,
+                               ROUTE_STREAM_BOUNDED, ROUTE_STREAM_CONTINUOUS} :
+        compare_early ?
         std::vector<route_kind>{ROUTE_PAIRED, ROUTE_KTILE, ROUTE_PREFETCH, ROUTE_COMPLETION, ROUTE_EARLY} :
         std::vector<route_kind>{compare_prefetch ? ROUTE_PAIRED : ROUTE_SERIAL,
                                compare_prefetch ? ROUTE_KTILE : ROUTE_PAIRED,
                                compare_prefetch ? ROUTE_PREFETCH :
                                compare_ktile ? ROUTE_KTILE : ROUTE_PAIRED_CONSERVATIVE};
-    std::array<std::vector<route_run>, 7> cold, steady;
+    if (compare_stream_early) routes.push_back(ROUTE_STREAM_EARLY);
+    std::array<std::vector<route_run>, 10> cold, steady;
     // Untimed route warmups initialize the issuer and route code; each output is checked.
     for (route_kind route : routes) run_route(potal, c.name, route, g, y, expected, gold, false, compare_early);
     for (int i = 0; i < repeat; ++i) {
@@ -449,12 +494,16 @@ void bench_one(ggml_backend_t potal, const bench_case & c, int repeat, bool comp
         summary(c.name, "cold", route, cold[(int) route]);
         summary(c.name, "steady", route, steady[(int) route]);
     }
-    const route_kind reference = compare_prefetch || compare_early ? ROUTE_PAIRED : ROUTE_SERIAL;
+    const route_kind reference = compare_stream ? ROUTE_KTILE :
+                                 compare_prefetch || compare_early ? ROUTE_PAIRED : ROUTE_SERIAL;
     const double reference_ms = median([&] { std::vector<double> v; for (const auto & r : steady[reference]) v.push_back(r.compute_ms); return v; }());
     for (route_kind route : routes) {
         if (route == reference) continue;
         std::vector<double> v; for (const auto & r : steady[(int) route]) v.push_back(r.compute_ms);
-        if (compare_prefetch || compare_early)
+        if (compare_stream)
+            std::printf("POTAL_STREAM_RATIO case=%s route=%s ktile_over_route=%.6f\n",
+                        c.name, route_name(route), reference_ms / median(v));
+        else if (compare_prefetch || compare_early)
             std::printf("POTAL_PREFETCH_RATIO case=%s route=%s h2_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
         else
             std::printf("POTAL_BENCH_RATIO case=%s route=%s serial_over_route=%.6f\n", c.name, route_name(route), reference_ms / median(v));
@@ -532,7 +581,8 @@ bool select_pipeline_mode() {
     return why == nullptr;
 }
 
-bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool early = false, bool bench_raw = false) {
+bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool early = false, bool bench_raw = false,
+                       bool with_stream = false, bool with_stream_early = false) {
     if (POTAL_HW_DIM != 32) return false;
     uint32_t observation_generation = 0;
     const auto saturate = [](int64_t x) {
@@ -543,22 +593,29 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool ear
         if (carrier >= 32) return x < 0 ? INT32_MIN : INT32_MAX;
         return saturate(x * (INT64_C(1) << carrier));
     };
-    for (int fixture = bench_raw ? 2 : 0; fixture < (observe || bench_raw ? 3 : 2); ++fixture) {
+    for (int fixture = bench_raw ? 2 : 0; fixture < (with_stream ? 5 : observe || bench_raw ? 3 : 2); ++fixture) {
         const bool gapped = fixture == 1;
         const bool full_rows = fixture == 2;
+        const bool wide_residual = fixture == 3;
+        const bool no_residual = fixture == 4;
         potal_test::paired_fixture f(full_rows ? 63 : 17, full_rows ? 129 : 65,
             gapped ? 512 : 544, 20261023,
-            [](size_t block, size_t column) { return int16_t(block % 4 == 0 ? 24 : column % 3); });
+            [wide_residual](size_t block, size_t column) {
+                return int16_t(wide_residual ? (block + column) % 3 : block % 4 == 0 ? 24 : column % 3);
+            });
         potal_tile_plan plan;
         if (!f.ok || potal_frozen_plan(f.M, f.N, f.K, full_rows ? 2 : 1,
                                      full_rows ? 4 : 2, 4, 1, &plan) != POTAL_OK) return false;
         residual::decoded_packet packet;
-        if (full_rows) {
+        if (wide_residual) {
+            for (uint8_t lane = 0; lane < 4; ++lane)
+                for (uint32_t row = 0; row < f.M; ++row) packet.rows.push_back({lane, row});
+        } else if (full_rows) {
             for (uint32_t row = 0; row < f.M; ++row) packet.rows.push_back({0, row});
-        } else {
+        } else if (!no_residual) {
             packet.rows = {{0, 0}, {1, 16}};
         }
-        for (size_t block = 0; block < f.K / 32; block += gapped ? 2 : 1) {
+        for (size_t block = 0; !no_residual && block < f.K / 32; block += gapped ? 2 : 1) {
             residual::run run;
             run.block_id = uint32_t(block);
             run.local_k = {1, 7, 29};
@@ -566,14 +623,17 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool ear
             packet.k_compact += 3;
         }
         packet.digits.resize(packet.rows.size() * packet.k_compact);
-        for (size_t i = 0; i < packet.digits.size(); ++i)
-            packet.digits[i] = int8_t(i % 3 == 0 ? -128 : 127);
+        for (size_t i = 0; i < packet.digits.size(); ++i) {
+            const size_t pattern = wide_residual ? i / packet.k_compact + i % packet.k_compact : i;
+            packet.digits[i] = int8_t(pattern % (wide_residual ? 5 : 3) == 0 ? -128 : 127);
+        }
         const size_t ldc = align_up(f.N, POTAL_HW_DIM);
         std::unique_ptr<int32_t, potal_test::dma_deleter> main_output(
             static_cast<int32_t *>(dma_alloc(align_up(f.M, POTAL_HW_DIM) * ldc * sizeof(int32_t))));
         std::unique_ptr<int32_t, potal_test::dma_deleter> residual_output(
+            no_residual ? nullptr :
             static_cast<int32_t *>(dma_alloc(align_up(packet.rows.size(), POTAL_HW_DIM) * ldc * sizeof(int32_t))));
-        if (!main_output || !residual_output) return false;
+        if (!main_output || (!no_residual && !residual_output)) return false;
         std::vector<int32_t> main_expected(f.M * f.N), residual_expected(packet.rows.size() * f.N);
         // Independent wide arithmetic; never use the production SCU helper,
         // emulator, Scale lowering, or the command plan for expected values.
@@ -604,23 +664,38 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool ear
             }
         }
         std::array<std::vector<double>, 5> raw_samples;
-        for (int sample = 0; sample < (bench_raw ? 40 : (with_prefetch ? 3 : 2)); ++sample) {
+        for (int sample = 0; sample < (bench_raw ? 40 : with_stream ? (with_stream_early ? 7 : 6) :
+                                      (with_prefetch ? 3 : 2)); ++sample) {
             const int iteration = sample / 5;
             const int mode = bench_raw ?
                 (iteration + (iteration % 2 ? 4 - sample % 5 : sample % 5)) % 5 : sample;
             const bool reuse = mode != 0;
-            const bool prefetch = bench_raw ? mode >= 2 : mode == 2;
-            const bool use_early = bench_raw ? mode == 4 : early && mode == 2;
+            const bool prefetch = bench_raw ? mode >= 2 : mode == 2 || (with_stream && mode == 3);
+            const bool use_early = bench_raw ? mode == 4 : with_stream ? mode == 3 : early && mode == 2;
             if (bench_raw) setenv("POTAL_H2_COMPLETION_REUSE", mode >= 3 ? "1" : "0", 1);
+            if (with_stream) {
+                // Every destination differs from its golden before every route.
+                // A missing readback cannot reuse the previous route's result.
+                for (size_t row = 0; row < f.M; ++row)
+                    for (size_t col = 0; col < f.N; ++col)
+                        main_output.get()[row * ldc + col] = ~main_expected[row * f.N + col];
+                for (size_t row = 0; row < packet.rows.size(); ++row)
+                    for (size_t col = 0; col < f.N; ++col)
+                        residual_output.get()[row * ldc + col] = ~residual_expected[row * f.N + col];
+            }
             potal_paired_request request;
             request.rows = f.M; request.n = f.N; request.k = f.K;
             request.main_plan = &plan; request.a = f.a.get(); request.lda = f.lda;
-            request.weight = &f.weight; request.residual = &packet;
+            request.weight = &f.weight; request.residual = no_residual ? nullptr : &packet;
             request.c_main = main_output.get(); request.ldc_main = ldc;
-            request.c_residual = residual_output.get(); request.ldc_residual = ldc;
+            request.c_residual = residual_output.get(); request.ldc_residual = no_residual ? 0 : ldc;
             request.ktile_scale_reuse = reuse;
             request.next_k_prefetch = prefetch;
             request.early_k_prefetch = use_early;
+            if (with_stream && mode >= 4)
+                request.stream = mode == 4 ? potal_paired_stream_mode::bounded :
+                                 mode == 5 ? potal_paired_stream_mode::continuous :
+                                             potal_paired_stream_mode::continuous_early;
             if (observe || bench_raw) request.generation = &observation_generation;
             potal_paired_report report;
             issuer_owner owner;
@@ -671,21 +746,45 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool ear
             for (size_t row = 0; exact && row < packet.rows.size(); ++row)
                 for (size_t column = 0; column < f.N; ++column)
                     exact = exact && residual_output.get()[row * ldc + column] == residual_expected[row * f.N + column];
+            const size_t residual_i = align_up(packet.rows.size(), POTAL_HW_DIM) / POTAL_HW_DIM;
+            size_t main_gemms = 0, residual_gemms = 0, windows = 0;
+            for (const auto & panel : report.tile.panels) windows += panel.windows.size();
+            for (const auto & op : report.plan.ops) {
+                if (op.kind == potal_paired_op_kind::main_gemm) {
+                    ++main_gemms;
+                    exact = exact && op.i_tiles == plan.tile_I;
+                } else if (op.kind == potal_paired_op_kind::residual_gemm) {
+                    ++residual_gemms;
+                    exact = exact && op.i_tiles == residual_i;
+                }
+            }
+            exact = exact && main_gemms == report.tile.j_groups * report.tile.k_panels &&
+                    residual_gemms == report.tile.j_groups * windows &&
+                    (residual_gemms == 0) == no_residual;
+            // D2 triggers after the last Residual; Early triggers after Main.
+            // With no Residual, only Early can prefetch the next panel.
             exact = exact && report.counts.scale_writes == report.counts.scale_releases &&
-                    (report.counts.scale_reused_windows > 0) == (reuse && !gapped) &&
-                    (report.counts.prefetch_loads > 0) == prefetch;
-            if (use_early)
+                    (report.counts.scale_reused_windows > 0) == (reuse && !gapped && !no_residual) &&
+                    report.counts.prefetch_loads ==
+                        (request.stream == potal_paired_stream_mode::continuous_early ?
+                         report.tile.j_groups * size_t(report.tile.k_panels > 1) :
+                         prefetch && (!no_residual || use_early) ?
+                         report.tile.j_groups * (report.tile.k_panels - 1) : 0);
+            if (use_early || request.stream == potal_paired_stream_mode::continuous_early)
                 exact = exact && report.counts.prefetch_ldb_only == report.counts.prefetch_loads &&
-                        report.counts.prefetch_mvins == 0;
+                        report.counts.prefetch_mvins == 0 &&
+                        report.counts.resident_main_loop_ws == report.counts.prefetch_loads;
             std::printf("POTAL_KTILE_RAW_GOLDEN %s gapped=%d reuse=%d prefetch=%d main_i32=%zu residual_i32=%zu "
                         "reused_windows=%llu scale_writes=%llu scale_releases=%llu prefetch_loads=%llu resident_main=%llu "
-                        "early=%d ldb_only=%llu\n",
+                        "early=%d ldb_only=%llu stream=%u fixture=%d main_I=%zu residual_I=%zu "
+                        "main_gemms=%zu residual_gemms=%zu\n",
                         exact ? "PASS" : "FAIL", int(gapped), int(reuse), int(prefetch), main_expected.size(), residual_expected.size(),
                         (unsigned long long)report.counts.scale_reused_windows,
                         (unsigned long long)report.counts.scale_writes, (unsigned long long)report.counts.scale_releases,
                         (unsigned long long)report.counts.prefetch_loads,
                         (unsigned long long)report.counts.resident_main_loop_ws, int(use_early),
-                        (unsigned long long)report.counts.prefetch_ldb_only);
+                        (unsigned long long)report.counts.prefetch_ldb_only, unsigned(request.stream),
+                        fixture, plan.tile_I, residual_i, main_gemms, residual_gemms);
             if (observe) {
                 std::printf("POTAL_PREFETCH_OBSERVATION mode=%d gapped=%d status=%d fixture=%d rows=%zu columns=%zu "
                     "b0_write_cycles=%llu b1_write_cycles=%llu mac0_cycles=%llu mac1_cycles=%llu "
@@ -722,6 +821,10 @@ bool ktile_raw_golden(bool with_prefetch = false, bool observe = false, bool ear
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--stream-early-golden") == 0)
+        return ktile_raw_golden(true, false, false, false, true, true) ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--stream-golden") == 0)
+        return ktile_raw_golden(true, false, false, false, true) ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--bench-raw-early") == 0) {
         if (std::getenv("POTAL_EARLY_TRACE") || std::getenv("POTAL_RAW_TRACE") ||
             std::getenv("POTAL_PAIRED_PROFILE")) return 2;
@@ -740,7 +843,13 @@ int main(int argc, char ** argv) {
     const bool compare_prefetch = argc > 1 && std::strcmp(argv[1], "--bench-prefetch") == 0;
     const bool observe_early = argc > 1 && std::strcmp(argv[1], "--observe-early") == 0;
     const bool compare_early = observe_early || (argc > 1 && std::strcmp(argv[1], "--bench-early") == 0);
-    const bool bench = compare_ktile || compare_prefetch || compare_early ||
+    const bool observe_stream_early = argc > 1 && std::strcmp(argv[1], "--observe-stream-early") == 0;
+    const bool compare_stream_early = observe_stream_early ||
+        (argc > 1 && std::strcmp(argv[1], "--bench-stream-early") == 0);
+    const bool observe_stream = observe_stream_early || (argc > 1 && std::strcmp(argv[1], "--observe-stream") == 0);
+    const bool compare_stream = compare_stream_early || observe_stream ||
+        (argc > 1 && std::strcmp(argv[1], "--bench-stream") == 0);
+    const bool bench = compare_ktile || compare_prefetch || compare_early || compare_stream ||
                        (argc > 1 && std::strcmp(argv[1], "--bench") == 0);
     const char * case_name = nullptr;
     int repeat = 7;
@@ -779,13 +888,34 @@ int main(int argc, char ** argv) {
             std::getenv("POTAL_RAW_TRACE") || (!observe_early && std::getenv("POTAL_EARLY_TRACE"))) {
             std::fprintf(stderr, "POTAL_BENCH_FAIL diagnostics enabled\n"); return 2;
         }
+        if (compare_stream) {
+#if LOG_DEBUG || LOG_CYCLE || CYCLE_SIM || CYCLE_DETAIL
+            if (!observe_stream) {
+                std::fprintf(stderr, "POTAL_BENCH_FAIL primary measurement requires a logging-disabled build\n");
+                return 2;
+            }
+#endif
+            if (std::getenv("POTAL_PAIRED_PROFILE") ||
+                (!observe_stream && (std::getenv("POTAL_STREAM_MANIFEST") || std::getenv("POTAL_STREAM_COUNTERS") ||
+                                     std::getenv("POTAL_STREAM_ADMISSION_PROFILE")))) {
+                std::fprintf(stderr, "POTAL_BENCH_FAIL internal profile enabled\n"); return 2;
+            }
+            setenv("POTAL_PAIRED_TIMING", "0", 1);
+            setenv("POTAL_H2_COMPLETION_REUSE", "1", 1);
+            if (observe_stream) {
+                setenv("POTAL_STREAM_MANIFEST", "1", 1);
+                setenv("POTAL_STREAM_COUNTERS", "1", 1);
+                std::printf("POTAL_STREAM_DIAGNOSTIC case=%s timing_is_not_performance=1\n", case_name);
+            }
+        }
         if (observe_early) {
             if (!std::getenv("POTAL_EARLY_TRACE")) setenv("POTAL_EARLY_TRACE", "1", 1);
             std::printf("POTAL_EARLY_DIAGNOSTIC case=%s timing_is_not_performance=1\n", case_name);
         }
         for (const bench_case & c : bench_cases) {
             if (std::strcmp(c.name, case_name) == 0) {
-                bench_one(potal.get(), c, repeat, compare_ktile, compare_prefetch, compare_early);
+                bench_one(potal.get(), c, repeat, compare_ktile, compare_prefetch, compare_early, compare_stream,
+                          compare_stream_early);
                 std::printf("POTAL_BENCH %s case=%s failures=%d\n", failures ? "FAIL" : "PASS", case_name, failures);
                 return failures ? 1 : 0;
             }

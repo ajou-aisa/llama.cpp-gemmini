@@ -11,8 +11,17 @@
 #include "ggml.h"
 
 #include <string>
+#include <cstdlib>
+#include <cstring>
 
 namespace ggml::potal::log {
+
+// Read at operation setup, never in the command hot path. Disabled timings
+// are reported as unmeasured zeroes; they are not zero-cost operations.
+inline bool timing_enabled() {
+    const char * value = std::getenv("POTAL_PAIRED_TIMING");
+    return !value || std::strcmp(value, "0") != 0;
+}
 
 // Default outputs of the shared logger (setup_default_outputs, once per process;
 // an output a tool already set, e.g. --gemmini-debug-log, is kept). Called by

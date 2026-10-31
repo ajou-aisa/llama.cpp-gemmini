@@ -372,6 +372,7 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const pota
 #define POTAL_FUNCT_INDEX_CONFIG              27
 #define POTAL_FUNCT_RESIDENT_VIEW             28
 #define POTAL_FUNCT_LDB_ONLY                  29
+#define POTAL_FUNCT_STREAM                    30
 #define POTAL_FUNCT_COUNTER                  126
 
 /* ---- H2 paired / indexed execution (potal_paired_*) ---------------------- */
@@ -743,6 +744,87 @@ potal_status potal_paired_h2_close(potal_paired_session **session);
 #define POTAL_PREFETCH_OBSERVATION_CAPABILITY UINT64_C(0x504f425301200007)
 typedef potal_status (*potal_observation_counter_fn)(void *ctx,
     const potal_paired_cmd_record *record, uint64_t *value);
+
+/* Explicit streaming mode; borrowed inputs are immutable from begin through
+ * successful end. A quarantined session retains every borrowed allocation.
+ * Main/residual stride is fixed for the entire stream, in bytes.
+ *
+ * Begin requires a clean exclusive session, probes COUNTER safely on old
+ * images, then installs EX and LOAD states 0/1/2 once. Every loop sends only
+ * five LOOP_WS staging words and the complete ordinary paired LOOP_WS.
+ * Scale columns must already be live; same-panel consumers may share one
+ * allocation/generation, but distinct live allocations cannot alias that
+ * generation. Index may follow scheduled Main B
+ * before physical completion. Replacing a consumed Index/A window requires
+ * wait_pair (or a global Fence) first.
+ *
+ * wait_pair completes the submitted prefix, not other pairs or readbacks.
+ * Scoped release requires a sealed panel and never certifies global completion. Retirement additionally
+ * requires every declared consumer submitted/completed and its scales freed.
+ * Readback requires a global drain; end requires retired panels, no live
+ * scales and a final checked Fence after readback. End keeps the ordinary
+ * session open for session_close.
+ *
+ * Invalid arguments issue nothing. Unsupported begin emits only the safe
+ * COUNTER probe. A command/response failure is sticky and quarantines the
+ * stream: cleanup, end and close cannot retry, free or permit fallback.
+ * An absent residual source is {NULL, 0, 0}; later Residual submissions are
+ * rejected. The final LOOP_WS uses xd=1; its five staging words use xd=0. */
+typedef struct potal_stream_source {
+    const int8_t *base;
+    size_t bytes, stride;
+} potal_stream_source;
+
+typedef struct potal_stream_config {
+    potal_h2_weight weight;
+    potal_stream_source main, residual;
+    potal_observation_counter_fn counter; /* software sink only; sink.ctx */
+    uint32_t continuous;           /* 0: bounded, 1: pair-local retirement */
+    uint32_t early_b_only;         /* default 0; requires continuous and its exact capability */
+} potal_stream_config;
+
+#define POTAL_STREAM_TAG UINT64_C(0x4853384800000000)
+#define POTAL_STREAM_CAPABILITY UINT64_C(0x4853384801200803)
+#define POTAL_STREAM_EARLY_TAG UINT64_C(0x4853384801000000)
+#define POTAL_STREAM_EARLY_CAPABILITY UINT64_C(0x4853384801200807)
+
+typedef struct potal_stream_panel_status {
+    potal_h2_ref ref;
+    uint64_t residency_index;
+    uint32_t declared, scheduled, dma_done, sealed;
+    uint32_t submitted, completed, readers;
+} potal_stream_panel_status;
+
+typedef struct potal_stream_status {
+    potal_paired_session_status core;
+    uint32_t active, quarantined, control_pending;
+    potal_stream_panel_status panel[POTAL_PAIRS];
+} potal_stream_status;
+
+potal_status potal_paired_stream_begin(potal_paired_session *, const potal_stream_config *);
+potal_status potal_paired_stream_panel_begin(potal_paired_session *, const potal_h2_panel *, potal_h2_ref *);
+/* Optional, Scale-free B producer for the adjacent same-J next-K panel.
+ * The other pair must have exactly its Main submitted. Target admission owns
+ * the source but completes no readers. A successful target wait_pair is required
+ * before Main may consume the prefetched B; it does not drain the other pair.
+ * Index remains unavailable until Main is submitted. Dispatched failures
+ * quarantine the stream even when no compute-loop count is outstanding. */
+potal_status potal_paired_stream_panel_prefetch(potal_paired_session *, potal_h2_ref target);
+potal_status potal_paired_stream_loop_issue(potal_paired_session *, potal_h2_ref,
+    uint32_t ordinal, const potal_paired_loop_ws *);
+potal_status potal_paired_stream_wait_pair(potal_paired_session *, potal_h2_ref);
+potal_status potal_paired_stream_scale_release(potal_paired_session *, potal_h2_ref,
+    uint32_t slot, uint32_t generation, uint32_t column);
+potal_status potal_paired_stream_panel_retire(potal_paired_session *, potal_h2_ref);
+potal_status potal_paired_stream_end(potal_paired_session *);
+potal_stream_status potal_paired_stream_query(const potal_paired_session *);
+/* Diagnostic only: existing target-clock events 10,19,20,41,27,29,31.
+ * Configure before declaring panels; snapshot only after final global Fence.
+ * Events overlap: never sum them as graph latency or treat them as bus bytes. */
+#define POTAL_STREAM_COUNTER_FIELDS 7
+potal_status potal_paired_stream_counters_begin(potal_paired_session *);
+potal_status potal_paired_stream_counters_end(potal_paired_session *,
+    uint64_t values[POTAL_STREAM_COUNTER_FIELDS]);
 /* Opt-in scheduler-owned LOAD2, never raw MVIN or future compute. Enable only
  * on a new idle H2 session after an exact capability probe. The existing
  * panel_prefetch then requires the adjacent same-J next-K panel, an issued

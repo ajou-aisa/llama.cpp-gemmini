@@ -576,6 +576,11 @@ endif()
 
 # Counts real Residual decode calls in the fallback regression, not elapsed time.
 target_compile_definitions(potal-paired-execution-test PRIVATE GGML_GEMMINI_TESTING)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_definitions(potal-paired-execution-test PRIVATE POTAL_TEST_CLOCK_OBSERVER)
+    target_link_options(potal-paired-execution-test PRIVATE
+        "-Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv")
+endif()
 
 # Benchmark (host and target, not a test): Q8_HP1 weight preparation cost per
 # stage and with the backend's weight cache, synthetic or from a GGUF (--gguf).

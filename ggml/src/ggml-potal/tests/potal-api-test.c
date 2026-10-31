@@ -9,6 +9,7 @@
  *
  * Output: "PASS <name>" / "FAIL <name>", final "POTAL_API_TEST PASS|FAIL".
  */
+#define _POSIX_C_SOURCE 200809L
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -686,7 +687,7 @@ static void test_acc_readback(void) {
 }
 
 /* Command sink: records the stream, answers xd commands with a programmable status. */
-#define SINK_CAPACITY 512
+#define SINK_CAPACITY 2048
 typedef struct sink_state {
     potal_paired_cmd_record records[SINK_CAPACITY];
     uint32_t count;
@@ -2090,6 +2091,555 @@ static void test_observation(void) {
 #endif
 }
 
+#if POTAL_HW_DIM == 32
+typedef struct stream_sink_state {
+    sink_state trace;
+    uint64_t capability, early_capability;
+    uint32_t fail_at;
+    potal_paired_session *session;
+} stream_sink_state;
+
+static potal_status stream_sink(void *ctx, const potal_paired_cmd_record *record) {
+    stream_sink_state *st = ctx;
+    const potal_status status = sink_cmd(&st->trace, record);
+    if (st->fail_at && st->trace.count == st->fail_at) return POTAL_ERR_BAD_RESPONSE;
+    return status;
+}
+
+static potal_status stream_counter(void *ctx, const potal_paired_cmd_record *record, uint64_t *value) {
+    stream_sink_state *st = ctx;
+    check_u64("stream probe is COUNTER xd1", record->funct == 126 && record->xd == 1 && !record->rs2, 1);
+    check_u64("stream first probe safely resets old counter", st->trace.count || record->rs1 == 10, 1);
+    *value = record->rs1 == 10 ? 0 :
+        record->rs1 == POTAL_STREAM_EARLY_TAG ? st->early_capability : st->capability;
+    return stream_sink(ctx, record);
+}
+
+static potal_stream_config stream_config(void) {
+    const potal_stream_config c = {
+        .weight = {FAKE_B, 160, 91, 128, 20443},
+        .main = {FAKE_A, 16384, H2_KTILES * POTAL_HW_DIM},
+        .residual = {(const int8_t *)(uintptr_t)0x40000, 16384, 2 * POTAL_HW_DIM},
+        .counter = stream_counter,
+    };
+    return c;
+}
+
+static potal_status stream_release_scales(potal_paired_session *s, potal_h2_ref ref,
+    const potal_paired_loop_ws *pl) {
+    const potal_loop_ws *l = &pl->loop;
+    for (uint32_t j = 0; j < l->j_tiles; ++j)
+        for (uint32_t col = 0; col < POTAL_HW_DIM - (j + 1 == l->j_tiles ? l->pad_j : 0); ++col) {
+            const potal_status status = potal_paired_stream_scale_release(s, ref,
+                l->scale_base + j, l->scale_generation, col);
+            if (status != POTAL_OK) return status;
+        }
+    return POTAL_OK;
+}
+
+static void test_stream(uint32_t continuous) {
+    stream_sink_state st = {0};
+    const potal_paired_sink sink = {stream_sink, &st};
+    potal_paired_session *s = NULL;
+    potal_stream_config config = stream_config();
+    config.continuous = continuous;
+    if (!continuous) {
+        const char * previous = getenv("POTAL_RAW_TRACE");
+        char * saved = previous ? strdup(previous) : NULL;
+        check_u64("stream trace fixture allocation", previous == NULL || saved != NULL, 1);
+        if (previous && !saved) return;
+        check_u64("stream trace fixture enables cached raw trace", setenv("POTAL_RAW_TRACE", "1", 1) == 0, 1);
+        check_status("stream traced session open", potal_paired_session_open(&sink, &s), POTAL_OK);
+        unsetenv("POTAL_RAW_TRACE"); // The session snapshot, not current getenv, controls tracing.
+        check_status("stream cached hot trace refused", potal_paired_stream_begin(s, &config), POTAL_ERR_UNSUPPORTED);
+        check_u64("stream hot trace refusal has no effects", st.trace.count, 0);
+        check_status("stream traced session closes idle", potal_paired_session_close(s), POTAL_OK);
+        if (saved) { setenv("POTAL_RAW_TRACE", saved, 1); free(saved); }
+        s = NULL;
+    }
+    check_status("stream open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+    potal_stream_config invalid = config;
+    invalid.main.bytes = 0;
+    check_status("stream invalid source", potal_paired_stream_begin(s, &invalid), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("stream invalid source no command", st.trace.count, 0);
+    check_status("stream old image", potal_paired_stream_begin(s, &config), POTAL_ERR_UNSUPPORTED);
+    check_u64("stream old image only two safe counters", st.trace.count == 2 &&
+        st.trace.records[0].funct == 126 && st.trace.records[1].funct == 126, 1);
+    check_status("stream unsupported close", potal_paired_session_close(s), POTAL_OK);
+
+    memset(&st, 0, sizeof(st));
+    st.capability = POTAL_STREAM_CAPABILITY;
+    check_status("stream supported open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+    check_status("stream begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+    check_u64("stream probe exact tag", st.trace.records[1].rs1, UINT64_C(0x4853384800000000));
+    check_u64("stream setup seven commands", st.trace.count, 7);
+    check_u64("stream checked mode begin", st.trace.records[2].funct == 30 &&
+        st.trace.records[2].xd == 1 && st.trace.records[2].rs1 == (continuous ? 2u : 1u) &&
+        !st.trace.records[2].rs2, 1);
+    check_u64("stream static EX", st.trace.records[3].rs1, UINT64_C(0x10004));
+    check_u64("stream Main load state0", st.trace.records[4].rs1, UINT64_C(0x200101));
+    check_u64("stream B load state1", st.trace.records[5].rs1, UINT64_C(0x200109));
+    check_u64("stream residual load state2", st.trace.records[6].rs1, UINT64_C(0x200111));
+    check_u64("stream real B pitch", st.trace.records[5].rs2, 128);
+    check_u64("stream fixed residual pitch", st.trace.records[6].rs2, 64);
+    uint64_t observed[POTAL_STREAM_COUNTER_FIELDS] = {0};
+    check_status("stream diagnostic counter setup", potal_paired_stream_counters_begin(s), POTAL_OK);
+    const uint64_t counter_words[] = {0xa008, 0x13018, 0x14028, 0x29038, 0x1b048, 0x1d058, 0x1f068, 1};
+    check_u64("stream diagnostic setup count", st.trace.count, 15);
+    for (uint32_t i = 0; i < 8; ++i)
+        check_u64("stream diagnostic raw counter fields", st.trace.records[7+i].funct == 126 &&
+            st.trace.records[7+i].xd == 1 && st.trace.records[7+i].rs1 == counter_words[i] &&
+            !st.trace.records[7+i].rs2, 1);
+    check_status("stream diagnostic cannot snapshot before final completion",
+        potal_paired_stream_counters_end(s, observed), POTAL_ERR_BUSY);
+    check_status("stream no legacy loop escape", potal_paired_loop_ws_issue(s, NULL), POTAL_ERR_BUSY);
+    check_status("stream no managed H2 escape", potal_paired_h2_begin(s, &config.weight), POTAL_ERR_BUSY);
+    potal_h2_panel p0 = managed_panel(0, 2), p1 = managed_panel(1, 1);
+    potal_h2_ref r0, r1;
+    check_status("stream declare zero", potal_paired_stream_panel_begin(s, &p0, &r0), POTAL_OK);
+    check_status("stream declare one", potal_paired_stream_panel_begin(s, &p1, &r1), POTAL_OK);
+    potal_paired_loop_ws m0 = managed_main(&p0), m1 = managed_main(&p1);
+    m1.loop.scale_base = 20;
+    m1.loop.scale_generation = 9;
+    check_status("stream prewrite zero", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("stream prewrite one", managed_scales(s, &m1, 0), POTAL_OK);
+    potal_paired_loop_ws conflict = m1;
+    conflict.loop.scale_base = 40;
+    conflict.loop.scale_generation = m0.loop.scale_generation;
+    check_status("stream prewrite distinct generation collision", managed_scales(s, &conflict, 0), POTAL_OK);
+    uint32_t before = st.trace.count;
+    potal_paired_loop_ws bad = m0;
+    bad.loop.a = (const int8_t *)(uintptr_t)0x50000;
+    check_status("stream immutable A extent", potal_paired_stream_loop_issue(s, r0, 0, &bad),
+        POTAL_ERR_INVALID_ARGUMENT);
+    bad = m0; bad.loop.scale_generation = 256;
+    check_status("stream no truncated generation", potal_paired_stream_loop_issue(s, r0, 0, &bad),
+        POTAL_ERR_INVALID_ARGUMENT);
+    potal_h2_ref stale = r0; stale.owner++;
+    check_status("stream foreign owner", potal_paired_stream_loop_issue(s, stale, 0, &m0),
+        POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("stream all refusals side effect free", st.trace.count, before);
+    check_status("stream Main zero", potal_paired_stream_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    check_u64("stream six words only", st.trace.count - before, 6);
+    const uint32_t functs[] = {9, 10, 11, 12, 13, 8};
+    for (uint32_t i = 0; i < 6; ++i)
+        check_u64("stream exact command sequence", st.trace.records[before + i].funct == functs[i] &&
+            st.trace.records[before + i].xd == (i == 5), 1);
+    check_u64("stream bounds independent", st.trace.records[before].rs2, UINT64_C(0x300020001));
+    check_u64("stream real B retained", st.trace.records[before + 1].rs2, UINT64_C(0x20020));
+    check_u64("stream full Main LOOP independent", st.trace.records[before + 5].rs1,
+        (UINT64_C(1) << 61) | (UINT64_C(3) << 45) | (UINT64_C(7) << 37) | UINT64_C(0x150002));
+    check_u64("stream Main LOOP offset zero", st.trace.records[before + 5].rs2, 0);
+    check_u64("stream scheduled not completed", potal_paired_stream_query(s).panel[0].scheduled &&
+        !potal_paired_stream_query(s).panel[0].dma_done, 1);
+    before = st.trace.count;
+    check_status("stream distinct live allocation generation collision",
+        potal_paired_stream_loop_issue(s, r1, 0, &conflict), POTAL_ERR_BUSY);
+    check_u64("stream generation collision issues nothing", st.trace.count, before);
+    check_status("stream Main one", potal_paired_stream_loop_issue(s, r1, 0, &m1), POTAL_OK);
+    potal_index_config index = managed_index(&p0);
+    check_status("stream Index on scheduled B", potal_paired_index_config(s, &index), POTAL_OK);
+    for (uint32_t i = 0; i < index.active_rows; ++i) {
+        const potal_index_write w = {i, i};
+        check_status("stream Index row", potal_paired_index_write(s, &w), POTAL_OK);
+    }
+    check_status("stream prefix wait", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+    potal_stream_status q = potal_paired_stream_query(s);
+    check_u64("stream local wait leaves other pair outstanding", q.core.outstanding_loops == 1 &&
+        q.panel[0].completed == 1 && !q.panel[1].completed && !q.core.drains, 1);
+    check_status("stream cannot retire unsealed", potal_paired_stream_panel_retire(s, r0), POTAL_ERR_BUSY);
+    check_status("stream unsealed Main release refused", stream_release_scales(s, r0, &m0), POTAL_ERR_BUSY);
+    check_u64("stream local Release not global", potal_paired_stream_query(s).core.outstanding_loops, 1);
+    potal_paired_loop_ws residual = managed_residual(&p0);
+    residual.loop.a = config.residual.base;
+    residual.loop.lda = config.residual.stride;
+    residual.loop.scale_base = m0.loop.scale_base;
+    residual.loop.scale_generation = m0.loop.scale_generation;
+    check_status("stream Residual", potal_paired_stream_loop_issue(s, r0, 1, &residual), POTAL_OK);
+    check_status("stream protects own Index", potal_paired_index_config(s, &index), POTAL_ERR_BUSY);
+    check_status("stream pair zero completed", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+    check_status("stream residual release", stream_release_scales(s, r0, &residual), POTAL_OK);
+    check_status("stream zero retire", potal_paired_stream_panel_retire(s, r0), POTAL_OK);
+    potal_h2_ref reused;
+    check_status("stream pair zero reuse while one busy", potal_paired_stream_panel_begin(s, &p0, &reused), POTAL_OK);
+    check_u64("stream software generation advances", reused.generation > r0.generation, 1);
+    check_status("stream old reference rejected", potal_paired_stream_wait_pair(s, r0), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("stream reused scales", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("stream reused Main", potal_paired_stream_loop_issue(s, reused, 0, &m0), POTAL_OK);
+    check_status("stream reused Index", potal_paired_index_config(s, &index), POTAL_OK);
+    for (uint32_t i = 0; i < index.active_rows; ++i) {
+        const potal_index_write w = {i, i};
+        check_status("stream reused Index row", potal_paired_index_write(s, &w), POTAL_OK);
+    }
+    check_status("stream reuse Main wait", potal_paired_stream_wait_pair(s, reused), POTAL_OK);
+    check_status("stream reuse unsealed Main release refused", stream_release_scales(s, reused, &m0), POTAL_ERR_BUSY);
+    check_status("stream reused Residual", potal_paired_stream_loop_issue(s, reused, 1, &residual), POTAL_OK);
+    potal_acc_readback readback = {.acc_bank = 0, .i_tiles = 1, .j_tiles = 2,
+        .pad_i = 3, .pad_j = 5, .c = FAKE_C, .ldc = 64};
+    check_status("stream readback requires global drain", potal_paired_acc_readback_issue(s, &readback),
+        POTAL_ERR_BUSY);
+    check_status("stream conservative global drain", potal_paired_fence(s), POTAL_OK);
+    check_status("stream reused residual release", stream_release_scales(s, reused, &residual), POTAL_OK);
+    check_status("stream reused retire", potal_paired_stream_panel_retire(s, reused), POTAL_OK);
+    check_status("stream one release", stream_release_scales(s, r1, &m1), POTAL_OK);
+    check_status("stream one retire", potal_paired_stream_panel_retire(s, r1), POTAL_OK);
+    check_status("stream unused collision allocation released globally", managed_scales(s, &conflict, 1), POTAL_OK);
+    readback.c = (int32_t *)(uintptr_t)config.main.base;
+    check_status("stream output cannot overwrite immutable source",
+        potal_paired_acc_readback_issue(s, &readback), POTAL_ERR_INVALID_ARGUMENT);
+    readback.c = FAKE_C;
+    check_status("stream drained readback", potal_paired_acc_readback_issue(s, &readback), POTAL_OK);
+    readback.acc_bank = 1;
+    check_status("stream second ACC readback follows first store",
+        potal_paired_acc_readback_issue(s, &readback), POTAL_OK);
+    check_u64("stream both readbacks remain outstanding",
+        potal_paired_stream_query(s).core.outstanding_readbacks, 2);
+    check_status("stream end cannot skip final fence", potal_paired_stream_end(s), POTAL_ERR_BUSY);
+    check_status("stream legacy Release fixture", potal_paired_scale_write(s, 255, 22, 0, 0), POTAL_OK);
+    check_status("stream legacy Release still drains", potal_paired_scale_release(s, 255, 22, 0), POTAL_OK);
+    check_u64("stream legacy Release clears readback count",
+        potal_paired_stream_query(s).core.outstanding_readbacks, 0);
+    check_status("stream Release cannot replace CPU consumption fence", potal_paired_stream_end(s), POTAL_ERR_BUSY);
+    check_status("stream final fence", potal_paired_fence(s), POTAL_OK);
+    check_status("stream end waits for diagnostic snapshot", potal_paired_stream_end(s), POTAL_ERR_BUSY);
+    const uint32_t snapshot_begin = st.trace.count;
+    check_status("stream completed diagnostic snapshot", potal_paired_stream_counters_end(s, observed), POTAL_OK);
+    check_u64("stream diagnostic records fit trace storage",
+        snapshot_begin + POTAL_STREAM_COUNTER_FIELDS <= SINK_CAPACITY, 1);
+    for (uint32_t i = 0; i < POTAL_STREAM_COUNTER_FIELDS; ++i) {
+        check_u64("stream diagnostic snapshot is full width", observed[i], POTAL_STREAM_CAPABILITY);
+        if (snapshot_begin + i < SINK_CAPACITY)
+            check_u64("stream diagnostic snapshot selects exact counter",
+                st.trace.records[snapshot_begin+i].rs1, (uint64_t)i << 4);
+    }
+    check_status("stream end", potal_paired_stream_end(s), POTAL_OK);
+    check_status("stream close", potal_paired_session_close(s), POTAL_OK);
+
+    memset(&st, 0, sizeof(st));
+    st.capability = POTAL_STREAM_CAPABILITY;
+    config.residual = (potal_stream_source){0};
+    check_status("stream zero residual open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_status("stream absent residual begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+    check_u64("stream absent residual harmless pitch", st.trace.records[6].rs2, 32);
+    p0.readers = 1;
+    check_status("stream absent residual declare", potal_paired_stream_panel_begin(s, &p0, &r0), POTAL_OK);
+    check_status("stream absent residual scales", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("stream absent residual Main", potal_paired_stream_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    before = st.trace.count;
+    check_status("stream absent residual submit refused", potal_paired_stream_loop_issue(s, r0, 1, &residual),
+        POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("stream absent residual refusal no effect", st.trace.count, before);
+    check_status("stream absent residual wait", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+    check_status("stream absent residual release", stream_release_scales(s, r0, &m0), POTAL_OK);
+    check_status("stream absent residual retire", potal_paired_stream_panel_retire(s, r0), POTAL_OK);
+    check_status("stream absent residual final fence", potal_paired_fence(s), POTAL_OK);
+    check_status("stream absent residual end", potal_paired_stream_end(s), POTAL_OK);
+    check_status("stream absent residual close", potal_paired_session_close(s), POTAL_OK);
+}
+
+static void test_stream_early(uint32_t with_residual, uint32_t global_completion) {
+    stream_sink_state st = {0};
+    st.capability = POTAL_STREAM_CAPABILITY;
+    potal_paired_session *s = NULL;
+    const potal_paired_sink sink = {stream_sink, &st};
+    potal_stream_config config = stream_config();
+    config.continuous = 1;
+    config.early_b_only = 1;
+    if (!with_residual) config.residual = (potal_stream_source){0};
+    check_status("stream Early probe open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    potal_stream_config invalid = config;
+    invalid.continuous = 0;
+    check_status("stream Early bounded refused", potal_paired_stream_begin(s, &invalid), POTAL_ERR_INVALID_ARGUMENT);
+    invalid = config; invalid.early_b_only = 2;
+    check_status("stream Early invalid option refused", potal_paired_stream_begin(s, &invalid), POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("stream Early invalid options have no effects", st.trace.count, 0);
+    check_status("stream Early old composition refused", potal_paired_stream_begin(s, &config), POTAL_ERR_UNSUPPORTED);
+    check_u64("stream Early old image only probes", st.trace.count, 3);
+    check_u64("stream Early exact probe", st.trace.records[2].rs1, UINT64_C(0x4853384801000000));
+    check_u64("stream Early probe cannot change counter options", st.trace.records[2].rs1 & UINT64_C(0xff), 0);
+    check_status("stream Early unsupported close", potal_paired_session_close(s), POTAL_OK);
+
+    memset(&st, 0, sizeof(st));
+    st.capability = POTAL_STREAM_CAPABILITY;
+    st.early_capability = POTAL_STREAM_EARLY_CAPABILITY;
+    check_status("stream Early open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    check_status("stream Early begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+    check_u64("stream Early negotiated mode", st.trace.count == 8 &&
+        st.trace.records[3].funct == 30 && st.trace.records[3].rs1 == 6 &&
+        st.trace.records[3].xd == 1 && !st.trace.records[3].rs2, 1);
+    const potal_h2_panel p0 = managed_panel(0, with_residual ? 2 : 1), p1 = managed_panel(1, 1);
+    potal_h2_ref r0, r1;
+    check_status("stream Early current declare", potal_paired_stream_panel_begin(s, &p0, &r0), POTAL_OK);
+    check_status("stream Early target declare", potal_paired_stream_panel_begin(s, &p1, &r1), POTAL_OK);
+    uint32_t before = st.trace.count;
+    check_status("stream Early needs current Main", potal_paired_stream_panel_prefetch(s, r1), POTAL_ERR_BUSY);
+    check_u64("stream Early no-Main refusal has no effects", st.trace.count, before);
+    potal_paired_loop_ws m0 = managed_main(&p0), m1 = managed_main(&p1);
+    m1.loop.scale_base = 20; m1.loop.scale_generation = 9;
+    check_status("stream Early current Scale", managed_scales(s, &m0, 0), POTAL_OK);
+    check_status("stream Early current Main", potal_paired_stream_loop_issue(s, r0, 0, &m0), POTAL_OK);
+    before = st.trace.count;
+    check_status("stream Early B-only", potal_paired_stream_panel_prefetch(s, r1), POTAL_OK);
+    check_u64("stream Early only six staging/admission words", st.trace.count - before, 6);
+    const uint32_t functs[] = {9, 10, 11, 12, 13, 29};
+    for (uint32_t i = 0; i < 6; ++i)
+        check_u64("stream Early raw sequence", st.trace.records[before+i].funct == functs[i] &&
+            st.trace.records[before+i].xd == (i == 5), 1);
+    check_u64("stream Early B dimensions", st.trace.records[before].rs2, UINT64_C(0x200020001));
+    check_u64("stream Early B padding", st.trace.records[before].rs1, UINT64_C(5) << 16);
+    check_u64("stream Early has no A source", st.trace.records[before+1].rs1, 0);
+    check_u64("stream Early immutable B source", st.trace.records[before+1].rs2, (uintptr_t)m1.loop.b);
+    check_u64("stream Early B stride", st.trace.records[before+3].rs2, config.weight.ldb);
+    check_u64("stream Early selector", st.trace.records[before+5].rs1, UINT64_C(0x11));
+    potal_stream_status q = potal_paired_stream_query(s);
+    check_u64("stream Early admission is no reader or completion",
+        q.core.outstanding_loops == 1 && !q.panel[1].scheduled && !q.panel[1].submitted &&
+        !q.panel[1].completed && !q.panel[1].dma_done, 1);
+    before = st.trace.count;
+    check_status("stream Early duplicate refused", potal_paired_stream_panel_prefetch(s, r1), POTAL_ERR_BUSY);
+    potal_h2_ref stale = r1; stale.generation++;
+    check_status("stream Early stale reference", potal_paired_stream_panel_prefetch(s, stale), POTAL_ERR_INVALID_ARGUMENT);
+    check_status("stream Early Main waits for producer", potal_paired_stream_loop_issue(s, r1, 0, &m1), POTAL_ERR_BUSY);
+    const potal_index_config target_index = managed_index(&p1);
+    check_status("stream Early cannot expose Index before Main", potal_paired_index_config(s, &target_index),
+        POTAL_ERR_INVALID_ARGUMENT);
+    check_u64("stream Early refusals have no effects", st.trace.count, before);
+    potal_paired_loop_ws residual = managed_residual(&p0);
+    residual.loop.a = config.residual.base;
+    residual.loop.lda = config.residual.stride;
+    residual.loop.scale_base = m0.loop.scale_base;
+    residual.loop.scale_generation = m0.loop.scale_generation;
+    if (with_residual) {
+        const potal_index_config index = managed_index(&p0);
+        check_status("stream Early current Index", potal_paired_index_config(s, &index), POTAL_OK);
+        for (uint32_t i = 0; i < index.active_rows; ++i) {
+            const potal_index_write w = {i, i};
+            check_status("stream Early current Index row", potal_paired_index_write(s, &w), POTAL_OK);
+        }
+        check_status("stream Early current Residual before B wait",
+            potal_paired_stream_loop_issue(s, r0, 1, &residual), POTAL_OK);
+    }
+    check_status("stream Early producer completion",
+        global_completion ? potal_paired_fence(s) : potal_paired_stream_wait_pair(s, r1), POTAL_OK);
+    q = potal_paired_stream_query(s);
+    check_u64("stream Early completed producer remains no reader",
+        q.panel[1].dma_done && !q.panel[1].scheduled && !q.panel[1].submitted && !q.panel[1].completed, 1);
+    check_u64("stream Early local/global completion distinction",
+        q.core.outstanding_loops == (global_completion ? 0 : p0.readers) &&
+        q.panel[0].completed == (global_completion ? p0.readers : 0) &&
+        q.core.drains == global_completion, 1);
+    check_status("stream Early target Scale", managed_scales(s, &m1, 0), POTAL_OK);
+    potal_gemm_ws_program ordinary;
+    check_status("stream Early canonical Main encoder", potal_paired_loop_ws_encode(&m1, &ordinary), POTAL_OK);
+    before = st.trace.count;
+    check_status("stream Early resident Main", potal_paired_stream_loop_issue(s, r1, 0, &m1), POTAL_OK);
+    const potal_rocc_cmd words[] = {ordinary.bounds, ordinary.addrs_ab, ordinary.addrs_dc,
+        ordinary.strides_ab, ordinary.strides_dc, ordinary.loop_ws};
+    check_u64("stream Early Main is still six words", st.trace.count - before, 6);
+    for (uint32_t i = 0; i < 6; ++i)
+        check_u64("stream Early only suppresses Main B address",
+            st.trace.records[before+i].rs1 == words[i].rs1 &&
+            st.trace.records[before+i].rs2 == (i == 1 ? 0 : words[i].rs2), 1);
+    check_status("stream Early target wait", potal_paired_stream_wait_pair(s, r1), POTAL_OK);
+    check_status("stream Early target release", stream_release_scales(s, r1, &m1), POTAL_OK);
+    check_status("stream Early target retire", potal_paired_stream_panel_retire(s, r1), POTAL_OK);
+    if (with_residual && !global_completion) {
+        potal_h2_ref reused;
+        check_status("stream Early target reuse", potal_paired_stream_panel_begin(s, &p1, &reused), POTAL_OK);
+        before = st.trace.count;
+        check_status("stream Early old incarnation refused", potal_paired_stream_panel_prefetch(s, r1),
+            POTAL_ERR_INVALID_ARGUMENT);
+        check_status("stream Early too-late opportunity refused", potal_paired_stream_panel_prefetch(s, reused),
+            POTAL_ERR_BUSY);
+        check_u64("stream Early late refusal no effect", st.trace.count, before);
+        check_status("stream Early ordinary reuse Scale", managed_scales(s, &m1, 0), POTAL_OK);
+        before = st.trace.count;
+        check_status("stream Early ordinary reuse Main", potal_paired_stream_loop_issue(s, reused, 0, &m1), POTAL_OK);
+        check_u64("stream Early refusal did not suppress B", st.trace.records[before+1].rs2, (uintptr_t)m1.loop.b);
+        check_status("stream Early reuse wait", potal_paired_stream_wait_pair(s, reused), POTAL_OK);
+        check_status("stream Early reuse release", stream_release_scales(s, reused, &m1), POTAL_OK);
+        check_status("stream Early reuse retire", potal_paired_stream_panel_retire(s, reused), POTAL_OK);
+    }
+    check_status("stream Early current wait", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+    check_status("stream Early current release", stream_release_scales(s, r0, with_residual ? &residual : &m0), POTAL_OK);
+    check_status("stream Early current retire", potal_paired_stream_panel_retire(s, r0), POTAL_OK);
+    check_status("stream Early final fence", potal_paired_fence(s), POTAL_OK);
+    check_status("stream Early end", potal_paired_stream_end(s), POTAL_OK);
+    check_status("stream Early close", potal_paired_session_close(s), POTAL_OK);
+}
+
+static void test_stream_early_geometry(void) {
+    for (uint32_t mismatch = 0; mismatch < 4; ++mismatch) {
+        stream_sink_state st = {0};
+        st.capability = POTAL_STREAM_CAPABILITY;
+        st.early_capability = POTAL_STREAM_EARLY_CAPABILITY;
+        const potal_paired_sink sink = {stream_sink, &st};
+        potal_paired_session *s = NULL;
+        potal_stream_config config = stream_config();
+        config.continuous = 1; config.early_b_only = 1;
+        check_status("stream Early geometry open", potal_paired_session_open(&sink, &s), POTAL_OK);
+        check_status("stream Early geometry begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+        const potal_h2_panel p0 = managed_panel(0, 1);
+        potal_h2_panel p1 = managed_panel(1, 1);
+        switch (mismatch) {
+            case 0: p1.k_begin = 0; break;
+            case 1: p1.j_begin = 0; break;
+            case 2: p1.j_tiles = 1; break;
+            case 3: p1.pad_j = 6; break;
+        }
+        potal_h2_ref r0, r1;
+        check_status("stream Early geometry current declare", potal_paired_stream_panel_begin(s, &p0, &r0), POTAL_OK);
+        check_status("stream Early geometry target remains valid", potal_paired_stream_panel_begin(s, &p1, &r1), POTAL_OK);
+        potal_paired_loop_ws m0 = managed_main(&p0), m1 = managed_main(&p1);
+        m1.loop.j_tiles = p1.j_tiles;
+        m1.loop.scale_base = 20; m1.loop.scale_generation = 9;
+        check_status("stream Early geometry current Scale", managed_scales(s, &m0, 0), POTAL_OK);
+        check_status("stream Early geometry current Main", potal_paired_stream_loop_issue(s, r0, 0, &m0), POTAL_OK);
+        uint32_t before = st.trace.count;
+        check_status("stream Early geometry mismatch refused", potal_paired_stream_panel_prefetch(s, r1),
+            POTAL_ERR_INVALID_ARGUMENT);
+        check_u64("stream Early geometry refusal has no effects", st.trace.count, before);
+        check_status("stream Early geometry ordinary Scale", managed_scales(s, &m1, 0), POTAL_OK);
+        before = st.trace.count;
+        check_status("stream Early geometry ordinary Main", potal_paired_stream_loop_issue(s, r1, 0, &m1), POTAL_OK);
+        check_u64("stream Early geometry refusal retains ordinary B", st.trace.records[before+1].rs2,
+            (uintptr_t)m1.loop.b);
+        check_status("stream Early geometry target wait", potal_paired_stream_wait_pair(s, r1), POTAL_OK);
+        check_status("stream Early geometry target release", stream_release_scales(s, r1, &m1), POTAL_OK);
+        check_status("stream Early geometry target retire", potal_paired_stream_panel_retire(s, r1), POTAL_OK);
+        check_status("stream Early geometry current wait", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+        check_status("stream Early geometry current release", stream_release_scales(s, r0, &m0), POTAL_OK);
+        check_status("stream Early geometry current retire", potal_paired_stream_panel_retire(s, r0), POTAL_OK);
+        check_status("stream Early geometry final fence", potal_paired_fence(s), POTAL_OK);
+        check_status("stream Early geometry end", potal_paired_stream_end(s), POTAL_OK);
+        check_status("stream Early geometry close", potal_paired_session_close(s), POTAL_OK);
+    }
+}
+
+static void stream_early_failure_case(uint32_t stage) {
+    stream_sink_state st = {0};
+    st.capability = POTAL_STREAM_CAPABILITY;
+    st.early_capability = POTAL_STREAM_EARLY_CAPABILITY;
+    const potal_paired_sink sink = {stream_sink, &st};
+    potal_paired_session *s = NULL, *other = NULL;
+    potal_stream_config config = stream_config();
+    config.continuous = 1; config.early_b_only = 1;
+    check_status("stream Early failure open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    if (stage < 8) {
+        st.fail_at = stage + 1;
+        check_status("stream Early partial begin", potal_paired_stream_begin(s, &config), POTAL_ERR_BAD_RESPONSE);
+    } else {
+        check_status("stream Early failure begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+        const potal_h2_panel p0 = managed_panel(0, 1), p1 = managed_panel(1, 1);
+        potal_paired_loop_ws m0 = managed_main(&p0), m1 = managed_main(&p1);
+        m1.loop.scale_base = 20; m1.loop.scale_generation = 9;
+        potal_h2_ref r0, r1;
+        check_status("stream Early failure current declare", potal_paired_stream_panel_begin(s, &p0, &r0), POTAL_OK);
+        check_status("stream Early failure target declare", potal_paired_stream_panel_begin(s, &p1, &r1), POTAL_OK);
+        check_status("stream Early failure current Scale", managed_scales(s, &m0, 0), POTAL_OK);
+        check_status("stream Early failure current Main", potal_paired_stream_loop_issue(s, r0, 0, &m0), POTAL_OK);
+        if (stage < 14) st.fail_at = st.trace.count + stage - 7;
+        check_status("stream Early partial producer", potal_paired_stream_panel_prefetch(s, r1),
+            stage < 14 ? POTAL_ERR_BAD_RESPONSE : POTAL_OK);
+        if (stage == 14) {
+            check_status("stream Early producer-only current wait", potal_paired_stream_wait_pair(s, r0), POTAL_OK);
+            check_status("stream Early producer-only current release", stream_release_scales(s, r0, &m0), POTAL_OK);
+            check_status("stream Early producer-only current retire", potal_paired_stream_panel_retire(s, r0), POTAL_OK);
+            const potal_stream_status before = potal_paired_stream_query(s);
+            check_u64("stream Early producer-only has zero compute and Scale",
+                !before.core.outstanding_loops && !before.core.live_scale_slots && before.panel[1].declared &&
+                !before.panel[1].submitted && !before.panel[1].dma_done, 1);
+            st.fail_at = st.trace.count + 1;
+            check_status("stream Early failed producer wait", potal_paired_stream_wait_pair(s, r1), POTAL_ERR_BAD_RESPONSE);
+        } else if (stage >= 15) {
+            check_status("stream Early before failed Main wait", potal_paired_stream_wait_pair(s, r1), POTAL_OK);
+            check_status("stream Early before failed Main Scale", managed_scales(s, &m1, 0), POTAL_OK);
+            st.fail_at = st.trace.count + stage - 14;
+            check_status("stream Early partial resident Main",
+                potal_paired_stream_loop_issue(s, r1, 0, &m1), POTAL_ERR_BAD_RESPONSE);
+        }
+    }
+    const potal_stream_status q = potal_paired_stream_query(s);
+    check_u64("stream Early failure quarantines", q.quarantined && q.core.failed, 1);
+    const uint32_t count = st.trace.count;
+    check_status("stream Early no failed fence retry", potal_paired_fence(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream Early no failed cleanup", potal_paired_session_cleanup(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream Early no failed end", potal_paired_stream_end(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream Early cannot free quarantine", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_u64("stream Early failure has no follow-up commands", st.trace.count, count);
+    check_status("stream Early failure prevents fallback", potal_paired_session_open(&sink, &other), POTAL_ERR_BUSY);
+}
+
+static void stream_failure_case(uint32_t stage) {
+    stream_sink_state st = {0};
+    st.capability = POTAL_STREAM_CAPABILITY;
+    potal_paired_session *s = NULL, *other = NULL;
+    const potal_paired_sink sink = {stream_sink, &st};
+    const potal_stream_config config = stream_config();
+    check_status("stream failure open", potal_paired_session_open(&sink, &s), POTAL_OK);
+    st.session = s;
+    if (stage < 7) {
+        st.fail_at = stage + 1;
+        check_status("stream partial begin fails", potal_paired_stream_begin(s, &config), POTAL_ERR_BAD_RESPONSE);
+    } else {
+        check_status("stream failure begin", potal_paired_stream_begin(s, &config), POTAL_OK);
+        const potal_h2_panel panel = managed_panel(0, 1);
+        const potal_paired_loop_ws main = managed_main(&panel);
+        potal_h2_ref ref;
+        check_status("stream failure declare", potal_paired_stream_panel_begin(s, &panel, &ref), POTAL_OK);
+        check_status("stream failure scales", managed_scales(s, &main, 0), POTAL_OK);
+        if (stage < 13) st.fail_at = st.trace.count + stage - 6;
+        check_status("stream partial program",
+            potal_paired_stream_loop_issue(s, ref, 0, &main), stage < 13 ? POTAL_ERR_BAD_RESPONSE : POTAL_OK);
+        if (stage == 13) {
+            st.fail_at = st.trace.count + 1;
+            check_status("stream failed wait", potal_paired_stream_wait_pair(s, ref), POTAL_ERR_BAD_RESPONSE);
+        } else if (stage == 14) {
+            check_status("stream before failed release", potal_paired_stream_wait_pair(s, ref), POTAL_OK);
+            st.fail_at = st.trace.count + 1;
+            check_status("stream failed local release", potal_paired_stream_scale_release(s, ref, 0, 7, 0),
+                POTAL_ERR_BAD_RESPONSE);
+        }
+    }
+    potal_stream_status q = potal_paired_stream_query(s);
+    check_u64("stream failure quarantines owner", q.quarantined && q.core.failed, 1);
+    const uint32_t count = st.trace.count;
+    check_status("stream no failed fence retry", potal_paired_fence(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream no automatic cleanup", potal_paired_session_cleanup(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream no failed end", potal_paired_stream_end(s), POTAL_ERR_BAD_RESPONSE);
+    check_status("stream cannot free quarantined session", potal_paired_session_close(s), POTAL_ERR_BUSY);
+    check_status("stream failure first status", potal_paired_stream_query(s).core.error, POTAL_ERR_BAD_RESPONSE);
+    check_u64("stream quarantine no commands", st.trace.count, count);
+    check_status("stream quarantine excludes fallback", potal_paired_session_open(&sink, &other), POTAL_ERR_BUSY);
+}
+
+static void run_stream_failure_cases(uint32_t count, void (*run_case)(uint32_t)) {
+    for (uint32_t stage = 0; stage < count; ++stage) {
+#if defined(__unix__)
+        fflush(NULL);
+        const int before = failures;
+        const pid_t child = fork();
+        if (child == 0) {
+            run_case(stage);
+            fflush(NULL);
+            _exit(failures == before ? 0 : 1);
+        }
+        check_u64("stream failure fork", child >= 0, 1);
+        if (child < 0) continue;
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+        check_u64("stream isolated failure", result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
+#else
+        check_u64("stream failure isolation requires fork", 0, 1);
+        (void)run_case;
+#endif
+    }
+}
+#endif
+
 int main(void) {
     printf("POTAL_API_TEST DIM=%u params_sha256=%s\n", (unsigned)potal_hw_dim(), potal_hw_params_sha256());
     check_u64("hw dim matches adapter", potal_hw_dim(), POTAL_HW_DIM);
@@ -2110,6 +2660,14 @@ int main(void) {
     test_managed_admission();
     test_observation();
 #if POTAL_HW_DIM == 32
+    test_stream(0);
+    test_stream(1);
+    test_stream_early(1, 0);
+    test_stream_early(1, 1);
+    test_stream_early(0, 1);
+    test_stream_early_geometry();
+    run_stream_failure_cases(15, stream_failure_case);
+    run_stream_failure_cases(21, stream_early_failure_case);
     test_managed_completion();
     test_managed_h2();
     test_managed_recovery();

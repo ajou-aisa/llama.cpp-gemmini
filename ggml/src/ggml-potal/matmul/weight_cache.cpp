@@ -1,6 +1,7 @@
 #include "weight_cache.hpp"
 
 #include "ggml-potal-buffer.hpp"
+#include "../log.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -13,6 +14,7 @@ namespace {
 using clock_type = std::chrono::steady_clock;
 
 double seconds_since(clock_type::time_point t0) {
+    if (t0 == clock_type::time_point{}) return 0;
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
@@ -76,7 +78,8 @@ weight_lookup weight_cache::get(const ggml_tensor * src0, const ggml_gemmini_arg
         }
     }
 
-    auto t = clock_type::now();
+    const bool measure = log::timing_enabled();
+    auto t = measure ? clock_type::now() : clock_type::time_point{};
     std::unique_ptr<hp1_weight> w(new (std::nothrow) hp1_weight);
     const bool                  allocated = w != nullptr && w->allocate(src0->ne[1], src0->ne[0]);
     r.alloc_s                             = seconds_since(t);
@@ -85,7 +88,7 @@ weight_lookup weight_cache::get(const ggml_tensor * src0, const ggml_gemmini_arg
         r.alloc_failed = true;
         return r;
     }
-    t          = clock_type::now();
+    t          = measure ? clock_type::now() : clock_type::time_point{};
     r.status   = prepare_weight(args, *w, &r.reader);
     r.prepare_s = seconds_since(t);
     if (r.status != quants::weight::hp1::status::ok) {

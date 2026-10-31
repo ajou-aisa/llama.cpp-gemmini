@@ -1029,10 +1029,37 @@ typedef struct h2_state {
     h2_panel_state panel[POTAL_PAIRS];
 } h2_state;
 
+typedef enum stream_b_phase {
+    STREAM_B_NONE,
+    STREAM_B_ISSUING,
+    STREAM_B_ACCEPTED,
+    STREAM_B_COMPLETE
+} stream_b_phase;
+
+typedef struct stream_panel_state {
+    potal_h2_panel declaration;
+    potal_stream_panel_status status;
+    const int8_t *source;
+    uint32_t b_sp_base;
+    stream_b_phase producer;
+} stream_panel_state;
+
+typedef struct stream_state {
+    potal_stream_config config;
+    uint64_t owner, sequence;
+    int in_call, control_pending, quarantined, globally_drained, final_fenced;
+    int counters_active;
+    uint32_t acc_written;
+    /* Slot consumers remain bound until release, even after physical completion. */
+    uint32_t slot_pairs[POTAL_SCALE_ENTRIES];
+    stream_panel_state panel[POTAL_PAIRS];
+} stream_state;
+
 struct potal_paired_session {
     potal_paired_sink sink;
     resident_ws_state *resident;            /* NULL for every legacy session */
     h2_state         *h2;                  /* mutually exclusive managed DIM32 mode */
+    stream_state     *stream;
     potal_observation_counter_fn observation_counter;
     int observation_active, observation_in_call;
     uint64_t observation_b0_base;          /* retained across the early capability counter0 probe */
@@ -1063,8 +1090,12 @@ static void h2_completed(potal_paired_session *s);
 static potal_status h2_fence(potal_paired_session *s);
 static potal_status h2_cleanup(potal_paired_session *s);
 static int h2_pending(const potal_paired_session *s);
+static void stream_completed(potal_paired_session *s);
+static potal_status stream_index_check(const potal_paired_session *s, const potal_index_config *cfg);
 
 static potal_status paired_fail(potal_paired_session *s, potal_status status, const char *stage) {
+    /* No automatic recovery of partially dispatched stream controls/programs. */
+    if (s->stream) s->stream->quarantined = 1;
     if (s->h2) s->h2->completion_certified = 0;
     if (!s->failed) {
         s->failed = 1;
@@ -1103,8 +1134,10 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
     if (s->sink.cmd != NULL) {
         const potal_paired_cmd_record rec = { funct, (uint32_t)xd, rs1, rs2 };
         if (s->h2) s->h2->in_call = 1;
+        if (s->stream) s->stream->in_call = 1;
         const potal_status status = s->sink.cmd(s->sink.ctx, &rec);
         if (s->h2) s->h2->in_call = 0;
+        if (s->stream) s->stream->in_call = 0;
         return status;
     }
 #if defined(__riscv)
@@ -1120,6 +1153,7 @@ static potal_status paired_raw_untraced(potal_paired_session *s, uint32_t funct,
             potal_rocc_loop_ws(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_RESIDENT_VIEW:             return hw_status(potal_rocc_resident_view(rs1, rs2));
         case POTAL_FUNCT_LDB_ONLY:                  return hw_status(potal_rocc_ldb_only(rs1, rs2));
+        case POTAL_FUNCT_STREAM:                    return hw_status(potal_rocc_stream(rs1, rs2));
         case POTAL_FUNCT_MVOUT:                     potal_rocc_mvout(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_MVIN:                      potal_rocc_mvin(rs1, rs2); return POTAL_OK;
         case POTAL_FUNCT_FLUSH:                     potal_rocc_flush(rs1, rs2); return POTAL_OK;
@@ -1205,6 +1239,7 @@ static void paired_drained(potal_paired_session *s) {
     s->drains++;
     if (s->resident) resident_ws_completed(s);
     if (s->h2) h2_completed(s);
+    if (s->stream) stream_completed(s);
 }
 
 static potal_status paired_ready(const potal_paired_session *s) {
@@ -1212,6 +1247,7 @@ static potal_status paired_ready(const potal_paired_session *s) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
     if (s->h2 && s->h2->in_call) return POTAL_ERR_BUSY;
+    if (s->stream && s->stream->in_call) return POTAL_ERR_BUSY;
     if (s->observation_in_call) return POTAL_ERR_BUSY;
     if (s->failed) {
         return s->error;
@@ -1251,7 +1287,7 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
-    if (s->resident || s->h2) return POTAL_ERR_BUSY; /* managed pointer-to-pointer close owns storage */
+    if (s->resident || s->h2 || s->stream) return POTAL_ERR_BUSY; /* managed state owns storage */
     if (s->observation_in_call || (s->observation_active && !s->failed)) return POTAL_ERR_BUSY;
     const int outstanding = s->outstanding_loops != 0 || s->outstanding_readbacks != 0 ||
                             s->outstanding_acc_updates != 0;
@@ -1308,7 +1344,7 @@ potal_paired_session_status potal_paired_session_query(const potal_paired_sessio
 }
 
 potal_status potal_paired_tlb_flush(potal_paired_session *s) {
-    if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->stream)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1349,6 +1385,7 @@ static potal_status paired_scale_write_core(potal_paired_session *s, uint32_t sl
     if (s->slot_columns[slot] != 0 && (s->slot_generation[slot] != generation || (s->slot_columns[slot] & bit) != 0)) {
         return POTAL_ERR_CAPACITY;
     }
+    if (s->stream && s->stream->slot_pairs[slot]) return POTAL_ERR_BUSY;
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1391,6 +1428,7 @@ static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t 
         return paired_fail(s, released, "scale_release");
     }
     s->slot_columns[slot] &= ~((uint64_t)1 << column); /* the slot is free when its last live column is released */
+    if (s->stream && !s->slot_columns[slot]) s->stream->slot_pairs[slot] = 0;
     paired_drained(s);
     return POTAL_OK;
 }
@@ -1474,6 +1512,12 @@ potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, 
 
 potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
     if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && s->stream) {
+        potal_status status = paired_ready(s);
+        if (status != POTAL_OK) return status;
+        status = stream_index_check(s, cfg);
+        if (status != POTAL_OK) return status;
+    }
     if (s && s->h2) {
         const potal_status ready = paired_ready(s);
         if (ready != POTAL_OK) return ready;
@@ -1523,7 +1567,7 @@ static potal_status paired_issue_program(potal_paired_session *s, const potal_ge
 }
 
 potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_paired_loop_ws *pl) {
-    if (s && (s->resident || s->h2)) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->h2 || s->stream)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1590,6 +1634,22 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
     if (status != POTAL_OK) {
         return status;
     }
+    if (s->stream) {
+        /* The first readback needs a global compute drain. Further readbacks
+         * may follow it: no stream loop can issue while readbacks are pending.
+         * Pending stores still prevent end until the final checked Fence. */
+        if ((!s->stream->globally_drained && !s->outstanding_readbacks) ||
+            s->outstanding_loops || s->stream->control_pending ||
+            !(s->stream->acc_written & (1u << r->acc_bank))) return POTAL_ERR_BUSY;
+        const uint64_t extent = matrix_extent((uint64_t)r->i_tiles * POTAL_HW_DIM - r->pad_i,
+            (uint64_t)r->j_tiles * POTAL_HW_DIM - r->pad_j, r->ldc, sizeof(int32_t));
+        const potal_stream_config *c = &s->stream->config;
+        if (ranges_overlap((uintptr_t)r->c, extent, (uintptr_t)c->weight.base, c->weight.bytes) ||
+            ranges_overlap((uintptr_t)r->c, extent, (uintptr_t)c->main.base, c->main.bytes) ||
+            ranges_overlap((uintptr_t)r->c, extent, (uintptr_t)c->residual.base, c->residual.bytes))
+            return POTAL_ERR_INVALID_ARGUMENT;
+        if (s->outstanding_readbacks == UINT32_MAX) return POTAL_ERR_CAPACITY;
+    }
     if (s->h2) {
         if (!(s->h2->acc_written & (1u << r->acc_bank)) || s->h2->status.control_pending)
             return POTAL_ERR_BUSY;
@@ -1602,17 +1662,21 @@ potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const pota
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
-    if (s->h2) s->outstanding_readbacks++; /* before even the first CONFIG can have effects */
+    if (s->h2 || s->stream) s->outstanding_readbacks++; /* before first CONFIG */
+    if (s->stream) {
+        s->stream->globally_drained = 0;
+        s->stream->final_fenced = 0;
+    }
     PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_st.rs1, config_st.rs2, 0, "acc_readback");
     for (uint32_t t = 0; t < count; ++t) {
         PAIRED_RAW(s, POTAL_FUNCT_MVOUT, mvouts[t].rs1, mvouts[t].rs2, 0, "acc_readback");
     }
-    if (!s->h2) s->outstanding_readbacks++;
+    if (!s->h2 && !s->stream) s->outstanding_readbacks++;
     return POTAL_OK;
 }
 
 potal_status potal_paired_acc_bias_issue(potal_paired_session *s, const potal_acc_bias *bias) {
-    if (s && (s->resident || s->h2)) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->h2 || s->stream)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1647,6 +1711,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
     if (s->observation_in_call) return POTAL_ERR_BUSY;
+    if (s->stream) return s->failed ? s->error : POTAL_ERR_BUSY;
     if (s->resident) return resident_ws_cleanup(s);
     if (s->h2) return h2_cleanup(s);
     if (!paired_can_issue(s)) {
@@ -1691,6 +1756,10 @@ potal_status potal_paired_fence(potal_paired_session *s) {
     }
     if (s->resident) return resident_ws_fence(s);
     if (s->h2) return h2_fence(s);
+    if (s->stream) {
+        const potal_status ready = paired_ready(s);
+        if (ready != POTAL_OK) return ready;
+    }
     if (!paired_can_issue(s)) {
         return POTAL_ERR_NO_HARDWARE;
     }
@@ -1702,6 +1771,7 @@ potal_status potal_paired_fence(potal_paired_session *s) {
         return paired_fail(s, status, "fence"); /* outstanding work stays outstanding */
     }
     paired_drained(s);
+    if (s->stream) s->stream->final_fenced = 1;
     return POTAL_OK;
 }
 
@@ -1771,7 +1841,7 @@ static void h2_completed(potal_paired_session *s) {
 }
 
 potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weight *w) {
-    if (s && s->resident) return POTAL_ERR_BUSY;
+    if (s && (s->resident || s->stream)) return POTAL_ERR_BUSY;
     potal_status status = paired_ready(s);
     if (status != POTAL_OK) return status;
     if (s->h2) return POTAL_ERR_BUSY;
@@ -1813,7 +1883,7 @@ potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weigh
 /* Check every tile's source and rear SP layout before issuing any command.
  * No caller-supplied panel pointer participates in address derivation.
  */
-static potal_status h2_panel_check(const h2_state *h, const potal_h2_panel *d,
+static potal_status h2_panel_check(const potal_h2_weight *weight, const potal_h2_panel *d,
     const int8_t **source, uint32_t *sp_base) {
     if (!d || d->pair >= POTAL_PAIRS || !d->readers || !d->k_tiles || !d->j_tiles ||
         !d->main_i_tiles || d->k_tiles > LOOP_WS_FIELD16_MAX ||
@@ -1823,8 +1893,8 @@ static potal_status h2_panel_check(const h2_state *h, const potal_h2_panel *d,
         return POTAL_ERR_INVALID_ARGUMENT;
     const uint64_t rows = (uint64_t)d->k_tiles * POTAL_HW_DIM;
     const uint64_t cols = (uint64_t)d->j_tiles * POTAL_HW_DIM - d->pad_j;
-    if (d->k_begin >= h->weight.k || rows > h->weight.k - d->k_begin ||
-        d->j_begin >= h->weight.n || cols > h->weight.n - d->j_begin)
+    if (d->k_begin >= weight->k || rows > weight->k - d->k_begin ||
+        d->j_begin >= weight->n || cols > weight->n - d->j_begin)
         return POTAL_ERR_INVALID_ARGUMENT;
     const uint64_t bank_tiles = POTAL_HW_BANK_ROWS / POTAL_HW_DIM;
     if ((uint64_t)d->k_tiles * d->j_tiles > bank_tiles ||
@@ -1833,11 +1903,11 @@ static potal_status h2_panel_check(const h2_state *h, const potal_h2_panel *d,
         (uint64_t)d->main_i_tiles * d->j_tiles * POTAL_HW_DIM > POTAL_HW_ACC_ROWS / 2)
         return POTAL_ERR_CAPACITY;
     /* The full original extent was checked at begin: these products cannot wrap. */
-    const uint64_t offset = d->k_begin * h->weight.ldb + d->j_begin;
-    const uint64_t extent = matrix_extent(rows, cols, h->weight.ldb, sizeof(int8_t));
-    if (offset >= h->weight.bytes || !extent || extent > h->weight.bytes - offset)
+    const uint64_t offset = d->k_begin * weight->ldb + d->j_begin;
+    const uint64_t extent = matrix_extent(rows, cols, weight->ldb, sizeof(int8_t));
+    if (offset >= weight->bytes || !extent || extent > weight->bytes - offset)
         return POTAL_ERR_INVALID_ARGUMENT;
-    const uintptr_t address = (uintptr_t)h->weight.base + (uintptr_t)offset;
+    const uintptr_t address = (uintptr_t)weight->base + (uintptr_t)offset;
     if (!tile_pointer_ok((const void *)address, extent, POTAL_HW_DIM))
         return POTAL_ERR_INVALID_ARGUMENT;
     const uint64_t base = pair_weight_begin(d->pair) + POTAL_HW_BANK_ROWS -
@@ -1847,6 +1917,241 @@ static potal_status h2_panel_check(const h2_state *h, const potal_h2_panel *d,
     *source = (const int8_t *)address;
     *sp_base = (uint32_t)base;
     return POTAL_OK;
+}
+
+static potal_status stream_ready(const potal_paired_session *s) {
+    if (!s || !s->stream) return POTAL_ERR_INVALID_ARGUMENT;
+    return paired_ready(s);
+}
+
+static stream_panel_state *stream_find(potal_paired_session *s, potal_h2_ref ref) {
+    if (ref.pair >= POTAL_PAIRS) return NULL;
+    stream_panel_state *p = &s->stream->panel[ref.pair];
+    return p->status.declared && ref.owner == p->status.ref.owner &&
+        ref.generation == p->status.ref.generation ? p : NULL;
+}
+
+static void stream_completed(potal_paired_session *s) {
+    if (s->failed) return;
+    s->stream->control_pending = 0;
+    s->stream->globally_drained = 1;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair) {
+        stream_panel_state *panel = &s->stream->panel[pair];
+        potal_stream_panel_status *p = &panel->status;
+        if (panel->producer == STREAM_B_ACCEPTED) panel->producer = STREAM_B_COMPLETE;
+        p->completed = p->submitted;
+        p->dma_done = p->scheduled || panel->producer == STREAM_B_COMPLETE;
+    }
+}
+
+static potal_status stream_index_check(const potal_paired_session *s, const potal_index_config *cfg) {
+    const potal_status status = potal_index_config_check(cfg);
+    if (status != POTAL_OK) return status;
+    const stream_panel_state *p = &s->stream->panel[cfg->pair];
+    if (!p->status.declared || !p->status.scheduled ||
+        cfg->b_sp_base != p->b_sp_base || cfg->j_tiles != p->declaration.j_tiles ||
+        cfg->source_k_rows != p->declaration.k_tiles * POTAL_HW_DIM)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    /* Initial Index may follow its scheduled Main; an older Residual must
+     * finish before replacing the Index window or recycling its A subrange. */
+    if (p->status.submitted > 1 && p->status.completed != p->status.submitted)
+        return POTAL_ERR_BUSY;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_panel_begin(potal_paired_session *s,
+    const potal_h2_panel *d, potal_h2_ref *reference) {
+    potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!reference) return POTAL_ERR_INVALID_ARGUMENT;
+    const int8_t *source;
+    uint32_t base;
+    status = h2_panel_check(&s->stream->config.weight, d, &source, &base);
+    if (status != POTAL_OK) return status;
+    if (d->readers > 1 && !s->stream->config.residual.base) return POTAL_ERR_INVALID_ARGUMENT;
+    stream_state *h = s->stream;
+    if (h->panel[d->pair].status.declared || s->pair[d->pair].outstanding ||
+        (s->index_open && s->index_pair == d->pair)) return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (h->panel[pair].status.declared &&
+            h->panel[pair].declaration.residency_index == d->residency_index)
+            return POTAL_ERR_INVALID_ARGUMENT;
+    if (h->sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    stream_panel_state *p = &h->panel[d->pair];
+    memset(p, 0, sizeof(*p));
+    p->declaration = *d;
+    p->source = source;
+    p->b_sp_base = base;
+    p->status.ref = (potal_h2_ref){h->owner, ++h->sequence, d->pair};
+    p->status.residency_index = d->residency_index;
+    p->status.declared = 1;
+    p->status.readers = d->readers;
+    *reference = p->status.ref;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_panel_prefetch(potal_paired_session *s, potal_h2_ref ref) {
+    potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_state *h = s->stream;
+    if (!h->config.early_b_only) return POTAL_ERR_UNSUPPORTED;
+    stream_panel_state *p = stream_find(s, ref);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    if (p->producer != STREAM_B_NONE || p->status.scheduled || p->status.submitted ||
+        s->pair[ref.pair].outstanding || (s->index_open && s->index_pair == ref.pair))
+        return POTAL_ERR_BUSY;
+    const stream_panel_state *current = &h->panel[1 - ref.pair];
+    if (!current->status.declared || !current->status.scheduled ||
+        current->status.submitted != 1 || s->pair[1 - ref.pair].outstanding != 1)
+        return POTAL_ERR_BUSY;
+    const potal_h2_panel *d = &p->declaration;
+    const potal_h2_panel *c = &current->declaration;
+    if (d->j_begin != c->j_begin || d->j_tiles != c->j_tiles || d->pad_j != c->pad_j ||
+        d->k_begin != c->k_begin + (uint64_t)c->k_tiles * POTAL_HW_DIM)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    /* panel_begin already checked the immutable source, stride and rear-SP
+     * placement. Own the producer before any staging word can reach hardware.
+     * This is not a compute reader and creates no software work completion. */
+    p->producer = STREAM_B_ISSUING;
+    h->control_pending = 1;
+    h->globally_drained = 0;
+    h->final_fenced = 0;
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS, (uint64_t)d->pad_j << 16,
+        ((uint64_t)d->k_tiles << 32) | ((uint64_t)d->j_tiles << 16) | 1, 0, "stream_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB, 0, (uintptr_t)p->source, 0, "stream_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC, 0, 0, 0, "stream_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB, 0, h->config.weight.ldb, 0, "stream_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC, 0, 0, 0, "stream_ldb_only");
+    PAIRED_RAW(s, POTAL_FUNCT_LDB_ONLY, UINT64_C(0x10) | ref.pair, 0, 1, "stream_ldb_only");
+    p->producer = STREAM_B_ACCEPTED; /* admission, not DMA completion */
+    h->control_pending = 0;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_loop_issue(potal_paired_session *s, potal_h2_ref ref,
+    uint32_t ordinal, const potal_paired_loop_ws *pl) {
+    potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_panel_state *p = stream_find(s, ref);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    potal_gemm_ws_program program;
+    status = potal_paired_loop_ws_encode(pl, &program);
+    if (status != POTAL_OK) return status;
+    const potal_loop_ws *l = &pl->loop;
+    const potal_h2_panel *d = &p->declaration;
+    stream_state *h = s->stream;
+    paired_pair_state *pr = &s->pair[ref.pair];
+    if (ordinal != p->status.submitted || ordinal >= d->readers || pl->pair != ref.pair ||
+        pl->path != (ordinal ? POTAL_PAIRED_RESIDUAL : POTAL_PAIRED_MAIN) ||
+        l->j_tiles != d->j_tiles || l->pad_j != d->pad_j)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_stream_source *a = ordinal ? &h->config.residual : &h->config.main;
+    const uint64_t extent = matrix_extent((uint64_t)l->i_tiles * POTAL_HW_DIM - l->pad_i,
+        (uint64_t)l->k_tiles * POTAL_HW_DIM - l->pad_k, l->lda, 1);
+    const uintptr_t address = (uintptr_t)l->a, base = (uintptr_t)a->base;
+    if (l->lda != a->stride || address < base || address - base >= a->bytes ||
+        extent > a->bytes - (address - base)) return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->outstanding_readbacks || s->outstanding_acc_updates || s->index_open)
+        return POTAL_ERR_BUSY;
+    if (!ordinal) {
+        if (l->i_tiles != d->main_i_tiles || l->pad_i != d->main_pad_i ||
+            l->k_tiles != d->k_tiles || l->pad_k || l->b != p->source ||
+            l->ldb != h->config.weight.ldb) return POTAL_ERR_INVALID_ARGUMENT;
+        if (pr->outstanding) return POTAL_ERR_BUSY;
+        if (p->producer != STREAM_B_NONE) {
+            if (p->producer != STREAM_B_COMPLETE) return POTAL_ERR_BUSY;
+            /* The ordinary checked Main has identical source, stride, K/J/pad
+             * and rear placement: (2*pair+2)*BANK_ROWS - K*J*DIM.
+             * Suppress only B's address; preserve every ordinary Main flag. */
+            program.addrs_ab.rs2 = 0;
+        }
+    } else {
+        if (!p->status.scheduled || !pr->index_valid ||
+            pr->index.b_sp_base != p->b_sp_base || pr->index.j_tiles != d->j_tiles ||
+            pr->index.source_k_rows != d->k_tiles * POTAL_HW_DIM ||
+            pr->index.active_rows != l->k_tiles * POTAL_HW_DIM - l->pad_k ||
+            pl->a_offset_tiles < d->main_i_tiles * d->k_tiles)
+            return POTAL_ERR_INVALID_ARGUMENT;
+        if (ordinal > 1 && p->status.completed != p->status.submitted)
+            return POTAL_ERR_BUSY;
+    }
+    const uint32_t slots = l->k_tiles / l->passes_per_block * l->j_tiles;
+    int generation_live = 0;
+    for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) {
+        if (h->slot_pairs[slot] && s->slot_generation[slot] == l->scale_generation) {
+            if (h->slot_pairs[slot] != (1u << ref.pair)) return POTAL_ERR_BUSY;
+            generation_live = 1;
+        }
+    }
+    for (uint32_t i = 0; i < slots; ++i) {
+        const uint32_t slot = l->scale_base + i;
+        const uint32_t cols = POTAL_HW_DIM - (i % l->j_tiles + 1 == l->j_tiles ? l->pad_j : 0);
+        const uint64_t mask = UINT64_MAX >> (64 - cols);
+        if (s->slot_generation[slot] != l->scale_generation ||
+            (s->slot_columns[slot] & mask) != mask) return POTAL_ERR_INVALID_ARGUMENT;
+        /* Main/Residual may consume the same allocation (including a subset).
+         * A different live allocation cannot borrow its generation value. */
+        if (generation_live && h->slot_pairs[slot] != (1u << ref.pair)) return POTAL_ERR_BUSY;
+        if (h->slot_pairs[slot] & ~(1u << ref.pair)) return POTAL_ERR_BUSY;
+    }
+    if (s->outstanding_loops == UINT32_MAX || pr->outstanding == UINT32_MAX)
+        return POTAL_ERR_CAPACITY;
+    /* Own a partial program before its first staging word. */
+    h->control_pending = 1;
+    h->globally_drained = 0;
+    h->final_fenced = 0;
+    s->outstanding_loops++;
+    pr->outstanding++;
+    for (uint32_t i = 0; i < slots; ++i) h->slot_pairs[l->scale_base + i] |= 1u << ref.pair;
+    const potal_rocc_cmd words[] = {program.bounds, program.addrs_ab, program.addrs_dc,
+        program.strides_ab, program.strides_dc, program.loop_ws};
+    const uint32_t functs[] = {POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS, POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB,
+        POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC, POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB,
+        POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC, POTAL_FUNCT_LOOP_WS};
+    for (uint32_t i = 0; i < 6; ++i)
+        PAIRED_RAW(s, functs[i], words[i].rs1, words[i].rs2, i == 5, "stream_loop");
+    h->control_pending = 0;
+    p->status.submitted++;
+    p->status.sealed = p->status.submitted == d->readers;
+    h->acc_written |= 1u << pl->path;
+    if (!ordinal) {
+        p->status.scheduled = 1; /* ordered producer, NOT physical completion */
+        pr->b_sp_base = p->b_sp_base;
+        pr->b_j_tiles = d->j_tiles;
+        pr->b_k_rows = d->k_tiles * POTAL_HW_DIM;
+        pr->main_a_tiles = d->main_i_tiles * d->k_tiles;
+        pr->index_valid = 0;
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_panel_retire(potal_paired_session *s, potal_h2_ref ref) {
+    const potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_panel_state *p = stream_find(s, ref);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!p->status.sealed || p->status.completed != p->status.readers || !p->status.dma_done ||
+        s->pair[ref.pair].outstanding || (s->index_open && s->index_pair == ref.pair))
+        return POTAL_ERR_BUSY;
+    for (uint32_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot)
+        if (s->stream->slot_pairs[slot] & (1u << ref.pair)) return POTAL_ERR_BUSY;
+    memset(&s->pair[ref.pair], 0, sizeof(s->pair[ref.pair]));
+    memset(p, 0, sizeof(*p));
+    return POTAL_OK;
+}
+
+potal_stream_status potal_paired_stream_query(const potal_paired_session *s) {
+    potal_stream_status q;
+    memset(&q, 0, sizeof(q));
+    q.core = potal_paired_session_query(s);
+    if (s && s->stream) {
+        q.active = 1;
+        q.quarantined = s->stream->quarantined;
+        q.control_pending = s->stream->control_pending;
+        for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+            q.panel[pair] = s->stream->panel[pair].status;
+    }
+    return q;
 }
 
 static potal_status h2_issue_prefetch(potal_paired_session *s, h2_panel_state *p) {
@@ -1912,7 +2217,7 @@ potal_status potal_paired_h2_panel_begin(potal_paired_session *s,
     h2_state *h = s->h2;
     const int8_t *source;
     uint32_t base;
-    status = h2_panel_check(h, d, &source, &base);
+    status = h2_panel_check(&h->weight, d, &source, &base);
     if (status != POTAL_OK) return status;
     if (h->status.pending_b || h->status.control_pending || s->index_open ||
         h->panel[d->pair].status.declared || s->pair[d->pair].outstanding)
@@ -2176,6 +2481,175 @@ static potal_status observation_counter(potal_paired_session *s, uint64_t rs1, u
 #endif
     }
     return status == POTAL_OK ? status : paired_fail(s, status, "observation_counter");
+}
+
+potal_status potal_paired_stream_begin(potal_paired_session *s, const potal_stream_config *c) {
+    potal_status status = paired_ready(s);
+    if (status != POTAL_OK) return status;
+    if (s->resident || s->h2 || s->stream || s->observation_active) return POTAL_ERR_BUSY;
+    if (POTAL_HW_DIM != 32 || POTAL_HW_BANK_NUM != 4) return POTAL_ERR_UNSUPPORTED;
+    if (s->trace_enabled) return POTAL_ERR_UNSUPPORTED; /* no hot libc/printf trace */
+    if (!c || c->continuous > 1 || c->early_b_only > 1 ||
+        (c->early_b_only && !c->continuous) || !c->weight.base || !c->weight.k || !c->weight.n ||
+        c->weight.ldb < c->weight.n || (s->sink.cmd && !c->counter))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_h2_weight *w = &c->weight;
+    const uint64_t extent = matrix_extent(w->k, w->n, w->ldb, 1);
+    if (!tile_pointer_ok(w->base, extent, POTAL_HW_DIM) || extent > w->bytes ||
+        w->bytes > UINTPTR_MAX - (uintptr_t)w->base) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_stream_source *sources[] = {&c->main, &c->residual};
+    for (uint32_t i = 0; i < 2; ++i) {
+        const potal_stream_source *a = sources[i];
+        if (i == 1 && !a->base && !a->bytes && !a->stride) continue;
+        if (!a->stride || a->stride > UINT32_MAX ||
+            !tile_pointer_ok(a->base, a->bytes, POTAL_HW_DIM) ||
+            a->bytes > UINTPTR_MAX - (uintptr_t)a->base ||
+            ranges_overlap((uintptr_t)a->base, a->bytes, (uintptr_t)w->base, w->bytes))
+            return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    if (w->ldb > UINT32_MAX) return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates ||
+        s->index_open || h2_live_scales(s)) return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (s->pair[pair].resident_b || s->pair[pair].index_valid || s->pair[pair].outstanding)
+            return POTAL_ERR_BUSY;
+    if (h2_owner_sequence == UINT64_MAX) return POTAL_ERR_CAPACITY;
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    stream_state *h = calloc(1, sizeof(*h));
+    if (!h) return POTAL_ERR_CAPACITY;
+    h->config = *c;
+    h->owner = ++h2_owner_sequence;
+    s->stream = h; /* Own uncertain responses even during capability negotiation. */
+    s->observation_counter = c->counter;
+    uint64_t value = 0;
+    status = observation_counter(s, UINT64_C(10), &value);
+    if (status == POTAL_OK) status = observation_counter(s, POTAL_STREAM_TAG, &value);
+    if (status != POTAL_OK) return status;
+    int supported = value == POTAL_STREAM_CAPABILITY;
+    if (supported && c->early_b_only) {
+        status = observation_counter(s, POTAL_STREAM_EARLY_TAG, &value);
+        if (status != POTAL_OK) return status;
+        supported = value == POTAL_STREAM_EARLY_CAPABILITY;
+    }
+    if (!supported) {
+        s->stream = NULL;
+        s->observation_counter = NULL;
+        free(h);
+        return POTAL_ERR_UNSUPPORTED;
+    }
+#if defined(__riscv)
+    potal_cpu_fence_rw(); /* publish ALL immutable input allocations, exactly once */
+#endif
+    h->control_pending = 1;
+    PAIRED_RAW(s, POTAL_FUNCT_STREAM, c->early_b_only ? 6 : c->continuous ? 2 : 1, 0, 1, "stream_begin");
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG,
+        ((uint64_t)1 << CONFIG_EX_A_STRIDE_SHIFT) | CONFIG_EX_WS | CONFIG_EX,
+        (uint64_t)1 << CONFIG_EX_C_STRIDE_SHIFT, 0, "stream_ex");
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld_rs1(0), c->main.stride, 0, "stream_main_ld");
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld_rs1(1), w->ldb, 0, "stream_weight_ld");
+    PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld_rs1(2),
+        c->residual.stride ? c->residual.stride : POTAL_HW_DIM, 0, "stream_residual_ld");
+    h->control_pending = 0;
+    paired_owner = 2;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_wait_pair(potal_paired_session *s, potal_h2_ref ref) {
+    const potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_panel_state *p = stream_find(s, ref);
+    if (!p) return POTAL_ERR_INVALID_ARGUMENT;
+    if ((!p->status.scheduled && p->producer != STREAM_B_ACCEPTED &&
+         p->producer != STREAM_B_COMPLETE) || (s->index_open && s->index_pair == ref.pair))
+        return POTAL_ERR_BUSY;
+    s->stream->control_pending = 1;
+    PAIRED_RAW(s, POTAL_FUNCT_STREAM, UINT64_C(4) | ((uint64_t)ref.pair << 4), 0, 1, "stream_wait");
+    s->stream->control_pending = 0;
+    /* Deliberately NOT paired_drained: no other pair, ACC DMA or H2 state changes. */
+    s->outstanding_loops -= s->pair[ref.pair].outstanding;
+    s->pair[ref.pair].outstanding = 0;
+    if (p->producer == STREAM_B_ACCEPTED) p->producer = STREAM_B_COMPLETE;
+    p->status.completed = p->status.submitted;
+    p->status.dma_done = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_scale_release(potal_paired_session *s, potal_h2_ref ref,
+    uint32_t slot, uint32_t generation, uint32_t column) {
+    const potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_panel_state *p = stream_find(s, ref);
+    uint64_t key;
+    if (!p || potal_scale_key_encode(slot, generation, column, &key) != POTAL_OK)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t bit = UINT64_C(1) << column;
+    if (!(s->slot_columns[slot] & bit) || s->slot_generation[slot] != generation ||
+        s->stream->slot_pairs[slot] != (1u << ref.pair))
+        return POTAL_ERR_INVALID_ARGUMENT;
+    if (!p->status.sealed || p->status.completed != p->status.submitted) return POTAL_ERR_BUSY;
+    s->stream->control_pending = 1;
+    PAIRED_RAW(s, POTAL_FUNCT_STREAM, 5, key, 1, "stream_release");
+    s->stream->control_pending = 0;
+    s->slot_columns[slot] &= ~bit;
+    if (!s->slot_columns[slot]) s->stream->slot_pairs[slot] = 0;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_counters_begin(potal_paired_session *s) {
+    potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_state *h = s->stream;
+    if (h->sequence || h->counters_active || h->control_pending) return POTAL_ERR_BUSY;
+    /* Stream capability inherits the existing minimum of seven counters. */
+    const uint32_t events[POTAL_STREAM_COUNTER_FIELDS] = {10, 19, 20, 41, 27, 29, 31};
+    h->control_pending = 1;
+    uint64_t ignored;
+    for (uint32_t i = 0; i < POTAL_STREAM_COUNTER_FIELDS; ++i) {
+        status = observation_counter(s, ((uint64_t)events[i] << 12) | ((uint64_t)i << 4) | 8, &ignored);
+        if (status != POTAL_OK) return status;
+    }
+    status = observation_counter(s, 1, &ignored);
+    if (status != POTAL_OK) return status;
+    h->control_pending = 0;
+    h->counters_active = 1;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_counters_end(potal_paired_session *s,
+    uint64_t values[POTAL_STREAM_COUNTER_FIELDS]) {
+    potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    if (!values) return POTAL_ERR_INVALID_ARGUMENT;
+    stream_state *h = s->stream;
+    if (!h->counters_active || !h->final_fenced || !h->globally_drained ||
+        s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates ||
+        h->control_pending) return POTAL_ERR_BUSY;
+    h->control_pending = 1;
+    for (uint32_t i = 0; i < POTAL_STREAM_COUNTER_FIELDS; ++i) {
+        status = observation_counter(s, (uint64_t)i << 4, &values[i]);
+        if (status != POTAL_OK) return status;
+    }
+    h->control_pending = 0;
+    h->counters_active = 0;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_stream_end(potal_paired_session *s) {
+    const potal_status status = stream_ready(s);
+    if (status != POTAL_OK) return status;
+    stream_state *h = s->stream;
+    if (h->counters_active || !h->final_fenced || !h->globally_drained || s->outstanding_loops || s->outstanding_readbacks ||
+        s->outstanding_acc_updates || s->index_open || h2_live_scales(s))
+        return POTAL_ERR_BUSY;
+    for (uint32_t pair = 0; pair < POTAL_PAIRS; ++pair)
+        if (h->panel[pair].status.declared) return POTAL_ERR_BUSY;
+    h->control_pending = 1;
+    PAIRED_RAW(s, POTAL_FUNCT_STREAM, 3, 0, 1, "stream_end");
+    s->stream = NULL;
+    s->observation_counter = NULL;
+    free(h);
+    paired_owner = 1;
+    return POTAL_OK;
 }
 
 potal_status potal_paired_h2_early_enable(potal_paired_session *s,

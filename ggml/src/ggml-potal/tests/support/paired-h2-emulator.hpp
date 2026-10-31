@@ -43,8 +43,8 @@ struct h2_emulator {
     scale_entry           scales[POTAL_SCALE_ENTRIES][D];
     index_table           tables[2];
     uint32_t              selected_table = 0;
-    uint64_t              ld_stride[2] = { 0, 0 }, st_stride = 0;
-    uint64_t              ld_config[2] = { 0, 0 };
+    uint64_t              ld_stride[3] = { 0, 0, 0 }, st_stride = 0;
+    uint64_t              ld_config[3] = { 0, 0, 0 };
     uint64_t              bounds_rs1 = 0, bounds_rs2 = 0, a_dram = 0, b_dram = 0, d_dram = 0, c_dram = 0,
                           a_stride = 0, b_stride = 0, d_stride = 0, c_stride_elems = 0;
     // Counters and records.
@@ -53,6 +53,26 @@ struct h2_emulator {
     uint64_t    raw_b_mvins = 0, raw_b_bytes = 0, resident_main_loops = 0;
     uint64_t    ldb_only_loads = 0, ldb_only_bytes = 0;
     uint64_t    ldb_only_capability = D == 32 ? POTAL_LDB_ONLY_CAPABILITY : 0;
+    uint64_t    stream_capability = D == 32 ? POTAL_STREAM_CAPABILITY : 0;
+    uint64_t    stream_early_capability = D == 32 ? POTAL_STREAM_EARLY_CAPABILITY : 0;
+    bool        stream_active = false, stream_continuous = false, stream_early = false;
+    uint64_t    stream_waits = 0, stream_releases = 0, load3_loops = 0;
+    struct borrowed_matrix {
+        const int8_t *source;
+        size_t rows, cols, stride;
+        std::vector<int8_t> bytes;
+    };
+    struct stream_pair {
+        uint64_t incarnation = 0, submitted = 0, completed = 0;
+        uint64_t b_source = 0;
+        bool scheduled = false, dma_done = false;
+        bool producer = false;
+        uint32_t b_k = 0, b_j = 0, b_pad_j = 0;
+        uint64_t b_pitch = 0;
+        std::vector<borrowed_matrix> borrowed;
+    } stream_pairs[2];
+    std::vector<borrowed_matrix> completed_sources;
+    uint8_t scale_pairs[POTAL_SCALE_ENTRIES] = {};
     std::vector<potal_paired_cmd_record> records;
     std::string                          errors;      // contract violations seen (empty: none)
     bool                                 scale_miss = false;
@@ -74,11 +94,14 @@ struct h2_emulator {
         auto & e = *static_cast<h2_emulator *>(ctx);
         e.records.push_back(*rec);
         if (rec->funct != POTAL_FUNCT_COUNTER || rec->xd != 1 || rec->rs2 ||
-            (rec->rs1 != UINT64_C(0xA) && rec->rs1 != POTAL_LDB_ONLY_TAG)) {
-            e.err("LdB-only capability query");
+            (rec->rs1 != UINT64_C(0xA) && rec->rs1 != POTAL_LDB_ONLY_TAG &&
+             rec->rs1 != POTAL_STREAM_TAG && rec->rs1 != POTAL_STREAM_EARLY_TAG)) {
+            e.err("capability query");
             return POTAL_HW_BAD_COMMAND;
         }
-        *value = rec->rs1 == POTAL_LDB_ONLY_TAG ? e.ldb_only_capability : 0;
+        *value = rec->rs1 == POTAL_STREAM_EARLY_TAG ? e.stream_early_capability :
+                 rec->rs1 == POTAL_STREAM_TAG ? e.stream_capability :
+                 rec->rs1 == POTAL_LDB_ONLY_TAG ? e.ldb_only_capability : 0;
         return POTAL_OK;
     }
 
@@ -95,25 +118,121 @@ struct h2_emulator {
             case POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_DC: d_dram = r.rs1; c_dram = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_AB: a_stride = r.rs1; b_stride = r.rs2; return POTAL_OK;
             case POTAL_FUNCT_LOOP_WS_CONFIG_STRIDES_DC: d_stride = r.rs1; c_stride_elems = r.rs2; return POTAL_OK;
-            case POTAL_FUNCT_LOOP_WS: return loop_ws(r.rs1, r.rs2);
+            case POTAL_FUNCT_LOOP_WS:
+                if (stream_active && r.xd != 1) {
+                    err("stream LOOP_WS requires checked admission response");
+                    return POTAL_HW_INVALID_ENCODING;
+                }
+                return loop_ws(r.rs1, r.rs2);
+            case POTAL_FUNCT_STREAM: return stream_control(r);
             case POTAL_FUNCT_LDB_ONLY: return ldb_only(r);
             case POTAL_FUNCT_MVIN: return mvin_b(r.rs1, r.rs2);
             case POTAL_FUNCT_MVOUT: return mvout(r.rs1, r.rs2);
             case POTAL_FUNCT_SCALE_WRITE: return scale_write(r.rs1, r.rs2);
-            case POTAL_FUNCT_SCALE_RELEASE: return scale_release(r.rs1);
+            case POTAL_FUNCT_SCALE_RELEASE: {
+                if (stream_active) { complete_pair(0); complete_pair(1); }
+                const auto status = scale_release(r.rs1);
+                if (status == POTAL_OK && stream_active) {
+                    const size_t slot = r.rs1 & 255;
+                    bool live = false;
+                    for (const auto & entry : scales[slot]) live = live || entry.valid;
+                    if (!live) scale_pairs[slot] = 0;
+                }
+                return status;
+            }
             case POTAL_FUNCT_INDEX_CONFIG: return index_config(r.rs1, r.rs2);
             case POTAL_FUNCT_INDEX_WRITE: return index_write(r.rs1, r.rs2);
-            case POTAL_FUNCT_FENCE: fences++; return POTAL_OK;
+            case POTAL_FUNCT_FENCE:
+                if (stream_active) { complete_pair(0); complete_pair(1); }
+                fences++; return POTAL_OK;
             case POTAL_FUNCT_FLUSH: flushes++; return POTAL_OK;
             default: err("unknown funct " + std::to_string(r.funct)); return POTAL_HW_BAD_COMMAND;
         }
+    }
+
+    // Arithmetic is synchronous; completion observations are deliberately not.
+    // These leases prove command/source lifecycle only, never physical overlap.
+    void borrow(uint32_t pair, uint64_t address, size_t rows, size_t cols, size_t stride) {
+        borrowed_matrix m{reinterpret_cast<const int8_t *>(uintptr_t(address)), rows, cols, stride, {}};
+        m.bytes.reserve(rows * cols);
+        for (size_t r = 0; r < rows; ++r)
+            m.bytes.insert(m.bytes.end(), m.source + r * stride, m.source + r * stride + cols);
+        stream_pairs[pair].borrowed.push_back(std::move(m));
+    }
+
+    void complete_pair(uint32_t pair) {
+        auto & p = stream_pairs[pair];
+        for (const auto & m : p.borrowed)
+            for (size_t r = 0; r < m.rows; ++r)
+                if (std::memcmp(m.source + r * m.stride, m.bytes.data() + r * m.cols, m.cols))
+                    err("immutable stream source changed before completion");
+        for (auto & m : p.borrowed) completed_sources.push_back(std::move(m));
+        p.borrowed.clear();
+        p.completed = p.submitted;
+        p.dma_done = p.scheduled || p.producer;
+    }
+
+    potal_status stream_control(const potal_paired_cmd_record & r) {
+        const uint32_t op = r.rs1 & 15, pair = (r.rs1 >> 4) & 1;
+        if (D != 32 || r.xd != 1 || op < 1 || op > 6 ||
+            (r.rs1 >> (op == 4 ? 5 : 4)) || (op == 5 ? r.rs2 >> 21 : r.rs2))
+            return POTAL_HW_INVALID_ENCODING;
+        if (op <= 2 || op == 6) {
+            if (stream_active) return POTAL_HW_BAD_COMMAND;
+            for (auto & p : stream_pairs) p = stream_pair{};
+            stream_active = true;
+            stream_continuous = op != 1;
+            stream_early = op == 6;
+            return POTAL_OK;
+        }
+        if (!stream_active) return POTAL_HW_BAD_COMMAND;
+        if (op == 4) {
+            complete_pair(pair);
+            ++stream_waits;
+            return POTAL_OK;
+        }
+        if (op == 5) {
+            const uint32_t slot = r.rs2 & 255;
+            const uint8_t owners = scale_pairs[slot];
+            for (uint32_t p = 0; p < 2; ++p)
+                if ((owners & (1u << p)) && stream_pairs[p].submitted != stream_pairs[p].completed) {
+                    err("local release before observed pair completion");
+                    return POTAL_HW_BAD_COMMAND;
+                }
+            const auto status = scale_release(r.rs2);
+            if (status == POTAL_OK) {
+                --scale_releases; // local, not the legacy globally draining opcode
+                ++stream_releases;
+                bool live = false;
+                for (const auto & entry : scales[slot]) live = live || entry.valid;
+                if (!live) scale_pairs[slot] = 0;
+            }
+            return status;
+        }
+        for (const auto & p : stream_pairs)
+            if (p.submitted != p.completed || (p.producer && !p.dma_done)) return POTAL_HW_BAD_COMMAND;
+        for (const auto & slot : scales)
+            for (const auto & entry : slot)
+                if (entry.valid) return POTAL_HW_BAD_COMMAND;
+        for (const auto & m : completed_sources)
+            for (size_t row = 0; row < m.rows; ++row)
+                if (std::memcmp(m.source + row * m.stride, m.bytes.data() + row * m.cols, m.cols))
+                    err("immutable stream source changed before stream end");
+        completed_sources.clear();
+        stream_active = false;
+        stream_continuous = stream_early = false;
+        return POTAL_OK;
     }
 
     potal_status config(uint64_t rs1, uint64_t rs2) {
         switch (rs1 & 3) {
             case 1: { // CONFIG_LD: state id at [4:3], row bytes in rs2
                 const size_t state = (rs1 >> 3) & 3;
-                if (state >= 2) return POTAL_HW_BAD_COMMAND;
+                if (state >= 3) return POTAL_HW_BAD_COMMAND;
+                if (stream_active && (stream_pairs[0].submitted || stream_pairs[1].submitted)) {
+                    err("stream changes static load configuration");
+                    return POTAL_HW_BAD_COMMAND;
+                }
                 ld_stride[state] = rs2;
                 ld_config[state] = rs1;
                 break;
@@ -142,6 +261,26 @@ struct h2_emulator {
             footprint > POTAL_HW_BANK_ROWS || ld_config[1] != canonical_ld || ld_stride[1] != b_stride) {
             err("LdB-only fields, LOAD2 configuration or bank extent");
             return POTAL_HW_INVALID_ENCODING;
+        }
+        if (stream_active) {
+            auto & p = stream_pairs[pair];
+            const auto & current = stream_pairs[1 - pair];
+            if (!stream_early || p.producer || p.submitted != p.completed ||
+                !current.scheduled || current.submitted != 1 || current.completed != 0) {
+                err("stream B-only requires free target and opposite pending Main");
+                return POTAL_HW_BAD_COMMAND;
+            }
+            for (const auto owners : scale_pairs)
+                if (owners & (1u << pair)) return POTAL_HW_BAD_COMMAND;
+            p.submitted = p.completed = 0;
+            p.scheduled = p.dma_done = false;
+            p.producer = true;
+            p.b_source = b_dram;
+            p.b_k = K;
+            p.b_j = J;
+            p.b_pad_j = pad_j;
+            p.b_pitch = b_stride;
+            borrow(pair, b_dram, rows, columns - pad_j, b_stride);
         }
         const size_t bank_end = (2 * size_t(pair) + 2) * POTAL_HW_BANK_ROWS;
         const size_t start = bank_end - size_t(footprint);
@@ -222,6 +361,13 @@ struct h2_emulator {
         t.source_k_rows = (uint32_t) (rs2 & 0xFFFFFFFFull);
         t.active_rows   = (uint32_t) (rs2 >> 32);
         const uint32_t buffer = t.b_base >= half_rows ? 1 : 0;
+        if (stream_active) {
+            const auto & p = stream_pairs[buffer];
+            if (!p.scheduled || (p.submitted > 1 && p.completed != p.submitted)) {
+                err("Index rewrite before previous Residual completed");
+                return POTAL_HW_BAD_COMMAND;
+            }
+        }
         const uint64_t begin  = buffer == 0 ? sp_rows / 4 : 3 * sp_rows / 4;
         const uint64_t end    = buffer == 0 ? sp_rows / 2 : sp_rows;
         const uint64_t region = (uint64_t) ((t.source_k_rows + D - 1) / D) * t.j_tiles * D;
@@ -276,6 +422,56 @@ struct h2_emulator {
             return POTAL_HW_BAD_COMMAND;
         }
         const uint32_t pair      = a_spad - 1;
+        if (pair >= 2) return POTAL_HW_BAD_COMMAND;
+        if (stream_active) {
+            const size_t a_state = residual ? 2 : 0;
+            const uint64_t canonical = (uint64_t(D) << 16) | UINT64_C(0x101);
+            auto & p = stream_pairs[pair];
+            if (ld_config[a_state] != (canonical | (a_state << 3)) ||
+                ld_stride[a_state] != a_stride || !a_dram ||
+                (!residual && (ld_config[1] != (canonical | 8) || ld_stride[1] != b_stride ||
+                               (!b_dram && !p.producer)))) {
+                err("stream static LOAD/LOAD2/LOAD3 state differs from descriptor");
+                return POTAL_HW_INVALID_ENCODING;
+            }
+            if (!residual) {
+                if (p.producer && (!stream_early || !p.dma_done || b_dram ||
+                    p.b_k != K || p.b_j != J || p.b_pad_j != pad_j || p.b_pitch != b_stride)) {
+                    err("prefetched Main requires completed equivalent B without reload");
+                    return POTAL_HW_BAD_COMMAND;
+                }
+                if (p.completed != p.submitted) {
+                    err("pair reused before observed completion");
+                    return POTAL_HW_BAD_COMMAND;
+                }
+                for (const auto owners : scale_pairs) if (owners & (1u << pair)) {
+                    err("pair reused with live generation lease");
+                    return POTAL_HW_BAD_COMMAND;
+                }
+                ++p.incarnation;
+                p.submitted = p.completed = 0;
+                if (!p.producer) p.b_source = b_dram;
+                p.scheduled = true;
+                p.dma_done = false;
+                if (!p.producer) borrow(pair, b_dram, K * D - pad_k, J * D - pad_j, ld_stride[1]);
+                p.producer = false;
+            } else if (!p.scheduled || (p.submitted > 1 && p.completed != p.submitted)) {
+                err("Residual missing producer or reusing pending A/Index window");
+                return POTAL_HW_BAD_COMMAND;
+            }
+            const uint32_t slots = K / ppb * J;
+            if (base + slots > POTAL_SCALE_ENTRIES) return POTAL_HW_INVALID_ADDRESS;
+            for (uint32_t slot = base; slot < base + slots; ++slot) {
+                if (scale_pairs[slot] & ~(1u << pair)) {
+                    err("Scale allocation leased by another pair");
+                    return POTAL_HW_BAD_COMMAND;
+                }
+                scale_pairs[slot] |= 1u << pair;
+            }
+            borrow(pair, a_dram, I * D - pad_i, K * D - pad_k, ld_stride[a_state]);
+            ++p.submitted;
+            if (residual) ++load3_loops;
+        }
         const size_t   a_base    = (size_t) pair * half_rows + (size_t) offset_tiles * D;
         const size_t   bank_rows = POTAL_HW_BANK_ROWS;
         if ((size_t) offset_tiles * D + (size_t) I * K * D > bank_rows) {

@@ -41,6 +41,7 @@ namespace gcycle = ggml::gemmini::cycle;
 namespace hp1    = quants::weight::hp1;
 
 double seconds_since(clock_type::time_point t0) {
+    if (t0 == clock_type::time_point{}) return 0;
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
@@ -267,6 +268,20 @@ bool options::paired_early_prefetch_requested(bool * invalid) {
     return false;
 }
 
+potal_paired_stream_mode options::paired_stream_requested(bool * invalid) {
+    *invalid = false;
+    const char * value = std::getenv("GGML_POTAL_PAIRED_STREAM");
+    if (value == nullptr || *value == '\0') return potal_paired_stream_mode::off;
+    std::string v(value);
+    for (char & ch : v) ch = (char) std::toupper((unsigned char) ch);
+    if (v == "OFF") return potal_paired_stream_mode::off;
+    if (v == "BOUNDED") return potal_paired_stream_mode::bounded;
+    if (v == "CONTINUOUS") return potal_paired_stream_mode::continuous;
+    if (v == "CONTINUOUS_EARLY") return potal_paired_stream_mode::continuous_early;
+    *invalid = true;
+    return potal_paired_stream_mode::off;
+}
+
 namespace {
 
 ggml_status hp1_fail(ggml_backend_potal_stats & st, ggml_tensor * node, const std::string & layer, const char * stage,
@@ -292,12 +307,13 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     // serial route; an invalid request fails the node (an options failure, like the
     // matmul options: before the node counts as a pipelined node), never picks a route.
     bool       paired_invalid = false, fences_invalid = false, ktile_invalid = false, prefetch_invalid = false;
-    bool       early_invalid = false;
+    bool       early_invalid = false, stream_invalid = false;
     const bool paired_request = options::paired_auto_requested(&paired_invalid);
     const bool conservative   = options::paired_fences_conservative(&fences_invalid);
     const bool ktile          = options::paired_ktile_requested(&ktile_invalid);
     const bool prefetch       = options::paired_prefetch_requested(&prefetch_invalid);
     const bool early          = options::paired_early_prefetch_requested(&early_invalid);
+    const auto stream         = options::paired_stream_requested(&stream_invalid);
     if (paired_invalid) {
         return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_AUTO must be ON, OFF, 1 or 0");
     }
@@ -316,6 +332,13 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
         return hp1_fail(st, node, layer, "options",
                         "GGML_POTAL_PAIRED_EARLY_PREFETCH must be ON/OFF/1/0; ON requires checked next-K prefetch");
     }
+    if (stream_invalid || (stream != potal_paired_stream_mode::off &&
+        (!paired_request || !options::compensation || POTAL_HW_DIM != 32 || !ktile ||
+         prefetch || early || conservative))) {
+        return hp1_fail(st, node, layer, "options",
+                        "GGML_POTAL_PAIRED_STREAM must be OFF/BOUNDED/CONTINUOUS/CONTINUOUS_EARLY; stream requires DIM32 Paired K-tile "
+                        "with RTL fences and without legacy prefetch");
+    }
     st.stripe_pipeline_nodes++;
 
     pipeline_config cfg;
@@ -326,15 +349,17 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     cfg.paired_ktile_scale_reuse = ktile;
     cfg.paired_next_k_prefetch = prefetch;
     cfg.paired_early_k_prefetch = early;
+    cfg.paired_stream = stream;
+    cfg.measure_timing = log::timing_enabled();
     cfg.layer        = layer;
     issuer_owner owner;
-    const uint64_t c0 = gcycle::read();
-    const auto     t  = clock_type::now();
+    const uint64_t c0 = cfg.measure_timing ? gcycle::read() : 0;
+    const auto     t  = cfg.measure_timing ? clock_type::now() : clock_type::time_point{};
     const pipeline_report r = run_stripe_pipeline(node->src[1], args, weight, plan, cfg, owner);
     // Caller-side interval: quantization, the overlapped issuer work and the
     // final drain; not SCU or array time.
     st.pipeline_wall_s += seconds_since(t);
-    cycle_stage(layer, "potal.stripe_pipeline", c0, gcycle::read());
+    if (cfg.measure_timing) cycle_stage(layer, "potal.stripe_pipeline", c0, gcycle::read());
 
     // The run's counters, merged once on this thread after the run ended.
     const pipeline_counts & c = r.counts;
@@ -363,6 +388,15 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.paired_resident_main_loop_ws += c.paired_resident_main_loop_ws;
     st.paired_residual_prefetch_issue_s += c.paired_residual_prefetch_issue_s;
     st.paired_main_prefetch_issue_s += c.paired_main_prefetch_issue_s;
+    st.paired_stream_loops += c.paired_stream_loops;
+    st.paired_stream_pair_waits += c.paired_stream_pair_waits;
+    st.paired_stream_local_releases += c.paired_stream_local_releases;
+    st.paired_stream_batches += c.paired_stream_batches;
+    st.paired_stream_capacity_boundaries += c.paired_stream_capacity_boundaries;
+    st.paired_residual_staging_bytes += c.paired_residual_staging_bytes;
+    st.paired_residual_pitch_padding_bytes += c.paired_residual_pitch_padding_bytes;
+    st.paired_residual_valid_bytes += c.paired_residual_valid_bytes;
+    st.paired_residual_load_bytes_declared += c.paired_residual_load_bytes_declared;
     st.act_quant_s += c.act_quant_s;
     st.scale_s += c.scale_s;
     st.issue_s += c.issue_s;
@@ -468,6 +502,13 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     }
     const options::MatmulInvocationMode mode        = resolved.options.mode;
     const ggml::gemmini::RmdBackend     rmd_backend = resolved.options.rmd_backend;
+    bool stream_invalid = false;
+    const auto stream = options::paired_stream_requested(&stream_invalid);
+    if (stream_invalid || (stream != potal_paired_stream_mode::off &&
+                           mode != options::MatmulInvocationMode::stripe_pipeline)) {
+        return hp1_fail(st, node, layer, "options",
+                        "explicit Paired stream requires STRIPE_PIPELINE and a valid stream mode");
+    }
     if (const char * why = options::unsupported_combination(mode, rmd_backend, resolved.options.job_capacity)) {
         return hp1_fail(st, node, layer, "options", why);
     }
@@ -508,17 +549,18 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
 
     // 1. Weight: the prepared B / carriers / channel scales of w (weight_cache.hpp).
     //    A hit reuses them; otherwise the HP1 blocks are validated and unpacked.
-    uint64_t           c0     = gcycle::read();
-    auto               t      = clock_type::now();
+    const bool         measure = log::timing_enabled();
+    uint64_t           c0     = measure ? gcycle::read() : 0;
+    auto               t      = measure ? clock_type::now() : clock_type::time_point{};
     weight_lookup      wl     = state.weights.get(w, args);
     const double       wl_s   = seconds_since(t);
-    uint64_t           c1     = gcycle::read();
+    uint64_t           c1     = measure ? gcycle::read() : 0;
     const bool         reused = wl.outcome == weight_cache_outcome::hit;
     if (reused) {
         st.weight_cache_hits++;
         st.weight_lookup_s += wl_s;
     } else {
-        cycle_stage(layer, "potal.weight_pack_hp1", c0, c1);
+        if (measure) cycle_stage(layer, "potal.weight_pack_hp1", c0, c1);
         st.weight_alloc_s += wl.alloc_s;
         st.weight_pack_s += wl.prepare_s;
         st.weight_validations += wl.alloc_failed ? 0 : 1;

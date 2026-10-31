@@ -202,6 +202,8 @@ struct pipeline_config {
     bool            paired_ktile_scale_reuse = false; // explicit DIM32-only Scale specialization
     bool            paired_next_k_prefetch = false;
     bool            paired_early_k_prefetch = false;
+    potal_paired_stream_mode paired_stream = potal_paired_stream_mode::off;
+    bool            measure_timing = true; // false: event timestamps and quant time are unmeasured
     // Optional; called on the thread of each step after its record, holding no
     // lock of the run (it may query or abort the run). Order across threads:
     // stripe_event::sequence.
@@ -268,6 +270,10 @@ struct pipeline_counts {
     uint64_t paired_resident_main_loop_ws = 0;
     double paired_residual_prefetch_issue_s = 0;
     double paired_main_prefetch_issue_s = 0;
+    uint64_t paired_stream_loops = 0, paired_stream_pair_waits = 0, paired_stream_local_releases = 0;
+    uint64_t paired_stream_batches = 0, paired_stream_capacity_boundaries = 0;
+    uint64_t paired_residual_staging_bytes = 0, paired_residual_pitch_padding_bytes = 0;
+    uint64_t paired_residual_valid_bytes = 0, paired_residual_load_bytes_declared = 0;
     double   act_quant_s                = 0; // ExSIA quantize_activation call, including producer capacity waits
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;

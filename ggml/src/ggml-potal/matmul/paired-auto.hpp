@@ -458,6 +458,8 @@ std::string potal_paired_op_text(const potal_paired_op & op);
 // plan.residual_rows in c_residual. Reconstruction (reconstruct_row, residual::
 // reconstruct_rows) and the checked merge stay with the caller (stripe.cpp).
 
+enum class potal_paired_stream_mode : uint8_t { off, bounded, continuous, continuous_early };
+
 struct potal_paired_request {
     uint64_t run_id    = 0; // identity, recorded only
     size_t   stripe_id = 0;
@@ -492,6 +494,8 @@ struct potal_paired_request {
     bool                    next_k_prefetch = false; // explicit managed-H2 load admission; publication still requires global drain
     bool                    early_k_prefetch = false; // capability-gated original LdB, Main then admission then extra Fence
     potal_observation_counter_fn early_counter = nullptr; // software sink only; hardware reads COUNTER directly
+    potal_paired_stream_mode stream = potal_paired_stream_mode::off;
+    potal_observation_counter_fn stream_counter = nullptr; // test sink capability; hardware uses COUNTER
 };
 
 struct potal_paired_counts {
@@ -501,11 +505,16 @@ struct potal_paired_counts {
     uint64_t scale_reused_windows = 0, scale_reused_columns = 0;
     uint64_t prefetch_loads = 0, prefetch_mvins = 0, prefetch_bytes_declared = 0, resident_main_loop_ws = 0;
     uint64_t prefetch_ldb_only = 0; // CPU descriptors, not generated LOAD2 commands
+    uint64_t stream_batches = 0, stream_capacity_boundaries = 0, stream_pair_waits = 0;
+    uint64_t stream_local_releases = 0;
+    uint64_t residual_staging_bytes = 0, residual_pitch_padding_bytes = 0, residual_valid_bytes = 0;
+    uint64_t residual_load_bytes_declared = 0; // command extent, never measured bus bytes
     double residual_prefetch_issue_s = 0; // Combined CPU API interval; not DMA/compute duration
     double main_prefetch_issue_s = 0; // Main + early admission + extra Fence, counted once in issue_s
     // Owner-thread seconds inside the session calls (steady clock, as tiling.cpp's
     // potal_ws_report): SCALE_WRITE / RELEASE, command issue (LOOP_WS, INDEX_*, MVOUT,
     // FLUSH), POTAL_FENCE. A release also waits for the drain it implies.
+    // Zero means unmeasured for stream or POTAL_PAIRED_TIMING=0, not zero cost.
     double   scale_s = 0, issue_s = 0, fence_s = 0;
 };
 
@@ -548,7 +557,7 @@ class potal_paired_staging {
   private:
     friend potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan &,
                                                           const residual::decoded_packet &, potal_paired_staging &,
-                                                          std::string *, const potal_paired_geometry &);
+                                                          std::string *, const potal_paired_geometry &, bool);
     int8_t * buffer_ = nullptr;
     size_t   bytes_  = 0;
 };
@@ -559,7 +568,8 @@ class potal_paired_staging {
 potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan & plan,
                                                const residual::decoded_packet & residual, potal_paired_staging & out,
                                                std::string * why,
-                                               const potal_paired_geometry & hw = potal_paired_hw_geometry());
+                                               const potal_paired_geometry & hw = potal_paired_hw_geometry(),
+                                               bool fixed_pitch = false);
 
 // The tile plan and the validated execution plan of one stripe (H3-0 + H3-1), the
 // planning step potal_paired_matmul_auto runs first; callers use it to decide the

@@ -192,6 +192,11 @@ struct ggml_backend_potal_stats {
     uint64_t paired_resident_main_loop_ws; // Main submissions whose B DMA was suppressed
     double paired_residual_prefetch_issue_s; // Combined CPU API interval, not hardware DMA time
     double paired_main_prefetch_issue_s;   // Main + early admission + extra Fence CPU interval
+    uint64_t paired_stream_loops;
+    uint64_t paired_stream_pair_waits, paired_stream_local_releases;
+    uint64_t paired_stream_batches, paired_stream_capacity_boundaries;
+    uint64_t paired_residual_staging_bytes, paired_residual_pitch_padding_bytes;
+    uint64_t paired_residual_valid_bytes, paired_residual_load_bytes_declared;
 
     // Tagged QK/PV attention, separate from Q8_HP1 weighted MatMul and CPU ops.
     // All MatMul partials use PoTal WS; Host preparation/reconstruction is not

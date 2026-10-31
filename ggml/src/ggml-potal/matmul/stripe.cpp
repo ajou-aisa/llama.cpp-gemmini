@@ -255,7 +255,7 @@ void stripe_run::set_state(slot & s, slot_state state) {
 
 void stripe_run::stamp_locked(stripe_event & ev) {
     ev.sequence    = next_event_sequence_++;
-    ev.t_ns        = now_ns();
+    ev.t_ns        = cfg_.measure_timing ? now_ns() : 0;
     ev.outstanding = outstanding_;
 }
 
@@ -626,6 +626,15 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         counts_.paired_resident_main_loop_ws += n.paired_resident_main_loop_ws;
         counts_.paired_residual_prefetch_issue_s += n.paired_residual_prefetch_issue_s;
         counts_.paired_main_prefetch_issue_s += n.paired_main_prefetch_issue_s;
+        counts_.paired_stream_loops += n.paired_stream_loops;
+        counts_.paired_stream_pair_waits += n.paired_stream_pair_waits;
+        counts_.paired_stream_local_releases += n.paired_stream_local_releases;
+        counts_.paired_stream_batches += n.paired_stream_batches;
+        counts_.paired_stream_capacity_boundaries += n.paired_stream_capacity_boundaries;
+        counts_.paired_residual_staging_bytes += n.paired_residual_staging_bytes;
+        counts_.paired_residual_pitch_padding_bytes += n.paired_residual_pitch_padding_bytes;
+        counts_.paired_residual_valid_bytes += n.paired_residual_valid_bytes;
+        counts_.paired_residual_load_bytes_declared += n.paired_residual_load_bytes_declared;
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
@@ -733,7 +742,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                               std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
             }
             paired_route = ps == potal_paired_status::ok;
-            if (!paired_route && cfg_.paired_ktile_scale_reuse) {
+            if (!paired_route && (cfg_.paired_ktile_scale_reuse ||
+                                  cfg_.paired_stream != potal_paired_stream_mode::off)) {
                 return failed("paired_plan", POTAL_ERR_UNSUPPORTED, false,
                               "explicit K-tile request cannot use Serial fallback: " + why);
             }
@@ -791,6 +801,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             pq.ktile_scale_reuse = cfg_.paired_ktile_scale_reuse;
             pq.next_k_prefetch = cfg_.paired_next_k_prefetch;
             pq.early_k_prefetch = cfg_.paired_early_k_prefetch;
+            pq.stream = cfg_.paired_stream;
             emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
             const potal_paired_status pst = runners.paired(pq, paired);
             gemm_fatal                    = gemm_fatal || paired.fatal;
@@ -813,6 +824,16 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             n.paired_resident_main_loop_ws += pc.resident_main_loop_ws;
             n.paired_residual_prefetch_issue_s += pc.residual_prefetch_issue_s;
             n.paired_main_prefetch_issue_s += pc.main_prefetch_issue_s;
+            if (cfg_.paired_stream != potal_paired_stream_mode::off)
+                n.paired_stream_loops += pc.main_loop_ws + pc.residual_loop_ws;
+            n.paired_stream_pair_waits += pc.stream_pair_waits;
+            n.paired_stream_local_releases += pc.stream_local_releases;
+            n.paired_stream_batches += pc.stream_batches;
+            n.paired_stream_capacity_boundaries += pc.stream_capacity_boundaries;
+            n.paired_residual_staging_bytes += pc.residual_staging_bytes;
+            n.paired_residual_pitch_padding_bytes += pc.residual_pitch_padding_bytes;
+            n.paired_residual_valid_bytes += pc.residual_valid_bytes;
+            n.paired_residual_load_bytes_declared += pc.residual_load_bytes_declared;
             n.scale_writes += pc.scale_writes;
             n.scale_releases += pc.scale_releases;
             n.tlb_flushes += pc.tlb_flushes;
@@ -1215,6 +1236,14 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     if (cfg.paired_early_k_prefetch && !cfg.paired_next_k_prefetch) {
         return refuse("options", "Early LdB prefetch requires checked next-K prefetch");
     }
+    if (cfg.paired_stream != potal_paired_stream_mode::off &&
+        ((cfg.paired_stream != potal_paired_stream_mode::bounded &&
+          cfg.paired_stream != potal_paired_stream_mode::continuous &&
+          cfg.paired_stream != potal_paired_stream_mode::continuous_early) ||
+         !cfg.paired || !cfg.paired_ktile_scale_reuse || HW_DIM != 32 ||
+         cfg.paired_next_k_prefetch || cfg.paired_early_k_prefetch || cfg.paired_conservative_fences)) {
+        return refuse("options", "stream requires DIM32 Paired K-tile with RTL fences and without legacy prefetch");
+    }
 
     std::shared_ptr<stripe_run> run;
     std::string                 why;
@@ -1248,9 +1277,11 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
             exsia::StripeReadySink sink{ &binding, &sink_binding::on_ready };
             args.exsia_stripe_ready_sink = &sink;
             run->emit_run(stripe_event_kind::quant_begin);
-            const auto quant_start = std::chrono::steady_clock::now();
+            const auto quant_start = cfg.measure_timing ? std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point{};
             const bool quantized = ggml::gemmini::quants::quantize_activation(src1, args);
-            act_quant_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - quant_start).count();
+            if (cfg.measure_timing)
+                act_quant_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - quant_start).count();
             args.exsia_stripe_ready_sink = nullptr;
             run->emit_run(stripe_event_kind::quant_end);
             if (quantized) {

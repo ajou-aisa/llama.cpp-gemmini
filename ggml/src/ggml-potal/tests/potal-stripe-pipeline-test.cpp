@@ -549,7 +549,8 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 
 // One pipelined MUL_MAT of nd through the production driver.
 run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recorder & rec,
-                        const std::function<void(ggml_gemmini_args_t &, const stripe_event &)> & producer_hook = {}) {
+                        const std::function<void(ggml_gemmini_args_t &, const stripe_event &)> & producer_hook = {},
+                        bool measure_timing = true) {
     ggml_gemmini_args_t args;
     run_result          r;
     if (!nd.args_for(args)) {
@@ -564,6 +565,7 @@ run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recor
     cfg.residual     = options::compensation;
     cfg.layer        = "pipeline-test";
     cfg.backend      = "EMULATED";
+    cfg.measure_timing = measure_timing;
     cfg.observer     = [&](const stripe_event & ev) {
         rec.on(ev);
         if (producer_hook) {
@@ -1350,6 +1352,14 @@ int main() {
                   std::string(options::compensation ? ", stripe 0 has a residual packet" : ""),
               nd.ok && g.ok && geometry && (!options::compensation || g.packets.count(0) == 1));
         if (nd.ok && g.ok && geometry && (!options::compensation || g.packets.count(0) == 1)) {
+            gated_runner untimed_runner;
+            recorder untimed_records;
+            const auto untimed = run_pipeline(nd, 2, untimed_runner, untimed_records, {}, false);
+            const auto events = untimed_records.events();
+            check("timing disabled preserves golden and marks event/quant timing unmeasured",
+                  untimed.report.ok && bitwise(nd.dst(), g.want) &&
+                  untimed.report.counts.act_quant_s == 0 && !events.empty() &&
+                  std::all_of(events.begin(), events.end(), [](const recorder::rec & ev) { return ev.t_ns == 0; }));
             test_overlap(nd, g);
             test_serialized_vs_pipelined(nd, g);
             test_failures(nd);

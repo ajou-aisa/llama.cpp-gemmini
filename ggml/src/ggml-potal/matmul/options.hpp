@@ -35,6 +35,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ggml::potal {
+enum class potal_paired_stream_mode : uint8_t;
+}
+
 namespace ggml::potal::options {
 
 static_assert(GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8, "PoTal hardware is A8W8");
@@ -104,6 +108,7 @@ bool paired_fences_conservative(bool * invalid);
 bool paired_ktile_requested(bool * invalid);
 bool paired_prefetch_requested(bool * invalid);
 bool paired_early_prefetch_requested(bool * invalid);
+potal_paired_stream_mode paired_stream_requested(bool * invalid);
 
 // nullptr when PoTal executes the resolved mode, residual backend and stripe
 // job capacity with the configured activation algorithm, else why not.

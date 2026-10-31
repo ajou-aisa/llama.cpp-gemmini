@@ -947,6 +947,33 @@ void test_ggml_contract() {
               after.hp1_completed == before.hp1_completed && after.hp1_failed == before.hp1_failed + 1 &&
               after.tiled_fences == before.tiled_fences);
 #endif
+    const char * keys[] = {"GEMMINI_MATMUL_MODE", "GEMMINI_RMD_BACKEND", "GGML_POTAL_PAIRED_STREAM"};
+    std::string saved[3];
+    bool present[3];
+    for (size_t i = 0; i < 3; ++i) {
+        const char * value = std::getenv(keys[i]);
+        present[i] = value != nullptr;
+        if (value) saved[i] = value;
+    }
+    setenv(keys[0], "FULL", 1);
+    setenv(keys[1], "CPU", 1);
+    for (const char * value : {"BOUNDED", "CONTINUOUS", "INVALID"}) {
+        setenv(keys[2], value, 1);
+        ggml_backend_ptr refused(ggml_backend_potal_init());
+        ggml_backend_potal_get_stats(refused.get(), &before);
+        const auto rejected = ggml_backend_graph_compute(refused.get(), g);
+        ggml_backend_potal_get_stats(refused.get(), &after);
+        check("F explicit stream never silently runs FULL or prepares weights",
+              rejected == GGML_STATUS_FAILED && std::isnan(static_cast<float *>(y->data)[0]) &&
+              after.hp1_failed == before.hp1_failed + 1 && after.hp1_completed == before.hp1_completed &&
+              after.hw_requests == before.hw_requests &&
+              after.weight_cache_hits == before.weight_cache_hits &&
+              after.weight_cache_misses == before.weight_cache_misses);
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (present[i]) setenv(keys[i], saved[i].c_str(), 1);
+        else unsetenv(keys[i]);
+    }
 }
 
 } // namespace
