@@ -684,6 +684,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         potal_paired_report             paired;     // paired route: the executor's report (residual rows)
         potal_paired_geometry           diagnostic_hw;
         potal_tile_plan                 diagnostic_main;
+        potal_tile_plan                 j8k8_main;
+        potal_tile_plan                 selected_main;
         const potal_tile_plan *         paired_main = &plan_;
         bool                            diagnostic_index = false;
         struct dma_block {
@@ -725,10 +727,27 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             }
             potal_paired_tile_plan    tile;
             std::string               why;
+            const char * j8k8_env = std::getenv("POTAL_PAIRED_J8K8_FFN");
+            const bool j8k8_ffn = j8k8_env != nullptr && std::strcmp(j8k8_env, "1") == 0;
+            if (j8k8_ffn) {
+                const potal_status frozen = potal_frozen_plan(rows, n_, k_, 1, 8, 8, 1, &j8k8_main);
+                if (frozen != POTAL_OK) {
+                    return failed("paired_plan", frozen, false,
+                                  "POTAL_PAIRED_J8K8_FFN: frozen Main plan rejected");
+                }
+                paired_main = &j8k8_main;
+            }
             const auto plan_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const double decode_ms = profile ? std::chrono::duration<double, std::milli>(plan_start - decode_start).count() : 0;
-            potal_paired_status ps = potal_paired_plan_stripe(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
-                                                             tile, routing, &why);
+            potal_paired_status ps;
+            if (cfg_.paired_auto_jk) {
+                ps = potal_paired_select_jk(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                             cfg_.paired_ktile_scale_reuse, selected_main, tile, routing, &why);
+                paired_main = &selected_main;
+            } else {
+                ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                               tile, routing, &why);
+            }
             if (ps == potal_paired_status::ok && diagnostic_index) {
                 // Smaller Index Windows must not enlarge the normal paired Main K panel.
                 diagnostic_main = tile.main;
@@ -737,7 +756,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
                                               tile, routing, &why, diagnostic_hw);
             }
-            if (ps != potal_paired_status::ok && !potal_paired_capacity_refusal(ps)) {
+            if (ps != potal_paired_status::ok && (cfg_.paired_auto_jk || j8k8_ffn || !potal_paired_capacity_refusal(ps))) {
                 return failed("paired_plan", POTAL_OK, false,
                               std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
             }
@@ -1205,6 +1224,39 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         r.detail = std::move(detail);
         return r;
     };
+    pipeline_config run_cfg = cfg;
+    const char * auto_env = std::getenv("POTAL_PAIRED_AUTO_JK");
+    if (auto_env != nullptr && std::strcmp(auto_env, "0") != 0 && std::strcmp(auto_env, "1") != 0) {
+        r.status = POTAL_ERR_INVALID_ARGUMENT;
+        return refuse("options", "POTAL_PAIRED_AUTO_JK must be 0 or 1");
+    }
+    run_cfg.paired_auto_jk = auto_env != nullptr && std::strcmp(auto_env, "1") == 0;
+    const char * j8k8_env = std::getenv("POTAL_PAIRED_J8K8_FFN");
+    if (j8k8_env != nullptr && std::strcmp(j8k8_env, "0") != 0 && std::strcmp(j8k8_env, "1") != 0) {
+        r.status = POTAL_ERR_INVALID_ARGUMENT;
+        return refuse("options", "POTAL_PAIRED_J8K8_FFN must be 0 or 1");
+    }
+    if (run_cfg.paired_auto_jk) {
+        if (!cfg.paired || (j8k8_env != nullptr && std::strcmp(j8k8_env, "1") == 0)) {
+            r.status = POTAL_ERR_INVALID_ARGUMENT;
+            return refuse("options", "POTAL_PAIRED_AUTO_JK requires Paired and conflicts with J8K8");
+        }
+        if (cfg.paired_stream != potal_paired_stream_mode::off || cfg.paired_next_k_prefetch ||
+            cfg.paired_early_k_prefetch || std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES") != nullptr) {
+            r.status = POTAL_ERR_UNSUPPORTED;
+            return refuse("options", "POTAL_PAIRED_AUTO_JK requires Streaming/Prefetch and diagnostic Index override OFF");
+        }
+    }
+    if (j8k8_env != nullptr && std::strcmp(j8k8_env, "1") == 0 &&
+        (HW_DIM != 32 || SCALE_BLOCK_K != 32 || plan.passes_per_block != 1 ||
+         args.I != 16 || args.J != 3072 || args.K != 768 || !cfg.paired ||
+         !cfg.paired_ktile_scale_reuse || cfg.paired_stream != potal_paired_stream_mode::off ||
+         cfg.paired_next_k_prefetch || cfg.paired_early_k_prefetch)) {
+        r.status = POTAL_ERR_UNSUPPORTED;
+        return refuse("options",
+                      "POTAL_PAIRED_J8K8_FFN=1 requires DIM32/K32, M16/N3072/K768, Paired K-tile Scale reuse "
+                      "and Streaming/Prefetch OFF");
+    }
     // Supported combination (options.hpp) and the frozen Main plan.
     if (options::activation_quant != options::ActivationQuantAlgo::EXSIA) {
         return refuse("options", "STRIPE_PIPELINE needs GGML_GEMMINI_ACTIVATION_QUANT=EXSIA");
@@ -1248,7 +1300,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     std::shared_ptr<stripe_run> run;
     std::string                 why;
     try {
-        run = std::make_shared<stripe_run>(cfg, args, w, plan);
+        run = std::make_shared<stripe_run>(run_cfg, args, w, plan);
     } catch (const std::bad_alloc &) {
         return refuse("alloc", "out of memory for the stripe run");
     }

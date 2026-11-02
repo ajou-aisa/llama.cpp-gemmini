@@ -1633,6 +1633,18 @@ double seconds_since(exec_clock::time_point t0) {
     return std::chrono::duration<double>(exec_clock::now() - t0).count();
 }
 
+inline uint64_t index_profile_cycles() {
+#if defined(__riscv) && __riscv_xlen == 64
+    uint64_t value;
+    // Compiler ordering only: no CPU fence, clock syscall or RoCC command.
+    asm volatile("rdcycle %0" : "=r"(value) :: "memory");
+    return value;
+#else
+    // Native command-model tests do not claim target CPU cycle measurements.
+    return 0;
+#endif
+}
+
 struct executor {
     const potal_paired_request &  req;
     potal_paired_session *        session;
@@ -1654,6 +1666,129 @@ struct executor {
     std::vector<stream_action> stream_actions;
     std::vector<size_t> stream_scale_base;
     std::vector<bool> stream_panel_retired;
+    struct index_profile_sample {
+        size_t op = no_index, ordinal = no_index, scale_window = no_index, residual_op = no_index;
+        uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, writes = 0;
+        bool complete = false, issue_sampled = false;
+    } index_profile;
+    enum class window_kind { index_config, index_write, descriptor, residual_issue,
+                             alias_fence, completion_fence, final_drain };
+    struct window_record {
+        window_kind kind{};
+        size_t op = no_index, window = no_index, entries = 0, calls = 0;
+        uint64_t start = 0, end = 0;
+        potal_status status = POTAL_OK;
+    };
+    bool window_profile = false;
+    std::vector<window_record> window_records;
+    std::vector<size_t> op_to_window;
+    size_t window_used = 0, current_op = no_index;
+
+    bool prepare_window_profile() {
+        if (!window_profile) return true;
+        // At most four window spans, two local drains and all dependency drains
+        // per op, plus the terminal drain. Checked arithmetic bounds storage.
+        size_t capacity = 0;
+        if (!mul(report.plan.ops.size(), size_t(6), capacity) || !add(capacity, 1, capacity)) return false;
+        for (const auto & op : report.plan.ops)
+            if (!add(capacity, op.deps.size(), capacity)) return false;
+        window_records.resize(capacity);
+        op_to_window.assign(report.plan.ops.size(), no_index);
+        size_t ordinal = 0;
+        for (const auto & index : report.plan.ops) {
+            if (index.kind != potal_paired_op_kind::index_program) continue;
+            for (const auto & op : report.plan.ops)
+                if (op.residency == index.residency && op.window == index.window)
+                    op_to_window[op.id] = ordinal;
+            ++ordinal;
+        }
+        return true;
+    }
+    window_record * window_begin(window_kind kind, size_t op, size_t calls = 1) {
+        if (!window_profile) return nullptr;
+        auto & r = window_records[window_used++];
+        r.kind = kind;
+        r.op = op;
+        r.window = op == no_index ? no_index : op_to_window[op];
+        r.calls = calls;
+        if (r.window != no_index) {
+            const auto & p = report.plan.ops[op];
+            r.entries = report.tile.panels[p.panel].windows[p.window].active_rows;
+        }
+        r.start = index_profile_cycles();
+        return &r;
+    }
+    void window_end(window_record * r, potal_status status) {
+        if (!r) return;
+        r->end = index_profile_cycles();
+        r->status = status;
+    }
+    void print_window_profile() const {
+        static const char * names[] = {"index_config", "index_write", "descriptor", "residual_issue",
+                                      "alias_fence", "completion_fence", "final_drain"};
+#if defined(__riscv) && __riscv_xlen == 64
+        constexpr unsigned supported = 1;
+#else
+        constexpr unsigned supported = 0;
+#endif
+        for (size_t i = 0; i < window_used; ++i) {
+            const auto & r = window_records[i];
+            const auto * op = r.op == no_index ? nullptr : &report.plan.ops[r.op];
+            std::fprintf(stderr, "[POTAL_INDEX_WINDOW] kind=%s run=%" PRIu64
+                " stripe=%zu op=%zu window=%zu group=%zu panel=%zu pair=%zu entries=%zu calls=%zu"
+                " status=%u start=%" PRIu64 " end=%" PRIu64 " cycle_supported=%u final_checked=1\n",
+                names[size_t(r.kind)], req.run_id, req.stripe_id, r.op, r.window,
+                op ? op->j_group : no_index, op ? op->panel : no_index, op ? op->pair : no_index,
+                r.entries, r.calls, unsigned(r.status), r.start, r.end, supported);
+        }
+    }
+    enum cost_kind { cost_prepare, cost_declare, cost_prefetch, cost_scale, cost_release,
+                     cost_index, cost_main, cost_residual, cost_wait, cost_retire,
+                     cost_fence, cost_readback, cost_begin, cost_end, cost_deps, cost_other, cost_count };
+    bool cost_profile = false;
+    uint64_t cost_cycles[cost_count] = {}, cost_calls[cost_count] = {};
+    uint64_t cost_start = 0, cost_stop = 0, cost_clock_before = 0, cost_clock_after = 0;
+    exec_clock::time_point cost_wall_start, cost_wall_stop;
+    uint64_t cost_now() const { return cost_profile ? index_profile_cycles() : 0; }
+    void cost_add(cost_kind kind, uint64_t before) {
+        if (!cost_profile) return;
+        cost_cycles[kind] += index_profile_cycles() - before;
+        ++cost_calls[kind];
+    }
+    void cost_begin_clock() {
+        if (!cost_profile) return;
+        // Session is idle here, before BEGIN / ordinary playback.
+        cost_clock_before = index_profile_cycles();
+        cost_wall_start = exec_clock::now();
+        cost_start = index_profile_cycles();
+    }
+    void cost_end_clock() {
+        if (!cost_profile) return;
+        // Only after successful END / final checked Fence.
+        cost_stop = index_profile_cycles();
+        cost_wall_stop = exec_clock::now();
+        cost_clock_after = index_profile_cycles();
+    }
+    void print_cost_profile() const {
+        if (!cost_profile) return;
+        const uint64_t total = cost_stop - cost_start;
+        static const char * names[] = {"prepare", "declare", "prefetch", "scale", "release",
+            "index", "main", "residual", "wait", "retire", "fence", "readback",
+            "begin", "end", "deps", "other"};
+        uint64_t sum = 0;
+        for (size_t i = cost_declare; i < cost_count; ++i) sum += cost_cycles[i];
+        std::fprintf(stderr, "[POTAL_GRAPH_CPU] mode=%s total=%" PRIu64 " bucket_sum=%" PRIu64
+            " unbucketed=%" PRIu64 " pair_waits=%" PRIu64
+            " hardware_waiting=0 primary_performance=0\n",
+            streaming() ? "early" : "ktile", total, sum, total - sum, report.counts.stream_pair_waits);
+        std::fprintf(stderr, "[POTAL_GRAPH_CLOCK] cpu_min=%" PRIu64 " cpu_max=%" PRIu64
+            " monotonic_ns=%" PRId64 " endpoints_drained=1 hardware_waiting=0 primary_performance=0\n",
+            total, cost_clock_after - cost_clock_before,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(cost_wall_stop - cost_wall_start).count());
+        for (size_t i = 0; i < cost_count; ++i)
+            std::fprintf(stderr, "[POTAL_GRAPH_BUCKET] kind=%s calls=%" PRIu64 " cpu_cycles=%" PRIu64 "\n",
+                names[i], cost_calls[i], cost_cycles[i]);
+    }
     size_t                        drained_upto = 0; // every op with id < drained_upto completed
     size_t                        last_op      = 0; // ops [0, last_op) were handled
     size_t                        pending_readback[2] = { potal_paired_no_index, potal_paired_no_index };
@@ -1709,14 +1844,33 @@ struct executor {
     // remains the numerical authority; only its completion/metadata schedule
     // changes. No allocation, timer, or source mutation belongs in playback.
     potal_paired_status prepare_stream() {
+        const char * indexed_option = std::getenv("POTAL_STREAM_PREPARE_INDEXED");
+        const bool indexed = indexed_option && std::strcmp(indexed_option, "1") == 0;
         const auto & plan = report.plan;
+        // Keep the default legacy search. The opt-in lists retain validated op
+        // IDs in original Plan order and affect only pre-publication discovery.
+        std::vector<std::vector<size_t>> residency_ops(indexed ? plan.residencies.size() : 0);
+        std::vector<std::vector<size_t>> readback_ops(indexed ? report.tile.j_groups : 0);
+        std::vector<std::vector<size_t>> alias_windows(indexed ? plan.residencies.size() : 0);
+        if (indexed) {
+            for (const auto & op : plan.ops) {
+                if (op.kind == potal_paired_op_kind::index_program ||
+                    op.kind == potal_paired_op_kind::main_gemm ||
+                    op.kind == potal_paired_op_kind::residual_gemm)
+                    residency_ops[op.residency].push_back(op.id);
+                else if (op.kind == potal_paired_op_kind::acc_complete)
+                    readback_ops[op.j_group].push_back(op.id);
+            }
+        }
         hw_generation.assign(plan.scale_windows.size(), 0);
         stream_scale_base.resize(plan.scale_windows.size());
         panels.resize(plan.residencies.size());
         stream_panel_retired.assign(plan.residencies.size(), false);
         std::vector<std::vector<size_t>> allocations(plan.residencies.size());
-        for (const auto & w : plan.scale_windows)
+        for (const auto & w : plan.scale_windows) {
             if (scale_owner[w.index] == w.index) allocations[w.residency].push_back(w.index);
+            else if (indexed) alias_windows[w.residency].push_back(w.index);
+        }
         std::vector<size_t> slot_owner(hw.scale_entries, no_index);
         bool live_generation[POTAL_GENERATION_MAX + 1] = {};
         size_t live_pair[potal_paired_pairs] = {no_index, no_index};
@@ -1788,8 +1942,7 @@ struct executor {
                     hw_generation[id] = generation;
                     action(stream_action_kind::scale, id);
                 }
-                for (const auto & w : plan.scale_windows) {
-                    if (w.residency != r || scale_owner[w.index] == w.index) continue;
+                const auto alias = [&](const potal_paired_scale_window & w) {
                     const size_t owner = scale_owner[w.index];
                     const auto & panel = report.tile.panels[residency.panel];
                     const auto & window = panel.windows[w.window];
@@ -1799,9 +1952,14 @@ struct executor {
                         (first - panel.block_begin) * plan.scale_windows[owner].j_tiles;
                     ++report.counts.scale_reused_windows;
                     report.counts.scale_reused_columns += w.blocks * residency.cols;
+                };
+                if (indexed) {
+                    for (const size_t id : alias_windows[r]) alias(plan.scale_windows[id]);
+                } else {
+                    for (const auto & w : plan.scale_windows)
+                        if (w.residency == r && scale_owner[w.index] != w.index) alias(w);
                 }
-                for (const auto & op : plan.ops) {
-                    if (op.residency != r) continue;
+                const auto emit_op = [&](const potal_paired_op & op) {
                     if (op.kind == potal_paired_op_kind::index_program) {
                         if (op.window != 0) {
                             action(req.stream == potal_paired_stream_mode::bounded ?
@@ -1812,15 +1970,25 @@ struct executor {
                                op.kind == potal_paired_op_kind::residual_gemm) {
                         action(stream_action_kind::loop, op.id);
                     }
+                };
+                if (indexed) {
+                    for (const size_t id : residency_ops[r]) emit_op(plan.ops[id]);
+                } else {
+                    for (const auto & op : plan.ops)
+                        if (op.residency == r) emit_op(op);
                 }
             }
             // Until full readback producer ordering is proven, retain this
             // output-epoch drain. It is not a per-K-panel barrier.
             action(stream_action_kind::fence, end - 1);
             ++report.counts.stream_batches;
-            for (const auto & op : plan.ops)
-                if (op.j_group == group && op.kind == potal_paired_op_kind::acc_complete)
-                    action(stream_action_kind::readback, op.id);
+            if (indexed) {
+                for (const size_t id : readback_ops[group]) action(stream_action_kind::readback, id);
+            } else {
+                for (const auto & op : plan.ops)
+                    if (op.j_group == group && op.kind == potal_paired_op_kind::acc_complete)
+                        action(stream_action_kind::readback, op.id);
+            }
             action(stream_action_kind::fence, end - 1);
             for (size_t pair = 0; pair < potal_paired_pairs; ++pair)
                 if (live_pair[pair] != no_index) retire(live_pair[pair], false);
@@ -1910,7 +2078,90 @@ struct executor {
                     req.stream == potal_paired_stream_mode::continuous_early ? "continuous_early" : "continuous");
             }
         }
+        const char * audit = std::getenv("POTAL_STREAM_PREPARE_AUDIT");
+        if (audit && std::strcmp(audit, "1") == 0) {
+            for (size_t i = 0; i < stream_actions.size(); ++i)
+                std::fprintf(stderr, "[POTAL_STREAM_PREPARE_ACTION] ordinal=%zu kind=%u id=%zu\n",
+                    i, unsigned(stream_actions[i].kind), stream_actions[i].index);
+            for (size_t i = 0; i < plan.scale_windows.size(); ++i)
+                std::fprintf(stderr, "[POTAL_STREAM_PREPARE_SCALE] window=%zu owner=%zu base=%zu generation=%u\n",
+                    i, scale_owner[i], stream_scale_base[i], hw_generation[i]);
+        }
         return potal_paired_status::ok;
+    }
+
+    void prepare_index_profile() {
+        const char * option = std::getenv("POTAL_INDEX_PROFILE");
+        if (req.stripe_id != 0 || !option || std::strcmp(option, "1") != 0 ||
+            (streaming() ? req.stream != potal_paired_stream_mode::continuous_early :
+                           !req.ktile_scale_reuse || req.next_k_prefetch)) return;
+        size_t ordinal = 0;
+        const auto select = [&](const potal_paired_op & op) {
+            if (op.j_group != 0 || op.panel != 0 || op.window != 0) return;
+            if (op.kind == potal_paired_op_kind::index_program) index_profile.op = op.id;
+            if (op.kind == potal_paired_op_kind::residual_gemm) {
+                index_profile.ordinal = ordinal;
+                index_profile.scale_window = op.scale_window;
+                index_profile.residual_op = op.id;
+            }
+        };
+        if (streaming()) {
+            for (const auto & action : stream_actions) {
+                if (action.kind == stream_action_kind::index || action.kind == stream_action_kind::loop)
+                    select(report.plan.ops[action.index]);
+                if (action.kind == stream_action_kind::loop ||
+                    action.kind == stream_action_kind::prefetch_panel) ++ordinal;
+            }
+        } else {
+            for (const auto & op : report.plan.ops) {
+                select(op);
+                if (op.kind == potal_paired_op_kind::main_gemm ||
+                    op.kind == potal_paired_op_kind::residual_gemm) ++ordinal;
+            }
+        }
+    }
+
+    // Called only after normal playback completion: STREAM_END or final K-tile Fence.
+    // Hash immutable descriptor/entry values here, never in the measured issue loop.
+    void print_index_profile() const {
+        if (!index_profile.complete || !index_profile.issue_sampled) return;
+        const auto & op = report.plan.ops[index_profile.op];
+        const auto & panel = report.tile.panels[op.panel];
+        uint64_t contents = UINT64_C(14695981039346656037);
+        for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
+            const auto & entry = report.plan.index_entries[e];
+            contents = (contents ^ entry.slot) * UINT64_C(1099511628211);
+            contents = (contents ^ entry.resident_k) * UINT64_C(1099511628211);
+        }
+#if defined(__riscv) && __riscv_xlen == 64
+        constexpr unsigned cycle_supported = 1;
+#else
+        constexpr unsigned cycle_supported = 0;
+#endif
+        std::fprintf(stderr,
+            "[POTAL_INDEX_PROFILE] run=%" PRIu64 " stripe=%zu group=%zu panel=%zu window=%zu "
+            "pair=%zu ordinal=%zu generation=%u entries=%zu config_issued=1 write_issued=%" PRIu64
+            " config_status=%u write_status=%u t0=%" PRIu64 " t1=%" PRIu64 " t2=%" PRIu64
+            " config_cpu_cycles=%" PRIu64 " writes_cpu_cycles=%" PRIu64 " total_cpu_cycles=%" PRIu64
+            " cycle_supported=%u software_only=%u rtl_waiting=0 primary_performance=0"
+            " mode=%s end=%s weight_k_begin=%zu weight_k_rows=%zu weight_col_begin=%zu weight_cols=%zu"
+            " weight_ldb=%zu b_sp=%zu j_tiles=%zu active_rows=%zu index_hash=%016" PRIx64
+            " t3=%" PRIu64 " residual_prepare_cpu_cycles=%" PRIu64
+            " t4=%" PRIu64 " residual_api_cpu_cycles=%" PRIu64 " residual_issued=1 residual_api=%s\n",
+            req.run_id, req.stripe_id, op.j_group, op.panel, op.window, op.index_buffer,
+            index_profile.ordinal, hw_generation[index_profile.scale_window], op.entry_end - op.entry_begin,
+            index_profile.writes, unsigned(POTAL_OK), unsigned(POTAL_OK),
+            index_profile.t0, index_profile.t1, index_profile.t2,
+            index_profile.t1 - index_profile.t0, index_profile.t2 - index_profile.t1,
+            index_profile.t2 - index_profile.t0, cycle_supported,
+            unsigned(req.stream_counter != nullptr), streaming() ? "continuous_early" : "ktile",
+            streaming() ? "stream_end" : "final_fence",
+            panel.k_begin, panel.k_rows, op.j_group * report.tile.tile_J * hw.dim,
+            group_j_tiles(op.j_group) * hw.dim - group_pad_j(op.j_group),
+            req.weight->ldb, op.index_b_base, op.index_j_tiles, op.index_active_rows, contents,
+            index_profile.t3, index_profile.t3 - index_profile.t2,
+            index_profile.t4, index_profile.t4 - index_profile.t3,
+            streaming() ? "potal_paired_stream_loop_issue" : "potal_paired_loop_ws_issue");
     }
 
     potal_paired_status run_stream() {
@@ -1931,9 +2182,15 @@ struct executor {
         const bool diagnostic = counters && std::strcmp(counters, "1") == 0;
         const char * admission = std::getenv("POTAL_STREAM_ADMISSION_PROFILE");
         const bool profile_admission = config.early_b_only && admission && std::strcmp(admission, "1") == 0;
+        const char * release_option = std::getenv("POTAL_STREAM_RELEASE_FAST");
+        const bool release_fast = release_option && std::strcmp(release_option, "1") == 0;
+        const char * write_option = std::getenv("POTAL_STREAM_WRITE_FAST");
+        const bool write_fast = write_option && std::strcmp(write_option, "1") == 0;
         // Separate diagnostic only. Allocate before BEGIN; print after END.
         std::vector<double> admission_ms(profile_admission ? panels.size() : 0);
+        cost_begin_clock();
         potal_status st = potal_paired_stream_begin(session, &config);
+        cost_add(cost_begin, cost_start);
         if (st != POTAL_OK) return hw_fail("stream_begin", st, nullptr);
         report.issued = true;
         if (diagnostic) {
@@ -1942,6 +2199,22 @@ struct executor {
         }
         for (const auto & action : stream_actions) {
             const size_t id = action.index;
+            const uint64_t cost_before = cost_now();
+            cost_kind bucket = cost_other;
+            switch (action.kind) {
+                case stream_action_kind::declare_panel: bucket = cost_declare; break;
+                case stream_action_kind::prefetch_panel: bucket = cost_prefetch; break;
+                case stream_action_kind::scale: bucket = cost_scale; break;
+                case stream_action_kind::release: bucket = cost_release; break;
+                case stream_action_kind::index: bucket = cost_index; break;
+                case stream_action_kind::loop:
+                    bucket = report.plan.ops[id].kind == potal_paired_op_kind::main_gemm ? cost_main : cost_residual;
+                    break;
+                case stream_action_kind::wait_pair: bucket = cost_wait; break;
+                case stream_action_kind::retire_panel: bucket = cost_retire; break;
+                case stream_action_kind::fence: bucket = cost_fence; break;
+                case stream_action_kind::readback: bucket = cost_readback; break;
+            }
             switch (action.kind) {
                 case stream_action_kind::declare_panel: {
                     const auto & r = report.plan.residencies[id];
@@ -1962,12 +2235,79 @@ struct executor {
                     report.counts.prefetch_bytes_declared += uint64_t(report.tile.panels[r.panel].k_rows) * r.cols;
                     break;
                 }
-                case stream_action_kind::scale:
-                case stream_action_kind::release: {
+                case stream_action_kind::release:
+                    if (release_fast) {
+                        const auto & w = report.plan.scale_windows[id];
+                        const size_t blocks = w.blocks, j_tiles = w.j_tiles;
+                        const size_t dim = hw.dim;
+                        const size_t pad_j = group_pad_j(report.plan.residencies[w.residency].j_group);
+                        const size_t base = stream_scale_base[id];
+                        const uint32_t generation = hw_generation[id];
+                        // Only immutable caller metadata is cached. Every column
+                        // still passes through its original checked C11 API.
+                        if (req.stream == potal_paired_stream_mode::bounded) {
+                            for (size_t b = 0; b < blocks; ++b) {
+                                for (size_t j = 0; j < j_tiles; ++j) {
+                                    const uint32_t slot = uint32_t(base + b * j_tiles + j);
+                                    const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
+                                    for (size_t c = 0; c < valid; ++c) {
+                                        st = potal_paired_scale_release(session, slot, generation, uint32_t(c));
+                                        if (st != POTAL_OK) return hw_fail("stream_scale_release", st, nullptr);
+                                        ++report.counts.scale_releases;
+                                    }
+                                }
+                            }
+                        } else {
+                            const potal_h2_ref reference = panels[w.residency].reference;
+                            for (size_t b = 0; b < blocks; ++b) {
+                                for (size_t j = 0; j < j_tiles; ++j) {
+                                    const uint32_t slot = uint32_t(base + b * j_tiles + j);
+                                    const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
+                                    for (size_t c = 0; c < valid; ++c) {
+                                        st = potal_paired_stream_scale_release(
+                                            session, reference, slot, generation, uint32_t(c));
+                                        if (st != POTAL_OK) return hw_fail("stream_scale_release", st, nullptr);
+                                        ++report.counts.scale_releases;
+                                        ++report.counts.stream_local_releases;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    [[fallthrough]];
+                case stream_action_kind::scale: {
                     const auto & w = report.plan.scale_windows[id];
                     const auto & residency = report.plan.residencies[w.residency];
                     const auto & panel = report.tile.panels[residency.panel];
                     const size_t col_base = residency.j_group * report.tile.tile_J * hw.dim;
+                    if (write_fast && action.kind == stream_action_kind::scale) {
+                        const size_t blocks = w.blocks, j_tiles = w.j_tiles;
+                        const size_t dim = hw.dim, pad_j = group_pad_j(residency.j_group);
+                        const size_t base = stream_scale_base[id];
+                        const uint32_t generation = hw_generation[id];
+                        const size_t cstride = req.weight->cstride;
+                        const uint32_t * const carriers = req.weight->carriers;
+                        // Prepared carriers are immutable. Cache only caller
+                        // addressing; retain every checked per-column Write.
+                        for (size_t b = 0; b < blocks; ++b) {
+                            const size_t block = w.residual ?
+                                report.tile.fragments[panel.windows[w.window].fragment_begin + b].block_id :
+                                panel.block_begin + b;
+                            for (size_t j = 0; j < j_tiles; ++j) {
+                                const uint32_t slot = uint32_t(base + b * j_tiles + j);
+                                const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
+                                const uint32_t * const row = carriers + block * cstride + col_base + j * dim;
+                                for (size_t c = 0; c < valid; ++c) {
+                                    st = potal_paired_scale_write(session, slot, generation, uint32_t(c), row[c]);
+                                    if (st != POTAL_OK) return hw_fail("stream_scale_write", st, nullptr);
+                                    ++report.counts.scale_writes;
+                                }
+                            }
+                        }
+                        *req.generation = generation;
+                        break;
+                    }
                     for (size_t b = 0; b < w.blocks; ++b) {
                         const size_t block = w.residual ?
                             report.tile.fragments[panel.windows[w.window].fragment_begin + b].block_id :
@@ -2052,13 +2392,19 @@ struct executor {
                     break;
                 }
             }
+            cost_add(bucket, cost_before);
         }
         uint64_t events[POTAL_STREAM_COUNTER_FIELDS] = {};
         if (diagnostic) {
             st = potal_paired_stream_counters_end(session, events);
             if (st != POTAL_OK) return hw_fail("stream_counters_end", st, nullptr);
         }
+        const uint64_t end_before = cost_now();
         st = potal_paired_stream_end(session);
+        cost_add(cost_end, end_before);
+        if (st == POTAL_OK) cost_end_clock();
+        if (st == POTAL_OK) print_cost_profile();
+        if (st == POTAL_OK) print_index_profile();
         if (st == POTAL_OK && profile_admission) {
             for (const auto & r : report.plan.residencies) {
                 if (!panels[r.index].prefetched) continue;
@@ -2155,9 +2501,11 @@ struct executor {
     }
     size_t group_pad_j(size_t g) const { return g + 1 == report.tile.j_groups ? report.tile.pad_J : 0; }
 
-    potal_status fence_now() {
+    potal_status fence_now(window_kind kind = window_kind::completion_fence) {
         const auto         t  = time_now();
+        auto * record = window_begin(kind, current_op);
         const potal_status st = potal_paired_fence(session);
+        window_end(record, st);
         report.counts.fence_s += seconds_since(t);
         if (st != POTAL_OK) {
             return st;
@@ -2458,7 +2806,7 @@ struct executor {
         if (req.ktile_scale_reuse && scale_owner[op.scale_window] != op.scale_window) {
             // An alias owns no allocation to release. Preserve the exact global
             // drain boundary, including stores and the other pair's readers.
-            const potal_status st = fence_now();
+            const potal_status st = fence_now(window_kind::alias_fence);
             return st == POTAL_OK ? potal_paired_status::ok : hw_fail("fence", st, &op);
         }
         const potal_status ds = drain_all();
@@ -2494,9 +2842,13 @@ struct executor {
     }
 
     potal_paired_status issue_loop(const potal_paired_loop_ws & l, const char * stage, const potal_paired_op & op) {
+        const bool sample = index_profile.complete && op.id == index_profile.residual_op;
         if (streaming()) {
             const uint32_t ordinal = op.kind == potal_paired_op_kind::main_gemm ? 0 : uint32_t(op.window + 1);
+            const uint64_t t3 = sample ? index_profile_cycles() : 0;
             const potal_status st = potal_paired_stream_loop_issue(session, panels[op.residency].reference, ordinal, &l);
+            const uint64_t t4 = sample ? index_profile_cycles() : 0;
+            if (sample) { index_profile.t3 = t3; index_profile.t4 = t4; index_profile.issue_sampled = true; }
             if (st != POTAL_OK) return hw_fail(stage, st, &op);
             if (op.kind == potal_paired_op_kind::residual_gemm) ++report.counts.residual_loop_ws;
             return potal_paired_status::ok;
@@ -2537,9 +2889,15 @@ struct executor {
         }
         const auto         t  = time_now();
         const uint32_t reader = op.kind == potal_paired_op_kind::main_gemm ? 0 : uint32_t(op.window + 1);
+        const uint64_t t3 = sample ? index_profile_cycles() : 0;
+        auto * record = op.kind == potal_paired_op_kind::residual_gemm ?
+            window_begin(window_kind::residual_issue, op.id) : nullptr;
         const potal_status st = req.next_k_prefetch ?
             potal_paired_h2_loop_issue(session, panels[op.residency].reference, reader, &l) :
             potal_paired_loop_ws_issue(session, &l);
+        window_end(record, st);
+        const uint64_t t4 = sample ? index_profile_cycles() : 0;
+        if (sample) { index_profile.t3 = t3; index_profile.t4 = t4; index_profile.issue_sampled = true; }
         report.issued = true;
         if (st != POTAL_OK && req.next_k_prefetch) return hw_fail(stage, st, &op);
         potal_paired_status prefetched = potal_paired_status::ok;
@@ -2647,6 +3005,9 @@ struct executor {
     }
 
     potal_paired_status index_program(const potal_paired_op & op) {
+        const bool sample = index_profile.op == op.id;
+        const uint64_t t0 = sample ? index_profile_cycles() : 0;
+        const uint64_t writes_before = sample ? report.counts.index_writes : 0;
         potal_index_config cfg;
         cfg.pair          = (uint32_t) op.index_buffer;
         cfg.b_sp_base     = (uint32_t) op.index_b_base;
@@ -2654,7 +3015,9 @@ struct executor {
         cfg.source_k_rows = (uint32_t) op.index_source_k_rows;
         cfg.active_rows   = (uint32_t) op.index_active_rows;
         const auto   t    = time_now();
+        auto * config_record = window_begin(window_kind::index_config, op.id);
         potal_status st   = potal_paired_index_config(session, &cfg);
+        window_end(config_record, st);
         report.issued     = true;
         if (st != POTAL_OK) {
             const double elapsed = streaming() ? 0 : seconds_since(t);
@@ -2662,18 +3025,31 @@ struct executor {
             if (profile) index_s += elapsed;
             return hw_fail("index_config", st, &op);
         }
+        const uint64_t t1 = sample ? index_profile_cycles() : 0;
         report.counts.index_configs++;
+        auto * write_record = window_begin(window_kind::index_write, op.id, 0);
         for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
             const potal_paired_index_entry & en = report.plan.index_entries[e];
             potal_index_write                w  = { (uint32_t) en.slot, (uint32_t) en.resident_k };
             st                                  = potal_paired_index_write(session, &w);
+            if (write_record) ++write_record->calls;
             if (st != POTAL_OK) {
+                window_end(write_record, st);
                 const double elapsed = streaming() ? 0 : seconds_since(t);
                 report.counts.issue_s += elapsed;
                 if (profile) index_s += elapsed;
                 return hw_fail("index_write", st, &op);
             }
             report.counts.index_writes++;
+        }
+        window_end(write_record, st);
+        const uint64_t t2 = sample ? index_profile_cycles() : 0;
+        if (sample) {
+            index_profile.t0 = t0;
+            index_profile.t1 = t1;
+            index_profile.t2 = t2;
+            index_profile.writes = report.counts.index_writes - writes_before;
+            index_profile.complete = true;
         }
         const double elapsed = streaming() ? 0 : seconds_since(t);
         report.counts.issue_s += elapsed;
@@ -2692,6 +3068,7 @@ struct executor {
         if (ds != POTAL_OK) {
             return hw_fail("fence", ds, &op);
         }
+        auto * descriptor_record = window_begin(window_kind::descriptor, op.id, 0);
         size_t wi = 0;
         while (wi < staging.windows.size() && !(staging.windows[wi].panel == op.panel && staging.windows[wi].index == op.window)) {
             ++wi;
@@ -2729,6 +3106,7 @@ struct executor {
         l.a_offset_tiles         = (uint32_t) op.a_offset_tiles;
         l.resident_b             = 1;
         l.indexed                = 1;
+        window_end(descriptor_record, POTAL_OK);
         const potal_paired_status st = issue_loop(l, "residual_loop_ws", op);
         if (st == potal_paired_status::ok) {
             if (window_diag) {
@@ -2770,8 +3148,11 @@ struct executor {
 
     potal_paired_status run() {
         const potal_paired_execution_plan & plan = report.plan;
+        cost_begin_clock();
         hw_generation.assign(plan.scale_windows.size(), 0);
         for (const potal_paired_op & op : plan.ops) {
+            current_op = op.id;
+            const uint64_t deps_before = cost_now();
             if (req.next_k_prefetch && op.kind == potal_paired_op_kind::scale_program &&
                 !plan.scale_windows[op.scale_window].residual) {
                 if (!panels[op.residency].reference.owner) {
@@ -2794,6 +3175,18 @@ struct executor {
                     }
                 }
             }
+            cost_add(cost_deps, deps_before);
+            const uint64_t cost_before = cost_now();
+            cost_kind bucket = cost_other;
+            switch (op.kind) {
+                case potal_paired_op_kind::scale_program: bucket = cost_scale; break;
+                case potal_paired_op_kind::scale_release: bucket = cost_release; break;
+                case potal_paired_op_kind::main_gemm: bucket = cost_main; break;
+                case potal_paired_op_kind::index_program: bucket = cost_index; break;
+                case potal_paired_op_kind::residual_gemm: bucket = cost_residual; break;
+                case potal_paired_op_kind::acc_complete: bucket = cost_readback; break;
+                default: break;
+            }
             potal_paired_status st = potal_paired_status::ok;
             switch (op.kind) {
                 case potal_paired_op_kind::scale_program:   st = scale_program(op); break;
@@ -2808,6 +3201,7 @@ struct executor {
                 case potal_paired_op_kind::pair_retire:     // its completion deps were ensured above
                     break;
             }
+            cost_add(bucket, cost_before);
             if (st != potal_paired_status::ok) {
                 return st;
             }
@@ -2826,7 +3220,10 @@ struct executor {
             last_op = op.id + 1;
         }
         // Every readback DMA must have landed before the CPU reads c_main / c_residual.
-        const potal_status st = fence_now();
+        const uint64_t fence_before = cost_now();
+        current_op = no_index;
+        const potal_status st = fence_now(window_kind::final_drain);
+        cost_add(cost_fence, fence_before);
         if (st != POTAL_OK) {
             return hw_fail("fence", st, nullptr);
         }
@@ -2837,6 +3234,10 @@ struct executor {
                 return hw_fail("h2_complete", POTAL_ERR_BUSY, nullptr);
             }
         }
+        cost_end_clock();
+        print_cost_profile();
+        print_index_profile();
+        print_window_profile();
         return potal_paired_status::ok;
     }
 };
@@ -2859,6 +3260,247 @@ potal_paired_status potal_paired_plan_stripe(const potal_tile_plan & main, size_
         return st;
     }
     return potal_make_execution_plan(tile, tile.residual ? residual : nullptr, plan, why, hw);
+}
+
+potal_paired_status potal_paired_select_jk(
+    const potal_tile_plan & producer, size_t rows, size_t n, size_t k,
+    const residual::decoded_packet * residual, bool reuse,
+    potal_tile_plan & selected_main, potal_paired_tile_plan & tile,
+    potal_paired_execution_plan & execution, std::string * why,
+    potal_paired_jk_report * report, const potal_paired_geometry & hw) try {
+    if (why) { why->clear(); }
+    const auto refuse = [&](potal_paired_status s, const char * text) {
+        explain(why, text);
+        return s;
+    };
+    const auto invalid = [&](const char * text) {
+        return refuse(potal_paired_status::invalid_argument, text);
+    };
+    const auto physical = potal_paired_hw_geometry();
+    const size_t D = hw.dim, BK = hw.block_k;
+    if (D != physical.dim || BK != residual::rmd::kBlockSize || !D || !BK || BK % D ||
+        hw.bank_num != physical.bank_num || hw.bank_rows > physical.bank_rows ||
+        hw.acc_rows > physical.acc_rows || hw.index_entries > physical.index_entries ||
+        hw.scale_entries > physical.scale_entries || hw.work_ids > physical.work_ids ||
+        !hw.bank_rows || hw.acc_rows < 2 || !hw.scale_entries || !hw.work_ids ||
+        (reuse && (D != 32 || BK != 32))) {
+        return invalid("selector: unsupported physical geometry or mode");
+    }
+    const size_t ppb = BK / D;
+    if (!rows || !n || !k || k % BK || k > UINT32_MAX || ppb > UINT32_MAX ||
+        producer.passes_per_block != ppb) {
+        return invalid("selector: invalid shape, K narrowing or passes_per_block");
+    }
+    const size_t I = tiles_of(rows, D), T = tiles_of(n, D), U = k / D;
+    if (I > producer.tile_I || producer.tile_I > loop_ws_field_max || !I) {
+        return invalid("selector: producer does not cover stripe I");
+    }
+    // Checked arithmetic is also used for costs: no wrapped/saturated ranking.
+    bool arithmetic_ok = true;
+    const auto product = [&](size_t a, size_t b) {
+        size_t v = 0;
+        if (!mul(a, b, v)) { arithmetic_ok = false; }
+        return v;
+    };
+    const auto sum = [&](size_t a, size_t b) {
+        size_t v = 0;
+        if (!add(a, b, v)) { arithmetic_ok = false; }
+        return v;
+    };
+    const size_t padded_rows = product(I, D), padded_n = product(T, D);
+    product(product(padded_rows, padded_n), sizeof(int32_t));
+    product(padded_rows, k);
+    product(k, padded_n);
+    if (!arithmetic_ok) { return invalid("selector: padded extent overflow"); }
+
+    std::vector<potal_paired_fragment> fragments;
+    size_t skipped = 0, L = 0;
+    if (residual) {
+        if ((residual->rows.empty() || residual->runs.empty()) &&
+            (!residual->rows.empty() || !residual->runs.empty() || residual->k_compact ||
+             !residual->digits.empty())) {
+            return invalid("selector: noncanonical empty residual");
+        }
+        if (!residual->rows.empty() && residual->digits.empty()) {
+            return invalid("selector: nonempty residual requires digits");
+        }
+        const auto status = potal_paired_fragments(*residual, rows, k, hw, fragments, why, &skipped);
+        if (status != potal_paired_status::ok) { return status; }
+        L = residual->rows.size();
+        if (L && fragments.empty()) { return invalid("selector: no surviving residual fragments"); }
+    }
+    const size_t R = tiles_of(L, D), F = fragments.size();
+    const size_t E = std::min(hw.index_entries / D, F);
+    const size_t AR = product(product(R, E), D);
+    product(product(product(R, D), padded_n), sizeof(int32_t));
+    product(L, product(F, D));
+    if (!arithmetic_ok) { return invalid("selector: residual extent overflow"); }
+
+    // The minimum pair witnesses capacity failure, in the documented order.
+    if (I > (hw.acc_rows / 2) / D || I > hw.work_ids) {
+        return refuse(potal_paired_status::main_acc_capacity, "selector: Main ACC capacity");
+    }
+    if (R > loop_ws_field_max || R > (hw.acc_rows / 2) / D || R > hw.work_ids) {
+        return refuse(potal_paired_status::residual_acc_capacity, "selector: Residual ACC capacity");
+    }
+    if (F && !E) { return refuse(potal_paired_status::index_window_capacity, "selector: Index capacity"); }
+    if (ppb > hw.bank_rows / D) {
+        return refuse(potal_paired_status::weight_bank_capacity, "selector: B capacity");
+    }
+    if (AR > hw.bank_rows || ppb > (hw.bank_rows - AR) / (I * D)) {
+        return refuse(potal_paired_status::activation_bank_capacity, "selector: A capacity");
+    }
+    if (E >= hw.scale_entries) {
+        return refuse(potal_paired_status::scale_window_capacity, "selector: Scale capacity");
+    }
+    potal_paired_jk_report local;
+    const size_t lattice_J = std::min(T, loop_ws_field_max);
+    const size_t lattice_K = floor_to(std::min(U, loop_ws_field_max), ppb);
+    local.considered = product(lattice_J, lattice_K / ppb);
+    size_t Jmax = std::min({lattice_J, (hw.acc_rows / 2) / D / I, hw.work_ids / I,
+                           (size_t(POTAL_HW_ACC_ROWS) / 2) / D / I,
+                           size_t(POTAL_WORK_IDS_PER_LOOP) / I});
+    if (R) { Jmax = std::min({Jmax, (hw.acc_rows / 2) / D / R, hw.work_ids / R}); }
+    const auto kmax = [&](size_t J) {
+        if (E * J >= hw.scale_entries) { return size_t(0); }
+        return floor_to(std::min({lattice_K, hw.bank_rows / (J * D),
+            (hw.bank_rows - AR) / (I * D), ppb * ((hw.scale_entries - E * J) / J),
+            (size_t(POTAL_HW_BANK_NUM) * POTAL_HW_BANK_ROWS / 2) / (D * (I + J)),
+            ppb * (size_t(scale_window_slots) / J)}), ppb);
+    };
+    struct candidate {
+        size_t J = 0, K = 0;
+        potal_paired_jk_cost cost;
+    } best, second;
+    const auto key = [](const candidate & a, const candidate & b) {
+        for (size_t i = 0; i < 6; ++i) {
+            if (a.cost.rank[i] != b.cost.rank[i]) { return i; }
+        }
+        return a.J != b.J ? size_t(6) : size_t(7);
+    };
+    const auto better = [&](const candidate & a, const candidate & b) {
+        if (!b.J) { return true; }
+        const size_t i = key(a, b);
+        return i < 6 ? a.cost.rank[i] < b.cost.rank[i] : i == 6 ? a.J > b.J : a.K > b.K;
+    };
+    // One scalar summary per K. No per-candidate packet, Index or op vectors.
+    for (size_t K = ppb, end = kmax(1); K <= end; K += ppb) {
+        size_t W = 0, A = 0, staging = 0, Wa = 0, Fa = 0;
+        for (size_t f = 0; f < F;) {
+            const size_t panel = fragments[f].block_id / (K / ppb);
+            size_t panel_end = f;
+            while (panel_end < F && fragments[panel_end].block_id / (K / ppb) == panel) { ++panel_end; }
+            while (f < panel_end) {
+                const size_t end_f = std::min(f + E, panel_end), count = end_f - f;
+                ++W;
+                A = sum(A, sum(product(count - 1, D), fragments[end_f - 1].count));
+                const size_t width = product(count, D);
+                staging = sum(staging, product(L, product(tiles_of(width, POTAL_HW_MAX_BYTES), POTAL_HW_MAX_BYTES)));
+                bool alias = reuse;
+                for (size_t x = f; x < end_f; ++x) {
+                    alias = alias && fragments[x].block_id == fragments[f].block_id + x - f;
+                }
+                // Consecutive fragments within this panel imply owner containment.
+                if (alias) { ++Wa; Fa = sum(Fa, count); }
+                f = end_f;
+            }
+        }
+        const size_t P = tiles_of(U, K);
+        for (size_t J = 1; J <= Jmax && K <= kmax(J); ++J) {
+            candidate c;
+            c.J = J; c.K = K;
+            auto & cost = c.cost;
+            const size_t G = tiles_of(T, J);
+            cost.main_loops = product(G, P);
+            cost.residual_loops = product(G, W);
+            cost.index_writes = product(G, A);
+            cost.scalar_writes = product(n, sum(k / BK, F - Fa));
+            cost.scalar_releases = cost.scalar_writes;
+            cost.alias_windows = product(G, Wa);
+            cost.staging_bytes = staging;
+            const size_t loops = sum(cost.main_loops, cost.residual_loops);
+            cost.fence_markers = sum(sum(loops, product(G, 1 + (L != 0))), 1);
+            cost.rank[0] = loops;
+            cost.rank[1] = cost.scalar_writes;
+            cost.rank[2] = cost.index_writes;
+            cost.rank[3] = staging;
+            cost.rank[4] = cost.main_loops;
+            cost.rank[5] = cost.fence_markers;
+            // Preflight vector counts/bytes and the builder's unchecked counters.
+            const size_t ops = sum(sum(product(6, cost.main_loops), product(5, cost.residual_loops)),
+                                   product(G, 1 + (L != 0)));
+            product(ops, sizeof(potal_paired_op));
+            product(product(ops, 8), sizeof(potal_paired_dep));
+            product(cost.index_writes, sizeof(potal_paired_index_entry));
+            product(loops, sizeof(potal_paired_scale_window));
+            product(cost.main_loops, sizeof(potal_paired_residency));
+            product(sum(product(I, product(T, P)), product(R, product(T, W))), D);
+            product(product(G, rows), k);
+            product(product(G, L), A);
+            if (!arithmetic_ok) { return invalid("selector: count or byte overflow"); }
+            ++local.feasible;
+            if (better(c, best)) { second = best; best = c; }
+            else if (better(c, second)) { second = c; }
+        }
+    }
+    if (!arithmetic_ok) { return invalid("selector: lattice overflow"); }
+    if (!best.J) { return invalid("selector: compiled limits admit no J/K pair"); }
+    local.selected = best.cost;
+    local.runner_up = second.cost;
+    local.runner_up_J = second.J; local.runner_up_K = second.K;
+    local.deciding_key = second.J ? key(best, second) : 8;
+    potal_tile_plan main;
+    const auto frozen = potal_frozen_plan(rows, n, k, I, best.J, best.K, ppb, &main);
+    if (frozen != POTAL_OK) {
+        explain(why, std::string("selector frozen winner: ") + potal_status_name(frozen));
+        return potal_paired_status::invalid_execution_plan;
+    }
+    potal_paired_tile_plan built;
+    potal_paired_execution_plan planned;
+    const auto status = potal_paired_plan_stripe(main, rows, n, k, residual, built, planned, why, hw);
+    if (status != potal_paired_status::ok) { return status; }
+    size_t scalar_writes = 0, aliases = 0, staged_bytes = 0;
+    for (const auto & w : planned.scale_windows) {
+        const auto & residency = planned.residencies[w.residency];
+        bool alias = reuse && w.residual;
+        if (alias) {
+            const auto & panel = built.panels[residency.panel];
+            const auto & window = panel.windows[w.window];
+            const size_t first = built.fragments[window.fragment_begin].block_id;
+            const auto & owner = planned.scale_windows[planned.ops[residency.main_gemm_op].scale_window];
+            alias = owner.residency == w.residency && owner.j_tiles == w.j_tiles &&
+                owner.program_op < w.program_op && owner.release_op > w.release_op &&
+                first >= panel.block_begin && first - panel.block_begin + w.blocks <= owner.blocks &&
+                product(first - panel.block_begin + w.blocks, w.j_tiles) <= POTAL_HW_SCALE_ENTRIES;
+            for (size_t f = window.fragment_begin; f < window.fragment_end; ++f) {
+                alias = alias && built.fragments[f].block_id == first + f - window.fragment_begin;
+            }
+        }
+        if (alias) { ++aliases; }
+        else { scalar_writes = sum(scalar_writes, product(w.blocks, residency.cols)); }
+    }
+    for (const auto & panel : built.panels) {
+        for (const auto & w : panel.windows) {
+            staged_bytes = sum(staged_bytes,
+                product(L, product(tiles_of(product(w.k_tiles, D), POTAL_HW_MAX_BYTES), POTAL_HW_MAX_BYTES)));
+        }
+    }
+    if (built.tile_K != best.K || built.tile_K_main != best.K || built.tile_J != best.J ||
+        planned.main_gemms != best.cost.main_loops || planned.residual_gemms != best.cost.residual_loops ||
+        planned.index_writes != best.cost.index_writes ||
+        !arithmetic_ok || scalar_writes != best.cost.scalar_writes || aliases != best.cost.alias_windows ||
+        staged_bytes != best.cost.staging_bytes ||
+        planned.scale_releases + planned.acc_completes + 1 != best.cost.fence_markers) {
+        return refuse(potal_paired_status::invalid_execution_plan, "selector: winner estimate/build mismatch");
+    }
+    selected_main = main;
+    tile = std::move(built);
+    execution = std::move(planned);
+    if (report) { *report = local; }
+    return potal_paired_status::ok;
+} catch (const std::bad_alloc &) {
+    explain(why, "selector: out of memory");
+    return potal_paired_status::allocation_failure;
 }
 
 bool potal_paired_capacity_refusal(potal_paired_status s) {
@@ -2925,10 +3567,27 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     report = potal_paired_report{};
     const potal_paired_geometry hw = req.hw != nullptr ? *req.hw : potal_paired_hw_geometry();
     executor                    ex(req, session, report, hw); // outlives the try: the staging is settled on any exit
+    const char * graph_cpu = std::getenv("POTAL_GRAPH_CPU");
+    ex.cost_profile = graph_cpu && std::strcmp(graph_cpu, "1") == 0;
     const char * profile = std::getenv("POTAL_PAIRED_PROFILE");
     ex.profile = profile != nullptr && std::strcmp(profile, "1") == 0;
     const char * timing = std::getenv("POTAL_PAIRED_TIMING");
     ex.measure = !ex.streaming() && !(timing && std::strcmp(timing, "0") == 0);
+    const char * window_option = std::getenv("POTAL_INDEX_WINDOW_PROFILE");
+    ex.window_profile = window_option && std::strcmp(window_option, "1") == 0;
+    if (ex.window_profile) {
+        ex.measure = false;
+        if (!req.ktile_scale_reuse || ex.streaming() || req.next_k_prefetch || req.early_k_prefetch)
+            return ex.fail(potal_paired_status::invalid_argument, "index_window_profile",
+                           "requires K-tile nonstream nonprefetch", POTAL_ERR_UNSUPPORTED);
+        for (const char * name : {"POTAL_PAIRED_PROFILE", "POTAL_GRAPH_CPU", "POTAL_INDEX_PROFILE",
+                                 "POTAL_SCALE_CPU", "POTAL_RAW_TRACE", "POTAL_EARLY_TRACE",
+                                 "POTAL_PAIRED_WINDOW_DIAG", "POTAL_RESIDUAL_TRACE"}) {
+            if (std::getenv(name))
+                return ex.fail(potal_paired_status::invalid_argument, "index_window_profile",
+                               "incompatible profiling or tracing option", POTAL_ERR_UNSUPPORTED);
+        }
+    }
     if (ex.profile) ex.plan_start = exec_clock::now();
     try {
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
@@ -3078,9 +3737,15 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         // No allocation or alias proof is deferred until after command effects.
         ex.prepare_scale_reuse();
         if (ex.streaming()) {
+            const uint64_t before = ex.cost_now();
             st = ex.prepare_stream();
+            ex.cost_add(executor::cost_prepare, before);
             if (st != potal_paired_status::ok) return st;
         }
+        ex.prepare_index_profile();
+        if (!ex.prepare_window_profile())
+            return ex.fail(potal_paired_status::invalid_argument, "index_window_profile",
+                           "record capacity overflow", POTAL_ERR_UNSUPPORTED);
 
         // 4. TLB maintenance before the first DMA of this stripe (the session is drained).
         if (req.tlb_flush) {

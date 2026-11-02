@@ -435,6 +435,31 @@ potal_paired_status potal_validate_execution_plan(const potal_paired_execution_p
 
 std::string potal_paired_op_text(const potal_paired_op & op);
 
+// Structural counts, not cycles or a latency prediction.
+struct potal_paired_jk_cost {
+    size_t main_loops = 0, residual_loops = 0, index_writes = 0;
+    size_t scalar_writes = 0, scalar_releases = 0, alias_windows = 0;
+    size_t staging_bytes = 0, fence_markers = 0;
+    size_t rank[6] = {};
+};
+
+struct potal_paired_jk_report {
+    size_t considered = 0, feasible = 0;
+    potal_paired_jk_cost selected, runner_up;
+    size_t runner_up_J = 0, runner_up_K = 0;
+    size_t deciding_key = 8;
+};
+
+// Exhaustive feasible J/K search with fixed stripe I. Only the winner is built
+// and validated. All outputs, including report, remain untouched on failure.
+potal_paired_status potal_paired_select_jk(
+    const potal_tile_plan & producer, size_t rows, size_t n, size_t k,
+    const residual::decoded_packet * residual, bool ktile_scale_reuse,
+    potal_tile_plan & selected_main, potal_paired_tile_plan & tile,
+    potal_paired_execution_plan & execution, std::string * why,
+    potal_paired_jk_report * report = nullptr,
+    const potal_paired_geometry & hw = potal_paired_hw_geometry());
+
 // ---- execution (H3-2B) -------------------------------------------------------------------
 //
 // potal_paired_matmul_auto() runs one stripe's Main and Residual GEMMs from a

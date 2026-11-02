@@ -5,9 +5,8 @@
 #include "potal_hw_params.h"
 
 #include <string.h>
-#if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
+#include <inttypes.h>
 #include <stdio.h>
-#endif
 
 #if defined(__riscv)
 #include "potal_rocc.h"
@@ -1077,7 +1076,31 @@ struct potal_paired_session {
     paired_pair_state pair[POTAL_PAIRS];
     uint64_t          slot_columns[POTAL_SCALE_ENTRIES];    /* live (written, not released) columns, bit c = column c */
     uint8_t           slot_generation[POTAL_SCALE_ENTRIES]; /* generation of the live columns */
+    int scale_cpu_profile, scale_cpu_stream;
+    uint64_t scale_cpu[2][4]; /* successful calls, validation, raw response, publication */
 };
+
+static uint64_t scale_cpu_cycles(int enabled) {
+    if (!enabled) return 0;
+#if defined(__riscv)
+    uint64_t value;
+    __asm__ volatile("rdcycle %0" : "=r"(value) :: "memory");
+    return value;
+#else
+    return 0;
+#endif
+}
+
+static void scale_cpu_record(potal_paired_session *s, uint32_t kind,
+    uint64_t t0, uint64_t t1, uint64_t t2) {
+    if (!s->scale_cpu_profile) return;
+    const uint64_t t3 = scale_cpu_cycles(1);
+    s->scale_cpu_stream = s->stream != NULL;
+    ++s->scale_cpu[kind][0];
+    s->scale_cpu[kind][1] += t1 - t0;
+    s->scale_cpu[kind][2] += t2 - t1;
+    s->scale_cpu[kind][3] += t3 - t2;
+}
 
 _Static_assert(POTAL_HW_DIM <= 64, "slot_columns holds one bit per column");
 
@@ -1278,6 +1301,8 @@ potal_status potal_paired_session_open(const potal_paired_sink *sink, potal_pair
     }
     const char *env = getenv("POTAL_RAW_TRACE");
     s->trace_enabled = env != NULL && env[0] == '1';
+    const char *scale_cpu = getenv("POTAL_SCALE_CPU");
+    s->scale_cpu_profile = scale_cpu != NULL && strcmp(scale_cpu, "1") == 0;
     paired_owner = 1;
     *out = s;
     return POTAL_OK;
@@ -1305,6 +1330,14 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
      */
     if (!outstanding && !live) {
         paired_owner = 0;
+    }
+    if (s->scale_cpu_profile && status == POTAL_OK && !outstanding && !live && !s->index_open) {
+        for (uint32_t i = 0; i < 2; ++i)
+            fprintf(stderr, "[POTAL_SCALE_CPU] mode=%s kind=%s calls=%" PRIu64
+                " validate=%" PRIu64 " raw=%" PRIu64 " publish=%" PRIu64
+                " hardware_waiting=0 primary_performance=0\n",
+                s->scale_cpu_stream ? "early" : "ktile", i ? "release" : "write",
+                s->scale_cpu[i][0], s->scale_cpu[i][1], s->scale_cpu[i][2], s->scale_cpu[i][3]);
     }
     free(s);
     return status;
@@ -1367,6 +1400,8 @@ potal_status potal_paired_tlb_flush(potal_paired_session *s) {
 
 static potal_status paired_scale_write_core(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                       uint32_t column, uint32_t carrier) {
+    const int diagnostic = s && s->scale_cpu_profile;
+    const uint64_t t0 = scale_cpu_cycles(diagnostic);
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1390,15 +1425,20 @@ static potal_status paired_scale_write_core(potal_paired_session *s, uint32_t sl
         return POTAL_ERR_NO_HARDWARE;
     }
     if (s->h2) s->h2->status.control_pending = 1;
+    const uint64_t t1 = scale_cpu_cycles(diagnostic);
     PAIRED_RAW(s, POTAL_FUNCT_SCALE_WRITE, rs1, carrier, 1, "scale_write");
+    const uint64_t t2 = scale_cpu_cycles(diagnostic);
     s->slot_columns[slot] |= bit;
     s->slot_generation[slot] = (uint8_t)generation;
     if (s->h2) s->h2->status.control_pending = 0;
+    scale_cpu_record(s, 0, t0, t1, t2);
     return POTAL_OK;
 }
 
 static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                         uint32_t column) {
+    const int diagnostic = s && s->scale_cpu_profile;
+    const uint64_t t0 = scale_cpu_cycles(diagnostic);
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
         return ready;
@@ -1418,7 +1458,9 @@ static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t 
      * (Controller.scala: releaseSafe := allDrained, the same signal as
      * fenceDrained): an accepted release is a drain point, like POTAL_FENCE.
      */
+    const uint64_t t1 = scale_cpu_cycles(diagnostic);
     const potal_status released = paired_raw(s, POTAL_FUNCT_SCALE_RELEASE, rs1, 0, 1);
+    const uint64_t t2 = scale_cpu_cycles(diagnostic);
     if (released != POTAL_OK) {
         if (s->h2) {
             s->h2->status.last_drain = released;
@@ -1430,6 +1472,7 @@ static potal_status paired_scale_release_core(potal_paired_session *s, uint32_t 
     s->slot_columns[slot] &= ~((uint64_t)1 << column); /* the slot is free when its last live column is released */
     if (s->stream && !s->slot_columns[slot]) s->stream->slot_pairs[slot] = 0;
     paired_drained(s);
+    scale_cpu_record(s, 1, t0, t1, t2);
     return POTAL_OK;
 }
 
@@ -2576,6 +2619,8 @@ potal_status potal_paired_stream_wait_pair(potal_paired_session *s, potal_h2_ref
 
 potal_status potal_paired_stream_scale_release(potal_paired_session *s, potal_h2_ref ref,
     uint32_t slot, uint32_t generation, uint32_t column) {
+    const int diagnostic = s && s->scale_cpu_profile;
+    const uint64_t t0 = scale_cpu_cycles(diagnostic);
     const potal_status status = stream_ready(s);
     if (status != POTAL_OK) return status;
     stream_panel_state *p = stream_find(s, ref);
@@ -2588,10 +2633,13 @@ potal_status potal_paired_stream_scale_release(potal_paired_session *s, potal_h2
         return POTAL_ERR_INVALID_ARGUMENT;
     if (!p->status.sealed || p->status.completed != p->status.submitted) return POTAL_ERR_BUSY;
     s->stream->control_pending = 1;
+    const uint64_t t1 = scale_cpu_cycles(diagnostic);
     PAIRED_RAW(s, POTAL_FUNCT_STREAM, 5, key, 1, "stream_release");
+    const uint64_t t2 = scale_cpu_cycles(diagnostic);
     s->stream->control_pending = 0;
     s->slot_columns[slot] &= ~bit;
     if (!s->slot_columns[slot]) s->stream->slot_pairs[slot] = 0;
+    scale_cpu_record(s, 1, t0, t1, t2);
     return POTAL_OK;
 }
 

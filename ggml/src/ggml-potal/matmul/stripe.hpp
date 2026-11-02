@@ -196,6 +196,7 @@ struct pipeline_config {
     // a stripe whose paired plan is refused for capacity runs the serial route,
     // reported as serial_fallback. Needs residual (compensation ON).
     bool            paired       = false;
+    bool            paired_auto_jk = false; // validated entry-time environment snapshot
     // GGML_POTAL_PAIRED_FENCES=CONSERVATIVE: the paired executor fences before every
     // Indexed LOOP_WS, ACC readback and scale release (potal_paired_request).
     bool            paired_conservative_fences = false;

@@ -1313,9 +1313,192 @@ void test_exec_real_packets() {
           same_rows && same_k && next_f == req.fragments.size());
 }
 
+// Full plans are deliberately confined to this small-lattice oracle.
+potal_paired_jk_cost actual_jk_cost(const potal_paired_execution_plan & e, size_t n, bool reuse) {
+    potal_paired_jk_cost c;
+    c.main_loops = e.main_gemms;
+    c.residual_loops = e.residual_gemms;
+    c.index_writes = e.index_entries.size();
+    for (const auto & w : e.scale_windows) {
+        const auto & residency = e.residencies[w.residency];
+        bool alias = reuse && w.residual;
+        if (alias) {
+            const auto & panel = e.tile.panels[residency.panel];
+            const auto & win = panel.windows[w.window];
+            const size_t first = e.tile.fragments[win.fragment_begin].block_id;
+            alias = first >= panel.block_begin && first + w.blocks <= panel.block_end;
+            for (size_t f = win.fragment_begin; f < win.fragment_end; ++f) {
+                alias = alias && e.tile.fragments[f].block_id == first + f - win.fragment_begin;
+            }
+        }
+        if (alias) { ++c.alias_windows; }
+        else { c.scalar_writes += w.blocks * residency.cols; }
+    }
+    c.scalar_releases = c.scalar_writes;
+    for (const auto & panel : e.tile.panels) {
+        for (const auto & win : panel.windows) {
+            const size_t width = win.k_tiles * PD;
+            c.staging_bytes += e.residual_rows.size() *
+                ((width + POTAL_HW_MAX_BYTES - 1) / POTAL_HW_MAX_BYTES * POTAL_HW_MAX_BYTES);
+        }
+    }
+    c.fence_markers = e.scale_releases + e.acc_completes + 1;
+    c.rank[0] = c.main_loops + c.residual_loops;
+    c.rank[1] = c.scalar_writes;
+    c.rank[2] = c.index_writes;
+    c.rank[3] = c.staging_bytes;
+    c.rank[4] = c.main_loops;
+    c.rank[5] = c.fence_markers;
+    (void) n;
+    return c;
+}
+
+bool equal_cost(const potal_paired_jk_cost & a, const potal_paired_jk_cost & b) {
+    return std::equal(a.rank, a.rank + 6, b.rank) &&
+        a.main_loops == b.main_loops && a.residual_loops == b.residual_loops &&
+        a.index_writes == b.index_writes && a.scalar_writes == b.scalar_writes &&
+        a.scalar_releases == b.scalar_releases && a.alias_windows == b.alias_windows &&
+        a.staging_bytes == b.staging_bytes && a.fence_markers == b.fence_markers;
+}
+
+void test_generic_jk_selector() {
+    const auto physical = potal_paired_hw_geometry();
+    size_t cases = 0, candidates = 0;
+    for (size_t fixture = 0; fixture < 6; ++fixture) {
+        const size_t rows = fixture % 2 ? PD + 1 : 3;
+        const size_t n = 3 * PD - 3, k = 5 * 32;
+        auto packet = synth(fixture == 4 ? rows * 2 : rows, rows,
+            fixture == 2 ? dense_runs(5, 32) :
+            std::vector<run_spec>{{0, first_k(3)}, {2, first_k(7)}, {4, first_k(1)}});
+        packet.digits.assign(packet.rows.size() * packet.k_compact, 1);
+        if (fixture == 5) {
+            // Global pruning removes block2, but zero rows alone do not remove work.
+            for (size_t r = 0; r < packet.rows.size(); ++r) {
+                std::fill(packet.digits.begin() + r * packet.k_compact + 3,
+                          packet.digits.begin() + r * packet.k_compact + 10, 0);
+            }
+        }
+        residual::decoded_packet empty;
+        const auto * residual = fixture == 0 ? nullptr : fixture == 1 ? &empty : &packet;
+        for (bool reuse : {false, true}) {
+            if (reuse && PD != 32) { continue; }
+            for (size_t bank_rows : {size_t(256), physical.bank_rows}) {
+                auto hw = physical;
+                hw.bank_rows = bank_rows;
+                hw.index_entries = 2 * PD;
+                potal_tile_plan seed;
+                check("JK frozen minimal seed", potal_frozen_plan(rows, n, k, 2, 1, PPB, PPB, &seed) == POTAL_OK);
+                struct entry { size_t J, K; potal_paired_jk_cost cost; };
+                std::vector<entry> oracle;
+                for (size_t J = 1; J <= 3; ++J) {
+                    for (size_t K = PPB; K <= k / PD; K += PPB) {
+                        potal_tile_plan m;
+                        potal_paired_tile_plan t;
+                        potal_paired_execution_plan e;
+                        std::string why;
+                        if (potal_frozen_plan(rows, n, k, 2, J, K, PPB, &m) != POTAL_OK ||
+                            potal_paired_plan_stripe(m, rows, n, k, residual, t, e, &why, hw) != potal_paired_status::ok ||
+                            t.tile_K != K) { continue; }
+                        oracle.push_back({J, K, actual_jk_cost(e, n, reuse)});
+                    }
+                }
+                std::sort(oracle.begin(), oracle.end(), [](const entry & a, const entry & b) {
+                    for (size_t i = 0; i < 6; ++i) {
+                        if (a.cost.rank[i] != b.cost.rank[i]) { return a.cost.rank[i] < b.cost.rank[i]; }
+                    }
+                    return a.J != b.J ? a.J > b.J : a.K > b.K;
+                });
+                potal_tile_plan main;
+                potal_paired_tile_plan tile;
+                potal_paired_execution_plan execution;
+                potal_paired_jk_report report;
+                std::string why = "stale";
+                const uint64_t selects = potal_tile_select_count();
+                const auto status = potal_paired_select_jk(seed, rows, n, k, residual, reuse,
+                    main, tile, execution, &why, &report, hw);
+                check("JK oracle has feasible candidates", !oracle.empty());
+                check("JK selector succeeds and clears diagnostic", status == potal_paired_status::ok && why.empty());
+                if (status != potal_paired_status::ok || oracle.empty()) { continue; }
+                check("JK exhaustive counts and seed-independent winner",
+                    report.considered == 3 * (k / 32) && report.feasible == oracle.size() &&
+                    main.tile_J == oracle[0].J && main.tile_K == oracle[0].K &&
+                    (main.tile_J > seed.tile_J || main.tile_K > seed.tile_K));
+                check("JK exact selected costs from full records",
+                    equal_cost(report.selected, oracle[0].cost) &&
+                    equal_cost(report.selected, actual_jk_cost(execution, n, reuse)));
+                size_t deciding = 8;
+                if (oracle.size() > 1) {
+                    deciding = 0;
+                    while (deciding < 6 && oracle[0].cost.rank[deciding] == oracle[1].cost.rank[deciding]) { ++deciding; }
+                    if (deciding == 6 && oracle[0].J == oracle[1].J) { deciding = 7; }
+                    check("JK exact runner-up costs and geometry", report.runner_up_J == oracle[1].J &&
+                        report.runner_up_K == oracle[1].K && equal_cost(report.runner_up, oracle[1].cost));
+                }
+                check("JK deciding rank or tie key", report.deciding_key == deciding);
+                seed.tile_J = 2; seed.tile_K = 2 * PPB;
+                potal_tile_plan again;
+                potal_paired_tile_plan t2;
+                potal_paired_execution_plan e2;
+                potal_paired_jk_report r2;
+                check("JK deterministic and independent of changed seed J/K",
+                    potal_paired_select_jk(seed, rows, n, k, residual, reuse, again, t2, e2, &why, &r2, hw) ==
+                        potal_paired_status::ok && again.tile_J == main.tile_J && again.tile_K == main.tile_K &&
+                        same_plan(tile, t2) && equal_cost(report.selected, r2.selected) &&
+                        potal_tile_select_count() == selects && seed.tile_J == 2 && seed.tile_K == 2 * PPB);
+                ++cases; candidates += oracle.size();
+            }
+        }
+    }
+    std::printf("JK oracle: %zu cases, %zu feasible full-plan candidates\n", cases, candidates);
+    potal_tile_plan seed;
+    check("JK failure seed", main_select(1, 64, 64, seed));
+    const auto packet = synth(1, 1, {{0, first_k(1)}});
+    for (size_t failure = 0; failure < 17; ++failure) {
+        auto hw = physical;
+        auto bad = packet;
+        bad.digits.assign(1, 1);
+        size_t rows = 1, n = 64, k = 64;
+        auto producer = seed;
+        bool reuse = false;
+        auto expected = potal_paired_status::invalid_argument;
+        switch (failure) {
+            case 0: hw.dim *= 2; break;
+            case 1: ++hw.bank_rows; break;
+            case 2: hw.bank_num = 2; break;
+            case 3: producer.tile_I = 0; break;
+            case 4: bad.digits.clear(); break;
+            case 5: bad.rows.clear(); break;
+            case 6: bad.digits[0] = 0; break;
+            case 7: bad.runs[0].local_k[0] = 32; break;
+            case 8: n = SIZE_MAX; break;
+            case 9: k = size_t(UINT32_MAX) + 1; break;
+            case 10: hw.acc_rows = 2; expected = potal_paired_status::main_acc_capacity; break;
+            case 11: hw.index_entries = PD - 1; expected = potal_paired_status::index_window_capacity; break;
+            case 12: hw.bank_rows = PD - 1; expected = potal_paired_status::weight_bank_capacity; break;
+            case 13: hw.bank_rows = 32; expected = potal_paired_status::activation_bank_capacity; break;
+            case 14: hw.scale_entries = 1; expected = potal_paired_status::scale_window_capacity; break;
+            case 15:
+                bad = synth(33, 1, {{0, first_k(1)}});
+                bad.digits.assign(33, 1); hw.work_ids = 1;
+                expected = potal_paired_status::residual_acc_capacity; break;
+            case 16: bad.runs.clear(); bad.rows.clear(); bad.digits.clear(); bad.k_compact = 1; break;
+        }
+        potal_tile_plan main; main.tile_J = 919;
+        potal_paired_tile_plan tile; tile.tile_J = 818;
+        potal_paired_execution_plan execution; execution.main_gemms = 717;
+        potal_paired_jk_report report; report.considered = 616;
+        std::string why;
+        const auto status = potal_paired_select_jk(producer, rows, n, k, &bad, reuse,
+            main, tile, execution, &why, &report, hw);
+        check("JK precise refusal and atomic sentinel outputs", status == expected && !why.empty() &&
+            main.tile_J == 919 && tile.tile_J == 818 && execution.main_gemms == 717 && report.considered == 616);
+    }
+}
+
 } // namespace
 
 int main() {
+    test_generic_jk_selector();
     test_geometry();
     test_main_tiles_kept();
     test_k_limits();

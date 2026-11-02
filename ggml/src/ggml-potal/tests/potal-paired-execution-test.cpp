@@ -27,9 +27,12 @@
 #include "matmul/options.hpp"
 #include "matmul/paired-auto.hpp"
 #include "matmul/stripe.hpp"
+#include "quants/act/quantize.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cinttypes>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -125,7 +128,8 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
         (stream_counter ? stream_counter : h2_emulator::on_counter) : nullptr;
 #if defined(POTAL_TEST_CLOCK_OBSERVER)
     stream_clock_reads = 0;
-    stream_clock_active = &emu.stream_active;
+    const bool window_clock_active = std::getenv("POTAL_INDEX_WINDOW_PROFILE") != nullptr;
+    stream_clock_active = window_clock_active ? &window_clock_active : &emu.stream_active;
 #endif
     r.status       = potal_paired_matmul_auto(q, s, r.report);
 #if defined(POTAL_TEST_CLOCK_OBSERVER)
@@ -2152,6 +2156,936 @@ size_t window_diag_field(const std::string & line, const char * name) {
     return p == std::string::npos ? SIZE_MAX : (size_t) std::strtoull(line.c_str() + p + key.size(), nullptr, 10);
 }
 
+void test_stream_prepare_indexed(bool release_comparison = false, bool write_comparison = false) {
+    if (PD != 32) return;
+    paired_fixture f(16, 65, 544, 237,
+        [](size_t block, size_t column) { return int16_t((block + column) % 3); });
+    potal_tile_plan main;
+    const bool fixture = f.ok && potal_frozen_plan(f.M, f.N, f.K, 1, 2, 8, PPB, &main) == POTAL_OK;
+    check("I7 prepare equality frozen I1/J2/K8 fixture", fixture);
+    if (!fixture) return;
+    const char * indexed_previous = std::getenv("POTAL_STREAM_PREPARE_INDEXED");
+    const bool had_indexed = indexed_previous != nullptr;
+    const std::string indexed_saved = indexed_previous ? indexed_previous : "";
+    const char * audit_previous = std::getenv("POTAL_STREAM_PREPARE_AUDIT");
+    const bool had_audit = audit_previous != nullptr;
+    const std::string audit_saved = audit_previous ? audit_previous : "";
+    const char * release_previous = std::getenv("POTAL_STREAM_RELEASE_FAST");
+    const bool had_release = release_previous != nullptr;
+    const std::string release_saved = release_previous ? release_previous : "";
+    const char * write_previous = std::getenv("POTAL_STREAM_WRITE_FAST");
+    const bool had_write = write_previous != nullptr;
+    const std::string write_saved = write_previous ? write_previous : "";
+    setenv("POTAL_STREAM_PREPARE_AUDIT", "1", 1);
+    // Mark each actual BEGIN in the same stderr capture as preparation. This
+    // proves the full audit was emitted before publication, not during playback.
+    struct begin_capture {
+        h2_emulator emu;
+        size_t fail_release = 0, releases = 0;
+        size_t fail_write = 0, writes = 0, commands_after_failure = 0;
+        bool failure_seen = false;
+        bool lose_response = false;
+        static bool is_release(const potal_paired_cmd_record & record) {
+            return record.funct == POTAL_FUNCT_SCALE_RELEASE ||
+                (record.funct == POTAL_FUNCT_STREAM && (record.rs1 & 15) == 5);
+        }
+        static potal_status command(void * context, const potal_paired_cmd_record * record) {
+            auto & self = *static_cast<begin_capture *>(context);
+            if (self.failure_seen) ++self.commands_after_failure;
+            const bool release_failed = is_release(*record) && ++self.releases == self.fail_release;
+            const bool write_failed = record->funct == POTAL_FUNCT_SCALE_WRITE &&
+                ++self.writes == self.fail_write;
+            if (release_failed || write_failed) {
+                self.failure_seen = true;
+                if (self.lose_response) (void) self.emu.command(*record);
+                else self.emu.records.push_back(*record);
+                return self.lose_response ? POTAL_ERR_NO_HARDWARE : POTAL_HW_INVALID_ADDRESS;
+            }
+            if (record->funct == POTAL_FUNCT_STREAM &&
+                (record->rs1 == 1 || record->rs1 == 2 || record->rs1 == 6))
+                std::fprintf(stderr, "[I7_STREAM_BEGIN]\n");
+            return self.emu.command(*record);
+        }
+        static potal_status counter(void * context, const potal_paired_cmd_record * record, uint64_t * value) {
+            return h2_emulator::on_counter(&static_cast<begin_capture *>(context)->emu, record, value);
+        }
+    };
+    const auto counts = [](const potal_paired_counts & c) {
+        // Timings are CPU observations, not deterministic command counts.
+        return std::vector<uint64_t>{
+            c.main_loop_ws, c.residual_loop_ws, c.index_configs, c.index_writes,
+            c.scale_writes, c.scale_releases, c.readbacks, c.readback_tiles,
+            c.fences, c.drains, c.tlb_flushes, c.ops,
+            c.scale_reused_windows, c.scale_reused_columns, c.prefetch_loads,
+            c.prefetch_mvins, c.prefetch_bytes_declared, c.resident_main_loop_ws,
+            c.prefetch_ldb_only, c.stream_batches, c.stream_capacity_boundaries,
+            c.stream_pair_waits, c.stream_local_releases, c.residual_staging_bytes,
+            c.residual_pitch_padding_bytes, c.residual_valid_bytes, c.residual_load_bytes_declared};
+    };
+    const auto session_state = [](const potal_paired_session_status & s) {
+        std::vector<uint64_t> state{
+            s.failed, static_cast<uint64_t>(s.error), s.outstanding_loops, s.outstanding_readbacks,
+            s.outstanding_acc_updates, s.index_transaction_open, s.index_transaction_pair,
+            s.index_transaction_written, s.live_scale_slots, s.commands, s.drains};
+        for (const auto & p : s.pair) {
+            const uint64_t fields[] = {p.resident_b, p.b_sp_base, p.b_j_tiles, p.b_k_rows,
+                p.main_a_tiles, p.index_valid, p.index_active_rows, p.outstanding};
+            state.insert(state.end(), std::begin(fields), std::end(fields));
+        }
+        return state;
+    };
+    const auto emulator_state = [](const h2_emulator & e) {
+        std::vector<uint64_t> state{
+            e.main_loops, e.residual_loops, e.index_configs, e.index_writes,
+            e.scale_writes, e.scale_releases, e.mvouts, e.fences, e.flushes, e.b_loads,
+            e.raw_b_mvins, e.raw_b_bytes, e.resident_main_loops, e.ldb_only_loads,
+            e.ldb_only_bytes, e.stream_active, e.stream_continuous, e.stream_early,
+            e.stream_waits, e.stream_releases, e.load3_loops, e.completed_sources.size()};
+        for (const auto & p : e.stream_pairs) {
+            const uint64_t fields[] = {p.incarnation, p.submitted, p.completed,
+                p.b_source, p.scheduled, p.dma_done, p.producer, p.b_k, p.b_j,
+                p.b_pad_j, p.b_pitch, p.borrowed.size()};
+            state.insert(state.end(), std::begin(fields), std::end(fields));
+        }
+        for (size_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) {
+            state.push_back(e.scale_pairs[slot]);
+            for (const auto & entry : e.scales[slot]) {
+                state.push_back(entry.valid);
+                state.push_back(entry.generation);
+                state.push_back(entry.carrier);
+            }
+        }
+        return state;
+    };
+    for (const bool residual : {true, false}) {
+        paired_inputs in;
+        const bool inputs = make_inputs(f, PD,
+            residual ? within_k(dense_entries(7, 40, 100), f.K) : entries_fn{}, in);
+        check("I7 prepare equality inputs", inputs);
+        if (!inputs) continue;
+        const golden_result golden = golden_of(f, PD, in);
+        serialized_result expected;
+        expected.main_ok = expected.legacy_ok = golden.ok;
+        expected.main_c = golden.main_c;
+        expected.legacy = golden.legacy;
+        expected.correction = golden.correction;
+        expected.rows.resize(in.theta.size());
+        expected.residual_c.resize(in.theta.size());
+        for (const auto & row : golden.residual[0]) {
+            expected.rows[0].push_back({row.lane, row.row});
+            expected.residual_c[0].insert(expected.residual_c[0].end(), row.c.begin(), row.c.end());
+        }
+        for (const auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                                potal_paired_stream_mode::continuous_early}) {
+            const std::string name = std::string(write_comparison ? "I9 Write " :
+                release_comparison ? "I8 release " : "I7 prepare ") +
+                (mode == potal_paired_stream_mode::bounded ? "bounded" :
+                 mode == potal_paired_stream_mode::continuous ? "continuous" : "continuous_early") +
+                (residual ? " residual" : " no-residual");
+            begin_capture legacy, indexed;
+            run_result off, on;
+            const potal_paired_sink off_sink{begin_capture::command, &legacy};
+            const potal_paired_sink on_sink{begin_capture::command, &indexed};
+            if (write_comparison) {
+                setenv("POTAL_STREAM_PREPARE_INDEXED", "1", 1);
+                setenv("POTAL_STREAM_RELEASE_FAST", "1", 1);
+                unsetenv("POTAL_STREAM_WRITE_FAST");
+            } else if (release_comparison) {
+                setenv("POTAL_STREAM_PREPARE_INDEXED", "1", 1);
+                unsetenv("POTAL_STREAM_RELEASE_FAST");
+            } else unsetenv("POTAL_STREAM_PREPARE_INDEXED");
+            const std::string off_log = capture_window_diag(nullptr, [&] {
+                off = run_paired(f, main, in, legacy.emu, true, 254, false, &off_sink, 1,
+                    nullptr, false, false, nullptr, mode, begin_capture::counter);
+            });
+            setenv("POTAL_STREAM_PREPARE_INDEXED", "1", 1);
+            if (release_comparison) setenv("POTAL_STREAM_RELEASE_FAST", "1", 1);
+            if (write_comparison) setenv("POTAL_STREAM_WRITE_FAST", "1", 1);
+            const std::string on_log = capture_window_diag(nullptr, [&] {
+                on = run_paired(f, main, in, indexed.emu, true, 254, false, &on_sink, 1,
+                    nullptr, false, false, nullptr, mode, begin_capture::counter);
+            });
+            // Preserve actual complete lines, without replacing IDs, generations
+            // or other audit fields. Ignore unrelated optional diagnostics.
+            const auto audit = [&](const std::string & log, const run_result & result) {
+                std::string text;
+                size_t actions = 0, scales = 0, last = 0;
+                bool fields = true;
+                for (size_t pos = 0; pos < log.size();) {
+                    const size_t end = log.find('\n', pos);
+                    if (end == std::string::npos) { fields = false; break; }
+                    const std::string line = log.substr(pos, end - pos + 1);
+                    const bool action = line.rfind("[POTAL_STREAM_PREPARE_ACTION]", 0) == 0;
+                    const bool scale = line.rfind("[POTAL_STREAM_PREPARE_SCALE]", 0) == 0;
+                    if (action || scale) {
+                        text += line;
+                        last = end;
+                        fields = fields && line.find("0x") == std::string::npos;
+                        if (action) {
+                            fields = fields && scales == 0 &&
+                                window_diag_field(line, "ordinal") == actions++ &&
+                                window_diag_field(line, "kind") != SIZE_MAX &&
+                                window_diag_field(line, "id") != SIZE_MAX;
+                        } else {
+                            fields = fields && window_diag_field(line, "window") == scales++ &&
+                                window_diag_field(line, "owner") != SIZE_MAX &&
+                                window_diag_field(line, "base") != SIZE_MAX &&
+                                window_diag_field(line, "generation") != SIZE_MAX;
+                        }
+                    }
+                    pos = end + 1;
+                }
+                const size_t begin = log.find("[I7_STREAM_BEGIN]");
+                check(name + " complete nonempty ordered action/scale audit before BEGIN",
+                      fields && actions > 0 && scales > 0 &&
+                      scales == result.report.plan.scale_windows.size() &&
+                      begin != std::string::npos && last < begin);
+                return text;
+            };
+            const auto off_audit = audit(off_log, off), on_audit = audit(on_log, on);
+            check(name + " full legacy/indexed audit strings equal", off_audit == on_audit);
+            const bool success = off.status == potal_paired_status::ok &&
+                                 on.status == potal_paired_status::ok;
+            check(name + " independent Main/Residual/radix/merged goldens",
+                  success && golden.ok && compare_stripe(f, in, expected, off, f.M).empty() &&
+                  compare_stripe(f, in, expected, on, f.M).empty() &&
+                  off.main_c == on.main_c && off.residual_c == on.residual_c);
+            // Same normalization as the I6 Graph/Scale comparator: only owned
+            // staging/output DMA is rebased. Main B=0 is not a Residual marker.
+            const auto commands = [&](const h2_emulator & emu, const run_result & result) {
+                auto records = emu.records;
+                uint64_t staging = UINT64_MAX;
+                const auto residual_address = [&](size_t i) {
+                    return records[i].funct == POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB &&
+                        i + 4 < records.size() && records[i + 4].funct == POTAL_FUNCT_LOOP_WS &&
+                        ((records[i + 4].rs1 >> 62) & 1) != 0;
+                };
+                for (size_t i = 0; i < records.size(); ++i)
+                    if (residual_address(i)) staging = std::min(staging, records[i].rs1);
+                const uint64_t cm = reinterpret_cast<uintptr_t>(result.c_main.get());
+                const uint64_t cr = reinterpret_cast<uintptr_t>(result.c_res.get());
+                const uint64_t main_bytes = align_up(result.main_c.size() / f.N, PD) *
+                                           align_up(f.N, PD) * sizeof(int32_t);
+                for (size_t i = 0; i < records.size(); ++i) {
+                    auto & word = records[i];
+                    if (residual_address(i)) word.rs1 -= staging;
+                    if (word.funct == POTAL_FUNCT_MVOUT)
+                        word.rs1 = word.rs1 >= cm && word.rs1 < cm + main_bytes ?
+                            word.rs1 - cm : (UINT64_C(1) << 63) | (word.rs1 - cr);
+                }
+                return records;
+            };
+            const auto before = commands(legacy.emu, off), after = commands(indexed.emu, on);
+            bool same = !before.empty() && before.size() == after.size();
+            for (size_t i = 0; same && i < before.size(); ++i)
+                same = before[i].funct == after[i].funct && before[i].xd == after[i].xd &&
+                       before[i].rs1 == after[i].rs1 && before[i].rs2 == after[i].rs2;
+            check(name + " every normalized funct/xd/rs1/rs2 in order", success && same);
+            if (write_comparison)
+                check(name + " nonempty Write command/count/carrier identity",
+                      success && legacy.writes > 0 && legacy.writes == indexed.writes &&
+                      legacy.writes == off.report.counts.scale_writes &&
+                      indexed.writes == on.report.counts.scale_writes && same);
+            if (release_comparison)
+                check(name + " explicit Release command/count identity",
+                      success && legacy.releases > 0 && legacy.releases == indexed.releases &&
+                      legacy.releases == off.report.counts.scale_releases &&
+                      indexed.releases == on.report.counts.scale_releases && same);
+            bool wrapped = false, saw255 = false, valid_generations = true;
+            for (const auto & word : legacy.emu.records)
+                if (word.funct == POTAL_FUNCT_SCALE_WRITE) {
+                    const uint32_t generation = (word.rs1 >> 8) & 255;
+                    saw255 = saw255 || generation == 255;
+                    wrapped = wrapped || (saw255 && generation == 1);
+                    valid_generations = valid_generations && generation != 0;
+                }
+            check(name + " counts and final generation retain wrap254",
+                  success && counts(off.report.counts) == counts(on.report.counts) &&
+                  off.generation == on.generation && off.generation == off.report.last_generation &&
+                  on.generation == on.report.last_generation && valid_generations && wrapped);
+            const auto idle = [](const run_result & r, const h2_emulator & e) {
+                bool done = !r.report.fatal && !r.session.failed && r.session.error == POTAL_OK &&
+                    r.session.error_stage == nullptr && !r.session.live_scale_slots &&
+                    !r.session.outstanding_loops && !r.session.outstanding_readbacks &&
+                    !r.session.outstanding_acc_updates && !r.session.index_transaction_open &&
+                    e.errors.empty() && !e.scale_miss && !e.stream_active &&
+                    !e.stream_continuous && !e.stream_early && e.completed_sources.empty();
+                for (size_t slot = 0; slot < POTAL_SCALE_ENTRIES; ++slot) {
+                    done = done && !e.scale_pairs[slot];
+                    for (const auto & entry : e.scales[slot]) done = done && !entry.valid;
+                }
+                for (size_t pair = 0; pair < 2; ++pair)
+                    done = done && !r.session.pair[pair].outstanding &&
+                        e.stream_pairs[pair].submitted == e.stream_pairs[pair].completed &&
+                        e.stream_pairs[pair].borrowed.empty();
+                return done;
+            };
+            check(name + " session/index/live/outstanding and emulator stream state",
+                  success && idle(off, legacy.emu) && idle(on, indexed.emu) &&
+                  session_state(off.session) == session_state(on.session) &&
+                  emulator_state(legacy.emu) == emulator_state(indexed.emu));
+            size_t most_windows = 0;
+            for (const auto & panel : off.report.tile.panels)
+                most_windows = std::max(most_windows, panel.windows.size());
+            check(name + " retains tails, multiple panels/groups and residual windows",
+                  success && off.report.tile.tile_I == 1 && off.report.tile.tile_J == 2 &&
+                  off.report.tile.tile_K == 8 && off.report.tile.k_panels == 3 &&
+                  off.report.tile.panels.back().k_tiles == 1 &&
+                  off.report.tile.j_groups == 2 && off.report.tile.pad_I == 16 &&
+                  off.report.tile.pad_J == 31 && (residual ? most_windows > 1 :
+                      off.report.tile.residual_windows == 0 && off.report.counts.residual_loop_ws == 0 &&
+                      off.report.counts.index_configs == 0 && off.report.counts.index_writes == 0));
+            if (write_comparison) {
+                potal_paired_session * owner = nullptr;
+                const auto owner_status = potal_paired_session_open(&on_sink, &owner);
+                check(name + " final owner reopened and closed",
+                      owner_status == POTAL_OK && potal_paired_session_close(owner) == POTAL_OK);
+            }
+            if (release_comparison || write_comparison) {
+                // As in the neighboring failure receipts, isolate quarantine:
+                // never drain unknown ownership just to run the other selector.
+                for (const bool lost : {false, true}) {
+                    const auto failure_receipt = [&](bool fast) {
+                        std::array<uint64_t, 15> receipt{};
+                        int channel[2];
+                        if (pipe(channel) != 0) { check(name + " Release pipe", false); return receipt; }
+                        std::fflush(nullptr);
+                        const pid_t child = fork();
+                        if (child == 0) {
+                            close(channel[0]);
+                            const char * option = write_comparison ?
+                                "POTAL_STREAM_WRITE_FAST" : "POTAL_STREAM_RELEASE_FAST";
+                            if (fast) setenv(option, "1", 1);
+                            else unsetenv(option);
+                            begin_capture failure;
+                            if (write_comparison) failure.fail_write = 2;
+                            else failure.fail_release = 2;
+                            failure.lose_response = lost;
+                            const potal_paired_sink sink{begin_capture::command, &failure};
+                            run_result result;
+                            (void) capture_window_diag(nullptr, [&] {
+                                result = run_paired(f, main, in, failure.emu, true, 254, false,
+                                    &sink, 1, nullptr, false, false, nullptr, mode, begin_capture::counter);
+                            });
+                            uint64_t state = UINT64_C(14695981039346656037);
+                            for (const auto & fields : {session_state(result.session),
+                                                       emulator_state(failure.emu), counts(result.report.counts)})
+                                for (const auto value : fields)
+                                    state = (state ^ value) * UINT64_C(1099511628211);
+                            uint64_t words = UINT64_C(14695981039346656037);
+                            for (const auto & word : failure.emu.records) {
+                                words = (words ^ word.funct) * UINT64_C(1099511628211);
+                                words = (words ^ word.xd) * UINT64_C(1099511628211);
+                                if (begin_capture::is_release(word) ||
+                                    (write_comparison && word.funct == POTAL_FUNCT_SCALE_WRITE)) {
+                                    words = (words ^ word.rs1) * UINT64_C(1099511628211);
+                                    words = (words ^ word.rs2) * UINT64_C(1099511628211);
+                                }
+                            }
+                            potal_paired_session * owner = nullptr;
+                            const auto owner_status = potal_paired_session_open(&sink, &owner);
+                            if (owner_status == POTAL_OK) (void) potal_paired_session_close(owner);
+                            receipt = {{uint64_t(result.status == potal_paired_status::execution_failed &&
+                                result.report.hw_status == (lost ? POTAL_ERR_NO_HARDWARE : POTAL_HW_INVALID_ADDRESS) &&
+                                std::string(result.report.stage ? result.report.stage : "") ==
+                                    (write_comparison ? "stream_scale_write" : "stream_scale_release")),
+                                uint64_t(result.report.fatal), uint64_t(result.report.cleaned),
+                                uint64_t(owner_status), state, words, failure.emu.records.size(),
+                                write_comparison ? failure.writes : failure.releases,
+                                uint64_t(result.main_c.empty() && result.residual_c.empty()),
+                                uint64_t(failure.emu.errors.empty()), result.generation,
+                                uint64_t(result.session.failed), failure.commands_after_failure,
+                                uint64_t(result.session.error ==
+                                    (lost ? POTAL_ERR_NO_HARDWARE : POTAL_HW_INVALID_ADDRESS)),
+                                result.report.counts.scale_writes}};
+                            ssize_t sent;
+                            do { sent = write(channel[1], receipt.data(), sizeof(receipt)); } while (sent < 0 && errno == EINTR);
+                            close(channel[1]);
+                            _exit(sent == ssize_t(sizeof(receipt)) ? 0 : 1);
+                        }
+                        close(channel[1]);
+                        ssize_t received;
+                        do { received = read(channel[0], receipt.data(), sizeof(receipt)); } while (received < 0 && errno == EINTR);
+                        close(channel[0]);
+                        int status = 0;
+                        pid_t reaped;
+                        do { reaped = child > 0 ? waitpid(child, &status, 0) : -1; } while (reaped < 0 && errno == EINTR);
+                        check(name + " Release failure process receipt",
+                              child > 0 && received == ssize_t(sizeof(receipt)) &&
+                              reaped == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                        return receipt;
+                    };
+                    const auto baseline = failure_receipt(false), fast = failure_receipt(true);
+                    check(name + (lost ? " lost response state/cleanup/ownership identical" :
+                                        " answered failure state/cleanup/ownership identical"),
+                          baseline == fast && baseline[0] == 1 && baseline[7] >= 2 &&
+                          baseline[8] == 1 && baseline[9] == 1 && baseline[11] == 1 &&
+                          (baseline[1] ? baseline[2] == 0 && baseline[3] == uint64_t(POTAL_ERR_BUSY) :
+                                             baseline[2] == 1 && baseline[3] == uint64_t(POTAL_OK)));
+                    if (write_comparison)
+                        check(name + " second Write retains first failure and unpublished generation without drain",
+                              baseline[7] == 2 && baseline[10] == 254 &&
+                              baseline[12] == 0 && baseline[13] == 1 && baseline[14] == 1);
+                }
+            }
+        }
+    }
+    if (had_indexed) setenv("POTAL_STREAM_PREPARE_INDEXED", indexed_saved.c_str(), 1);
+    else unsetenv("POTAL_STREAM_PREPARE_INDEXED");
+    if (had_audit) setenv("POTAL_STREAM_PREPARE_AUDIT", audit_saved.c_str(), 1);
+    else unsetenv("POTAL_STREAM_PREPARE_AUDIT");
+    if (had_release) setenv("POTAL_STREAM_RELEASE_FAST", release_saved.c_str(), 1);
+    else unsetenv("POTAL_STREAM_RELEASE_FAST");
+    if (had_write) setenv("POTAL_STREAM_WRITE_FAST", write_saved.c_str(), 1);
+    else unsetenv("POTAL_STREAM_WRITE_FAST");
+}
+
+void test_index_window_profile() {
+    if (PD != 32) return;
+    std::vector<std::pair<std::string, std::pair<bool, std::string>>> environment;
+    for (const char * name : {"POTAL_INDEX_WINDOW_PROFILE", "POTAL_PAIRED_TIMING", "POTAL_PAIRED_PROFILE",
+             "POTAL_GRAPH_CPU", "POTAL_INDEX_PROFILE", "POTAL_SCALE_CPU", "POTAL_RAW_TRACE",
+             "POTAL_EARLY_TRACE", "POTAL_PAIRED_WINDOW_DIAG", "POTAL_RESIDUAL_TRACE"}) {
+        const char * value = std::getenv(name);
+        environment.push_back({name, {value != nullptr, value ? value : ""}});
+        unsetenv(name);
+    }
+    paired_fixture f(16, 65, 544, 237,
+        [](size_t block, size_t column) { return int16_t((block + column) % 3); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool fixture = f.ok &&
+        potal_frozen_plan(f.M, f.N, f.K, 1, 2, 8, PPB, &main) == POTAL_OK &&
+        make_inputs(f, PD, within_k(dense_entries(7, 40, 100), f.K), in);
+    check("Window profile fixture", fixture);
+    size_t final_fence = 0;
+    if (fixture) for (bool conservative : {false, true}) {
+        h2_emulator off_emu, on_emu;
+        run_result off, on;
+        unsetenv("POTAL_INDEX_WINDOW_PROFILE");
+        const auto off_log = capture_window_diag(nullptr, [&] {
+            off = run_paired(f, main, in, off_emu, true, 0, conservative, nullptr, 1);
+        });
+        setenv("POTAL_INDEX_WINDOW_PROFILE", "1", 1);
+        const auto on_log = capture_window_diag(nullptr, [&] {
+            on = run_paired(f, main, in, on_emu, true, 0, conservative, nullptr, 1);
+        });
+        const auto normalized = [&](const h2_emulator & emu, const run_result & r) {
+            auto words = emu.records;
+            uint64_t staging = UINT64_MAX;
+            const auto residual = [&](size_t i) {
+                return words[i].funct == POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB &&
+                    i + 4 < words.size() && words[i + 4].funct == POTAL_FUNCT_LOOP_WS &&
+                    ((words[i + 4].rs1 >> 62) & 1);
+            };
+            for (size_t i = 0; i < words.size(); ++i)
+                if (residual(i)) staging = std::min(staging, words[i].rs1);
+            const auto cm = reinterpret_cast<uintptr_t>(r.c_main.get());
+            const auto cr = reinterpret_cast<uintptr_t>(r.c_res.get());
+            const size_t bytes = align_up(f.M, PD) * align_up(f.N, PD) * sizeof(int32_t);
+            for (size_t i = 0; i < words.size(); ++i) {
+                if (residual(i)) words[i].rs1 -= staging;
+                if (words[i].funct == POTAL_FUNCT_MVOUT)
+                    words[i].rs1 = words[i].rs1 >= cm && words[i].rs1 < cm + bytes ?
+                        words[i].rs1 - cm : (UINT64_C(1) << 63) | (words[i].rs1 - cr);
+            }
+            return words;
+        };
+        const auto a = normalized(off_emu, off), b = normalized(on_emu, on);
+        bool same = a.size() == b.size();
+        for (size_t i = 0; same && i < a.size(); ++i)
+            same = a[i].funct == b[i].funct && a[i].xd == b[i].xd &&
+                   a[i].rs1 == b[i].rs1 && a[i].rs2 == b[i].rs2;
+        check("Window profile exact normalized commands and golden equivalence",
+            off.status == potal_paired_status::ok && on.status == potal_paired_status::ok &&
+            same && off.main_c == on.main_c && off.residual_c == on.residual_c &&
+            compare_stripe(f, in, serialized_of(f, main.tile_I * PD, in), on, f.M).empty());
+        check("Window profile preserves drained ownership",
+            off_emu.errors.empty() && on_emu.errors.empty() && !on.report.fatal &&
+            !on.session.failed && !on.session.live_scale_slots && !on.session.outstanding_loops &&
+            !on.session.outstanding_readbacks && !on.session.index_transaction_open);
+        if (!conservative) final_fence = count_funct(on_emu, POTAL_FUNCT_FENCE);
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+        check("Window profile alone suppresses default legacy wall clocks", on.hot_clock_reads == 0);
+#endif
+        std::map<std::string, size_t> counts, calls;
+        std::map<size_t, size_t> windows;
+        bool valid = off_log.find("[POTAL_INDEX_WINDOW]") == std::string::npos;
+        size_t pos = 0, records = 0;
+        const size_t aliases = off.report.counts.scale_reused_windows;
+        while ((pos = on_log.find("[POTAL_INDEX_WINDOW] ", pos)) != std::string::npos) {
+            const size_t end = on_log.find('\n', pos);
+            const auto line = on_log.substr(pos, end - pos);
+            const size_t k = line.find("kind=") + 5;
+            const auto kind = line.substr(k, line.find(' ', k) - k);
+            ++counts[kind];
+            calls[kind] += window_diag_field(line, "calls");
+            const size_t op_id = window_diag_field(line, "op");
+            valid = valid && window_diag_field(line, "status") == POTAL_OK &&
+                window_diag_field(line, "start") == 0 && window_diag_field(line, "end") == 0 &&
+                window_diag_field(line, "cycle_supported") == 0 &&
+                window_diag_field(line, "final_checked") == 1;
+            if (kind == "final_drain") valid = valid && op_id == SIZE_MAX &&
+                window_diag_field(line, "calls") == 1 && end + 1 == on_log.size();
+            else {
+                valid = valid && op_id < on.report.plan.ops.size();
+                if (op_id < on.report.plan.ops.size()) {
+                    const auto & op = on.report.plan.ops[op_id];
+                    valid = valid && window_diag_field(line, "group") == op.j_group &&
+                        window_diag_field(line, "panel") == op.panel && window_diag_field(line, "pair") == op.pair;
+                    if (kind == "alias_fence") valid = valid &&
+                        op.kind == potal_paired_op_kind::scale_release &&
+                        on.report.plan.scale_windows[op.scale_window].residual &&
+                        window_diag_field(line, "calls") == 1;
+                    if (kind == "completion_fence") valid = valid && window_diag_field(line, "calls") == 1;
+                    if (kind == "index_config" || kind == "index_write" ||
+                        kind == "descriptor" || kind == "residual_issue") {
+                        const size_t window = window_diag_field(line, "window");
+                        ++windows[window];
+                        valid = valid && window != SIZE_MAX && window < on.report.counts.index_configs &&
+                            window_diag_field(line, "entries") ==
+                                on.report.tile.panels[op.panel].windows[op.window].active_rows;
+                    }
+                }
+            }
+            ++records;
+            pos = end;
+        }
+        for (const auto & w : windows) valid = valid && w.second == 4;
+        const size_t n = on.report.counts.index_configs;
+        std::printf("Window records conservative=%u valid=%u windows=%zu configs=%zu writes=%zu/%" PRIu64
+            " descriptor=%zu issue=%zu alias=%zu/%zu completion=%zu final=%zu fences=%" PRIu64
+            " actual=%zu records=%zu\n", unsigned(conservative), unsigned(valid), windows.size(), n,
+            calls["index_write"], on.report.counts.index_writes, counts["descriptor"], counts["residual_issue"],
+            counts["alias_fence"], aliases, counts["completion_fence"], counts["final_drain"],
+            on.report.counts.fences, count_funct(on_emu, POTAL_FUNCT_FENCE), records);
+        check("Window raw records classes counts bounds status and native zero cycles",
+            valid && n > 1 && windows.size() == n && counts["index_config"] == n &&
+            counts["index_write"] == n && counts["descriptor"] == n && counts["residual_issue"] == n &&
+            calls["index_config"] == n && calls["index_write"] == on.report.counts.index_writes &&
+            calls["descriptor"] == 0 && calls["residual_issue"] == on.report.counts.residual_loop_ws &&
+            counts["alias_fence"] == aliases && aliases > 0 && counts["final_drain"] == 1 &&
+            counts["completion_fence"] == off.report.counts.fences - aliases - 1 &&
+            (!conservative || counts["completion_fence"] > 0) &&
+            calls["alias_fence"] + calls["completion_fence"] + calls["final_drain"] ==
+                count_funct(on_emu, POTAL_FUNCT_FENCE) &&
+            records == 4 * n + on.report.counts.fences);
+    }
+    if (fixture) for (const auto failure : {
+            std::pair<uint32_t, size_t>{POTAL_FUNCT_INDEX_CONFIG, 1},
+            {POTAL_FUNCT_INDEX_WRITE, 2}, {POTAL_FUNCT_LOOP_WS, 2},
+            {POTAL_FUNCT_FENCE, 1}, {POTAL_FUNCT_FENCE, final_fence}}) {
+        const auto receipt = [&](bool enabled) {
+            std::array<uint64_t, 13> result{};
+            int channel[2];
+            if (pipe(channel) != 0) { check("Window failure pipe", false); return result; }
+            std::fflush(nullptr);
+            const pid_t child = fork();
+            if (child == 0) {
+                close(channel[0]);
+                if (enabled) setenv("POTAL_INDEX_WINDOW_PROFILE", "1", 1);
+                else unsetenv("POTAL_INDEX_WINDOW_PROFILE");
+                struct failing_sink {
+                    h2_emulator emu;
+                    uint32_t funct;
+                    size_t ordinal, seen = 0;
+                    static potal_status command(void * context, const potal_paired_cmd_record * word) {
+                        auto & self = *static_cast<failing_sink *>(context);
+                        if (word->funct == self.funct && ++self.seen == self.ordinal) {
+                            self.emu.fail_funct = self.funct;
+                            self.emu.fail_status = POTAL_HW_INVALID_ADDRESS;
+                        }
+                        return self.emu.command(*word);
+                    }
+                } sink{{}, failure.first, failure.second};
+                const potal_paired_sink checked{failing_sink::command, &sink};
+                run_result r;
+                const auto text = capture_window_diag(nullptr, [&] {
+                    r = run_paired(f, main, in, sink.emu, true, 0, false, &checked, 1);
+                });
+                uint64_t hash = UINT64_C(14695981039346656037);
+                for (const auto & word : sink.emu.records) {
+                    hash = (hash ^ word.funct) * UINT64_C(1099511628211);
+                    hash = (hash ^ word.xd) * UINT64_C(1099511628211);
+                    if (word.funct == POTAL_FUNCT_INDEX_CONFIG || word.funct == POTAL_FUNCT_INDEX_WRITE) {
+                        hash = (hash ^ word.rs1) * UINT64_C(1099511628211);
+                        hash = (hash ^ word.rs2) * UINT64_C(1099511628211);
+                    }
+                }
+                potal_paired_session * owner = nullptr;
+                const auto next = sink.emu.sink();
+                const auto reopened = potal_paired_session_open(&next, &owner);
+                if (reopened == POTAL_OK) (void) potal_paired_session_close(owner);
+                const char * stage = failure.first == POTAL_FUNCT_INDEX_CONFIG ? "index_config" :
+                    failure.first == POTAL_FUNCT_INDEX_WRITE ? "index_write" :
+                    failure.first == POTAL_FUNCT_LOOP_WS ? "residual_loop_ws" : "fence";
+                result = {{uint64_t(r.status == potal_paired_status::execution_failed &&
+                    r.report.stage && std::strcmp(r.report.stage, stage) == 0 &&
+                    r.report.hw_status == POTAL_HW_INVALID_ADDRESS),
+                    uint64_t(r.report.fatal), uint64_t(r.report.cleaned), r.session.failed,
+                    r.session.live_scale_slots, r.session.outstanding_loops, r.session.outstanding_readbacks,
+                    r.session.index_transaction_open, uint64_t(reopened), hash, sink.emu.records.size(),
+                    uint64_t(text.find("[POTAL_INDEX_WINDOW]") != std::string::npos),
+                    count_funct(sink.emu, POTAL_FUNCT_FENCE)}};
+                ssize_t n;
+                do { n = write(channel[1], result.data(), sizeof(result)); } while (n < 0 && errno == EINTR);
+                close(channel[1]);
+                _exit(n == ssize_t(sizeof(result)) ? 0 : 1);
+            }
+            close(channel[1]);
+            ssize_t n;
+            do { n = read(channel[0], result.data(), sizeof(result)); } while (n < 0 && errno == EINTR);
+            close(channel[0]);
+            int status = 0;
+            pid_t reaped;
+            do { reaped = child > 0 ? waitpid(child, &status, 0) : -1; } while (reaped < 0 && errno == EINTR);
+            check("Window failure isolated receipt exit0", child > 0 && reaped == child &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 0 && n == ssize_t(sizeof(result)));
+            return result;
+        };
+        const auto off = receipt(false), on = receipt(true);
+        check("Window errors and final drain failure preserve cleanup ownership and suppress samples",
+              off == on && on[0] == 1 && on[11] == 0);
+    }
+    if (fixture) {
+        for (const char * value : {"0", "true"}) {
+            setenv("POTAL_INDEX_WINDOW_PROFILE", value, 1);
+            h2_emulator emu;
+            run_result r;
+            const auto text = capture_window_diag(nullptr, [&] {
+                r = run_paired(f, main, in, emu, true, 0, false, nullptr, 1);
+            });
+            check("Window flag accepts only exact opt in",
+                  r.status == potal_paired_status::ok && text.find("[POTAL_INDEX_WINDOW]") == std::string::npos);
+        }
+        setenv("POTAL_INDEX_WINDOW_PROFILE", "1", 1);
+        struct snapshot_sink {
+            h2_emulator emu;
+            bool changed = false;
+            static potal_status command(void * context, const potal_paired_cmd_record * word) {
+                auto & self = *static_cast<snapshot_sink *>(context);
+                if (!self.changed) {
+                    setenv("POTAL_INDEX_WINDOW_PROFILE", "0", 1);
+                    self.changed = true;
+                }
+                return self.emu.command(*word);
+            }
+        } snapshot;
+        const potal_paired_sink snap_sink{snapshot_sink::command, &snapshot};
+        run_result snapped;
+        const auto snap_log = capture_window_diag(nullptr, [&] {
+            snapped = run_paired(f, main, in, snapshot.emu, true, 0, false, &snap_sink, 1);
+        });
+        check("Window flag snapshotted before first command",
+              snapped.status == potal_paired_status::ok && snapshot.changed &&
+              snap_log.find("kind=final_drain") != std::string::npos);
+        setenv("POTAL_INDEX_WINDOW_PROFILE", "1", 1);
+        for (const char * name : {"POTAL_PAIRED_PROFILE", "POTAL_GRAPH_CPU", "POTAL_INDEX_PROFILE",
+                 "POTAL_SCALE_CPU", "POTAL_RAW_TRACE", "POTAL_EARLY_TRACE",
+                 "POTAL_PAIRED_WINDOW_DIAG", "POTAL_RESIDUAL_TRACE"}) {
+            setenv(name, "1", 1);
+            h2_emulator emu;
+            const auto r = run_paired(f, main, in, emu, true, 0, false, nullptr, 1);
+            check("Window incompatible diagnostic refused before commands",
+                  r.status == potal_paired_status::invalid_argument && emu.records.empty() && !r.report.issued);
+            unsetenv(name);
+        }
+        for (int route = 0; route < 3; ++route) {
+            h2_emulator emu;
+            const auto r = run_paired(f, main, in, emu, true, 0, false, nullptr, route == 0 ? 0 : 1,
+                nullptr, route == 1, false, nullptr,
+                route == 2 ? potal_paired_stream_mode::continuous_early : potal_paired_stream_mode::off);
+            check("Window unsupported route refused before commands",
+                  r.status == potal_paired_status::invalid_argument && emu.records.empty());
+        }
+    }
+    for (const auto & e : environment) {
+        if (e.second.first) setenv(e.first.c_str(), e.second.second.c_str(), 1);
+        else unsetenv(e.first.c_str());
+    }
+}
+
+void test_first_index_profile(potal_paired_stream_mode mode) {
+    if (PD != 32) return;
+    paired_fixture f(16, 65, 544, 237,
+        [](size_t block, size_t column) { return int16_t((block + column) % 3); });
+    potal_tile_plan main;
+    paired_inputs in;
+    const bool fixture = f.ok &&
+        potal_frozen_plan(f.M, f.N, f.K, 1, 2, 8, PPB, &main) == POTAL_OK &&
+        make_inputs(f, PD, within_k(dense_entries(7, 40, 100), f.K), in);
+    check("Index profile fixture", fixture);
+    if (!fixture) return;
+    const char * previous = std::getenv("POTAL_INDEX_PROFILE");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    const char * graph_previous = std::getenv("POTAL_GRAPH_CPU");
+    const bool had_graph_previous = graph_previous != nullptr;
+    const std::string graph_saved = graph_previous ? graph_previous : "";
+    const char * scale_previous = std::getenv("POTAL_SCALE_CPU");
+    const bool had_scale_previous = scale_previous != nullptr;
+    const std::string scale_saved = scale_previous ? scale_previous : "";
+    h2_emulator off_emu, on_emu;
+    run_result off, on;
+    unsetenv("POTAL_INDEX_PROFILE");
+    unsetenv("POTAL_GRAPH_CPU");
+    unsetenv("POTAL_SCALE_CPU");
+    const std::string off_log = capture_window_diag(nullptr, [&] {
+        off = run_paired(f, main, in, off_emu, true, 0, false, nullptr, 1, nullptr,
+            false, false, nullptr, mode);
+    });
+    setenv("POTAL_INDEX_PROFILE", "1", 1);
+    setenv("POTAL_GRAPH_CPU", "1", 1);
+    const std::string on_log = capture_window_diag(nullptr, [&] {
+        on = run_paired(f, main, in, on_emu, true, 0, false, nullptr, 1, nullptr,
+            false, false, nullptr, mode);
+    });
+    if (had_previous) setenv("POTAL_INDEX_PROFILE", saved.c_str(), 1);
+    else unsetenv("POTAL_INDEX_PROFILE");
+    if (had_graph_previous) setenv("POTAL_GRAPH_CPU", graph_saved.c_str(), 1);
+    else unsetenv("POTAL_GRAPH_CPU");
+    const auto index_words = [](const h2_emulator & emu) {
+        std::vector<potal_paired_cmd_record> words;
+        for (const auto & word : emu.records)
+            if (word.funct == POTAL_FUNCT_INDEX_CONFIG || word.funct == POTAL_FUNCT_INDEX_WRITE)
+                words.push_back(word);
+        return words;
+    };
+    const auto before = index_words(off_emu), after = index_words(on_emu);
+    bool same_words = before.size() == after.size() && !before.empty();
+    for (size_t i = 0; same_words && i < before.size(); ++i)
+        same_words = before[i].funct == after[i].funct && before[i].xd == after[i].xd &&
+                     before[i].rs1 == after[i].rs1 && before[i].rs2 == after[i].rs2;
+    check("Index profile ON/OFF retains exact ordered CONFIG/WRITE contents and counts",
+          off.status == potal_paired_status::ok && on.status == potal_paired_status::ok &&
+          same_words && off.report.counts.index_configs == on.report.counts.index_configs &&
+          off.report.counts.index_writes == on.report.counts.index_writes &&
+          off_emu.records.size() == on_emu.records.size());
+    check("Index profile ON/OFF retains numerical outputs and completed ownership",
+          on.main_c == off.main_c && on.residual_c == off.residual_c &&
+          off_emu.errors.empty() && on_emu.errors.empty() &&
+          !on.report.fatal && !on.session.failed && !on.session.live_scale_slots &&
+          !on.session.outstanding_loops && !on.session.outstanding_readbacks &&
+          !on.session.index_transaction_open && !on_emu.stream_active);
+    // Isolate Graph/Scale CPU diagnostics from INDEX_PROFILE. Normalize only owned DMA,
+    // retaining every command, operand offset, funct, xd and order.
+    const auto commands = [&](const h2_emulator & emu, const run_result & result) {
+        auto records = emu.records;
+        uint64_t staging = UINT64_MAX;
+        const auto residual_address = [&](size_t i) {
+            // A prefetched Main also has B DRAM=0. Use the actual path bit,
+            // not B's address, to identify invocation-owned Residual staging.
+            return records[i].funct == POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB &&
+                i + 4 < records.size() && records[i + 4].funct == POTAL_FUNCT_LOOP_WS &&
+                ((records[i + 4].rs1 >> 62) & 1) != 0;
+        };
+        for (size_t i = 0; i < records.size(); ++i)
+            if (residual_address(i)) staging = std::min(staging, records[i].rs1);
+        const uint64_t cm = reinterpret_cast<uintptr_t>(result.c_main.get());
+        const uint64_t cr = reinterpret_cast<uintptr_t>(result.c_res.get());
+        const uint64_t main_bytes = align_up(result.main_c.size() / f.N, PD) *
+                                   align_up(f.N, PD) * sizeof(int32_t);
+        for (size_t i = 0; i < records.size(); ++i) {
+            auto & word = records[i];
+            if (residual_address(i)) word.rs1 -= staging;
+            if (word.funct == POTAL_FUNCT_MVOUT)
+                word.rs1 = word.rs1 >= cm && word.rs1 < cm + main_bytes ?
+                    word.rs1 - cm : (UINT64_C(1) << 63) | (word.rs1 - cr);
+        }
+        return records;
+    };
+    unsetenv("POTAL_INDEX_PROFILE");
+    setenv("POTAL_GRAPH_CPU", "1", 1);
+    setenv("POTAL_SCALE_CPU", "1", 1);
+    h2_emulator graph_emu;
+    run_result graph;
+    const std::string graph_log = capture_window_diag(nullptr, [&] {
+        graph = run_paired(f, main, in, graph_emu, true, 0, false, nullptr, 1, nullptr,
+            false, false, nullptr, mode);
+    });
+    if (had_previous) setenv("POTAL_INDEX_PROFILE", saved.c_str(), 1);
+    else unsetenv("POTAL_INDEX_PROFILE");
+    if (had_graph_previous) setenv("POTAL_GRAPH_CPU", graph_saved.c_str(), 1);
+    else unsetenv("POTAL_GRAPH_CPU");
+    if (had_scale_previous) setenv("POTAL_SCALE_CPU", scale_saved.c_str(), 1);
+    else unsetenv("POTAL_SCALE_CPU");
+    const auto off_words = commands(off_emu, off);
+    const auto graph_words = commands(graph_emu, graph);
+    bool all_words = off_words.size() == graph_words.size();
+    for (size_t i = 0; all_words && i < off_words.size(); ++i)
+        all_words = off_words[i].funct == graph_words[i].funct &&
+            off_words[i].xd == graph_words[i].xd &&
+            off_words[i].rs1 == graph_words[i].rs1 && off_words[i].rs2 == graph_words[i].rs2;
+    check("Graph CPU isolated numeric and completed session",
+          graph.status == potal_paired_status::ok && graph_emu.errors.empty() &&
+          graph.main_c == off.main_c && graph.residual_c == off.residual_c &&
+          !graph.report.fatal && !graph.session.failed && !graph.session.live_scale_slots &&
+          !graph.session.outstanding_loops && !graph.session.outstanding_readbacks &&
+          !graph.session.index_transaction_open && !graph_emu.stream_active);
+    check("Graph and Scale CPU diagnostics preserve every ordered command field, numerics and ownership",
+          all_words && graph.status == potal_paired_status::ok && graph_emu.errors.empty() &&
+          graph.main_c == off.main_c && graph.residual_c == off.residual_c &&
+          !graph.report.fatal && !graph.session.failed && !graph.session.live_scale_slots &&
+          !graph.session.outstanding_loops && !graph.session.outstanding_readbacks &&
+          !graph.session.index_transaction_open && !graph_emu.stream_active &&
+          graph_log.find("[POTAL_GRAPH_CPU]") != std::string::npos &&
+          graph_log.find("[POTAL_SCALE_CPU]") != std::string::npos &&
+          graph_log.find("[POTAL_INDEX_PROFILE]") == std::string::npos &&
+          graph.hot_clock_reads == 0);
+    const size_t prefix = on_log.find("[POTAL_INDEX_PROFILE]");
+    check("Graph CPU diagnostic is default OFF and partitions completed playback",
+          off_log.find("[POTAL_GRAPH_CPU]") == std::string::npos &&
+          on_log.find("[POTAL_GRAPH_CPU]") != std::string::npos &&
+          window_diag_field(on_log, "bucket_sum") <= window_diag_field(on_log, "total") &&
+          window_diag_field(on_log, "unbucketed") ==
+              window_diag_field(on_log, "total") - window_diag_field(on_log, "bucket_sum"));
+    const auto first = std::find_if(on.report.plan.ops.begin(), on.report.plan.ops.end(),
+        [](const potal_paired_op & op) { return op.kind == potal_paired_op_kind::index_program; });
+    check("Index profile emits only one completed first-window machine record",
+          off_log.find("[POTAL_INDEX_PROFILE]") == std::string::npos &&
+          prefix != std::string::npos &&
+          on_log.find("[POTAL_INDEX_PROFILE]", prefix + 1) == std::string::npos &&
+          first != on.report.plan.ops.end() &&
+          window_diag_field(on_log, "entries") == first->entry_end - first->entry_begin &&
+          window_diag_field(on_log, "write_issued") == first->entry_end - first->entry_begin &&
+          window_diag_field(on_log, "config_issued") == 1 &&
+          window_diag_field(on_log, "config_status") == POTAL_OK &&
+          window_diag_field(on_log, "write_status") == POTAL_OK &&
+          window_diag_field(on_log, "residual_issued") == 1 &&
+          window_diag_field(on_log, "t3") != SIZE_MAX &&
+          window_diag_field(on_log, "t3") >= window_diag_field(on_log, "t2") &&
+          window_diag_field(on_log, "residual_prepare_cpu_cycles") ==
+              window_diag_field(on_log, "t3") - window_diag_field(on_log, "t2") &&
+          window_diag_field(on_log, "t4") != SIZE_MAX &&
+          window_diag_field(on_log, "t4") >= window_diag_field(on_log, "t3") &&
+          window_diag_field(on_log, "residual_api_cpu_cycles") ==
+              window_diag_field(on_log, "t4") - window_diag_field(on_log, "t3") &&
+          on_log.find(mode == potal_paired_stream_mode::off ?
+              "residual_api=potal_paired_loop_ws_issue\n" :
+              "residual_api=potal_paired_stream_loop_issue\n") != std::string::npos &&
+          window_diag_field(on_log, "stripe") == 0 && window_diag_field(on_log, "group") == 0 &&
+          window_diag_field(on_log, "panel") == 0 && window_diag_field(on_log, "window") == 0);
+    h2_emulator other_emu;
+    run_result other;
+    capture_window_diag(nullptr, [&] {
+        other = run_paired(f, main, in, other_emu, true, 0, false, nullptr, 1, nullptr,
+            false, false, nullptr, mode == potal_paired_stream_mode::off ?
+                potal_paired_stream_mode::continuous_early : potal_paired_stream_mode::off);
+    });
+    const auto other_words = index_words(other_emu);
+    bool same_routes = after.size() == other_words.size() && !after.empty();
+    for (size_t i = 0; same_routes && i < after.size(); ++i)
+        same_routes = after[i].funct == other_words[i].funct && after[i].xd == other_words[i].xd &&
+                      after[i].rs1 == other_words[i].rs1 && after[i].rs2 == other_words[i].rs2;
+    check("K-tile and Continuous Early retain exact ordered Index commands",
+          same_routes && other.status == potal_paired_status::ok &&
+          other.main_c == on.main_c && other.residual_c == on.residual_c && other_emu.errors.empty());
+#if defined(POTAL_TEST_CLOCK_OBSERVER)
+    check("Index cycle diagnostic adds no hot steady_clock reads",
+          off.hot_clock_reads == 0 && on.hot_clock_reads == 0);
+#endif
+    // Isolate either ownership outcome; never drain a quarantined test to
+    // manufacture a second run. Compare the actual ON/OFF failure receipts.
+    struct fail_profile_command {
+        h2_emulator emu;
+        uint32_t funct;
+        size_t ordinal, seen = 0;
+        static potal_status command(void * context, const potal_paired_cmd_record * record) {
+            auto & self = *static_cast<fail_profile_command *>(context);
+            if (record->funct == self.funct &&
+                (self.funct != POTAL_FUNCT_STREAM || record->rs1 == 5) &&
+                ++self.seen == self.ordinal) {
+                self.emu.fail_funct = self.funct;
+                self.emu.fail_status = POTAL_HW_INVALID_ADDRESS;
+            }
+            return self.emu.command(*record);
+        }
+        static potal_status counter(void * context, const potal_paired_cmd_record * record, uint64_t * value) {
+            return h2_emulator::on_counter(&static_cast<fail_profile_command *>(context)->emu, record, value);
+        }
+    };
+    for (const uint32_t funct : {POTAL_FUNCT_INDEX_CONFIG, POTAL_FUNCT_INDEX_WRITE, POTAL_FUNCT_LOOP_WS,
+                                POTAL_FUNCT_SCALE_WRITE, mode == potal_paired_stream_mode::off ?
+                                    POTAL_FUNCT_SCALE_RELEASE : POTAL_FUNCT_STREAM}) {
+      for (const bool graph_only : {false, true}) {
+        const auto failure_receipt = [&](bool enabled) {
+            std::array<uint64_t, 14> receipt{};
+            int channel[2];
+            if (pipe(channel) != 0) { check("Index failure pipe", false); return receipt; }
+            std::fflush(nullptr);
+            const pid_t child = fork();
+            if (child == 0) {
+                close(channel[0]);
+                if (enabled && !graph_only) setenv("POTAL_INDEX_PROFILE", "1", 1);
+                else unsetenv("POTAL_INDEX_PROFILE");
+                if (enabled && graph_only) setenv("POTAL_GRAPH_CPU", "1", 1);
+                else unsetenv("POTAL_GRAPH_CPU");
+                if (enabled && graph_only) setenv("POTAL_SCALE_CPU", "1", 1);
+                else unsetenv("POTAL_SCALE_CPU");
+                fail_profile_command failure = {{}, funct, funct == POTAL_FUNCT_LOOP_WS ? size_t(2) : size_t(1)};
+                auto & emu = failure.emu;
+                const potal_paired_sink failing_sink = {&fail_profile_command::command, &failure};
+                run_result result;
+                const auto text = capture_window_diag(nullptr, [&] {
+                    result = run_paired(f, main, in, emu, true, 0, false, &failing_sink, 1, nullptr,
+                        false, false, nullptr, mode, fail_profile_command::counter);
+                });
+                uint64_t words = UINT64_C(14695981039346656037);
+                for (const auto & word : emu.records) {
+                    words = (words ^ word.funct) * UINT64_C(1099511628211);
+                    words = (words ^ word.xd) * UINT64_C(1099511628211);
+                    if (word.funct == POTAL_FUNCT_INDEX_CONFIG || word.funct == POTAL_FUNCT_INDEX_WRITE) {
+                        words = (words ^ word.rs1) * UINT64_C(1099511628211);
+                        words = (words ^ word.rs2) * UINT64_C(1099511628211);
+                    }
+                }
+                potal_paired_session * owner = nullptr;
+                const auto sink = emu.sink();
+                const auto owner_status = potal_paired_session_open(&sink, &owner);
+                if (owner_status == POTAL_OK) (void) potal_paired_session_close(owner);
+                const char * expected_stage =
+                    funct == POTAL_FUNCT_INDEX_CONFIG ? "index_config" :
+                    funct == POTAL_FUNCT_INDEX_WRITE ? "index_write" :
+                    funct == POTAL_FUNCT_LOOP_WS ? "residual_loop_ws" :
+                    funct == POTAL_FUNCT_SCALE_WRITE ?
+                        (mode == potal_paired_stream_mode::off ? "scale_write" : "stream_scale_write") :
+                        (mode == potal_paired_stream_mode::off ? "scale_release" : "stream_scale_release");
+                const bool failed_at_stage = result.status == potal_paired_status::execution_failed &&
+                    result.report.hw_status == POTAL_HW_INVALID_ADDRESS &&
+                    std::string(result.report.stage ? result.report.stage : "") == expected_stage;
+                receipt = {{uint64_t(failed_at_stage), uint64_t(result.report.fatal),
+                    uint64_t(result.report.cleaned), result.session.failed,
+                    result.session.live_scale_slots, result.session.outstanding_loops,
+                    result.session.outstanding_readbacks, result.session.index_transaction_open,
+                    uint64_t(owner_status), words, emu.records.size(),
+                    count_funct(emu, POTAL_FUNCT_INDEX_CONFIG), count_funct(emu, POTAL_FUNCT_INDEX_WRITE),
+                    uint64_t(text.find("[POTAL_INDEX_PROFILE]") != std::string::npos ||
+                             text.find("[POTAL_GRAPH_CPU]") != std::string::npos ||
+                             text.find("[POTAL_SCALE_CPU]") != std::string::npos)}};
+                ssize_t sent;
+                do { sent = write(channel[1], receipt.data(), sizeof(receipt)); } while (sent < 0 && errno == EINTR);
+                close(channel[1]);
+                _exit(sent == ssize_t(sizeof(receipt)) ? 0 : 1);
+            }
+            close(channel[1]);
+            ssize_t received;
+            do { received = read(channel[0], receipt.data(), sizeof(receipt)); } while (received < 0 && errno == EINTR);
+            close(channel[0]);
+            int status = 0;
+            pid_t reaped;
+            do { reaped = child > 0 ? waitpid(child, &status, 0) : -1; } while (reaped < 0 && errno == EINTR);
+            check("Index failure process receipt", child > 0 && received == ssize_t(sizeof(receipt)) &&
+                  reaped == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            return receipt;
+        };
+        const auto baseline = failure_receipt(false);
+        const auto diagnostic = failure_receipt(true);
+        check("CPU diagnostics preserve injected error, cleanup, command order and ownership",
+              baseline == diagnostic && baseline[0] == 1 && baseline[13] == 0);
+      }
+    }
+}
+
 std::string capture_index_diag(const char * entries, const char * window, const std::function<void()> & run) {
     const char * previous = std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
     const bool had_previous = previous != nullptr;
@@ -3147,7 +4081,320 @@ void test_index16_pipeline() {
 
 } // namespace
 
+namespace {
+
+void test_auto_jk_execution() {
+    if (PD != 32) return;
+    for (int variant : {0, 1, 2}) {
+        // I>1 with I/J tails; signed data, zero carriers, and a
+        // saturation/sign-reversal case independent of the selected K panel.
+        const bool saturation = variant == 2;
+        paired_fixture f(54, 97, saturation ? 160 : 2080, 721,
+            [=](size_t block, size_t n) {
+                return int16_t(saturation ? (block < 4 ? 16 : 0) :
+                               n % 7 == 0 ? INT16_MIN : int(n % 5));
+            },
+            [=](size_t k, size_t, std::mt19937 & rng) {
+                return saturation ? int8_t(k < 128 ? 127 : -1) : random_i8(k, 0, rng);
+            },
+            [=](size_t row, size_t k, std::mt19937 & rng) {
+                return saturation ? int8_t(row == 0 ? 127 : -128) : random_i8(k, row, rng);
+            });
+        potal_tile_plan producer;
+        paired_inputs in;
+        const entries_fn entries = [&](size_t, size_t rows) {
+            std::vector<res_entry> out;
+            for (size_t block = 0; block < f.K / 32; ++block) {
+                if (!saturation && block % 3 == 1) continue;
+                for (size_t k = 0; k < (saturation ? 32u : 3u); ++k) {
+                    out.push_back({0, block * 32 + k, saturation ? 127 : 513});
+                    out.push_back({rows - 1, block * 32 + k, saturation ? -128 : -65537});
+                }
+            }
+            return out;
+        };
+        const bool fixture = f.ok &&
+            potal_frozen_plan(f.M, f.N, f.K, 2, 1, PPB, PPB, &producer) == POTAL_OK &&
+            make_inputs(f, 2 * PD, variant == 0 ? entries_fn{} : entries, in);
+        check("AUTO synthetic full-stripe I2/tail fixture", fixture);
+        if (!fixture) continue;
+        residual::decoded_packet decoded;
+        const bool has_res = in.packets[0] != nullptr;
+        if (has_res && residual::decode_packet(*in.packets[0], f.weight, decoded) != grmd::RmdStatus::success) {
+            check("AUTO packet decode", false);
+            continue;
+        }
+        const auto golden = golden_of(f, 2 * PD, in);
+        if (saturation) {
+            check("AUTO independent ordered Sat32 reverses sign after saturation",
+                  golden.ok && golden.main_c[0] == INT32_MAX - 4064 &&
+                  golden.main_c[f.N] == INT32_MIN + 4096);
+        }
+        for (bool reuse : {false, true}) {
+            potal_tile_plan selected;
+            potal_paired_tile_plan tile;
+            potal_paired_execution_plan plan;
+            potal_paired_jk_report search;
+            std::string why;
+            const auto status = potal_paired_select_jk(producer, f.M, f.N, f.K,
+                has_res ? &decoded : nullptr, reuse, selected, tile, plan, &why, &search);
+            check("AUTO selects without mutating producer or stripe height",
+                  status == potal_paired_status::ok && producer.tile_I == 2 &&
+                  producer.tile_J == 1 && producer.tile_K == PPB &&
+                  selected.tile_I == 2 && (selected.tile_J > 1 || selected.tile_K > PPB));
+            if (status != potal_paired_status::ok) continue;
+            h2_emulator emu;
+            const auto result = run_paired(f, selected, in, emu, true, 255, false, nullptr, reuse, &plan);
+            std::vector<int32_t> golden_residual;
+            for (const auto & row : golden.residual[0])
+                golden_residual.insert(golden_residual.end(), row.c.begin(), row.c.end());
+            bool numbers = golden.ok && result.status == potal_paired_status::ok &&
+                result.main_c == golden.main_c && result.residual_c == golden_residual &&
+                emu.errors.empty() && !emu.scale_miss;
+            grmd::BlockScaledInt64Correction correction;
+            if (has_res) {
+                numbers = numbers &&
+                    residual::reconstruct_rows(*in.packets[0], result.rows, result.residual_c.data(),
+                        f.N, f.N, correction) == grmd::RmdStatus::success &&
+                    correction.values == golden.correction[0];
+            }
+            std::vector<float> out(f.M * f.N);
+            if (numbers) {
+                for (size_t row = 0; row < f.M; ++row)
+                    reconstruct_row(result.main_c.data() + row * f.N, f.N,
+                        double(std::ldexp(1.0f, in.theta[0])), f.weight.scale, out.data() + row * f.N, 1);
+                if (has_res) {
+                    ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot snap;
+                    snap.theta = in.theta[0];
+                    numbers = residual::merge_prepared_hp1(f.weight, 0, f.M, snap, correction,
+                        out.data(), f.M, f.N, 1, nullptr) == grmd::RmdStatus::success;
+                }
+                numbers = numbers && std::memcmp(out.data(), golden.legacy.data(), out.size() * sizeof(float)) == 0;
+            }
+            check("AUTO Main/Residual INT32, radix INT64 and F32 match independent golden", numbers);
+            check("AUTO planned structural counts match successful H2 commands",
+                  numbers && result.report.counts.main_loop_ws == search.selected.main_loops &&
+                  result.report.counts.residual_loop_ws == search.selected.residual_loops &&
+                  result.report.counts.index_writes == search.selected.index_writes &&
+                  result.report.counts.scale_writes == search.selected.scalar_writes &&
+                  result.report.counts.scale_releases == search.selected.scalar_releases &&
+                  emu.main_loops == plan.main_gemms && emu.residual_loops == plan.residual_gemms);
+            check("AUTO wrap drains ownership and all Scale allocations",
+                  numbers && !result.report.fatal &&
+                  result.session.outstanding_loops == 0 && result.session.live_scale_slots == 0 &&
+                  result.generation != 255 && emu.scale_writes == emu.scale_releases);
+            h2_emulator again;
+            const auto second = run_paired(f, selected, in, again, true, result.generation, false, nullptr, reuse, &plan);
+            check("AUTO next execution reuses drained pairs with continuing generation",
+                  second.status == potal_paired_status::ok && second.main_c == result.main_c &&
+                  second.residual_c == result.residual_c && again.errors.empty());
+            auto changed = plan;
+            changed.tile.n++;
+            h2_emulator refused;
+            const auto mismatch = run_paired(f, selected, in, refused, true, 255, false, nullptr, reuse, &changed);
+            check("AUTO mismatching supplied frozen Main is refused before commands",
+                  mismatch.status != potal_paired_status::ok && !mismatch.report.issued &&
+                  refused.records.empty() && mismatch.generation == 255);
+            if (has_res) {
+                h2_emulator failed;
+                failed.fail_funct = POTAL_FUNCT_INDEX_WRITE;
+                failed.fail_status = POTAL_HW_INVALID_ADDRESS;
+                const auto clean = run_paired(f, selected, in, failed, true, 255, false, nullptr, reuse, &plan);
+                check("AUTO answered Index failure drains and releases without publishing",
+                      clean.status == potal_paired_status::execution_failed && clean.report.cleaned &&
+                      !clean.report.fatal && clean.main_c.empty() &&
+                      clean.session.outstanding_loops == 0 && clean.session.live_scale_slots == 0);
+            }
+            // A fatal session deliberately keeps accelerator ownership. Isolate
+            // it exactly as the existing lost-response fixtures do.
+            const pid_t child = fork();
+            if (child == 0) {
+                h2_emulator failed;
+                failed.fail_funct = POTAL_FUNCT_FENCE;
+                failed.fail_status = POTAL_ERR_BAD_RESPONSE;
+                const auto fatal = run_paired(f, selected, in, failed, true, 255, false, nullptr, reuse, &plan);
+                _exit(fatal.status == potal_paired_status::execution_failed && fatal.report.fatal &&
+                      !fatal.report.cleaned && fatal.session.failed && fatal.main_c.empty() ? 0 : 1);
+            }
+            int child_status = 0;
+            check("AUTO failed Fence is fatal, quarantined, and publishes nothing",
+                  child > 0 && waitpid(child, &child_status, 0) == child &&
+                  WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+        }
+    }
+}
+
+// Environment changes stay on the producer thread, before owner start or in
+// its synchronous inspection callback; each run joins before restoring them.
+void test_auto_jk_pipeline() {
+    if (PD != 32) return;
+    struct saved_env {
+        const char * name;
+        bool present;
+        std::string value;
+        explicit saved_env(const char * n) : name(n), present(std::getenv(n) != nullptr),
+            value(present ? std::getenv(n) : "") {}
+        ~saved_env() { if (present) setenv(name, value.c_str(), 1); else unsetenv(name); }
+    } auto_env("POTAL_PAIRED_AUTO_JK"), j8_env("POTAL_PAIRED_J8K8_FFN"),
+      index_env("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    unsetenv("POTAL_PAIRED_AUTO_JK");
+    unsetenv("POTAL_PAIRED_J8K8_FFN");
+    unsetenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    pipe_node nd(96, 96, 256, 41, 60.0f, 4, 1);
+    check("AUTO pipeline fixture", nd.ok);
+    if (!nd.ok) return;
+    const auto producer = nd.plan;
+    const auto baseline = run_pipe(nd, 1, 1);
+    setenv("POTAL_PAIRED_AUTO_JK", "0", 1);
+    const auto off = run_pipe(nd, 1, 1);
+    check("AUTO absent and zero preserve output and default command counts",
+          baseline.report.ok && off.report.ok && baseline.out == off.out &&
+          baseline.h2_main == off.h2_main && baseline.h2_residual == off.h2_residual &&
+          baseline.h2_index == off.h2_index && baseline.decode_calls == off.decode_calls);
+    const auto no_commands = [](const pipe_result & r) {
+        return !r.report.ok && r.untouched && r.paired_calls == 0 &&
+            r.planned_commands.empty() && r.h2_main == 0;
+    };
+    for (const char * value : {"", "true", "2", "-1", "01"}) {
+        setenv("POTAL_PAIRED_AUTO_JK", value, 1);
+        const auto r = run_pipe(nd, 1, 1);
+        check("AUTO malformed boolean rejected before owner work",
+              no_commands(r) && r.report.status == POTAL_ERR_INVALID_ARGUMENT);
+    }
+    setenv("POTAL_PAIRED_AUTO_JK", "1", 1);
+    check("AUTO requires Paired", no_commands(run_pipe(nd, 1, 0)));
+    setenv("POTAL_PAIRED_J8K8_FFN", "1", 1);
+    const auto conflict = run_pipe(nd, 1, 1);
+    check("AUTO strict J8 conflict is INVALID_ARGUMENT",
+          no_commands(conflict) && conflict.report.status == POTAL_ERR_INVALID_ARGUMENT);
+    unsetenv("POTAL_PAIRED_J8K8_FFN");
+    setenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES", "16", 1);
+    const auto diag = run_pipe(nd, 1, 1);
+    check("AUTO diagnostic Index override unsupported before owner work",
+          no_commands(diag) && diag.report.status == POTAL_ERR_UNSUPPORTED);
+    unsetenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+    for (auto mode : {potal_paired_stream_mode::bounded, potal_paired_stream_mode::continuous,
+                      potal_paired_stream_mode::continuous_early}) {
+        const auto r = run_pipe(nd, 1, 1, {}, true, false, false, mode);
+        check("AUTO streaming unsupported", no_commands(r) && r.report.status == POTAL_ERR_UNSUPPORTED);
+    }
+    for (bool early : {false, true}) {
+        const auto r = run_pipe(nd, 1, 1, {}, true, true, early);
+        check("AUTO next/early prefetch unsupported", no_commands(r) && r.report.status == POTAL_ERR_UNSUPPORTED);
+    }
+    for (bool reuse : {false, true}) {
+        bool identity = true;
+        const auto selected = run_pipe(nd, 1, 1, [&](const potal_paired_request & q) {
+            potal_tile_plan main;
+            potal_paired_tile_plan tile;
+            potal_paired_execution_plan plan;
+            std::string why;
+            identity = identity && q.plan && potal_paired_select_jk(producer, q.rows, q.n, q.k,
+                q.residual, reuse, main, tile, plan, &why) == potal_paired_status::ok &&
+                q.main_plan->tile_I == main.tile_I && q.main_plan->tile_J == main.tile_J &&
+                q.main_plan->tile_K == main.tile_K && q.plan->ops.size() == plan.ops.size() &&
+                q.plan->main_gemms == plan.main_gemms && q.plan->index_writes == plan.index_writes;
+            if (identity) {
+                for (size_t i = 0; i < plan.ops.size(); ++i)
+                    identity = identity && potal_paired_op_text(q.plan->ops[i]) == potal_paired_op_text(plan.ops[i]);
+            }
+            // The remaining stripes must retain the entry-time snapshot.
+            setenv("POTAL_PAIRED_AUTO_JK", "0", 1);
+        }, reuse);
+        check("AUTO selected frozen Main and existing plan reach one dispatch per decoded stripe",
+              selected.report.ok && identity && selected.out == baseline.out &&
+              selected.paired_calls == nd.stripes() && selected.planned_commands.empty() &&
+              selected.decode_calls == selected.report.counts.residual_nonempty_packets &&
+              selected.report.counts.paired_fallback_stripes == 0 &&
+              nd.plan.tile_I == producer.tile_I && nd.plan.tile_J == producer.tile_J &&
+              nd.plan.tile_K == producer.tile_K);
+        setenv("POTAL_PAIRED_AUTO_JK", "1", 1);
+    }
+    const auto conservative = run_pipe(nd, 1, 4);
+    check("AUTO allows conservative fences", conservative.report.ok &&
+          conservative.conservative_req && conservative.out == baseline.out);
+    const auto mutated = run_pipe(nd, 1, 1, [](const potal_paired_request & q) {
+        // Test-only corruption of the route's supplied plan, not a rebuilt plan.
+        const_cast<potal_paired_execution_plan *>(q.plan)->tile.n++;
+    });
+    check("AUTO supplied plan corruption fails before commands without partial commit",
+          !mutated.report.ok && mutated.untouched && mutated.paired_calls == 1 &&
+          mutated.h2_main == 0 && mutated.planned_commands.empty());
+    size_t dispatches = 0;
+    const auto late = run_pipe(nd, 1, 1, [&](const potal_paired_request & q) {
+        if (++dispatches == 2)
+            const_cast<potal_paired_execution_plan *>(q.plan)->tile.n++;
+    });
+    check("AUTO later stripe failure cannot commit an earlier completed stripe",
+          !late.report.ok && late.untouched && late.paired_calls == 2 &&
+          late.report.counts.stripes_semantic_completed == 1 &&
+          late.planned_commands.empty());
+    const auto missing = run_pipe(nd, 1, 2);
+    const auto fatal = run_pipe(nd, 1, 3);
+    check("AUTO missing owner runner fails without fallback or commit", no_commands(missing));
+    check("AUTO fatal runner quarantines with no partial commit or retry",
+          !fatal.report.ok && fatal.report.fatal && fatal.consumer.fatal && fatal.untouched &&
+          fatal.paired_calls == 1 && fatal.planned_commands.empty());
+    pipe_node dense(256, 32, 256, 43, 3000.0f, 1, 6);
+    // Deterministic synthetic packet: do not assume real ExSIA outliers
+    // produce two lanes for every row after stripe exponent adaptation.
+    ggml_gemmini_args_t args;
+    const bool dense_fixture = dense.ok &&
+        potal_frozen_plan(dense.M, dense.N, dense.K, POTAL_HW_ACC_ROWS / (2 * PD),
+                          1, PPB, PPB, &dense.plan) == POTAL_OK &&
+        dense.args_for(args) && ggml::gemmini::quants::quantize_activation(dense.x, args);
+    if (dense_fixture) {
+        std::vector<res_entry> entries;
+        for (size_t row = 0; row < dense.M; ++row) entries.push_back({row, 0, 65537});
+        exsia::StripeReadyEvent event;
+        event.run_id = 721;
+        event.stripe_id = 0;
+        event.row_begin = 0;
+        event.row_end = dense.M;
+        event.activation_metadata = exsia::StripeMetadataSnapshot{};
+        event.activation_metadata->theta = 0;
+        event.rmd_packet = make_packet(0, 0, dense.M, dense.K, dense.N, entries);
+        pipeline_config cfg;
+        cfg.job_capacity = 1;
+        cfg.residual = true;
+        cfg.paired = true;
+        cfg.paired_auto_jk = true; // already validated entry snapshot
+        stripe_run run(cfg, args, dense.weight, dense.plan);
+        std::string why;
+        const bool submitted = event.rmd_packet && run.begin(why) && run.submit(event, args);
+        size_t planned = 0, paired = 0;
+        owner_runners runners;
+        runners.planned = [&](const potal_stripe_gemm_desc &) {
+            ++planned;
+            return planned_result{};
+        };
+        runners.paired = [&](const potal_paired_request &, potal_paired_report & report) {
+            ++paired;
+            report.status = potal_paired_status::execution_failed;
+            return report.status;
+        };
+        if (submitted) (void) run.consume(runners);
+        const auto report = run.report();
+        std::printf("AUTO synthetic capacity submitted=%d planned=%zu paired=%zu stage=%s detail=%s begin=%s\n",
+                    int(submitted), planned, paired, report.stage ? report.stage : "-",
+                    report.detail.c_str(), why.c_str());
+        const std::string capacity = std::string("POTAL_PAIRED_") +
+            potal_paired_status_name(potal_paired_status::residual_acc_capacity);
+        check("AUTO irreducible Residual ACC refusal is terminal without dispatch or Serial fallback",
+              submitted && !report.ok && !report.fatal && paired == 0 && planned == 0 &&
+              report.stage && std::strcmp(report.stage, "paired_plan") == 0 &&
+              report.detail.find(capacity + ":") != std::string::npos &&
+              report.counts.paired_fallback_stripes == 0 &&
+              report.counts.stripes_semantic_completed == 0 && !run.finish());
+    } else check("AUTO dense fixture", false);
+}
+
+} // namespace
+
 int main() {
+    test_index_window_profile();
+    test_auto_jk_execution();
+    test_auto_jk_pipeline();
     test_translation();
     test_staging();
     test_numerics();
@@ -3165,6 +4412,11 @@ int main() {
     test_failures();
     test_review_followups();
     test_conservative();
+    test_first_index_profile(potal_paired_stream_mode::off);
+    test_first_index_profile(potal_paired_stream_mode::continuous_early);
+    test_stream_prepare_indexed();
+    test_stream_prepare_indexed(true);
+    test_stream_prepare_indexed(false, true);
     test_window_diag();
     test_index16_plan();
     test_pipeline();
