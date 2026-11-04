@@ -342,6 +342,11 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.stripe_pipeline_nodes++;
 
     pipeline_config cfg;
+    bool roles_invalid = false;
+    cfg.hart_roles = hart_roles_requested(roles_invalid);
+    if (roles_invalid) {
+        return hp1_fail(st, node, layer, "options", "GGML_POTAL_HART_ROLES must be ON, OFF, 1 or 0");
+    }
     cfg.job_capacity = job_capacity;
     cfg.residual     = options::compensation;
     cfg.paired       = paired_request && options::compensation;
@@ -502,6 +507,13 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     }
     const options::MatmulInvocationMode mode        = resolved.options.mode;
     const ggml::gemmini::RmdBackend     rmd_backend = resolved.options.rmd_backend;
+    bool roles_invalid = false;
+    const bool roles = hart_roles_requested(roles_invalid);
+    if (roles_invalid || (roles && (mode != options::MatmulInvocationMode::stripe_pipeline ||
+                                    rmd_backend != ggml::gemmini::RmdBackend::gemmini_ws_compact))) {
+        return hp1_fail(st, node, layer, "options",
+                        "GGML_POTAL_HART_ROLES must be ON/OFF/1/0; ON requires STRIPE_PIPELINE+WS");
+    }
     bool stream_invalid = false;
     const auto stream = options::paired_stream_requested(&stream_invalid);
     if (stream_invalid || (stream != potal_paired_stream_mode::off &&

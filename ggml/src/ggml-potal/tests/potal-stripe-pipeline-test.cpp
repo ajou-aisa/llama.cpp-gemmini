@@ -64,6 +64,8 @@
 #include "potal_hw_params.h"
 #include "support/stripe-golden.hpp"
 #include "support/stripe-owner.hpp"
+#include "support/paired-h2-emulator.hpp"
+#include "trace/timeline.hpp"
 
 #include "quants/act/exsia/types.hpp"
 #include "quants/act/quantize.hpp"
@@ -95,6 +97,8 @@
 #if defined(__linux__)
 #    include <pthread.h>
 #    include <sched.h>
+#    include <sys/syscall.h>
+#    include <unistd.h>
 #endif
 
 using namespace ggml::potal;
@@ -252,6 +256,11 @@ struct recorder {
             if (ev.kind == kind::residual_end && ev.c != nullptr) {
                 copy(residual_c[ev.stripe_id], ev.c, ev.ldc, ev.rows, ev.cols);
             }
+            if (ev.kind == kind::paired_end && ev.c != nullptr) {
+                copy(main_c[ev.stripe_id], ev.c, ev.ldc, ev.rows, ev.cols);
+                if (ev.residual_c != nullptr)
+                    copy(residual_c[ev.stripe_id], ev.residual_c, ev.residual_ldc, ev.residual_rows, ev.cols);
+            }
             if (ev.kind == kind::radix_reconstruct_end && ev.correction != nullptr) {
                 correction[ev.stripe_id].assign(ev.correction, ev.correction + ev.rows * ev.cols);
             }
@@ -343,7 +352,7 @@ struct recorder {
 // its chain. packets: the stripes that must carry the residual steps
 // (nullptr: the stripes that show a residual_prepare_begin).
 std::string order_violation(recorder & rec, size_t capacity, size_t stripes, bool complete,
-                            const std::set<size_t> * packets = nullptr) {
+                            const std::set<size_t> * packets = nullptr, bool roles = false, bool paired = false) {
     const std::vector<recorder::rec> ev = rec.events();
     std::vector<uint64_t>            seqs;
     for (const recorder::rec & r : ev) {
@@ -390,9 +399,14 @@ std::string order_violation(recorder & rec, size_t capacity, size_t stripes, boo
         const bool        residual = packets != nullptr ? packets->count(s) != 0
                                                         : one(kind::residual_prepare_begin, s) != nullptr;
         std::vector<kind> chain    = { kind::folding_commit, kind::submit_accepted, kind::main_begin, kind::main_end };
+        if (paired)
+            chain = {kind::folding_commit, kind::submit_accepted, kind::main_begin, kind::paired_prepare_begin,
+                     kind::paired_prepare_end, kind::paired_begin, kind::paired_end};
         if (residual) {
-            chain.insert(chain.end(), { kind::residual_prepare_begin, kind::residual_prepare_end, kind::residual_begin,
-                                        kind::residual_end, kind::radix_reconstruct_begin,
+            if (!paired)
+                chain.insert(chain.end(), { kind::residual_prepare_begin, kind::residual_prepare_end,
+                                            kind::residual_begin, kind::residual_end });
+            chain.insert(chain.end(), { kind::radix_reconstruct_begin,
                                         kind::radix_reconstruct_end, kind::merge_begin, kind::merge_end });
         }
         chain.insert(chain.end(), { kind::semantic_complete, kind::capacity_release });
@@ -440,7 +454,7 @@ std::string order_violation(recorder & rec, size_t capacity, size_t stripes, boo
         if (s + 1 < stripes) {
             const recorder::rec * next_main = one(kind::main_begin, s + 1);
             const recorder::rec * sem       = one(kind::semantic_complete, s);
-            if (next_main != nullptr && (sem == nullptr || rel == nullptr || next_main->sequence < sem->sequence ||
+            if (!roles && next_main != nullptr && (sem == nullptr || rel == nullptr || next_main->sequence < sem->sequence ||
                                          next_main->sequence < rel->sequence)) {
                 return name(kind::main_begin, s + 1) + " before the semantic completion of stripe " + std::to_string(s);
             }
@@ -550,7 +564,8 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 // One pipelined MUL_MAT of nd through the production driver.
 run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recorder & rec,
                         const std::function<void(ggml_gemmini_args_t &, const stripe_event &)> & producer_hook = {},
-                        bool measure_timing = true) {
+                        bool measure_timing = true, bool roles = false,
+                        const std::function<bool(const char *, size_t)> & checkpoint = {}, bool paired = false) {
     ggml_gemmini_args_t args;
     run_result          r;
     if (!nd.args_for(args)) {
@@ -566,13 +581,27 @@ run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recor
     cfg.layer        = "pipeline-test";
     cfg.backend      = "EMULATED";
     cfg.measure_timing = measure_timing;
+    cfg.hart_roles = roles;
+    cfg.paired = paired;
+    cfg.role_checkpoint = checkpoint;
     cfg.observer     = [&](const stripe_event & ev) {
         rec.on(ev);
         if (producer_hook) {
             producer_hook(args, ev);
         }
     };
-    potal_test::thread_owner owner([&runner](const potal_stripe_gemm_desc & d) { return runner.run(d); });
+    auto h2 = paired ? std::make_unique<potal_test::h2_emulator>() : nullptr;
+    uint32_t generation = 0;
+    paired_runner paired_exec;
+    if (paired) {
+        paired_exec = [&](const potal_paired_request & request, potal_paired_report & report) {
+            auto q = request;
+            q.generation = &generation;
+            const auto sink = h2->sink();
+            return potal_paired_run_session(q, &sink, report);
+        };
+    }
+    potal_test::thread_owner owner([&runner](const potal_stripe_gemm_desc & d) { return runner.run(d); }, paired_exec);
     r.report = run_stripe_pipeline(nd.x, args, nd.weight, nd.plan, cfg, owner);
     owner.join();
     r.consumer            = owner.outcome;
@@ -1308,9 +1337,221 @@ void test_jsonl_order() {
 #endif
 }
 
+// Five CPU roles use the same independent scalar goldens as the default path.
+bool roles_values(node & nd, const golden_node & g, recorder & rec, const run_result & result, bool paired = false) {
+    bool ok = result.report.ok && bitwise(nd.dst(), g.want) &&
+              result.report.completions.size() == nd.stripes();
+    const auto packets = g.packet_stripes();
+    ok = ok && order_violation(rec, result.report.counts.max_outstanding_semantic,
+                               nd.stripes(), true, &packets, true, paired).empty();
+    for (size_t s = 0; s < nd.stripes(); ++s) {
+        const size_t rb = s * nd.plan.tile_I * D, re = std::min(nd.M, rb + nd.plan.tile_I * D);
+        ok = ok && rec.main_c[s] == g.main_c(nd, rb, re);
+        const auto packet = g.packets.find(s);
+        if (packet == g.packets.end()) {
+            ok = ok && rec.residual_c.count(s) == 0 && rec.correction.count(s) == 0;
+        } else {
+            std::vector<potal_test::golden_lane_row> rows;
+            std::vector<int32_t> c;
+            std::vector<int64_t> correction;
+            const bool built = potal_test::residual_golden(
+                *packet->second, nd.N, D, [&](size_t k, size_t n) { return (int32_t) g.o.b[k * g.o.ldb + n]; },
+                [&](size_t b, size_t n) { return g.o.carriers[b * g.o.cstride + n]; }, rows);
+            for (const auto & row : rows) c.insert(c.end(), row.c.begin(), row.c.end());
+            ok = ok && built && potal_test::compose_golden(rows, re - rb, nd.N, correction) &&
+                 rec.residual_c[s] == c && rec.correction[s] == correction;
+        }
+    }
+    return ok;
+}
+
+bool roles_host_map() {
+#if defined(__linux__)
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(mask), &mask) != 0) return false;
+    std::string map;
+    size_t count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE && count < 5; ++cpu) {
+        if (!CPU_ISSET(cpu, &mask)) continue;
+        if (count++) map += ",";
+        map += std::to_string(cpu);
+    }
+    if (count != 5) return false;
+    return setenv("GGML_POTAL_HART_MAP", map.c_str(), 1) == 0;
+#else
+    return false;
+#endif
+}
+
+struct roles_probe {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::set<size_t> prepared, sealed, released;
+    std::set<long> tids;
+    std::set<int> next_local_cpus;
+    std::map<size_t, std::set<int>> finished_local_cpus;
+    bool valid = true, issuer_second_done = false;
+    bool gate = false;
+    std::string failure;
+    bool injected = false;
+    std::array<int, 5> cpus;
+
+    roles_probe() {
+        std::string why;
+        valid = find_role_cpus(cpus, why);
+    }
+    bool checkpoint(const char * stage, size_t s) {
+        std::unique_lock<std::mutex> lock(mu);
+#if defined(__linux__)
+        tids.insert(syscall(SYS_gettid));
+        const int cpu = sched_getcpu();
+        const bool local = std::strcmp(stage, "local") == 0 || std::strcmp(stage, "local_done") == 0;
+        valid = valid && (local ? cpu == cpus[1] || cpu == cpus[2] :
+                         cpu == cpus[std::strcmp(stage, "finalizer") == 0 ? 4 : 3]);
+        if (local && s == 1) next_local_cpus.insert(cpu);
+        if (std::strcmp(stage, "local_done") == 0) finished_local_cpus[s].insert(cpu);
+#endif
+        if (std::strcmp(stage, "prepare") == 0) {
+            valid = valid && (s == 0 || sealed.count(s - 1)) && (s < 2 || released.count(s - 2));
+            prepared.insert(s);
+        } else if (std::strcmp(stage, "local_seal") == 0) {
+            valid = valid && finished_local_cpus[s].size() == 2;
+            sealed.insert(s);
+        } else if (std::strcmp(stage, "release") == 0) {
+            released.insert(s);
+        } else if (std::strcmp(stage, "local") == 0) {
+            valid = valid && prepared.count(s);
+        } else if (std::strcmp(stage, "fold") == 0) {
+            valid = valid && sealed.count(s);
+        }
+        cv.notify_all();
+        if (gate && s == 0 && std::strcmp(stage, "fold") == 0)
+            valid = cv.wait_for(lock, std::chrono::seconds(10), [&] { return next_local_cpus.size() == 2; }) && valid;
+        if (gate && s == 0 && std::strcmp(stage, "finalizer") == 0)
+            valid = cv.wait_for(lock, std::chrono::seconds(10), [&] { return issuer_second_done; }) && valid;
+        if (s == 1 && failure == stage) {
+            injected = true;
+            return false;
+        }
+        return valid;
+    }
+    void observe(const stripe_event & ev) {
+        std::lock_guard<std::mutex> lock(mu);
+        if ((ev.kind == kind::main_end || ev.kind == kind::paired_end) && ev.stripe_id == 1)
+            issuer_second_done = true;
+        if (ev.kind == kind::main_begin) {
+            valid = valid && sealed.count(ev.stripe_id);
+#if defined(__linux__)
+            valid = valid && sched_getcpu() == cpus[0];
+            tids.insert(syscall(SYS_gettid));
+#endif
+        }
+        cv.notify_all();
+    }
+    bool joined() const {
+#if defined(__linux__)
+        for (long tid : tids) {
+            if (access(("/proc/self/task/" + std::to_string(tid)).c_str(), F_OK) == 0) return false;
+        }
+#endif
+        return true;
+    }
+};
+
+void test_roles(bool timeline_only) {
+    check("ROLES native map has five available CPUs", roles_host_map());
+    if (failures) return;
+    // Snapshot/restore these test-only switches; no process affinity changes.
+    const char * old = std::getenv("GGML_POTAL_HART_ROLES");
+    const std::string saved = old ? old : "";
+    const bool had_old = old != nullptr;
+    setenv("GGML_POTAL_HART_ROLES", "ON", 1);
+    const size_t rounds = timeline_only ? 1 : 24;
+    for (size_t run = 0; run < rounds; ++run) {
+        const size_t stripes = timeline_only ? 4 : (run % 3 == 0 ? 1 : run % 3 == 1 ? 2 : 5);
+        const size_t capacity = timeline_only ? 2 : 1 + run % 2;
+        const bool paired = options::compensation && (timeline_only || run % 4 >= 2);
+        node nd((stripes - 1) * D + D / 2, 64, 64, (uint32_t) (77 + run), 400.0f);
+        check("ROLES fixture plan", nd.ok &&
+              potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) == POTAL_OK);
+        golden_node g(nd);
+        gated_runner runner;
+        recorder rec;
+        roles_probe probe;
+        // One deterministic run proves both overlap edges without clock comparisons.
+        probe.gate = capacity == 2 && stripes >= 2;
+        rec.hook = [&](const stripe_event & ev) { probe.observe(ev); };
+        const auto result = run_pipeline(nd, capacity, runner, rec, {}, true, true,
+            [&](const char * stage, size_t s) { return probe.checkpoint(stage, s); }, paired);
+        check("ROLES cap=" + std::to_string(capacity) + " stripes=" + std::to_string(stripes) +
+              " run=" + std::to_string(run) + (paired ? " paired" : " serial") +
+              ": Main/Residual INT32, INT64, F32 and dependencies",
+              g.ok && roles_values(nd, g, rec, result, paired) && probe.valid && probe.joined());
+        if (probe.gate) {
+            const kind device_end = paired ? kind::paired_end : kind::main_end;
+            check("ROLES issuer advances while finalizer owns stripe zero",
+                  rec.seq(device_end, 1) < rec.seq(kind::capacity_release, 0) &&
+                  rec.seq(device_end, 1) > 0);
+        }
+    }
+    if (!timeline_only) {
+        node nd(5 * D - 1, 64, 64, 119, 400.0f);
+        check("ROLES failure fixture", nd.ok &&
+              potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) == POTAL_OK);
+        for (const char * stage : {"local", "fold", "finalizer"}) {
+            for (size_t capacity : {size_t(1), size_t(2)}) {
+                gated_runner runner;
+                recorder rec;
+                roles_probe probe;
+                probe.failure = stage;
+                rec.hook = [&](const stripe_event & ev) { probe.observe(ev); };
+                const auto result = run_pipeline(nd, capacity, runner, rec, {}, true, true,
+                    [&](const char * st, size_t s) { return probe.checkpoint(st, s); });
+                check(std::string("ROLES failure ") + stage + " cap=" + std::to_string(capacity) +
+                      ": no partial commit, joined, sticky failure",
+                      !result.report.ok && result.committed_untouched && probe.joined() &&
+                      probe.injected && result.report.stage != nullptr && rec.seq(kind::run_commit) < 0 &&
+                      std::string(result.report.stage) == (probe.failure == "finalizer" ? "finalizer" : "exsia_roles"));
+            }
+        }
+        golden_node g(nd);
+        gated_runner runner;
+        recorder rec;
+        setenv("GGML_POTAL_HART_ROLES", "OFF", 1);
+        const auto off = run_pipeline(nd, 2, runner, rec);
+        check("ROLES OFF retains default independent golden output",
+              off.report.ok && bitwise(nd.dst(), g.want));
+#if !defined(__riscv)
+        const std::string map = std::getenv("GGML_POTAL_HART_MAP");
+        unsetenv("GGML_POTAL_HART_MAP");
+        ggml_gemmini_args_t args;
+        potal_test::refusing_owner owner;
+        pipeline_config cfg;
+        cfg.hart_roles = true;
+        cfg.residual = options::compensation;
+        check("ROLES missing topology refuses without fallback",
+              nd.args_for(args) && !run_stripe_pipeline(nd.x, args, nd.weight, nd.plan, cfg, owner).ok);
+        setenv("GGML_POTAL_HART_MAP", "0,0,0,0,0", 1);
+        std::array<int, 5> cpus;
+        std::string why;
+        check("ROLES duplicate CPU map refuses", !find_role_cpus(cpus, why));
+        setenv("GGML_POTAL_HART_MAP", map.c_str(), 1);
+#endif
+    }
+    if (had_old) setenv("GGML_POTAL_HART_ROLES", saved.c_str(), 1);
+    else unsetenv("GGML_POTAL_HART_ROLES");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--roles-timeline") == 0) {
+        test_roles(true);
+        if (::potal::timeline::enabled()) check("ROLES timeline flush", ::potal::timeline::flush());
+        std::printf("POTAL_STRIPE_ROLES_TIMELINE %s\n", failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
     const char * log_dir = std::getenv("GEMMINI_LOG_DIR");
     if (log_dir == nullptr || *log_dir == '\0') {
         const char *      tmp  = std::getenv("TMPDIR");
@@ -1402,6 +1643,7 @@ int main() {
             test_repetition(nd, g, calm, gc);
         }
         test_jsonl_order();
+        test_roles(false);
     }
     if (failures != 0) {
         std::printf("POTAL_STRIPE_PIPELINE_TEST FAIL (%d)\n", failures);

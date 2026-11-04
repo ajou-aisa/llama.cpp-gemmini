@@ -3,6 +3,7 @@
 // their Index Windows (paired-auto.hpp). No RoCC command, no hardware access.
 
 #include "paired-auto.hpp"
+#include "trace/timeline.hpp"
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
 #include "planning-profile.hpp"
@@ -1653,6 +1654,49 @@ struct executor {
     potal_paired_staging          staging;
     std::vector<uint32_t>         hw_generation; // per scale window
     std::vector<size_t>           scale_owner; // opt-in: physical Main owner of a logical Residual window
+    bool                         index_queue = false;
+    std::vector<uint32_t>         queue_entries; // prepared before issue
+
+    template<class F>
+    potal_status timeline_call(::potal::timeline::stage stage, size_t op, uint64_t work, F && call,
+                              const uint32_t *reply_status = nullptr) {
+        if (!::potal::timeline::enabled()) return call();
+        const uint32_t tile = op == no_index ? ::potal::timeline::no_id : uint32_t(op);
+        const uint32_t pair = op == no_index ? ::potal::timeline::no_id : uint32_t(report.plan.ops[op].pair);
+        ::potal::timeline::record(stage, ::potal::timeline::event::begin, 0, uint32_t(req.run_id),
+            ::potal::timeline::no_id, uint32_t(req.stripe_id), tile, pair, 0, work);
+        const potal_status status = call();
+        ::potal::timeline::record(stage, ::potal::timeline::event::end,
+            uint8_t(reply_status ? *reply_status : uint32_t(status)), uint32_t(req.run_id),
+            ::potal::timeline::no_id, uint32_t(req.stripe_id), tile, pair, 0, work);
+        return status;
+    }
+
+    potal_status issue_fence() {
+        return timeline_call(::potal::timeline::stage::acc_fence, current_op, 0,
+            [&] { return potal_paired_fence(session); });
+    }
+
+    potal_status issue_readback(const potal_acc_readback & r, size_t op) {
+        return timeline_call(::potal::timeline::stage::acc_readback, op,
+            uint64_t(r.i_tiles * hw.dim - r.pad_i) * (r.j_tiles * hw.dim - r.pad_j) * sizeof(int32_t),
+            [&] { return potal_paired_acc_readback_issue(session, &r); });
+    }
+
+    potal_status issue_scale_write(uint32_t slot, uint32_t generation, uint32_t column, uint32_t carrier) {
+        return timeline_call(::potal::timeline::stage::acc_scale_write, current_op, 1,
+            [&] { return potal_paired_scale_write(session, slot, generation, column, carrier); });
+    }
+
+    potal_status issue_scale_release(uint32_t slot, uint32_t generation, uint32_t column) {
+        return timeline_call(::potal::timeline::stage::acc_scale_release, current_op, 1,
+            [&] { return potal_paired_scale_release(session, slot, generation, column); });
+    }
+
+    potal_status issue_stream_release(potal_h2_ref ref, uint32_t slot, uint32_t generation, uint32_t column) {
+        return timeline_call(::potal::timeline::stage::acc_scale_release, current_op, 1,
+            [&] { return potal_paired_stream_scale_release(session, ref, slot, generation, column); });
+    }
     struct managed_panel {
         potal_h2_ref reference{};
         bool prefetched = false, retired = false;
@@ -2199,6 +2243,13 @@ struct executor {
         }
         for (const auto & action : stream_actions) {
             const size_t id = action.index;
+            current_op = no_index;
+            if (action.kind == stream_action_kind::scale || action.kind == stream_action_kind::release)
+                current_op = action.kind == stream_action_kind::scale ?
+                    report.plan.scale_windows[id].program_op : report.plan.scale_windows[id].release_op;
+            else if (action.kind == stream_action_kind::index || action.kind == stream_action_kind::loop ||
+                     action.kind == stream_action_kind::readback)
+                current_op = id;
             const uint64_t cost_before = cost_now();
             cost_kind bucket = cost_other;
             switch (action.kind) {
@@ -2225,7 +2276,9 @@ struct executor {
                 case stream_action_kind::prefetch_panel: {
                     const auto & r = report.plan.residencies[id];
                     const auto before = profile_admission ? exec_clock::now() : exec_clock::time_point{};
-                    st = potal_paired_stream_panel_prefetch(session, panels[id].reference);
+                    st = timeline_call(::potal::timeline::stage::acc_prefetch_issue, r.main_gemm_op,
+                        uint64_t(report.tile.panels[r.panel].k_rows) * r.cols,
+                        [&] { return potal_paired_stream_panel_prefetch(session, panels[id].reference); });
                     if (profile_admission)
                         admission_ms[id] = std::chrono::duration<double, std::milli>(exec_clock::now() - before).count();
                     if (st != POTAL_OK) return hw_fail("stream_b_prefetch", st, &report.plan.ops[r.main_gemm_op]);
@@ -2251,7 +2304,7 @@ struct executor {
                                     const uint32_t slot = uint32_t(base + b * j_tiles + j);
                                     const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
                                     for (size_t c = 0; c < valid; ++c) {
-                                        st = potal_paired_scale_release(session, slot, generation, uint32_t(c));
+                                        st = issue_scale_release(slot, generation, uint32_t(c));
                                         if (st != POTAL_OK) return hw_fail("stream_scale_release", st, nullptr);
                                         ++report.counts.scale_releases;
                                     }
@@ -2264,8 +2317,7 @@ struct executor {
                                     const uint32_t slot = uint32_t(base + b * j_tiles + j);
                                     const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
                                     for (size_t c = 0; c < valid; ++c) {
-                                        st = potal_paired_stream_scale_release(
-                                            session, reference, slot, generation, uint32_t(c));
+                                        st = issue_stream_release(reference, slot, generation, uint32_t(c));
                                         if (st != POTAL_OK) return hw_fail("stream_scale_release", st, nullptr);
                                         ++report.counts.scale_releases;
                                         ++report.counts.stream_local_releases;
@@ -2299,7 +2351,7 @@ struct executor {
                                 const size_t valid = dim - (j + 1 == j_tiles ? pad_j : 0);
                                 const uint32_t * const row = carriers + block * cstride + col_base + j * dim;
                                 for (size_t c = 0; c < valid; ++c) {
-                                    st = potal_paired_scale_write(session, slot, generation, uint32_t(c), row[c]);
+                                    st = issue_scale_write(slot, generation, uint32_t(c), row[c]);
                                     if (st != POTAL_OK) return hw_fail("stream_scale_write", st, nullptr);
                                     ++report.counts.scale_writes;
                                 }
@@ -2319,12 +2371,12 @@ struct executor {
                                 if (action.kind == stream_action_kind::scale) {
                                     const uint32_t carrier = req.weight->carriers[
                                         block * req.weight->cstride + col_base + j * hw.dim + c];
-                                    st = potal_paired_scale_write(session, slot, hw_generation[id], uint32_t(c), carrier);
+                                    st = issue_scale_write(slot, hw_generation[id], uint32_t(c), carrier);
                                     if (st == POTAL_OK) ++report.counts.scale_writes;
                                 } else {
                                     st = req.stream == potal_paired_stream_mode::bounded ?
-                                        potal_paired_scale_release(session, slot, hw_generation[id], uint32_t(c)) :
-                                        potal_paired_stream_scale_release(session, panels[w.residency].reference,
+                                        issue_scale_release(slot, hw_generation[id], uint32_t(c)) :
+                                        issue_stream_release(panels[w.residency].reference,
                                                                          slot, hw_generation[id], uint32_t(c));
                                     if (st == POTAL_OK) {
                                         ++report.counts.scale_releases;
@@ -2369,7 +2421,7 @@ struct executor {
                     stream_panel_retired[id] = true;
                     break;
                 case stream_action_kind::fence:
-                    st = potal_paired_fence(session);
+                    st = issue_fence();
                     if (st != POTAL_OK) return hw_fail("fence", st, nullptr);
                     ++report.counts.fences;
                     ++report.counts.drains;
@@ -2385,7 +2437,7 @@ struct executor {
                     r.pad_j = uint32_t(group_pad_j(op.j_group));
                     r.c = (op.acc_bank == 0 ? req.c_main : req.c_residual) + op.j_group * tile.tile_J * hw.dim;
                     r.ldc = op.acc_bank == 0 ? req.ldc_main : req.ldc_residual;
-                    st = potal_paired_acc_readback_issue(session, &r);
+                    st = issue_readback(r, op.id);
                     if (st != POTAL_OK) return hw_fail("stream_readback", st, &op);
                     ++report.counts.readbacks;
                     report.counts.readback_tiles += uint64_t(r.i_tiles) * r.j_tiles;
@@ -2400,7 +2452,9 @@ struct executor {
             if (st != POTAL_OK) return hw_fail("stream_counters_end", st, nullptr);
         }
         const uint64_t end_before = cost_now();
-        st = potal_paired_stream_end(session);
+        current_op = no_index;
+        st = timeline_call(::potal::timeline::stage::acc_fence, no_index, 0,
+            [&] { return potal_paired_stream_end(session); });
         cost_add(cost_end, end_before);
         if (st == POTAL_OK) cost_end_clock();
         if (st == POTAL_OK) print_cost_profile();
@@ -2504,7 +2558,7 @@ struct executor {
     potal_status fence_now(window_kind kind = window_kind::completion_fence) {
         const auto         t  = time_now();
         auto * record = window_begin(kind, current_op);
-        const potal_status st = potal_paired_fence(session);
+        const potal_status st = issue_fence();
         window_end(record, st);
         report.counts.fence_s += seconds_since(t);
         if (st != POTAL_OK) {
@@ -2595,7 +2649,10 @@ struct executor {
 
     potal_paired_status prefetch_next(const potal_paired_op & op) {
         const size_t next = op.residency + 1;
-        const potal_status st = potal_paired_h2_panel_prefetch(session, panels[next].reference);
+        const auto & future = report.plan.residencies[next];
+        const potal_status st = timeline_call(::potal::timeline::stage::acc_prefetch_issue, op.id,
+            uint64_t(report.tile.panels[future.panel].k_rows) * future.cols,
+            [&] { return potal_paired_h2_panel_prefetch(session, panels[next].reference); });
         report.issued = true;
         // Fresh session, exclusive prefetch ownership: cumulative attempts.
         const auto state = potal_paired_h2_query(session);
@@ -2633,7 +2690,7 @@ struct executor {
 
     potal_paired_status diagnose_window(const potal_paired_op & op) {
         // Keep these commands out of performance counts and leave the plan's drain bookkeeping unchanged.
-        potal_status st = potal_paired_fence(session);
+        potal_status st = issue_fence();
         if (st != POTAL_OK) {
             return hw_fail("fence", st, &op);
         }
@@ -2646,13 +2703,13 @@ struct executor {
         r.pad_j    = (uint32_t) op.pad_j;
         r.c        = window_snapshot.get();
         r.ldc      = window_ldc;
-        st = potal_paired_acc_readback_issue(session, &r);
+        st = issue_readback(r, op.id);
         if (st != POTAL_OK) {
             return hw_fail("window_diag_readback", st, &op);
         }
         ++window_readbacks;
         window_readback_tiles += (size_t) r.i_tiles * r.j_tiles;
-        st = potal_paired_fence(session);
+        st = issue_fence();
         if (st != POTAL_OK) {
             return hw_fail("fence", st, &op);
         }
@@ -2783,7 +2840,7 @@ struct executor {
                 const size_t valid = hw.dim - (j + 1 == w.j_tiles ? pad_j : 0);
                 for (size_t c = 0; c < valid; ++c) {
                     const uint32_t carrier = req.weight->carriers[block * req.weight->cstride + col_base + j * hw.dim + c];
-                    const potal_status st  = potal_paired_scale_write(session, (uint32_t) (w.slot_base + b * w.j_tiles + j),
+                    const potal_status st  = issue_scale_write((uint32_t) (w.slot_base + b * w.j_tiles + j),
                                                                       gen, (uint32_t) c, carrier);
                     report.issued = true;
                     if (st != POTAL_OK) {
@@ -2820,7 +2877,7 @@ struct executor {
             for (size_t j = 0; j < w.j_tiles; ++j) {
                 const size_t valid = hw.dim - (j + 1 == w.j_tiles ? pad_j : 0);
                 for (size_t c = 0; c < valid; ++c) {
-                    const potal_status st = potal_paired_scale_release(session, (uint32_t) (w.slot_base + b * w.j_tiles + j),
+                    const potal_status st = issue_scale_release((uint32_t) (w.slot_base + b * w.j_tiles + j),
                                                                        hw_generation[w.index], (uint32_t) c);
                     if (st != POTAL_OK) {
                         const double elapsed = seconds_since(t);
@@ -2846,7 +2903,9 @@ struct executor {
         if (streaming()) {
             const uint32_t ordinal = op.kind == potal_paired_op_kind::main_gemm ? 0 : uint32_t(op.window + 1);
             const uint64_t t3 = sample ? index_profile_cycles() : 0;
-            const potal_status st = potal_paired_stream_loop_issue(session, panels[op.residency].reference, ordinal, &l);
+            const potal_status st = timeline_call(op.kind == potal_paired_op_kind::main_gemm ?
+                ::potal::timeline::stage::acc_main_issue : ::potal::timeline::stage::acc_residual_issue, op.id, 1,
+                [&] { return potal_paired_stream_loop_issue(session, panels[op.residency].reference, ordinal, &l); });
             const uint64_t t4 = sample ? index_profile_cycles() : 0;
             if (sample) { index_profile.t3 = t3; index_profile.t4 = t4; index_profile.issue_sampled = true; }
             if (st != POTAL_OK) return hw_fail(stage, st, &op);
@@ -2878,7 +2937,7 @@ struct executor {
         if (trace_residual) {
             // Separate diagnostic pass: isolate this Residual without changing
             // primary timing or Main-to-prefetch issue order.
-            const potal_status drained = potal_paired_fence(session);
+            const potal_status drained = issue_fence();
             if (drained != POTAL_OK) return hw_fail("h2_residual_trace_fence", drained, &op);
             report.counts.fences++;
             report.counts.drains++;
@@ -2892,9 +2951,11 @@ struct executor {
         const uint64_t t3 = sample ? index_profile_cycles() : 0;
         auto * record = op.kind == potal_paired_op_kind::residual_gemm ?
             window_begin(window_kind::residual_issue, op.id) : nullptr;
-        const potal_status st = req.next_k_prefetch ?
+        const potal_status st = timeline_call(op.kind == potal_paired_op_kind::main_gemm ?
+            ::potal::timeline::stage::acc_main_issue : ::potal::timeline::stage::acc_residual_issue, op.id, 1,
+            [&] { return req.next_k_prefetch ?
             potal_paired_h2_loop_issue(session, panels[op.residency].reference, reader, &l) :
-            potal_paired_loop_ws_issue(session, &l);
+            potal_paired_loop_ws_issue(session, &l); });
         window_end(record, st);
         const uint64_t t4 = sample ? index_profile_cycles() : 0;
         if (sample) { index_profile.t3 = t3; index_profile.t4 = t4; index_profile.issue_sampled = true; }
@@ -2907,7 +2968,7 @@ struct executor {
             // stalls on RoCC busy. Keep all clock reads outside this pair.
             if (combined) prefetched = prefetch_next(op);
             if (combined && req.early_k_prefetch && prefetched == potal_paired_status::ok) {
-                const potal_status drained = potal_paired_fence(session);
+                const potal_status drained = issue_fence();
                 if (drained != POTAL_OK) return hw_fail("h2_early_fence", drained, &op);
                 report.counts.fences++;
                 report.counts.drains++;
@@ -2917,7 +2978,7 @@ struct executor {
             if (trace_main && !combined) {
                 // Diagnostic-only final-panel snapshot. Primary timing never
                 // enables this extra Fence or any trace command.
-                const potal_status drained = potal_paired_fence(session);
+                const potal_status drained = issue_fence();
                 if (drained != POTAL_OK) return hw_fail("h2_trace_fence", drained, &op);
                 report.counts.fences++;
                 report.counts.drains++;
@@ -3014,9 +3075,20 @@ struct executor {
         cfg.j_tiles       = (uint32_t) op.index_j_tiles;
         cfg.source_k_rows = (uint32_t) op.index_source_k_rows;
         cfg.active_rows   = (uint32_t) op.index_active_rows;
+        if (index_queue) {
+            potal_index_queue_result result{};
+            const uint64_t commands = potal_paired_session_query(session).commands;
+            const potal_status st = timeline_call(::potal::timeline::stage::acc_queue_install, op.id, cfg.active_rows,
+                [&] { return potal_index_queue_install(session, &cfg, queue_entries.data() + op.entry_begin,
+                                                       op.entry_end - op.entry_begin, &result); }, &result.reply.status);
+            report.counts.queue_allocations += result.allocations;
+            report.issued = report.issued || potal_paired_session_query(session).commands != commands;
+            return st == POTAL_OK ? potal_paired_status::ok : hw_fail("index_queue", st, &op);
+        }
         const auto   t    = time_now();
         auto * config_record = window_begin(window_kind::index_config, op.id);
-        potal_status st   = potal_paired_index_config(session, &cfg);
+        potal_status st   = timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, cfg.active_rows,
+            [&] { return potal_paired_index_config(session, &cfg); });
         window_end(config_record, st);
         report.issued     = true;
         if (st != POTAL_OK) {
@@ -3031,7 +3103,8 @@ struct executor {
         for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
             const potal_paired_index_entry & en = report.plan.index_entries[e];
             potal_index_write                w  = { (uint32_t) en.slot, (uint32_t) en.resident_k };
-            st                                  = potal_paired_index_write(session, &w);
+            st = timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, 1,
+                [&] { return potal_paired_index_write(session, &w); });
             if (write_record) ++write_record->calls;
             if (st != POTAL_OK) {
                 window_end(write_record, st);
@@ -3132,7 +3205,7 @@ struct executor {
         r.c   = (op.acc_bank == 0 ? req.c_main : req.c_residual) + col;
         r.ldc = op.acc_bank == 0 ? req.ldc_main : req.ldc_residual;
         const auto         tm = time_now();
-        const potal_status st = potal_paired_acc_readback_issue(session, &r);
+        const potal_status st = issue_readback(r, op.id);
         const double elapsed = seconds_since(tm);
         report.counts.issue_s += elapsed;
         if (profile) readback_s += elapsed;
@@ -3573,6 +3646,8 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     ex.profile = profile != nullptr && std::strcmp(profile, "1") == 0;
     const char * timing = std::getenv("POTAL_PAIRED_TIMING");
     ex.measure = !ex.streaming() && !(timing && std::strcmp(timing, "0") == 0);
+    const char * queue = std::getenv("GGML_POTAL_INDEX_QUEUE");
+    ex.index_queue = queue && std::strcmp(queue, "ON") == 0;
     const char * window_option = std::getenv("POTAL_INDEX_WINDOW_PROFILE");
     ex.window_profile = window_option && std::strcmp(window_option, "1") == 0;
     if (ex.window_profile) {
@@ -3712,6 +3787,18 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             ex.plan_start = exec_clock::time_point{};
         }
         const auto pack_start = ex.profile ? exec_clock::now() : exec_clock::time_point{};
+        // Queue preflight covers every J group and panel of this entire request.
+        // No FLUSH, capability query, Scale write or BEGIN precedes admission.
+        if (ex.index_queue) {
+            const size_t windows = std::count_if(report.plan.ops.begin(), report.plan.ops.end(),
+                [](const potal_paired_op & op) { return op.kind == potal_paired_op_kind::index_program; });
+            const uint32_t remaining = potal_index_queue_remaining();
+            if (!remaining || windows > remaining)
+                return ex.fail(potal_paired_status::execution_failed, "index_queue_preflight",
+                               "request exceeds admitted process Queue budget", POTAL_ERR_CAPACITY);
+            ex.queue_entries.reserve(report.plan.index_entries.size());
+            for (const auto & entry : report.plan.index_entries) ex.queue_entries.push_back(uint32_t(entry.resident_k));
+        }
         // 2. Residual staging (DMA-ready, slot order), before any command.
         if (report.tile.residual) {
             st = potal_paired_pack_residual(report.plan, *req.residual, ex.staging, &why, hw, ex.streaming());

@@ -41,6 +41,15 @@
 #include <tuple>
 #include <utility>
 #include <variant>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#if GGML_POTAL_TIMELINE_HOOKS
+#include "../../../../ggml-potal/trace/timeline.hpp"
+#if defined(__linux__)
+#include <sched.h>
+#endif
+#endif
 
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #include <omp.h>
@@ -298,6 +307,7 @@ bool ExSIA::run(Meta &                  meta,
                 const ggml_tensor *     A,
                 ggml_gemmini_args_t &   args,
                 const StripeReadySink * sink) {
+    const HartRoles * roles = sink ? sink->hart_roles : nullptr;
     const char *                layer             = args.matmul_layer.c_str();
     [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
     const uint64_t              run_id            = next_exsia_run_id();
@@ -396,8 +406,8 @@ bool ExSIA::run(Meta &                  meta,
     state_.mode   = requested_mode_;
     state_.run_id = run_id;
 #if !defined(GGML_GEMMINI_HAS_OPENMP)
-    if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
-        state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
+    if (!roles && (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
+        state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline))
         return fail(ExSIAState::FailureCode::OpenMPUnavailable);
 #endif
     if (state_.mode != ExSIAState::ExecutionMode::Sequential &&
@@ -406,7 +416,7 @@ bool ExSIA::run(Meta &                  meta,
         return fail(ExSIAState::FailureCode::InvalidInput);
     }
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-    if ((state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
+    if (!roles && (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
          state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) &&
         (omp_in_parallel() || omp_get_active_level() > 0)) {
         return fail(ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported);
@@ -642,7 +652,6 @@ bool ExSIA::run(Meta &                  meta,
         cpu_wall.resume();
         return accepted;
     };
-#if defined(GGML_GEMMINI_HAS_OPENMP)
 #if EXSIA_BRANCH_COUNTS_ENABLED
     const auto record_sample = [](StripeCycleStats & stats, const LocalBlockCycleSample & sample) {
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -716,10 +725,240 @@ bool ExSIA::run(Meta &                  meta,
 #endif
         return true;
     };
-#endif
-
     EXSIA_PROFILE_COLLECT(std::vector<StripeProfileRecord> stripe_profiles(num_stripes);)
-    if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) {
+    if (roles) {
+        // The local workspace is shared between stripes. Only prepare resets
+        // it, after both locals have sealed the previous stripe. Fold owns all
+        // prepare/post operations and two slots, releasing s-2 before preparing s.
+        std::mutex role_mutex;
+        std::condition_variable role_cv;
+        size_t prepared_count = 0;
+        std::array<size_t, 2> local_done{{0, 0}};
+        std::vector<std::array<uint32_t, 2>> prepared_edges(num_stripes), sealed_edges(num_stripes);
+        std::atomic<bool> stopped{false};
+        const auto stop = [&](ExSIAState::FailureCode code, size_t s) {
+            {
+                std::lock_guard<std::mutex> lock(role_mutex);
+                record_failure(code, s);
+                stopped.store(true, std::memory_order_release);
+                role_cv.notify_all();
+            }
+            if (roles->on_failure) roles->on_failure(failure_code_name(code), s);
+        };
+        const auto checkpoint = [&](const char * stage, size_t s) {
+            if (stopped.load(std::memory_order_acquire) || (roles->cancelled && roles->cancelled()) ||
+                (roles->checkpoint && !roles->checkpoint(stage, s))) {
+                stop(std::strcmp(stage, "local") == 0 ? ExSIAState::FailureCode::LocalBlockFailure
+                                                      : ExSIAState::FailureCode::FoldingFailure, s);
+                return false;
+            }
+            return true;
+        };
+        const auto trace_role = [&](unsigned hart) {
+            std::string why;
+            if (!roles->pin || !roles->pin(hart, why)) {
+                std::fprintf(stderr, "ExSIA ROLES hart%u affinity: %s\n", hart, why.c_str());
+                stop(ExSIAState::FailureCode::InvalidInput, 0);
+                return false;
+            }
+#if GGML_POTAL_TIMELINE_HOOKS
+            if (::potal::timeline::enabled()) {
+                int expected_hart = -1; // Native test CPUs have no physical RISC-V hart id.
+#if defined(__riscv)
+                expected_hart = (int) hart;
+#endif
+                ::potal::timeline::register_thread(
+                    hart == 1 ? ::potal::timeline::role::exsia_local0 :
+                    hart == 2 ? ::potal::timeline::role::exsia_local1 : ::potal::timeline::role::exsia_fold,
+                    expected_hart, sched_getcpu());
+            }
+#endif
+            return true;
+        };
+        const auto edge_id = [&]() -> uint32_t {
+#if GGML_POTAL_TIMELINE_HOOKS
+            return ::potal::timeline::enabled() ? ::potal::timeline::next_edge_id() : 0;
+#else
+            return 0;
+#endif
+        };
+        const auto event = [&](unsigned stage, unsigned type, size_t s, size_t task = SIZE_MAX, uint32_t edge = 0) {
+#if GGML_POTAL_TIMELINE_HOOKS
+            if (::potal::timeline::enabled())
+                ::potal::timeline::record(static_cast<::potal::timeline::stage>(stage),
+                    static_cast<::potal::timeline::event>(type), 0, roles->timeline_run, roles->timeline_layer,
+                    (uint32_t) s, (uint32_t) task,
+                    s == SIZE_MAX ? UINT32_MAX : (uint32_t) (s % EXSIA_PIPELINE_SLOT_COUNT), edge, 0);
+#else
+            (void) stage; (void) type; (void) s; (void) task; (void) edge;
+#endif
+        };
+        const auto local_role = [&](size_t index) {
+            size_t current = 0;
+            try {
+                if (!trace_role((unsigned) index + 1)) return;
+                for (size_t s = 0; s < num_stripes; ++s) {
+                    current = s;
+                    {
+                        std::unique_lock<std::mutex> lock(role_mutex);
+                        event(11, 3, s);
+                        role_cv.wait(lock, [&] { return stopped || prepared_count > s; });
+                        event(11, 4, s);
+                        if (stopped) return;
+                        event(11, 6, s, index, prepared_edges[s][index]);
+                    }
+                    auto & slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
+                    for (size_t task = index; task < EXSIA_LOCAL_WORKER_COUNT; task += 2) {
+                        event(11, 1, s, task);
+                        bool ok = checkpoint("local", s);
+                        auto & worker = local_workspace_.workers[task];
+                        auto & runtime = local_workspace_.local_tasks[task];
+                        for (size_t b = worker.block_start; ok && b < worker.block_end; ++b) {
+                            if (stopped.load(std::memory_order_acquire) || (roles->cancelled && roles->cancelled())) {
+                                ok = false;
+                                break;
+                            }
+                            ok = run_local_block(slot, worker.scratch,
+                                slot.row_start + b / state_.blocks_per_row, b % state_.blocks_per_row
+#if EXSIA_BRANCH_COUNTS_ENABLED
+                                , runtime.cycle_stats
+#endif
+                                );
+                        }
+                        runtime.completed = ok;
+                        event(11, 2, s, task);
+                        if (!ok) {
+                            stop(ExSIAState::FailureCode::LocalBlockFailure, s);
+                            return;
+                        }
+                    }
+                    if (!checkpoint("local_done", s)) return;
+                    {
+                        std::lock_guard<std::mutex> lock(role_mutex);
+                        sealed_edges[s][index] = edge_id();
+                        event(11, 5, s, index, sealed_edges[s][index]);
+                        local_done[index] = s + 1;
+                        role_cv.notify_all();
+                    }
+                }
+            } catch (...) {
+                stop(ExSIAState::FailureCode::Exception, current);
+            }
+        };
+        const auto fold_role = [&] {
+            size_t current = 0;
+            try {
+                if (!trace_role(3)) return;
+                const auto prepare = [&](size_t s) {
+                    event(10, 1, s);
+                    auto & slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
+                    const size_t r0 = s * rows_per_stripe, r1 = std::min(r0 + rows_per_stripe, args.I);
+                    slot.acquire(s);
+                    slot.reset_for_stripe(s, r0, r1, state_.K_padded, state_.blocks_per_row);
+                    local_workspace_.reset_for_stripe(s, r0, r1, state_.blocks_per_row);
+                    slot.mark_quantization_started(aggregate_now_tick(), aggregate_now_ns());
+                    const bool ok = checkpoint("prepare", s);
+                    event(10, 2, s);
+                    if (!ok) return false;
+                    std::lock_guard<std::mutex> lock(role_mutex);
+                    if (stopped) return false;
+                    for (size_t i = 0; i < 2; ++i) {
+                        prepared_edges[s][i] = edge_id();
+                        event(10, 5, s, i, prepared_edges[s][i]);
+                    }
+                    prepared_count = s + 1;
+                    role_cv.notify_all();
+                    return true;
+                };
+                if (!prepare(0)) return;
+                for (size_t s = 0; s < num_stripes; ++s) {
+                    current = s;
+                    auto & slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
+                    {
+                        std::unique_lock<std::mutex> lock(role_mutex);
+                        event(12, 3, s);
+                        role_cv.wait(lock, [&] { return stopped.load() || (local_done[0] > s && local_done[1] > s); });
+                        event(12, 4, s);
+                        if (stopped) return;
+                        for (size_t i = 0; i < 2; ++i)
+                            event(12, 6, s, i, sealed_edges[s][i]);
+                    }
+                    event(12, 1, s);
+                    bool sealed = true;
+                    for (const auto & task : local_workspace_.local_tasks) sealed = sealed && task.completed;
+                    sealed = sealed && checkpoint("local_seal", s);
+                    event(12, 2, s);
+                    if (!sealed) {
+                        stop(ExSIAState::FailureCode::LocalBlockFailure, s);
+                        return;
+                    }
+                    // s-1 was released by the previous iteration. Locals for
+                    // s+1 now overlap this iteration's ordered folding of s.
+                    if (s + 1 < num_stripes && !prepare(s + 1)) return;
+                    event(13, 1, s);
+                    const bool assembled = assemble_stripe_mask(slot, state_);
+                    event(13, 2, s);
+                    if (!assembled) {
+                        stop(ExSIAState::FailureCode::MaskAssemblyFailure, s);
+                        return;
+                    }
+                    event(14, 1, s);
+                    reduce_stripe_exponents(slot, slot.active_block_count);
+                    slot.mark_local_filled();
+                    event(14, 2, s);
+                    event(15, 1, s);
+                    const bool folded = checkpoint("fold", s) && folding_.run(meta, state_, slot.stripe, args, s,
+                        slot.q_wide, slot.block_exp, state_.residual, slot.rmd_builder);
+                    event(15, 2, s);
+                    if (!folded) {
+                        stop(ExSIAState::FailureCode::FoldingFailure, s);
+                        return;
+                    }
+                    event(16, 1, s);
+                    const bool packet_ok = seal_stripe_packet(meta, slot, args);
+                    slot.mark_folding_committed(aggregate_now_ns(), aggregate_now_tick());
+                    const bool snapshot_ok = snapshot_validation_mask(s, slot.stripe.outlier_mask);
+                    event(16, 2, s);
+                    if (!packet_ok || !snapshot_ok) {
+                        stop(ExSIAState::FailureCode::FoldingFailure, s);
+                        return;
+                    }
+                    CpuWallInterval wall(layer, run_id, "exsia.publish", s);
+                    event(17, 1, s);
+                    const bool accepted = notify_stripe_ready(slot, run_id, false, wall
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                        , &stripe_profiles[s]
+#endif
+                        );
+                    event(17, 2, s);
+                    if (!accepted) {
+                        stop(ExSIAState::FailureCode::StripeReadySinkFailure, s);
+                        return;
+                    }
+                    slot.release();
+                    if (!checkpoint("release", s)) return;
+                    {
+                        std::lock_guard<std::mutex> lock(role_mutex);
+                        if (stopped) return;
+                    }
+                }
+            } catch (...) {
+                stop(ExSIAState::FailureCode::Exception, current);
+            }
+        };
+        std::array<std::thread, 3> threads;
+        try {
+            threads[0] = std::thread(local_role, 0);
+            threads[1] = std::thread(local_role, 1);
+            threads[2] = std::thread(fold_role);
+        } catch (...) {
+            stop(ExSIAState::FailureCode::Exception, 0);
+        }
+        event(1, 3, SIZE_MAX);
+        for (auto & thread : threads) if (thread.joinable()) thread.join();
+        event(1, 4, SIZE_MAX);
+        if (stopped) return fail();
+    } else if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
         std::vector<uint8_t>       prepared_storage(num_stripes);
         std::vector<uint8_t>       worker_done_storage(num_stripes * EXSIA_LOCAL_WORKER_COUNT);

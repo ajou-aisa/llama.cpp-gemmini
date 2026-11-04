@@ -156,6 +156,14 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     endif()
 endif()
 
+# Cross-hart clock probe (H3-8I-25P): no accelerator use; runs natively and on the FireSim Linux guest.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Threads REQUIRED)
+    add_executable(potal-clock-probe tests/potal-clock-probe.c)
+    target_link_libraries(potal-clock-probe PRIVATE Threads::Threads)
+    set_target_properties(potal-clock-probe PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+endif()
+
 if (POTAL_API_ONLY)
     return()
 endif()
@@ -297,6 +305,8 @@ set(POTAL_BACKEND_SOURCES
     quants/weight/hp1/hp1.hpp
     residual/stripe-residual.cpp
     residual/stripe-residual.hpp
+    trace/timeline.cpp
+    trace/timeline.hpp
     ${POTAL_GEMMINI_SHARED_SOURCES})
 if (POTAL_PLANNING_DIAGNOSTICS)
     # Smoke and regression executables also compile backend sources. One shared
@@ -327,6 +337,7 @@ set(POTAL_LOG_DEFINITIONS
     GGML_POTAL_PAIRED_AUTO=${_POTAL_PAIRED_AUTO_VALUE}
     GGML_GEMMINI_EXECUTION_BACKEND_HARDWARE=1
     EXSIA_VALIDATION=0
+    GGML_POTAL_TIMELINE_HOOKS=1
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
 set(POTAL_PRIVATE_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -506,6 +517,17 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-tiling-unit-test COMMAND potal-tiling-unit-test)
 endif()
 
+# Hardware-free checks (host and target) of the opt-in timeline trace
+# (trace/timeline.hpp, POTAL_TIMELINE): 4-thread recording, handoff edges,
+# ring overflow, the disabled path and the flushed CSV.
+add_executable(potal-timeline-test tests/potal-timeline-test.cpp trace/timeline.cpp)
+target_include_directories(potal-timeline-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(potal-timeline-test PRIVATE cxx_std_17)
+target_link_libraries(potal-timeline-test PRIVATE Threads::Threads)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-timeline-test COMMAND potal-timeline-test)
+endif()
+
 # Hardware-free checks (host and target): the PoTal WS residual of one packet
 # (run-aware rows/runs, K32 padded lowering, gather from the prepared weight)
 # against an independent compact-run SCU/Sat32 golden, radix INT64
@@ -555,6 +577,14 @@ endif()
 #             translation (LOOP_WS / INDEX / scale / readback counts and order),
 #             residual staging, Main / Residual INT32, radix INT64 and merged
 #             F32 == the serialized reference, pairs and generations, failures
+add_executable(potal-index-queue-test tests/potal-index-queue-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-index-queue-test)
+target_include_directories(potal-index-queue-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-index-queue-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-index-queue-test COMMAND potal-index-queue-test)
+endif()
+
 foreach(_paired_test plan schedule unit auto execution)
     add_executable(potal-paired-${_paired_test}-test tests/potal-paired-${_paired_test}-test.cpp ${POTAL_BACKEND_SOURCES})
     potal_add_backend_settings(potal-paired-${_paired_test}-test)
@@ -627,6 +657,13 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     potal_add_backend_settings(potal-stripe-smoke)
     target_include_directories(potal-stripe-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(potal-stripe-smoke PRIVATE ggml)
+
+    # FireSim (H3-8I-25P): one STRIPE_PIPELINE MUL_MAT repeated under serial / five-hart roles /
+    # Register-fed Queue modes, each run checked bitwise against the potal-stripe-smoke golden.
+    add_executable(potal-pipeline-bench tests/potal-pipeline-bench.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-pipeline-bench)
+    target_include_directories(potal-pipeline-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-pipeline-bench PRIVATE ggml)
 
     # FireSim: the paired route (GGML_POTAL_PAIRED_AUTO) on the H2 hardware, same
     # golden as potal-stripe-smoke, each case paired and serial (measured timing).

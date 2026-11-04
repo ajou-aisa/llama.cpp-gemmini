@@ -73,6 +73,7 @@
 #include <gemmini/trace-context.h>
 
 #include <condition_variable>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -187,6 +188,12 @@ struct stripe_event {
 using stripe_observer = std::function<void(const stripe_event &)>;
 
 struct pipeline_config {
+    bool            hart_roles = false; // explicit five-hart roles; default path is unchanged
+    std::array<int, 5> role_cpus{{-1, -1, -1, -1, -1}}; // validated by the driver
+    uint32_t        timeline_run = 0;
+    uint32_t        timeline_layer = 0;
+    // Optional deterministic role test seam. False fails before that stage.
+    std::function<bool(const char *, size_t)> role_checkpoint;
     size_t          job_capacity = 2;          // 1 or 2 semantic stripes in flight
     bool            residual     = false;      // compensation ON: ws_packet packets may arrive
     std::string     layer;                     // log layer of the node
@@ -320,6 +327,7 @@ class stripe_run {
     bool finish();
     // Fails the run (sticky; nothing new starts) and closes the input.
     void abort(const char * stage, const std::string & detail);
+    bool cancelled() const { return cancelled_.load(std::memory_order_acquire); }
 
     // ---- consumer: on the accelerator owner thread -----------------------------
     consume_outcome consume(const owner_runners & runners);
@@ -338,8 +346,14 @@ class stripe_run {
   private:
     struct slot;
     struct stripe_result;
+    struct stripe_work;
 
     stripe_result execute(slot & s, const stripe_event & main_begin, const owner_runners & runners);
+    stripe_result finalize(slot & s, stripe_work & work);
+    void          finalizer_loop();
+    void          merge_counts(const pipeline_counts & n);
+    void          timeline(unsigned stage, unsigned event, size_t stripe = no_stripe,
+                           size_t buffer = no_stripe, uint32_t edge = 0) const;
     std::string   check_event(const exsia::StripeReadyEvent & e, size_t rows) const;
     std::string   check_order_locked(const exsia::StripeReadyEvent & e, size_t rows) const;
     void          fail_locked(const char * stage, potal_status status, bool fatal, std::string detail);
@@ -369,8 +383,11 @@ class stripe_run {
     std::condition_variable cv_;
     std::vector<std::unique_ptr<slot>> slots_;
     std::deque<slot *>                 ready_;
+    std::deque<std::pair<slot *, std::shared_ptr<stripe_work>>> final_ready_;
+    bool                               device_done_ = false;
     bool                               closing_     = false;
     bool                               failed_      = false;
+    std::atomic<bool>                  cancelled_{false};
     bool                               fatal_       = false;
     bool                               run_bound_   = false;
     uint64_t                           run_id_      = 0;

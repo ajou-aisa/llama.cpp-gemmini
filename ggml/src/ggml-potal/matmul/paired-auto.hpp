@@ -528,6 +528,7 @@ struct potal_paired_counts {
              scale_releases = 0, readbacks = 0, readback_tiles = 0, fences = 0, drains = 0, tlb_flushes = 0,
              ops = 0;
     uint64_t scale_reused_windows = 0, scale_reused_columns = 0;
+    uint64_t queue_allocations = 0; // process BEGIN credits consumed, never refunded
     uint64_t prefetch_loads = 0, prefetch_mvins = 0, prefetch_bytes_declared = 0, resident_main_loop_ws = 0;
     uint64_t prefetch_ldb_only = 0; // CPU descriptors, not generated LOAD2 commands
     uint64_t stream_batches = 0, stream_capacity_boundaries = 0, stream_pair_waits = 0;

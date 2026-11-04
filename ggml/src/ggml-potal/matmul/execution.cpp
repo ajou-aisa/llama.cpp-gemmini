@@ -10,6 +10,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
 
 #if defined(__linux__)
 #    include <pthread.h>
@@ -37,6 +41,131 @@
 static_assert(POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32, "ggml-potal requires DIM16 or DIM32");
 
 namespace ggml::potal {
+
+bool hart_roles_requested(bool & invalid) {
+    invalid = false;
+    const char * value = std::getenv("GGML_POTAL_HART_ROLES");
+    if (value == nullptr || *value == '\0') return false;
+    std::string v(value);
+    for (char & ch : v) ch = (char) std::toupper((unsigned char) ch);
+    if (v == "ON" || v == "1") return true;
+    if (v == "OFF" || v == "0") return false;
+    invalid = true;
+    return false;
+}
+
+bool find_hart_cpu(unsigned hart, int & cpu, std::string & err) {
+#if defined(__linux__)
+    FILE * f = std::fopen("/proc/cpuinfo", "r");
+    if (f == nullptr) {
+        err = std::string("cannot open /proc/cpuinfo: ") + std::strerror(errno);
+        return false;
+    }
+    std::array<int, 5> map{{-1, -1, -1, -1, -1}};
+    char line[256];
+    int processor = -1;
+    bool has_harts = false, valid = true;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        int v;
+        if (line[0] == '\n') processor = -1;
+        if (std::sscanf(line, "processor : %d", &v) == 1) {
+            processor = v;
+        } else if (std::sscanf(line, "hart : %d", &v) == 1) {
+            has_harts = true;
+            if (processor < 0 || v < 0) valid = false;
+            if (v >= 0 && v < (int) map.size()) {
+                if (map[v] != -1) valid = false;
+                map[v] = processor;
+            }
+        }
+    }
+    std::fclose(f);
+    if (!has_harts) {
+#if !defined(__riscv)
+        const char * p = std::getenv("GGML_POTAL_HART_MAP");
+        if (p == nullptr) {
+            err = "ROLES requires /proc/cpuinfo hart fields or native test-only GGML_POTAL_HART_MAP";
+            return false;
+        }
+        for (size_t i = 0; i < map.size(); ++i) {
+            char * end = nullptr;
+            errno = 0;
+            const long v = std::strtol(p, &end, 10);
+            if (errno || end == p || v < 0 || v >= CPU_SETSIZE ||
+                (i + 1 < map.size() ? *end != ',' : *end != '\0')) {
+                err = "GGML_POTAL_HART_MAP must contain exactly five Linux CPU ids";
+                return false;
+            }
+            map[i] = (int) v;
+            p = end + (i + 1 < map.size() ? 1 : 0);
+        }
+#else
+        err = "ROLES requires /proc/cpuinfo hart fields (native test map forbidden on RISC-V)";
+        return false;
+#endif
+    }
+    if (!valid || hart >= map.size() || map[hart] < 0 || map[hart] >= CPU_SETSIZE) {
+        err = "missing or malformed processor/hart pair for hart " + std::to_string(hart);
+        return false;
+    }
+    cpu = map[hart];
+    return true;
+#else
+    (void) hart;
+    (void) cpu;
+    err = "ROLES requires Linux thread affinity";
+    return false;
+#endif
+}
+
+bool find_role_cpus(std::array<int, 5> & cpus, std::string & err) {
+    for (unsigned h = 0; h < cpus.size(); ++h) {
+        if (!find_hart_cpu(h, cpus[h], err)) return false;
+        for (unsigned j = 0; j < h; ++j) {
+            if (cpus[j] == cpus[h]) {
+                err = "ROLES requires five distinct Linux CPUs";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool pin_role_cpu(int cpu, std::string & err) {
+#if defined(__linux__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        err = "role CPU is outside CPU_SETSIZE";
+        return false;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc == 0) {
+        cpu_set_t got;
+        CPU_ZERO(&got);
+        rc = pthread_getaffinity_np(pthread_self(), sizeof(got), &got);
+        if (rc == 0 && (CPU_COUNT(&got) != 1 || !CPU_ISSET(cpu, &got))) {
+            err = "affinity is not {" + std::to_string(cpu) + "} after pinning";
+            return false;
+        }
+    }
+    if (rc != 0) {
+        err = "pinning to cpu " + std::to_string(cpu) + " failed: " + std::strerror(rc);
+        return false;
+    }
+    const int running = sched_getcpu();
+    if (running != cpu) {
+        err = "sched_getcpu()=" + std::to_string(running) + " after pinning to cpu " + std::to_string(cpu);
+        return false;
+    }
+    return true;
+#else
+    (void) cpu;
+    err = "ROLES requires Linux thread affinity";
+    return false;
+#endif
+}
 
 namespace {
 
@@ -114,62 +243,13 @@ double seconds_since(clock_type::time_point t0) {
 
 // Linux CPU whose /proc/cpuinfo "hart" is 0, where the PoTal RoCC is attached.
 bool find_hart0_cpu(int & cpu, std::string & err) {
-    FILE * f = std::fopen("/proc/cpuinfo", "r");
-    if (f == nullptr) {
-        err = std::string("cannot open /proc/cpuinfo: ") + std::strerror(errno);
-        return false;
-    }
-    char line[256];
-    int  processor = -1;
-    bool ok        = true;
-    cpu            = -1;
-    while (ok && std::fgets(line, sizeof(line), f) != nullptr) {
-        int v;
-        if (std::sscanf(line, "processor : %d", &v) == 1) {
-            processor = v;
-        } else if (std::sscanf(line, "hart : %d", &v) == 1 && v == 0) {
-            ok  = processor >= 0 && cpu == -1;
-            cpu = processor;
-        }
-    }
-    std::fclose(f);
-    if (!ok) {
-        err = "malformed /proc/cpuinfo: hart 0 listed twice or before any processor line";
-        return false;
-    }
-    if (cpu < 0) {
-        err = "no Linux CPU reports hart 0 in /proc/cpuinfo";
-        return false;
-    }
-    return true;
+    return find_hart_cpu(0, cpu, err);
 }
 
 // Pin the calling thread to exactly `cpu`, then confirm the kernel's view:
 // affinity == {cpu} and sched_getcpu() == cpu (as potal-multicore-smoke).
 bool pin_self(int cpu, std::string & err) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-    if (rc == 0) {
-        cpu_set_t got;
-        CPU_ZERO(&got);
-        rc = pthread_getaffinity_np(pthread_self(), sizeof(got), &got);
-        if (rc == 0 && (CPU_COUNT(&got) != 1 || !CPU_ISSET(cpu, &got))) {
-            err = "affinity is not {" + std::to_string(cpu) + "} after pinning";
-            return false;
-        }
-    }
-    if (rc != 0) {
-        err = "pinning to cpu " + std::to_string(cpu) + " failed: " + std::strerror(rc);
-        return false;
-    }
-    const int running = sched_getcpu();
-    if (running != cpu) {
-        err = "sched_getcpu()=" + std::to_string(running) + " after pinning to cpu " + std::to_string(cpu);
-        return false;
-    }
-    return true;
+    return pin_role_cpu(cpu, err);
 }
 
 // Cleanup after a failure that happened before any GEMM was issued; the

@@ -5,6 +5,7 @@
 #include "residual/stripe-residual.hpp"
 
 #include "potal_hw_params.h"
+#include "trace/timeline.hpp"
 
 #include "quants/act/quantize.hpp"
 #include "quants/common/hp1_scu.hpp"
@@ -21,6 +22,7 @@
 #include <limits>
 #include <new>
 #include <utility>
+#include <thread>
 
 namespace ggml::potal {
 
@@ -37,6 +39,22 @@ constexpr uint32_t SCALE_BLOCK_K = quants::weight::hp1::block_k;
 // ExSIA SEQUENTIAL quantizes on the producer alone: pin it to one CPU. The
 // OpenMP modes start their team from it: keep every CPU but the issuer's.
 constexpr bool producer_on_one_cpu = GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE == 0;
+
+struct role_span {
+    const pipeline_config & cfg;
+    ::potal::timeline::stage stage;
+    uint32_t stripe, buffer;
+    role_span(const pipeline_config & c, unsigned st, size_t s = SIZE_MAX, size_t b = SIZE_MAX) :
+        cfg(c), stage(static_cast<::potal::timeline::stage>(st)), stripe((uint32_t) s), buffer((uint32_t) b) {
+        record(::potal::timeline::event::begin);
+    }
+    ~role_span() { record(::potal::timeline::event::end); }
+    void record(::potal::timeline::event event) {
+        if (cfg.hart_roles && ::potal::timeline::enabled())
+            ::potal::timeline::record(stage, event, 0, cfg.timeline_run, cfg.timeline_layer,
+                stripe, UINT32_MAX, buffer, 0, 0);
+    }
+};
 
 uint64_t now_ns() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -126,6 +144,8 @@ struct stripe_run::slot {
     uint64_t                      quantization_start_ns = 0;
     uint64_t                      quantization_end_ns   = 0;
     uint64_t                      folding_commit_ns     = 0;
+    uint32_t                      submit_edge = 0;
+    uint32_t                      final_edge = 0;
 
     ~slot() {
         std::free(a);
@@ -139,6 +159,32 @@ struct stripe_run::stripe_result {
     potal_status status = POTAL_OK;
     const char * stage  = nullptr;
 };
+
+// Retains every readback and its reconstruction inputs until semantic completion.
+// A queued finalizer owns this object, and the slot remains non-FREE throughout.
+struct stripe_run::stripe_work {
+    residual::request req;
+    rmd::BlockScaledInt64Correction correction;
+    residual::decoded_packet decoded;
+    potal_paired_execution_plan routing;
+    potal_paired_report paired;
+    struct dma_block {
+        void * p = nullptr;
+        ~dma_block() { std::free(p); }
+        void abandon() { p = nullptr; }
+    } paired_rc;
+    pipeline_counts counts;
+    stripe_completion done;
+    bool paired_route = false;
+};
+
+void stripe_run::timeline(unsigned stage, unsigned event, size_t stripe, size_t buffer, uint32_t edge) const {
+    if (cfg_.hart_roles && ::potal::timeline::enabled()) {
+        ::potal::timeline::record(static_cast<::potal::timeline::stage>(stage),
+            static_cast<::potal::timeline::event>(event), 0, cfg_.timeline_run, cfg_.timeline_layer,
+            (uint32_t) stripe, UINT32_MAX, (uint32_t) buffer, edge, 0);
+    }
+}
 
 stripe_run::stripe_run(const pipeline_config & cfg, const ggml_gemmini_args_t & args, const hp1_weight & w,
                        const potal_tile_plan & plan) :
@@ -240,6 +286,7 @@ void stripe_run::fail_locked(const char * stage, potal_status status, bool fatal
         first_detail_ = std::move(detail);
     }
     fatal_ = fatal_ || fatal;
+    cancelled_.store(true, std::memory_order_release);
     cv_.notify_all();
 }
 
@@ -290,7 +337,9 @@ void stripe_run::emit(const stripe_event & ev) {
         // thread writes it right after releasing mutex_, so this waits for one
         // record write, never for a later step of either thread.
         std::unique_lock<std::mutex> lock(log_mutex_);
+        timeline(17, 3, ev.stripe_id, ev.slot);
         log_cv_.wait(lock, [&] { return logged_sequence_ + 1 == ev.sequence; });
+        timeline(17, 4, ev.stripe_id, ev.slot);
     }
     {
         struct next_record {
@@ -439,7 +488,9 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
                 lock.lock();
                 continue; // the state may have changed while the lock was released
             }
+            timeline(17, 3, e.stripe_id, e.slot);
             cv_.wait(lock);
+            timeline(17, 4, e.stripe_id, e.slot);
         }
         if (failed_) {
             return false;
@@ -494,6 +545,10 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
         // push (it may allocate) comes first, so nothing that can throw lies
         // between the stamp and the record.
         ready_.push_back(s);
+        if (cfg_.hart_roles && ::potal::timeline::enabled()) {
+            s->submit_edge = ::potal::timeline::next_edge_id();
+            timeline(17, 5, s->stripe_id, s->index, s->submit_edge);
+        }
         counts_.stripes_accepted++;
         s->state                 = slot_state::ready;
         stripe_event ev          = slot_event_locked(stripe_event_kind::submit_accepted, *s);
@@ -521,7 +576,9 @@ bool stripe_run::finish() {
                         " accepted");
     }
     cv_.notify_all();
+    timeline(1, 3);
     cv_.wait(lock, [this] { return failed_ || completed_ == expected_; });
+    timeline(1, 4);
     return !failed_;
 }
 
@@ -539,12 +596,35 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
 
 consume_outcome stripe_run::consume(const owner_runners & runners) {
     consume_outcome out;
+    std::thread finalizer;
+    if (cfg_.hart_roles) {
+        std::string why;
+        if (!pin_role_cpu(cfg_.role_cpus[0], why)) {
+            fail("issuer_affinity", POTAL_OK, false, why);
+            return out;
+        }
+        if (::potal::timeline::enabled()) {
+            int expected_hart = -1;
+#if defined(__riscv)
+            expected_hart = 0;
+#endif
+            ::potal::timeline::register_thread(::potal::timeline::role::issuer, expected_hart, cfg_.role_cpus[0]);
+        }
+        try {
+            finalizer = std::thread(&stripe_run::finalizer_loop, this);
+        } catch (const std::exception & ex) {
+            fail("finalizer_start", POTAL_OK, false, ex.what());
+            return out;
+        }
+    }
     for (;;) {
         slot *       s = nullptr;
         stripe_event begin{ stripe_event_kind::main_begin };
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return failed_ || !ready_.empty() || (closing_ && outstanding_ == 0); });
+            timeline(20, 3);
+            cv_.wait(lock, [this] { return failed_ || !ready_.empty() || (closing_ && ready_.empty()); });
+            timeline(20, 4);
             if (failed_ || ready_.empty()) {
                 break; // failed: READY stripes are dropped, nothing new starts
             }
@@ -552,6 +632,7 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
             ready_.pop_front();
             s->state = slot_state::main_running;
             begin    = slot_event_locked(stripe_event_kind::main_begin, *s);
+            timeline(17, 6, s->stripe_id, s->index, s->submit_edge);
         }
         stripe_result r;
         try {
@@ -571,25 +652,20 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
             break;
         }
     }
+    if (finalizer.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            device_done_ = true;
+            cv_.notify_all();
+        }
+        timeline(20, 3);
+        finalizer.join();
+        timeline(20, 4);
+    }
     return out;
 }
 
-stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const owner_runners & runners) {
-    const planned_runner & exec = runners.planned;
-    ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
-    stripe_result                       res;
-    bool                                gemm_fatal = false; // a planned GEMM left the accelerator state unknown
-    bool                                released   = false; // capacity returned: slot and counts are the run's
-    pipeline_counts                     n; // this stripe's counts, merged into the run's under the lock
-    const size_t                        rows = s.row_end - s.row_begin;
-    stripe_completion                   done; // this stripe's record, published with its capacity
-    done.stripe_id   = s.stripe_id;
-    done.row_begin   = s.row_begin;
-    done.row_end     = s.row_end;
-    done.slot        = s.index;
-    done.accepted_ns = s.accepted_ns;
-
-    const auto merge_counts = [this, &n] {
+void stripe_run::merge_counts(const pipeline_counts & n) {
         counts_.main_logical_gemms += n.main_logical_gemms;
         counts_.main_loop_ws += n.main_loop_ws;
         counts_.main_validated += n.main_validated;
@@ -638,7 +714,27 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
-    };
+}
+
+stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const owner_runners & runners) {
+    const planned_runner & exec = runners.planned;
+    ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
+    stripe_result res;
+    bool gemm_fatal = false;
+    // Keep the serial path's stack-owned scratch; only ROLES transfers ownership.
+    std::optional<stripe_work> serial_work;
+    std::shared_ptr<stripe_work> role_work;
+    if (cfg_.hart_roles) role_work = std::make_shared<stripe_work>();
+    else serial_work.emplace();
+    stripe_work * work = cfg_.hart_roles ? role_work.get() : &*serial_work;
+    pipeline_counts & n = work->counts;
+    const size_t rows = s.row_end - s.row_begin;
+    stripe_completion & done = work->done;
+    done.stripe_id   = s.stripe_id;
+    done.row_begin   = s.row_begin;
+    done.row_end     = s.row_end;
+    done.slot        = s.index;
+    done.accepted_ns = s.accepted_ns;
     const auto account = [&n](const planned_result & pr, bool main) {
         const potal_stripe_gemm_report & g = pr.report;
         (main ? n.main_loop_ws : n.residual_loop_ws) += g.loop_ws;
@@ -657,9 +753,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
     // the producer's again: use this stripe's own id, merge nothing twice.
     const auto failed = [&](const char * stage, potal_status status, bool fatal, std::string detail) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!released) {
-            merge_counts();
-        }
+        merge_counts(n);
         fail_locked(stage, status, fatal, "stripe " + std::to_string(done.stripe_id) + ": " + detail);
         res.fatal  = fatal;
         res.status = status;
@@ -677,29 +771,25 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         done.main_begin_ns   = main_begin.t_ns;
         done.slot_generation = main_begin.slot_generation;
 
-        residual::request               req;        // serial route: the Residual GEMM's operands and C
-        rmd::BlockScaledInt64Correction correction;
-        residual::decoded_packet        decoded;    // paired route: the packet, decoded once
-        potal_paired_execution_plan     routing;    // paired route: the plan that chose the route, executed as is
-        potal_paired_report             paired;     // paired route: the executor's report (residual rows)
+        auto & req = work->req;
+        auto & decoded = work->decoded;
+        auto & routing = work->routing;
+        auto & paired = work->paired;
+        auto & paired_rc = work->paired_rc;
         potal_paired_geometry           diagnostic_hw;
         potal_tile_plan                 diagnostic_main;
         potal_tile_plan                 j8k8_main;
         potal_tile_plan                 selected_main;
         const potal_tile_plan *         paired_main = &plan_;
         bool                            diagnostic_index = false;
-        struct dma_block {
-            void * p = nullptr;
-            ~dma_block() { std::free(p); }
-            void abandon() { p = nullptr; } // the accelerator may still reach it
-        } paired_rc;                                // paired route: Residual C, lane rows x ldc_
 
         // 0. Paired route (cfg_.paired): decode the packet, plan Main + Residual
         //    (potal_paired_plan_stripe, CPU, before any command) and choose the
         //    route. A capacity refusal runs the serial route below and is
         //    reported as serial_fallback; any other refusal fails the stripe.
-        bool paired_route = false;
+        bool & paired_route = work->paired_route;
         if (cfg_.paired) {
+            role_span preparing(cfg_, 21, s.stripe_id, s.index);
             const char * profile_env = std::getenv("POTAL_PAIRED_PROFILE");
             const bool profile = profile_env != nullptr && std::strcmp(profile_env, "1") == 0;
             emit(advance(s, slot_state::paired_prepare, stripe_event_kind::paired_prepare_begin));
@@ -1032,6 +1122,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
 
             // 2. Residual GEMM of the sealed packet, on the same accelerator.
             if (s.packet) {
+                {
+                role_span preparing(cfg_, 21, s.stripe_id, s.index);
                 emit(advance(s, slot_state::residual_prepare, stripe_event_kind::residual_prepare_begin));
                 // In this Serial branch, cfg_.paired means a recognized capacity
                 // refusal after a successful decode of this same immutable packet.
@@ -1049,6 +1141,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                     ev.k_execution  = req.k_execution;
                     ev.runs         = req.runs.size();
                     emit(ev);
+                }
                 }
                 emit(advance(s, slot_state::residual_running, stripe_event_kind::residual_begin));
                 potal_stripe_gemm_desc r = d;
@@ -1101,14 +1194,99 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             }
         }
 
+        if (cfg_.hart_roles) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!failed_) {
+                final_ready_.emplace_back(&s, role_work);
+                if (::potal::timeline::enabled()) {
+                    s.final_edge = ::potal::timeline::next_edge_id();
+                    timeline(40, 5, s.stripe_id, s.index, s.final_edge);
+                }
+                cv_.notify_all();
+            } else {
+                merge_counts(n);
+            }
+            res.ok = true;
+            return res;
+        }
+        return finalize(s, *work);
+    } catch (const std::exception & ex) {
+        return failed("exception", POTAL_OK, gemm_fatal, ex.what());
+    }
+}
+
+void stripe_run::finalizer_loop() {
+    try {
+        std::string why;
+        if (!pin_role_cpu(cfg_.role_cpus[4], why)) {
+            fail("finalizer_affinity", POTAL_OK, false, why);
+            return;
+        }
+        if (::potal::timeline::enabled()) {
+            int expected_hart = -1;
+#if defined(__riscv)
+            expected_hart = 4;
+#endif
+            ::potal::timeline::register_thread(::potal::timeline::role::finalizer, expected_hart, cfg_.role_cpus[4]);
+        }
+        for (;;) {
+            std::pair<slot *, std::shared_ptr<stripe_work>> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                timeline(41, 3);
+                cv_.wait(lock, [&] { return failed_ || device_done_ || !final_ready_.empty(); });
+                timeline(41, 4);
+                if (failed_ || final_ready_.empty()) return;
+                job = std::move(final_ready_.front());
+                final_ready_.pop_front();
+                timeline(40, 6, job.first->stripe_id, job.first->index, job.first->final_edge);
+            }
+            if (!finalize(*job.first, *job.second).ok) return;
+        }
+    } catch (const std::exception & ex) {
+        fail("finalizer", POTAL_OK, false, ex.what());
+    } catch (...) {
+        fail("finalizer", POTAL_OK, false, "unknown finalizer exception");
+    }
+}
+
+stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
+    ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
+    stripe_result res;
+    auto & n = work.counts;
+    auto & done = work.done;
+    auto & correction = work.correction;
+    auto & req = work.req;
+    auto & paired = work.paired;
+    auto & paired_rc = work.paired_rc;
+    const bool paired_route = work.paired_route;
+    const size_t rows = s.row_end - s.row_begin;
+    bool released = false;
+    const auto failed = [&](const char * stage, potal_status status, bool fatal, std::string detail) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!released) merge_counts(n);
+        fail_locked(stage, status, fatal, "stripe " + std::to_string(done.stripe_id) + ": " + detail);
+        res.status = status;
+        res.stage = stage;
+        res.fatal = fatal;
+        return res;
+    };
+    try {
+        if (cfg_.hart_roles && cfg_.role_checkpoint && !cfg_.role_checkpoint("finalizer", s.stripe_id))
+            return failed("finalizer", POTAL_OK, false, "injected finalizer failure");
         // 3. CPU: Main reconstruction into the private output, then the
         //    residual radix reconstruction and checked merge.
         set_state(s, slot_state::reconstruct_merge);
         float * out = out_.data() + s.row_begin * n_;
-        for (size_t r = 0; r < rows; ++r) {
-            reconstruct_row(s.c + r * ldc_, n_, s.activation_scale, w_.scale, out + r * n_, 1);
+        {
+            role_span dequantizing(cfg_, 43, s.stripe_id, s.index);
+            for (size_t r = 0; r < rows; ++r) {
+                reconstruct_row(s.c + r * ldc_, n_, s.activation_scale, w_.scale, out + r * n_, 1);
+            }
         }
         if (s.packet) {
+            {
+            role_span reconstructing(cfg_, 42, s.stripe_id, s.index);
             emit(event_of(stripe_event_kind::radix_reconstruct_begin, s));
             const rmd::RmdStatus composed =
                 paired_route ? residual::reconstruct_rows(*s.packet, paired.plan.residual_rows,
@@ -1125,6 +1303,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 ev.cols         = n_;
                 emit(ev);
             }
+            }
+            role_span merging(cfg_, 43, s.stripe_id, s.index);
             emit(event_of(stripe_event_kind::merge_begin, s));
             // The prepared weight (validated once, immutable) gives the channel
             // scales: no HP1 metadata pass per stripe.
@@ -1149,6 +1329,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 emit(ev);
             }
         }
+        role_span releasing(cfg_, 44, s.stripe_id, s.index);
         {
             stripe_event ev = advance(s, slot_state::semantic_done, stripe_event_kind::semantic_complete);
             ev.out          = out;
@@ -1166,7 +1347,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         {
             std::lock_guard<std::mutex> lock(mutex_);
             completions_.push_back(done); // may allocate: before anything changes
-            merge_counts();
+            merge_counts(n);
             counts_.stripes_semantic_completed++;
             s.state = slot_state::free;
             s.packet.reset();
@@ -1182,7 +1363,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         return res;
     } catch (const std::exception & ex) {
         // Drained unless a GEMM above reported fatal (then still unknown).
-        return failed("exception", POTAL_OK, gemm_fatal, ex.what());
+        return failed("exception", POTAL_OK, false, ex.what());
     }
 }
 
@@ -1225,6 +1406,12 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         return r;
     };
     pipeline_config run_cfg = cfg;
+    bool roles_invalid = false;
+    const bool roles_requested = hart_roles_requested(roles_invalid);
+    run_cfg.hart_roles = cfg.hart_roles || roles_requested;
+    if (roles_invalid) return refuse("options", "GGML_POTAL_HART_ROLES must be ON/OFF/1/0");
+    if (run_cfg.hart_roles && args.residual_route != ggml::gemmini::residual::ResidualRoute::ws_packet)
+        return refuse("options", "ROLES requires STRIPE_PIPELINE+WS");
     const char * auto_env = std::getenv("POTAL_PAIRED_AUTO_JK");
     if (auto_env != nullptr && std::strcmp(auto_env, "0") != 0 && std::strcmp(auto_env, "1") != 0) {
         r.status = POTAL_ERR_INVALID_ARGUMENT;
@@ -1299,6 +1486,22 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
 
     std::shared_ptr<stripe_run> run;
     std::string                 why;
+    if (run_cfg.hart_roles && !find_role_cpus(run_cfg.role_cpus, why))
+        return refuse("hart_map", why);
+    if (run_cfg.hart_roles && ::potal::timeline::enabled()) {
+        ::potal::timeline::register_thread(::potal::timeline::role::caller, -1, -1);
+        run_cfg.timeline_run = ::potal::timeline::begin_run(
+            ::potal::timeline::op_type::linear,
+            args.I == 1 ? ::potal::timeline::phase::decode : ::potal::timeline::phase::prefill,
+            run_cfg.timeline_layer);
+    }
+    struct end_timeline {
+        const pipeline_config & cfg;
+        ~end_timeline() {
+            if (cfg.hart_roles && ::potal::timeline::enabled()) ::potal::timeline::end_run(cfg.timeline_run);
+        }
+    } timeline_run{run_cfg};
+    role_span node_span(run_cfg, 1);
     try {
         run = std::make_shared<stripe_run>(run_cfg, args, w, plan);
     } catch (const std::bad_alloc &) {
@@ -1322,11 +1525,25 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
             stripe_owner & owner;
             ~unpin() { owner.unpin_producer(); }
         } scoped_producer{ owner };
-        if (!owner.pin_producer(producer_on_one_cpu, why)) {
+        if (!run_cfg.hart_roles && !owner.pin_producer(producer_on_one_cpu, why)) {
             run->abort("producer_affinity", why);
         } else {
             sink_binding           binding{ run.get(), &args };
             exsia::StripeReadySink sink{ &binding, &sink_binding::on_ready };
+            exsia::HartRoles roles;
+            if (run_cfg.hart_roles) {
+                roles.pin = [&run_cfg](unsigned hart, std::string & error) {
+                    return pin_role_cpu(run_cfg.role_cpus[hart], error);
+                };
+                roles.timeline_run = run_cfg.timeline_run;
+                roles.timeline_layer = run_cfg.timeline_layer;
+                roles.checkpoint = run_cfg.role_checkpoint;
+                roles.cancelled = [run] { return run->cancelled(); };
+                roles.on_failure = [run](const char * code, size_t stripe) {
+                    run->abort("exsia_roles", std::string(code) + " at stripe " + std::to_string(stripe));
+                };
+                sink.hart_roles = &roles;
+            }
             args.exsia_stripe_ready_sink = &sink;
             run->emit_run(stripe_event_kind::quant_begin);
             const auto quant_start = cfg.measure_timing ? std::chrono::steady_clock::now() :
@@ -1346,12 +1563,19 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         args.exsia_stripe_ready_sink = nullptr;
         run->abort("exception", ex.what());
     }
+    if (run_cfg.hart_roles && ::potal::timeline::enabled())
+        ::potal::timeline::record(::potal::timeline::stage::node_total, ::potal::timeline::event::wait_begin,
+            0, run_cfg.timeline_run, run_cfg.timeline_layer, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0, 0);
     owner.join();
+    if (run_cfg.hart_roles && ::potal::timeline::enabled())
+        ::potal::timeline::record(::potal::timeline::stage::node_total, ::potal::timeline::event::wait_end,
+            0, run_cfg.timeline_run, run_cfg.timeline_layer, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0, 0);
 
     r             = run->report();
     r.counts.act_quant_s = act_quant_s;
     r.completions = run->poll_completed();
     if (r.ok) {
+        role_span commit_span(run_cfg, 50);
         const float * out = run->output();
         for (size_t m = 0; m < args.I; ++m) {
             float * dst = args.f_out + m * args.stride_f_out;

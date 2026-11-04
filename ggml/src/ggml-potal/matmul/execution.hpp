@@ -14,12 +14,20 @@
 #include <gemmini/trace-context.h>
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 
 namespace ggml::potal {
+
+// Linux CPU numbers are not hart numbers. The native-only override is accepted
+// only when /proc/cpuinfo has no hart fields; it never overrides target topology.
+bool find_hart_cpu(unsigned hart, int & cpu, std::string & why);
+bool find_role_cpus(std::array<int, 5> & cpus, std::string & why);
+bool pin_role_cpu(int cpu, std::string & why);
+bool hart_roles_requested(bool & invalid);
 
 // matmul/paired-auto.hpp (not included here: it includes this header through dense.hpp).
 struct potal_paired_request;

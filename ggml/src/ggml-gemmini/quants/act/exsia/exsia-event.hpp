@@ -9,6 +9,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <functional>
+#include <string>
 #if CYCLE_SIM
 #include <vector>
 #endif
@@ -61,9 +63,19 @@ struct StripeReadyEvent {
     mutable std::optional<uint64_t> submission_wait_ns;
 };
 
+struct HartRoles {
+    std::function<bool(unsigned, std::string &)> pin;
+    uint32_t timeline_run = 0;
+    uint32_t timeline_layer = 0;
+    std::function<bool(const char *, size_t)> checkpoint;
+    std::function<bool()> cancelled;
+    std::function<void(const char *, size_t)> on_failure;
+};
+
 struct StripeReadySink {
     void * user_data                                   = nullptr;
     bool (*on_ready)(void *, const StripeReadyEvent &) = nullptr;
+    const HartRoles * hart_roles = nullptr;
 };
 
 } // namespace ggml::gemmini::quants::act::exsia
