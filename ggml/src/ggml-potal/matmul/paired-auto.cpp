@@ -1656,11 +1656,38 @@ struct executor {
     std::vector<size_t>           scale_owner; // opt-in: physical Main owner of a logical Residual window
     bool                         index_queue = false;
     std::vector<uint32_t>         queue_entries; // prepared before issue
+    // Read once on the executing thread: unregistered threads (serial route) record nothing,
+    // and per-entry spans exist only in the detail profile.
+    const bool                    tl_on     = ::potal::timeline::active();
+    const bool                    tl_detail = ::potal::timeline::detail_profile();
+
+    // One aggregated span per Scale/release window, Index op, LOOP_WS op or readback op.
+    // END.work = entries issued inside it (counter delta, or fixed); status 1 unless done().
+    struct op_span {
+        ::potal::timeline::scoped_span span;
+        const uint64_t *               counter;
+        uint64_t                       before;
+        op_span(const executor & ex, int stage, size_t op, const uint64_t * c, uint64_t fixed_work) :
+            span(ex.tl_on && stage != 0, static_cast<::potal::timeline::stage>(stage), uint32_t(ex.req.run_id),
+                 ::potal::timeline::no_id, uint32_t(ex.req.stripe_id),
+                 op == no_index ? ::potal::timeline::no_id : uint32_t(op)),
+            counter(c), before(c ? *c : 0) {
+            span.status = 1;
+            span.work   = fixed_work;
+        }
+        void done() { span.status = 0; }
+        void finish() {
+            if (counter) span.work = *counter - before;
+            counter = nullptr;
+            span.close();
+        }
+        ~op_span() { finish(); }
+    };
 
     template<class F>
     potal_status timeline_call(::potal::timeline::stage stage, size_t op, uint64_t work, F && call,
                               const uint32_t *reply_status = nullptr) {
-        if (!::potal::timeline::enabled()) return call();
+        if (!tl_on) return call();
         const uint32_t tile = op == no_index ? ::potal::timeline::no_id : uint32_t(op);
         const uint32_t pair = op == no_index ? ::potal::timeline::no_id : uint32_t(report.plan.ops[op].pair);
         ::potal::timeline::record(stage, ::potal::timeline::event::begin, 0, uint32_t(req.run_id),
@@ -1684,16 +1711,19 @@ struct executor {
     }
 
     potal_status issue_scale_write(uint32_t slot, uint32_t generation, uint32_t column, uint32_t carrier) {
+        if (!tl_detail) return potal_paired_scale_write(session, slot, generation, column, carrier);
         return timeline_call(::potal::timeline::stage::acc_scale_write, current_op, 1,
             [&] { return potal_paired_scale_write(session, slot, generation, column, carrier); });
     }
 
     potal_status issue_scale_release(uint32_t slot, uint32_t generation, uint32_t column) {
+        if (!tl_detail) return potal_paired_scale_release(session, slot, generation, column);
         return timeline_call(::potal::timeline::stage::acc_scale_release, current_op, 1,
             [&] { return potal_paired_scale_release(session, slot, generation, column); });
     }
 
     potal_status issue_stream_release(potal_h2_ref ref, uint32_t slot, uint32_t generation, uint32_t column) {
+        if (!tl_detail) return potal_paired_stream_scale_release(session, ref, slot, generation, column);
         return timeline_call(::potal::timeline::stage::acc_scale_release, current_op, 1,
             [&] { return potal_paired_stream_scale_release(session, ref, slot, generation, column); });
     }
@@ -2266,6 +2296,16 @@ struct executor {
                 case stream_action_kind::fence: bucket = cost_fence; break;
                 case stream_action_kind::readback: bucket = cost_readback; break;
             }
+            op_span window(*this,
+                action.kind == stream_action_kind::scale    ? 45 :
+                action.kind == stream_action_kind::release  ? 46 :
+                action.kind == stream_action_kind::index    ? 47 :
+                action.kind == stream_action_kind::loop     ? 48 :
+                action.kind == stream_action_kind::readback ? 49 : 0, current_op,
+                action.kind == stream_action_kind::scale   ? &report.counts.scale_writes :
+                action.kind == stream_action_kind::release ? &report.counts.scale_releases : nullptr,
+                action.kind == stream_action_kind::index ?
+                    uint64_t(report.plan.ops[id].entry_end - report.plan.ops[id].entry_begin) : 1);
             switch (action.kind) {
                 case stream_action_kind::declare_panel: {
                     const auto & r = report.plan.residencies[id];
@@ -2444,6 +2484,7 @@ struct executor {
                     break;
                 }
             }
+            window.done();
             cost_add(bucket, cost_before);
         }
         uint64_t events[POTAL_STREAM_COUNTER_FIELDS] = {};
@@ -3103,8 +3144,9 @@ struct executor {
         for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
             const potal_paired_index_entry & en = report.plan.index_entries[e];
             potal_index_write                w  = { (uint32_t) en.slot, (uint32_t) en.resident_k };
-            st = timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, 1,
-                [&] { return potal_paired_index_write(session, &w); });
+            st = tl_detail ? timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, 1,
+                                 [&] { return potal_paired_index_write(session, &w); }) :
+                             potal_paired_index_write(session, &w);
             if (write_record) ++write_record->calls;
             if (st != POTAL_OK) {
                 window_end(write_record, st);
@@ -3261,6 +3303,15 @@ struct executor {
                 default: break;
             }
             potal_paired_status st = potal_paired_status::ok;
+            op_span window(*this,
+                op.kind == potal_paired_op_kind::scale_program ? 45 :
+                op.kind == potal_paired_op_kind::scale_release ? 46 :
+                op.kind == potal_paired_op_kind::index_program ? 47 :
+                op.kind == potal_paired_op_kind::main_gemm || op.kind == potal_paired_op_kind::residual_gemm ? 48 :
+                op.kind == potal_paired_op_kind::acc_complete ? 49 : 0, op.id,
+                op.kind == potal_paired_op_kind::scale_program ? &report.counts.scale_writes :
+                op.kind == potal_paired_op_kind::scale_release ? &report.counts.scale_releases : nullptr,
+                op.kind == potal_paired_op_kind::index_program ? uint64_t(op.entry_end - op.entry_begin) : 1);
             switch (op.kind) {
                 case potal_paired_op_kind::scale_program:   st = scale_program(op); break;
                 case potal_paired_op_kind::scale_release:   st = scale_release(op); break;
@@ -3274,6 +3325,8 @@ struct executor {
                 case potal_paired_op_kind::pair_retire:     // its completion deps were ensured above
                     break;
             }
+            if (st == potal_paired_status::ok) window.done();
+            window.finish(); // END before the post-op retire bookkeeping
             cost_add(bucket, cost_before);
             if (st != potal_paired_status::ok) {
                 return st;
@@ -3640,6 +3693,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     report = potal_paired_report{};
     const potal_paired_geometry hw = req.hw != nullptr ? *req.hw : potal_paired_hw_geometry();
     executor                    ex(req, session, report, hw); // outlives the try: the staging is settled on any exit
+    const uint32_t tl_run = uint32_t(req.run_id), tl_stripe = uint32_t(req.stripe_id);
+    ::potal::timeline::scoped_span setup_span(ex.tl_on, ::potal::timeline::stage::exec_setup, tl_run,
+                                              ::potal::timeline::no_id, tl_stripe, ::potal::timeline::no_id);
     const char * graph_cpu = std::getenv("POTAL_GRAPH_CPU");
     ex.cost_profile = graph_cpu && std::strcmp(graph_cpu, "1") == 0;
     const char * profile = std::getenv("POTAL_PAIRED_PROFILE");
@@ -3747,6 +3803,8 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             if (st != potal_paired_status::ok) {
                 return ex.fail(st, "plan", why, POTAL_OK);
             }
+            ::potal::timeline::scoped_span copy_span(ex.tl_on, ::potal::timeline::stage::exec_plan_copy, tl_run,
+                                                     ::potal::timeline::no_id, tl_stripe, ::potal::timeline::no_id);
             {
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
                 planning_profile::Scope planning_copy(planning_profile::Site::report_plan_copy, planning_profile::Component::copy);
@@ -3801,6 +3859,8 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         }
         // 2. Residual staging (DMA-ready, slot order), before any command.
         if (report.tile.residual) {
+            ::potal::timeline::scoped_span pack_span(ex.tl_on, ::potal::timeline::stage::exec_pack_residual, tl_run,
+                                                     ::potal::timeline::no_id, tl_stripe, ::potal::timeline::no_id);
             st = potal_paired_pack_residual(report.plan, *req.residual, ex.staging, &why, hw, ex.streaming());
             if (st != potal_paired_status::ok) {
                 return ex.fail(st, "pack", why, POTAL_OK);
@@ -3836,6 +3896,8 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
 
         // 4. TLB maintenance before the first DMA of this stripe (the session is drained).
         if (req.tlb_flush) {
+            ::potal::timeline::scoped_span tlb_span(ex.tl_on, ::potal::timeline::stage::exec_tlb_flush, tl_run,
+                                                    ::potal::timeline::no_id, tl_stripe, ::potal::timeline::no_id);
             const auto         t  = ex.time_now();
             const potal_status fs = potal_paired_tlb_flush(session);
             report.counts.issue_s += seconds_since(t);
@@ -3849,7 +3911,13 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         if (st != potal_paired_status::ok) return st;
 
         // 5. The plan's ops, then the final drain.
-        st = ex.streaming() ? ex.run_stream() : ex.run();
+        setup_span.close();
+        {
+            ::potal::timeline::scoped_span run_span(ex.tl_on, ::potal::timeline::stage::exec_run, tl_run,
+                                                    ::potal::timeline::no_id, tl_stripe, ::potal::timeline::no_id);
+            st = ex.streaming() ? ex.run_stream() : ex.run();
+            run_span.status = st == potal_paired_status::ok ? 0 : 1;
+        }
         if (st != potal_paired_status::ok) {
             return st;
         }

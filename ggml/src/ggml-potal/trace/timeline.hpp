@@ -36,6 +36,14 @@ enum class stage : uint16_t {
     stripe_submit            = 17,
     issuer_ready_wait        = 20,
     stripe_residual_prepare  = 21,
+    issuer_stripe            = 22,  // inclusive: one stripe on the issuer, RECV to SEND
+    prep_decode              = 23,  // children of 21
+    prep_plan                = 24,
+    prep_rc_alloc            = 25,
+    exec_setup               = 26,  // inclusive: executor setup before the first command
+    exec_plan_copy           = 27,  // children of 26
+    exec_pack_residual       = 28,
+    exec_tlb_flush           = 29,
     acc_scale_write          = 30,
     acc_index_scalar         = 31,
     acc_queue_install        = 32,
@@ -45,12 +53,23 @@ enum class stage : uint16_t {
     acc_readback             = 36,
     acc_scale_release        = 37,
     acc_prefetch_issue       = 38,
+    exec_run                 = 39,  // inclusive: the op/action loop and final drain
+    acc_scale_window         = 45,  // one Scale window; END.work = column writes
+    acc_release_window       = 46,  // one release window; END.work = column releases
+    acc_index_window         = 47,  // one Index op; END.work = entries
+    acc_gemm_op              = 48,  // one Main/Residual LOOP_WS op incl. staging
+    acc_readback_op          = 49,  // one ACC completion/readback op
     final_handoff            = 40,
     final_wait               = 41,
     final_reconstruct_int64  = 42,
     final_dequant_merge      = 43,
     final_slot_release       = 44,
     node_commit              = 50,
+    node_setup               = 51,  // caller: stripe_run construction and issuer start
+    exsia_role_setup         = 52,  // caller: ExSIA role block setup before thread spawn
+    exsia_thread_spawn       = 53,  // caller: role thread creation
+    role_start               = 54,  // each role thread: pin + register; both ends direct-stamped
+    node_report              = 55,  // caller: report and completion poll after join
 };
 
 enum class event : uint8_t {
@@ -117,6 +136,8 @@ struct thread_ring {
 
 // Constant-initialized: false until the POTAL_TIMELINE load-time check enables it.
 extern bool g_on;
+// POTAL_TIMELINE_PROFILE=detail: per Scale/Index entry spans (high overhead). Default: window.
+extern bool g_detail;
 extern thread_local thread_ring * t_ring;
 
 void note_unregistered() noexcept;
@@ -133,10 +154,26 @@ inline uint64_t now_local() noexcept {
 #endif
 }
 
+inline uint64_t mono_ns() noexcept {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
 }  // namespace detail
 
 // True when POTAL_TIMELINE was set (read once).
 bool enabled() noexcept;
+
+// Inline hot-path gates: the calling thread is registered (and the timeline is on).
+inline bool active() noexcept {
+    return detail::g_on && detail::t_ring != nullptr;
+}
+
+// Per-entry (Scale column, Index entry) spans are recorded only in the detail profile.
+inline bool detail_profile() noexcept {
+    return detail::g_detail && active();
+}
 
 // Registers the calling thread (idempotent per thread). hart_id / cpu_id are the
 // expected placement (-1 = not pinned / unknown); the module records the actual
@@ -168,9 +205,10 @@ struct stats_t {
 };
 stats_t stats() noexcept;
 
-inline void record(stage st, event ev, uint8_t status, uint32_t run_id, uint32_t layer_id,
-                   uint32_t stripe_id, uint32_t tile_id, uint32_t buffer_id, uint32_t edge_id,
-                   uint64_t work) noexcept {
+// mono != 0 forces a direct CLOCK_MONOTONIC stamp with that value (role_start begin).
+inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uint32_t layer_id,
+                        uint32_t stripe_id, uint32_t tile_id, uint32_t buffer_id, uint32_t edge_id,
+                        uint64_t work, uint64_t mono) noexcept {
     if (__builtin_expect(!detail::g_on, 1)) {
         return;
     }
@@ -204,15 +242,56 @@ inline void record(stage st, event ev, uint8_t status, uint32_t run_id, uint32_t
     e.work         = work;
     // Rocket stops rdcycle while a hart sits in WFI, so t_local cannot span a blocking
     // wait. Waits and handoffs (never inside a RoCC issue window) carry CLOCK_MONOTONIC.
-    if (r->direct_all || ev == event::wait_begin || ev == event::wait_end || ev == event::handoff_send ||
-        ev == event::handoff_recv) {
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        e.reserved = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+    if (mono != 0) {
+        e.reserved = mono;
+    } else if (r->direct_all || ev == event::wait_begin || ev == event::wait_end || ev == event::handoff_send ||
+               ev == event::handoff_recv) {
+        e.reserved = detail::mono_ns();
     } else {
         e.reserved = 0;
     }
     r->head.store(h + 1, std::memory_order_relaxed);
 }
+
+inline void record(stage st, event ev, uint8_t status, uint32_t run_id, uint32_t layer_id,
+                   uint32_t stripe_id, uint32_t tile_id, uint32_t buffer_id, uint32_t edge_id,
+                   uint64_t work) noexcept {
+    record_mono(st, ev, status, run_id, layer_id, stripe_id, tile_id, buffer_id, edge_id, work, 0);
+}
+
+// CLOCK_MONOTONIC now if the timeline is on, else 0 (start mark before a thread registers).
+inline uint64_t mono_if_on() noexcept {
+    return detail::g_on ? detail::mono_ns() : 0;
+}
+
+// role_start span of a just-registered thread: BEGIN carries mono_begin (taken before pin and
+// registration, when the thread had no ring), END carries now. Both ends are direct stamps.
+inline void record_role_start(uint32_t run_id, uint32_t layer_id, uint64_t mono_begin) noexcept {
+    if (!active() || mono_begin == 0) return;
+    record_mono(stage::role_start, event::begin, 0, run_id, layer_id, no_id, no_id, no_id, 0, 0, mono_begin);
+    record_mono(stage::role_start, event::end, 0, run_id, layer_id, no_id, no_id, no_id, 0, 0, detail::mono_ns());
+}
+
+// BEGIN/END pair on the calling registered thread; inert when `on` is false.
+// close() ends the span early; END carries `work` and `status` as set by the owner.
+struct scoped_span {
+    bool     on;
+    stage    st;
+    uint32_t run_id, layer_id, stripe_id, tile_id;
+    uint64_t work   = 0;
+    uint8_t  status = 0;
+
+    scoped_span(bool enable, stage s, uint32_t run, uint32_t layer, uint32_t stripe, uint32_t tile) noexcept :
+        on(enable), st(s), run_id(run), layer_id(layer), stripe_id(stripe), tile_id(tile) {
+        if (on) record(st, event::begin, 0, run_id, layer_id, stripe_id, tile_id, no_id, 0, 0);
+    }
+    void close() noexcept {
+        if (on) record(st, event::end, status, run_id, layer_id, stripe_id, tile_id, no_id, 0, work);
+        on = false;
+    }
+    ~scoped_span() { close(); }
+    scoped_span(const scoped_span &)             = delete;
+    scoped_span & operator=(const scoped_span &) = delete;
+};
 
 }  // namespace potal::timeline

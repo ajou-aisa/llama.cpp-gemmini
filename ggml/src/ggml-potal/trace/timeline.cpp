@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@ namespace potal::timeline {
 
 namespace detail {
 bool                        g_on   = false;
+bool                        g_detail = false;
 thread_local thread_ring *  t_ring = nullptr;
 void                        init() noexcept;
 }  // namespace detail
@@ -268,6 +270,7 @@ std::string build_meta(const state & s) {
     m += ",clock_local=steady_ns";
 #endif
     m += ",clock_common=CLOCK_MONOTONIC_ns";
+    m += std::string(",profile=") + (detail::g_detail ? "detail" : "window");
     m += ",ring_events=" + std::to_string(s.events_cap);
     m += ",anchor_capacity=" + std::to_string(s.anchors_cap);
     m += ",env=" + joined;
@@ -306,6 +309,8 @@ void init_once() {
     s.path        = p;
     s.events_cap  = parse_count("POTAL_TIMELINE_EVENTS", kDefaultEvents);
     s.anchors_cap = parse_count("POTAL_TIMELINE_ANCHORS", kDefaultAnchors);
+    const char * profile = std::getenv("POTAL_TIMELINE_PROFILE");
+    detail::g_detail = profile != nullptr && std::strcmp(profile, "detail") == 0;
     s.cpu_to_hart = read_cpu_to_hart();
     s.meta        = build_meta(s);
     if (std::atexit(flush_at_exit) != 0) {
@@ -318,13 +323,12 @@ struct load_time_init {
     load_time_init() { detail::init(); }
 } g_load_time_init;
 
+// Anonymous pages are zero and page-aligned: no memset, so registration does not touch
+// the whole ring inside a measured region. A page faults in on its first record
+// (one per 64 records); never unmapped, the flush reads exited threads' rings.
 template <typename T> T * alloc_zeroed(size_t n) {
-    void * p = nullptr;
-    if (posix_memalign(&p, 64, n * sizeof(T)) != 0) {
-        return nullptr;
-    }
-    std::memset(p, 0, n * sizeof(T));  // touch every page now, not on the hot path
-    return static_cast<T *>(p);
+    void * p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : static_cast<T *>(p);
 }
 
 const char * stage_name(uint16_t id) {
@@ -340,6 +344,25 @@ const char * stage_name(uint16_t id) {
         case stage::stripe_submit: return "stripe.submit";
         case stage::issuer_ready_wait: return "issuer.ready_wait";
         case stage::stripe_residual_prepare: return "stripe.residual_prepare";
+        case stage::issuer_stripe: return "issuer.stripe";
+        case stage::prep_decode: return "prep.decode";
+        case stage::prep_plan: return "prep.plan";
+        case stage::prep_rc_alloc: return "prep.rc_alloc";
+        case stage::exec_setup: return "exec.setup";
+        case stage::exec_plan_copy: return "exec.plan_copy";
+        case stage::exec_pack_residual: return "exec.pack_residual";
+        case stage::exec_tlb_flush: return "exec.tlb_flush";
+        case stage::exec_run: return "exec.run";
+        case stage::acc_scale_window: return "acc.scale_window";
+        case stage::acc_release_window: return "acc.release_window";
+        case stage::acc_index_window: return "acc.index_window";
+        case stage::acc_gemm_op: return "acc.gemm_op";
+        case stage::acc_readback_op: return "acc.readback_op";
+        case stage::node_setup: return "node.setup";
+        case stage::exsia_role_setup: return "exsia.role_setup";
+        case stage::exsia_thread_spawn: return "exsia.thread_spawn";
+        case stage::role_start: return "role.start";
+        case stage::node_report: return "node.report";
         case stage::acc_scale_write: return "acc.scale_write";
         case stage::acc_index_scalar: return "acc.index_scalar";
         case stage::acc_queue_install: return "acc.queue_install";

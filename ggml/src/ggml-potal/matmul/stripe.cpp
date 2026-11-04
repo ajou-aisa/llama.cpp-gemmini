@@ -598,6 +598,7 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
     consume_outcome out;
     std::thread finalizer;
     if (cfg_.hart_roles) {
+        const uint64_t start_mono = ::potal::timeline::mono_if_on();
         std::string why;
         if (!pin_role_cpu(cfg_.role_cpus[0], why)) {
             fail("issuer_affinity", POTAL_OK, false, why);
@@ -609,6 +610,7 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
             expected_hart = 0;
 #endif
             ::potal::timeline::register_thread(::potal::timeline::role::issuer, expected_hart, cfg_.role_cpus[0]);
+            ::potal::timeline::record_role_start(cfg_.timeline_run, cfg_.timeline_layer, start_mono);
         }
         try {
             finalizer = std::thread(&stripe_run::finalizer_loop, this);
@@ -636,6 +638,7 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
         }
         stripe_result r;
         try {
+            role_span stripe_span(cfg_, 22, s->stripe_id, s->index);
             r = execute(*s, begin, runners);
         } catch (...) {
             // Only a failure while reporting a failure gets here (no memory for
@@ -810,6 +813,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             }
             const auto decode_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (s.packet) {
+                role_span decode_span(cfg_, 23, s.stripe_id, s.index);
                 const rmd::RmdStatus dec = residual::decode_packet(*s.packet, w_, decoded);
                 if (dec != rmd::RmdStatus::success) {
                     return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(dec));
@@ -827,6 +831,9 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 }
                 paired_main = &j8k8_main;
             }
+            ::potal::timeline::scoped_span plan_span(cfg_.hart_roles && ::potal::timeline::active(),
+                ::potal::timeline::stage::prep_plan, cfg_.timeline_run, cfg_.timeline_layer, (uint32_t) s.stripe_id,
+                ::potal::timeline::no_id);
             const auto plan_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const double decode_ms = profile ? std::chrono::duration<double, std::milli>(plan_start - decode_start).count() : 0;
             potal_paired_status ps;
@@ -846,6 +853,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
                                               tile, routing, &why, diagnostic_hw);
             }
+            plan_span.close();
             if (ps != potal_paired_status::ok && (cfg_.paired_auto_jk || j8k8_ffn || !potal_paired_capacity_refusal(ps))) {
                 return failed("paired_plan", POTAL_OK, false,
                               std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
@@ -866,6 +874,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             const std::string refusal =
                 paired_route ? std::string() : std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why;
             if (paired_route && !decoded.rows.empty()) {
+                role_span alloc_span(cfg_, 25, s.stripe_id, s.index);
                 paired_rc.p = dma_alloc(align_up(decoded.rows.size(), HW_DIM) * ldc_ * sizeof(int32_t));
                 if (paired_rc.p == nullptr) {
                     return failed("alloc", POTAL_OK, false, "out of memory for the paired Residual C");
@@ -1217,6 +1226,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
 
 void stripe_run::finalizer_loop() {
     try {
+        const uint64_t start_mono = ::potal::timeline::mono_if_on();
         std::string why;
         if (!pin_role_cpu(cfg_.role_cpus[4], why)) {
             fail("finalizer_affinity", POTAL_OK, false, why);
@@ -1228,6 +1238,7 @@ void stripe_run::finalizer_loop() {
             expected_hart = 4;
 #endif
             ::potal::timeline::register_thread(::potal::timeline::role::finalizer, expected_hart, cfg_.role_cpus[4]);
+            ::potal::timeline::record_role_start(cfg_.timeline_run, cfg_.timeline_layer, start_mono);
         }
         for (;;) {
             std::pair<slot *, std::shared_ptr<stripe_work>> job;
@@ -1502,6 +1513,9 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         }
     } timeline_run{run_cfg};
     role_span node_span(run_cfg, 1);
+    ::potal::timeline::scoped_span setup_span(run_cfg.hart_roles && ::potal::timeline::active(),
+        ::potal::timeline::stage::node_setup, run_cfg.timeline_run, run_cfg.timeline_layer,
+        ::potal::timeline::no_id, ::potal::timeline::no_id);
     try {
         run = std::make_shared<stripe_run>(run_cfg, args, w, plan);
     } catch (const std::bad_alloc &) {
@@ -1519,6 +1533,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         r.status = status;
         return refuse("issuer", why); // nothing was issued
     }
+    setup_span.close();
     double act_quant_s = 0;
     try {
         struct unpin {
@@ -1571,9 +1586,14 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         ::potal::timeline::record(::potal::timeline::stage::node_total, ::potal::timeline::event::wait_end,
             0, run_cfg.timeline_run, run_cfg.timeline_layer, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0, 0);
 
-    r             = run->report();
-    r.counts.act_quant_s = act_quant_s;
-    r.completions = run->poll_completed();
+    {
+        ::potal::timeline::scoped_span report_span(run_cfg.hart_roles && ::potal::timeline::active(),
+            ::potal::timeline::stage::node_report, run_cfg.timeline_run, run_cfg.timeline_layer,
+            ::potal::timeline::no_id, ::potal::timeline::no_id);
+        r             = run->report();
+        r.counts.act_quant_s = act_quant_s;
+        r.completions = run->poll_completed();
+    }
     if (r.ok) {
         role_span commit_span(run_cfg, 50);
         const float * out = run->output();

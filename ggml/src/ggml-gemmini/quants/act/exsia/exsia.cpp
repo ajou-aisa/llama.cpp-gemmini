@@ -308,6 +308,12 @@ bool ExSIA::run(Meta &                  meta,
                 ggml_gemmini_args_t &   args,
                 const StripeReadySink * sink) {
     const HartRoles * roles = sink ? sink->hart_roles : nullptr;
+#if GGML_POTAL_TIMELINE_HOOKS
+    const bool tl_roles = roles != nullptr && ::potal::timeline::active();
+    ::potal::timeline::scoped_span role_setup(tl_roles, ::potal::timeline::stage::exsia_role_setup,
+        roles ? roles->timeline_run : 0, roles ? roles->timeline_layer : 0, ::potal::timeline::no_id,
+        ::potal::timeline::no_id);
+#endif
     const char *                layer             = args.matmul_layer.c_str();
     [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
     const uint64_t              run_id            = next_exsia_run_id();
@@ -755,6 +761,9 @@ bool ExSIA::run(Meta &                  meta,
             return true;
         };
         const auto trace_role = [&](unsigned hart) {
+#if GGML_POTAL_TIMELINE_HOOKS
+            const uint64_t start_mono = ::potal::timeline::mono_if_on();
+#endif
             std::string why;
             if (!roles->pin || !roles->pin(hart, why)) {
                 std::fprintf(stderr, "ExSIA ROLES hart%u affinity: %s\n", hart, why.c_str());
@@ -771,6 +780,7 @@ bool ExSIA::run(Meta &                  meta,
                     hart == 1 ? ::potal::timeline::role::exsia_local0 :
                     hart == 2 ? ::potal::timeline::role::exsia_local1 : ::potal::timeline::role::exsia_fold,
                     expected_hart, sched_getcpu());
+                ::potal::timeline::record_role_start(roles->timeline_run, roles->timeline_layer, start_mono);
             }
 #endif
             return true;
@@ -947,6 +957,11 @@ bool ExSIA::run(Meta &                  meta,
             }
         };
         std::array<std::thread, 3> threads;
+#if GGML_POTAL_TIMELINE_HOOKS
+        role_setup.close();
+        ::potal::timeline::scoped_span spawn(tl_roles, ::potal::timeline::stage::exsia_thread_spawn,
+            roles->timeline_run, roles->timeline_layer, ::potal::timeline::no_id, ::potal::timeline::no_id);
+#endif
         try {
             threads[0] = std::thread(local_role, 0);
             threads[1] = std::thread(local_role, 1);
@@ -954,6 +969,9 @@ bool ExSIA::run(Meta &                  meta,
         } catch (...) {
             stop(ExSIAState::FailureCode::Exception, 0);
         }
+#if GGML_POTAL_TIMELINE_HOOKS
+        spawn.close();
+#endif
         event(1, 3, SIZE_MAX);
         for (auto & thread : threads) if (thread.joinable()) thread.join();
         event(1, 4, SIZE_MAX);

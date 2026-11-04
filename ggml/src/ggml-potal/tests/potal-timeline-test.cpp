@@ -249,6 +249,7 @@ int child_main() {
     const std::string text = slurp(path);
     CHECK(text.rfind("# potal_timeline v1\nMETA,format=potal_timeline_v1,", 0) == 0);
     CHECK(text.find(",model_id=timeline-test,") != std::string::npos);
+    CHECK(text.find(",profile=window,") != std::string::npos);  // per-entry spans are opt-in (detail)
     CHECK(text.find("POTAL_TIMELINE=") != std::string::npos);
     CHECK(text.find("unregistered_records=1") != std::string::npos);
     CHECK(text.find("#END,events=" + std::to_string(expected) + "\n") != std::string::npos);

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -164,7 +165,7 @@ bool select_pipeline_mode() {
 } // namespace
 
 int main(int argc, char ** argv) {
-    int64_t     M = 128, N = 768, K = 768, repeat = 3;
+    int64_t     M = 128, N = 768, K = 768, repeat = 3, warmup = 0;
     float       outlier = 400.0f;
     int         blocks  = 2;
     unsigned    seed    = 20261104;
@@ -175,6 +176,7 @@ int main(int argc, char ** argv) {
         else if (!std::strncmp(a, "--n=", 4)) N = std::atoll(a + 4);
         else if (!std::strncmp(a, "--k=", 4)) K = std::atoll(a + 4);
         else if (!std::strncmp(a, "--repeat=", 9)) repeat = std::atoll(a + 9);
+        else if (!std::strncmp(a, "--warmup=", 9)) warmup = std::atoll(a + 9);
         else if (!std::strncmp(a, "--outlier=", 10)) outlier = (float) std::atof(a + 10);
         else if (!std::strncmp(a, "--blocks=", 9)) blocks = std::atoi(a + 9);
         else if (!std::strncmp(a, "--seed=", 7)) seed = (unsigned) std::strtoul(a + 7, nullptr, 10);
@@ -185,7 +187,7 @@ int main(int argc, char ** argv) {
         }
     }
     std::vector<mode> modes;
-    if (M <= 0 || N <= 0 || K <= 0 || repeat <= 0 || !parse_modes(modes_arg, modes)) {
+    if (M <= 0 || N <= 0 || K <= 0 || repeat <= 0 || warmup < 0 || !parse_modes(modes_arg, modes)) {
         std::printf("BENCH_VERDICT FAIL usage: bad shape/repeat/modes\n");
         return 2;
     }
@@ -222,7 +224,9 @@ int main(int argc, char ** argv) {
 
     int failures = 0;
     std::vector<std::vector<int64_t>> walls(modes.size());
-    for (int64_t rep = 0; rep < repeat; ++rep) {
+    // Warm-up reps (rep < 0) run every mode once per rep, are golden-checked like the
+    // others, and are excluded from BENCH_SUMMARY (first-use allocation, trace rings).
+    for (int64_t rep = -warmup; rep < repeat; ++rep) {
         for (size_t mi = 0; mi < modes.size(); ++mi) {
             const mode & md = modes[mi];
             setenv("GGML_POTAL_HART_ROLES", md.roles ? "ON" : "OFF", 1);
@@ -242,12 +246,12 @@ int main(int argc, char ** argv) {
                             a.stripe_pipeline_failed == b.stripe_pipeline_failed &&
                             (!md.queue || q1 < q0);
             failures += ok ? 0 : 1;
-            walls[mi].push_back(t1 - t0);
-            std::printf("BENCH mode=%s rep=%" PRId64 " ok=%d status=%d wall_ns=%" PRId64 " stripes=%" PRIu64
+            if (rep >= 0) walls[mi].push_back(t1 - t0);
+            std::printf("%s mode=%s rep=%" PRId64 " ok=%d status=%d wall_ns=%" PRId64 " stripes=%" PRIu64
                         " main_gemms=%" PRIu64 " main_loop_ws=%" PRIu64 " residual_gemms=%" PRIu64
                         " residual_loop_ws=%" PRIu64 " merges=%" PRIu64 " queue_used=%u queue_remaining=%u"
                         " hash=%016" PRIx64 "\n",
-                        md.name.c_str(), rep, ok ? 1 : 0, (int) status, t1 - t0, stripes,
+                        rep < 0 ? "BENCH_WARMUP" : "BENCH", md.name.c_str(), rep, ok ? 1 : 0, (int) status, t1 - t0, stripes,
                         a.main_logical_gemms - b.main_logical_gemms, a.main_loop_ws - b.main_loop_ws,
                         a.residual_logical_gemms - b.residual_logical_gemms, a.residual_loop_ws - b.residual_loop_ws,
                         a.merges_completed - b.merges_completed, q0 - q1, q1, h);
@@ -256,15 +260,35 @@ int main(int argc, char ** argv) {
     for (size_t mi = 0; mi < modes.size(); ++mi) {
         std::vector<int64_t> v = walls[mi];
         std::sort(v.begin(), v.end());
+        const size_t n   = v.size();
+        const double med = n % 2 ? (double) v[n / 2] : 0.5 * ((double) v[n / 2 - 1] + (double) v[n / 2]);
+        double       sum = 0, sq = 0;
+        for (int64_t x : v) sum += (double) x;
+        const double mean = sum / (double) n;
+        for (int64_t x : v) sq += ((double) x - mean) * ((double) x - mean);
+        std::vector<double> dev;
+        for (int64_t x : v) dev.push_back(std::fabs((double) x - med));
+        std::sort(dev.begin(), dev.end());
+        const double mad = n % 2 ? dev[n / 2] : 0.5 * (dev[n / 2 - 1] + dev[n / 2]);
+        // wall_ns_median keeps the I25P definition (upper middle element); median_exact averages for even n.
         std::printf("BENCH_SUMMARY mode=%s runs=%zu wall_ns_min=%" PRId64 " wall_ns_median=%" PRId64
-                    " wall_ns_max=%" PRId64 "\n",
-                    modes[mi].name.c_str(), v.size(), v.front(), v[v.size() / 2], v.back());
+                    " wall_ns_max=%" PRId64 " wall_ns_median_exact=%.0f wall_ns_mean=%.0f wall_ns_sd=%.0f"
+                    " wall_ns_mad=%.0f\n",
+                    modes[mi].name.c_str(), n, v.front(), v[n / 2], v.back(), med, mean,
+                    n > 1 ? std::sqrt(sq / (double) (n - 1)) : 0.0, mad);
     }
     if (::potal::timeline::enabled() && !::potal::timeline::flush()) {
         std::printf("BENCH_TIMELINE_FLUSH FAIL\n");
         failures++;
     }
+    if (::potal::timeline::enabled()) {
+        const ::potal::timeline::stats_t ts = ::potal::timeline::stats();
+        std::printf("BENCH_TIMELINE profile=%s threads=%u events=%" PRIu64 " dropped=%" PRIu64
+                    " unregistered=%" PRIu64 " overflowed_threads=%u\n",
+                    std::getenv("POTAL_TIMELINE_PROFILE") ? std::getenv("POTAL_TIMELINE_PROFILE") : "window",
+                    ts.threads, ts.events, ts.dropped, ts.unregistered, ts.overflowed_threads);
+    }
     std::printf("BENCH_VERDICT %s failures=%d runs=%zu\n", failures == 0 ? "PASS" : "FAIL", failures,
-                (size_t) (repeat * (int64_t) modes.size()));
+                (size_t) ((repeat + warmup) * (int64_t) modes.size()));
     return failures == 0 ? 0 : 1;
 }
