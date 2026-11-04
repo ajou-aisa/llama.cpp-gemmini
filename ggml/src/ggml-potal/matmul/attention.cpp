@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -275,7 +276,8 @@ void prepare_activation(const ggml_tensor & tensor, size_t head, size_t batch, s
             if (operation == role::pv) {
                 out.codes[index] = std::clamp(out.codes[index], 0, 65535);
             }
-            split(out, index, int64_t(out.codes[index]) - (operation == role::pv ? bias : 0));
+            split(out, index, int64_t(out.codes[index]) -
+                  (operation == role::pv && out.algorithm == pv_algorithm::legacy ? bias : 0));
         }
     }
 }
@@ -446,7 +448,7 @@ void integer_reference(const stream & activation, const stationary & weight, rol
     out.assign(product(activation.rows, weight.n), 0);
     std::vector<int32_t> correction;
     unsigned planes = 0;
-    if (operation == role::pv) {
+    if (operation == role::pv && activation.algorithm == pv_algorithm::legacy) {
         planes = pv_bitplanes(activation, weight, correction);
     }
     for (size_t limb = 0; limb < (planes ? planes : activation.limb_count); ++limb) {
@@ -467,7 +469,7 @@ void integer_reference(const stream & activation, const stationary & weight, rol
                         const uint32_t carrier = weight.carriers[(begin / block_k) * weight.n + j];
                         acc = sat32(int64_t(acc) + scu(partial, carrier, 0));
                     }
-                    if (operation == role::pv && limb == 0 && !planes) {
+                    if (operation == role::pv && activation.algorithm == pv_algorithm::legacy && limb == 0 && !planes) {
                         acc = sat32(int64_t(acc) + correction[j]);
                     }
                     reconstruct(stationary_sum, acc, pass);
@@ -485,7 +487,8 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
     out.assign(product(activation.rows, weight.n), 0);
     std::vector<int32_t> correction;
     unsigned planes = 0;
-    if (operation == role::pv) {
+    const bool legacy = operation == role::pv && activation.algorithm == pv_algorithm::legacy;
+    if (legacy) {
         require(bool(corrected), POTAL_ERR_UNSUPPORTED);
         planes = pv_bitplanes(activation, weight, correction);
         report.pv_bitplane_stripes += planes != 0;
@@ -500,7 +503,7 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
         require(operands.allocate({ int64_t(activation.rows), int64_t(weight.n), int64_t(k_total) }),
                 POTAL_ERR_CAPACITY);
         std::unique_ptr<void, decltype(&std::free)> bias_dma(nullptr, std::free);
-        if (operation == role::pv && limb == 0 && !planes) {
+        if (legacy && limb == 0 && !planes) {
             bias_dma.reset(dma_alloc(product(operands.n_pad, sizeof(int32_t))));
             require(bool(bias_dma), POTAL_ERR_CAPACITY);
             std::memcpy(bias_dma.get(), correction.data(), weight.n * sizeof(int32_t));
@@ -564,7 +567,7 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
             // Regular WS overwrites the first K panel, accumulates later
             // panels, and stores C only at the final panel. Its fence covers
             // that store before Host consumption or reuse for the next limb.
-            const planned_result completed = operation == role::qk || limb != 0 || planes ? run(descriptor) :
+            const planned_result completed = !legacy || limb != 0 || planes ? run(descriptor) :
                 corrected(descriptor, static_cast<const int32_t *>(bias_dma.get()), weight.n);
             const auto & work = completed.report;
             report.jobs += work.loop_ws != 0;
@@ -590,10 +593,11 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
             report.residual_jobs += limb != 0;
             report.qk_limb_jobs += operation == role::qk;
             report.pv_bitplane_jobs += planes != 0;
-            report.correction_jobs += operation == role::pv && limb == 0 && !planes;
-            report.bias_updates += operation == role::pv && limb == 0 && !planes ?
+            report.correction_jobs += legacy && limb == 0 && !planes;
+            report.bias_updates += legacy && limb == 0 && !planes ?
                 ((activation.rows + POTAL_HW_DIM - 1) / POTAL_HW_DIM) *
                 ((weight.n + POTAL_HW_DIM - 1) / POTAL_HW_DIM) : 0;
+            const auto reconstruct_start = std::chrono::steady_clock::now();
             for (size_t i = 0; i < activation.rows; ++i) {
                 for (size_t j = 0; j < weight.n; ++j) {
                     const int32_t value = operands.c[i * operands.ldc + j];
@@ -604,11 +608,16 @@ void execute_stripe(const stream & activation, const stationary & weight, role o
                     }
                 }
             }
+            report.reconstruct_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - reconstruct_start).count();
         }
         if (operation == role::qk) {
+            const auto reconstruct_start = std::chrono::steady_clock::now();
             for (size_t index = 0; index < out.size(); ++index) {
                 reconstruct(out[index], stationary_sum[index], limb);
             }
+            report.reconstruct_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - reconstruct_start).count();
         }
     }
 }
@@ -673,10 +682,11 @@ potal_status prepare_stationary(const ggml_tensor & tensor, size_t head, size_t 
 }
 
 potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batch,
-                            size_t begin, size_t rows, role operation, stream & out) {
+                            size_t begin, size_t rows, role operation, stream & out, pv_algorithm algorithm) {
     return checked([&] {
         nearest_rounding rounding;
         stream prepared;
+        prepared.algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
         prepare_activation(tensor, head, batch, begin, rows, operation, prepared);
         out = std::move(prepared);
     });
@@ -699,7 +709,7 @@ potal_status column_bias(const stationary & weight, std::vector<int32_t> & out) 
     });
 }
 
-result execute(ggml_tensor * op, const planned_runner & run, const corrected_runner & corrected) {
+result execute(ggml_tensor * op, const planned_runner & run, const corrected_runner & corrected, pv_algorithm algorithm) {
     result report;
     if (check(op, true) != GGML_POTAL_REJECT_NONE || !run) {
         report.status = POTAL_ERR_INVALID_ARGUMENT;
@@ -728,6 +738,7 @@ result execute(ggml_tensor * op, const planned_runner & run, const corrected_run
                     for (size_t head = ah * head_repeat; head < (ah + 1) * head_repeat; ++head) {
                         for (size_t begin = 0; begin < rows; begin += stripe_rows) {
                             stream activation;
+                            activation.algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
                             prepare_activation(b, head, batch, begin, std::min(stripe_rows, rows - begin),
                                                operation, activation);
                             std::vector<int64_t> integers;

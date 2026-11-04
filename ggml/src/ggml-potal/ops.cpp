@@ -178,11 +178,11 @@ ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
     }
     ++stats.attention_completed;
     log::debug("potal.attention", "[POTAL_ATTENTION] node=%s role=%s dispatch=HARDWARE limb_jobs=%llu "
-               "loop_ws=%llu bias_mvins=%llu pv_bitplane_stripes=%llu pv_bitplane_jobs=%llu",
+               "loop_ws=%llu bias_mvins=%llu pv_bitplane_stripes=%llu pv_bitplane_jobs=%llu reconstruct_s=%.9f",
                node->name, attention::get_role(node) == attention::role::qk ? "QK" : "PV",
                (unsigned long long)result.jobs, (unsigned long long)result.loops,
                (unsigned long long)result.bias_updates, (unsigned long long)result.pv_bitplane_stripes,
-               (unsigned long long)result.pv_bitplane_jobs);
+               (unsigned long long)result.pv_bitplane_jobs, result.reconstruct_s);
     ggml::gemmini::performance::record_npu("POTAL", "attention", "work_total_cycles", 0, false,
                                           "unavailable_device_counter");
     return GGML_STATUS_SUCCESS;

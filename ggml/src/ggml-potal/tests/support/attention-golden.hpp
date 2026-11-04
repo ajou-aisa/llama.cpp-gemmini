@@ -302,4 +302,196 @@ inline bool pv_bitplanes(const stream & a, const stationary & b, pv_planes & out
     return true;
 }
 
+// PV comparison only. These records are oracle_derived, never device telemetry.
+enum class pv_status { ok, unsupported, oracle_capacity, invalid };
+enum class pv_branch { legacy_bias, legacy_planes, balanced };
+
+struct pv_context {
+    size_t batch = 0, query_head = 0, kv_head = 0, stripe = 0;
+    size_t row_begin = 0, column_begin = 0, k_begin = 0;
+    size_t i_panel = 0, j_panel = 0;
+    size_t panel_k = 0; // 0 means one panel; otherwise whole K32 blocks.
+};
+
+struct pv_counts {
+    size_t scu_positive = 0, scu_negative = 0;
+    size_t acc_positive = 0, acc_negative = 0;
+    size_t bias_acc_positive = 0, bias_acc_negative = 0; // Subset of ACC totals.
+    bool clipped() const {
+        return scu_positive || scu_negative || acc_positive || acc_negative;
+    }
+};
+
+struct pv_event {
+    const char * provenance = "oracle_derived";
+    pv_branch branch = pv_branch::balanced;
+    pv_context context;
+    size_t row = 0, column = 0, limb = 0;
+    size_t k_start = 0, k32 = 0, k_panel = 0;
+    uint32_t carrier = 0;
+    bool post_k_bias = false, overwrite = false;
+    wide raw_dot = 0;
+    // If symbolic_shift, exact value is raw_dot * 2^carrier; no huge shift occurs.
+    bool symbolic_shift = false;
+    wide shifted_exact = 0;
+    int32_t scu = 0, previous_acc = 0, new_acc = 0;
+    wide wide_add = 0;
+    bool scu_positive = false, scu_negative = false;
+    bool acc_positive = false, acc_negative = false;
+};
+
+struct pv_value {
+    pv_status status = pv_status::invalid;
+    pv_branch branch = pv_branch::balanced;
+    std::vector<std::vector<int8_t>> limbs; // Independently encoded, padding zero.
+    std::vector<std::vector<int32_t>> completed;
+    std::vector<int64_t> output; // Absent (empty) unless status == ok.
+    pv_counts counts;
+    std::vector<pv_event> events;
+};
+
+struct pv_comparison {
+    pv_value a, b;
+    pv_status c_status = pv_status::invalid;
+    std::vector<wide> c; // Exact quantized dot, not FP32 input math.
+    bool nonsaturating_comparable = false;
+    bool nonsaturating_equal = false;
+};
+
+inline pv_comparison compare_pv(const stream & a, const stationary & b,
+                                pv_context context = {}, bool keep_events = true) {
+    pv_comparison result;
+    if (!pv_metadata(a,b) || (POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32) ||
+        context.k_begin % 32 || (context.panel_k && context.panel_k % 32)) return result;
+    for (size_t k = a.k; k < a.kp; ++k)
+        for (size_t j = 0; j < b.n; ++j)
+            if (b.limbs[0][k*b.n+j]) return result;
+
+    result.c_status = pv_exact(a,b,result.c) ? pv_status::ok : pv_status::oracle_capacity;
+    std::vector<int32_t> bias(b.n);
+    bool bias_fits = true;
+    for (size_t j = 0; j < b.n; ++j) {
+        std::map<uint32_t,wide> terms;
+        for (size_t k = 0; k < b.k; ++k) {
+            const auto carrier = b.carriers[k/32*b.n+j];
+            if (carrier != POTAL_CARRIER_ZERO)
+                terms[carrier] += wide{128} * b.limbs[0][k*b.n+j];
+        }
+        wide exact = 0;
+        if (!binary_sum(std::move(terms),exact) || exact < INT32_MIN || exact > INT32_MAX)
+            bias_fits = false;
+        else bias[j] = static_cast<int32_t>(exact);
+    }
+    result.a.branch = bias_fits ? pv_branch::legacy_bias : pv_branch::legacy_planes;
+    if (!bias_fits) {
+        pv_planes planes;
+        if (!pv_bitplanes(a,b,planes)) return result;
+        if (!planes.certified) result.a.status = pv_status::unsupported;
+        else result.a.limbs = std::move(planes.digits);
+    }
+    // Use the existing balanced recurrence on ORIGINAL codes, never prepared limbs.
+    for (pv_value * value : {&result.a,&result.b}) {
+        if (value->status == pv_status::unsupported) continue;
+        if (value->branch != pv_branch::legacy_planes) {
+            size_t count = 1;
+            value->limbs.assign(3,std::vector<int8_t>(a.codes.size(),0));
+            for (size_t i = 0; i < a.rows; ++i)
+                for (size_t k = 0; k < a.k; ++k) {
+                    const auto d = digits(int64_t{a.codes[i*a.kp+k]} -
+                                          (value->branch == pv_branch::legacy_bias ? 128 : 0));
+                    for (size_t l = 0; l < 3; ++l) {
+                        value->limbs[l][i*a.kp+k] = d[l];
+                        if (d[l]) count = std::max(count,l+1);
+                    }
+                }
+            value->limbs.resize(count);
+        }
+        value->completed.assign(value->limbs.size(),std::vector<int32_t>(a.rows*b.n));
+        std::vector<int64_t> integers(a.rows*b.n);
+        value->status = pv_status::ok;
+        wide place = 1;
+        for (size_t l = 0; l < value->limbs.size(); ++l) {
+            for (size_t i = 0; i < a.rows; ++i)
+                for (size_t j = 0; j < b.n; ++j) {
+                    int32_t acc = 0;
+                    for (size_t begin = 0; begin < a.kp; begin += POTAL_HW_DIM) {
+                        pv_event event;
+                        event.branch = value->branch;
+                        event.context = context;
+                        event.row = context.row_begin+i;
+                        event.column = context.column_begin+j;
+                        event.limb = l;
+                        event.k_start = context.k_begin+begin;
+                        event.k32 = event.k_start/32;
+                        event.k_panel = context.panel_k ? begin/context.panel_k : 0;
+                        event.carrier = b.carriers[begin/32*b.n+j];
+                        event.overwrite = begin == 0;
+                        for (size_t k = begin; k < begin+POTAL_HW_DIM && k < a.k; ++k)
+                            event.raw_dot += wide{value->limbs[l][i*a.kp+k]} * b.limbs[0][k*b.n+j];
+                        event.scu = shifted(event.raw_dot,event.carrier,0);
+                        if (event.carrier != POTAL_CARRIER_ZERO && event.raw_dot) {
+                            if (event.carrier >= 32) {
+                                event.symbolic_shift = true;
+                                event.scu_positive = event.raw_dot > 0;
+                                event.scu_negative = event.raw_dot < 0;
+                            } else {
+                                event.shifted_exact = event.raw_dot * (wide{1} << event.carrier);
+                                event.scu_positive = event.shifted_exact > INT32_MAX;
+                                event.scu_negative = event.shifted_exact < INT32_MIN;
+                            }
+                        }
+                        event.previous_acc = acc;
+                        event.wide_add = event.overwrite ? wide{event.scu} : wide{acc}+event.scu;
+                        event.acc_positive = !event.overwrite && event.wide_add > INT32_MAX;
+                        event.acc_negative = !event.overwrite && event.wide_add < INT32_MIN;
+                        acc = event.new_acc = clamp32(event.wide_add);
+                        value->counts.scu_positive += event.scu_positive;
+                        value->counts.scu_negative += event.scu_negative;
+                        value->counts.acc_positive += event.acc_positive;
+                        value->counts.acc_negative += event.acc_negative;
+                        if (keep_events) value->events.push_back(event);
+                    }
+                    if (value->branch == pv_branch::legacy_bias && l == 0) {
+                        pv_event event;
+                        event.branch = value->branch;
+                        event.context = context;
+                        event.row = context.row_begin+i;
+                        event.column = context.column_begin+j;
+                        event.post_k_bias = true;
+                        event.k_start = context.k_begin+a.kp;
+                        event.k32 = event.k_start/32;
+                        event.k_panel = context.panel_k ? (a.kp-1)/context.panel_k : 0;
+                        event.raw_dot = event.shifted_exact = event.scu = bias[j];
+                        event.previous_acc = acc;
+                        event.wide_add = wide{acc}+bias[j];
+                        event.acc_positive = event.wide_add > INT32_MAX;
+                        event.acc_negative = event.wide_add < INT32_MIN;
+                        acc = event.new_acc = clamp32(event.wide_add);
+                        value->counts.acc_positive += event.acc_positive;
+                        value->counts.acc_negative += event.acc_negative;
+                        value->counts.bias_acc_positive += event.acc_positive;
+                        value->counts.bias_acc_negative += event.acc_negative;
+                        if (keep_events) value->events.push_back(event);
+                    }
+                    const size_t index = i*b.n+j;
+                    value->completed[l][index] = acc;
+                    const wide sum = wide{integers[index]} + wide{acc}*place;
+                    if (sum < INT64_MIN || sum > INT64_MAX) value->status = pv_status::oracle_capacity;
+                    else integers[index] = static_cast<int64_t>(sum);
+                }
+            place *= value->branch == pv_branch::legacy_planes ? 2 : 256;
+        }
+        if (value->status == pv_status::ok) value->output = std::move(integers);
+    }
+    result.nonsaturating_comparable = result.a.status == pv_status::ok &&
+        result.b.status == pv_status::ok && result.c_status == pv_status::ok &&
+        !result.a.counts.clipped() && !result.b.counts.clipped();
+    if (result.nonsaturating_comparable) {
+        result.nonsaturating_equal = result.a.output == result.b.output;
+        for (size_t x = 0; x < result.c.size(); ++x)
+            result.nonsaturating_equal &= wide{result.b.output[x]} == result.c[x];
+    }
+    return result;
+}
+
 } // namespace potal_test::attention_golden

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -110,6 +111,7 @@ struct graph {
 
 stream make_stream(size_t rows, size_t k, const std::vector<int32_t> & codes, role r, size_t count = 5) {
     stream a;
+    a.algorithm = attention::pv_algorithm::legacy;
     a.rows = rows; a.k = k; a.kp = (k + 31)/32*32; a.limb_count = count;
     a.codes.assign(rows*a.kp, 0);
     for (auto & limb : a.limbs) limb.assign(rows*a.kp, 0);
@@ -408,7 +410,7 @@ void test_prepare() {
     for (int mode : {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO, FE_TONEAREST}) {
         if (!check("set caller rounding mode", std::fesetround(mode) == 0)) continue;
         stream p;
-        const auto status = attention::prepare_stream(ties.t,0,0,0,1,role::pv,p);
+        const auto status = attention::prepare_stream(ties.t,0,0,0,1,role::pv,p,attention::pv_algorithm::legacy);
         check("P quantization restores caller rounding", std::fegetround() == mode);
         if (check("prepare P ties",status == POTAL_OK))
             check("P RNE ties, unsigned upper carry", p.scale == -15 && p.codes.size() == 32 &&
@@ -432,7 +434,7 @@ void test_prepare() {
     tensor pclip(GGML_TYPE_F32,1,1);
     pclip.set(0,0,std::nextafter(1.0f,0.0f));
     stream clipped_p;
-    if (check("prepare P unsigned16 clipping",attention::prepare_stream(pclip.t,0,0,0,1,role::pv,clipped_p) == POTAL_OK))
+    if (check("prepare P unsigned16 clipping",attention::prepare_stream(pclip.t,0,0,0,1,role::pv,clipped_p,attention::pv_algorithm::legacy) == POTAL_OK))
         check("P clips RNE overflow to 65535 with upper carry",clipped_p.scale == -16 &&
               clipped_p.codes.size() == 32 && clipped_p.codes[0] == 65535 &&
               clipped_p.limb_count >= 3 && limbs_match(clipped_p,role::pv));
@@ -457,7 +459,7 @@ void test_prepare() {
                       -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
         ties.set(7,0,bad);
         auto out = sentinel;
-        check("P negative/nonfinite rejected",attention::prepare_stream(ties.t,0,0,0,1,role::pv,out) != POTAL_OK);
+        check("P negative/nonfinite rejected",attention::prepare_stream(ties.t,0,0,0,1,role::pv,out,attention::pv_algorithm::legacy) != POTAL_OK);
         check("failed P prepare restores rounding",std::fegetround() == saved_round);
         check("failed P prepare leaves output unchanged",same_stream(out,sentinel));
         ties.set(7,0,1);
@@ -473,9 +475,9 @@ void test_prepare() {
         check("failed Q prepare publishes nothing",same_stream(qout,sentinel));
     }
     auto out = sentinel;
-    check("zero requested rows rejected",attention::prepare_stream(ties.t,0,0,0,0,role::pv,out) != POTAL_OK);
-    check("out-of-range stream row rejected",attention::prepare_stream(ties.t,0,0,1,1,role::pv,out) != POTAL_OK);
-    check("out-of-range head rejected",attention::prepare_stream(ties.t,1,0,0,1,role::pv,out) != POTAL_OK);
+    check("zero requested rows rejected",attention::prepare_stream(ties.t,0,0,0,0,role::pv,out,attention::pv_algorithm::legacy) != POTAL_OK);
+    check("out-of-range stream row rejected",attention::prepare_stream(ties.t,0,0,1,1,role::pv,out,attention::pv_algorithm::legacy) != POTAL_OK);
+    check("out-of-range head rejected",attention::prepare_stream(ties.t,1,0,0,1,role::pv,out,attention::pv_algorithm::legacy) != POTAL_OK);
     check("out-of-range batch rejected",attention::prepare_stationary(ties.t,0,1,role::pv,w) != POTAL_OK);
 }
 
@@ -780,7 +782,7 @@ void test_pv_execute() {
                     bias_contract = bias_contract && bias[j] == expected;
                 }
                 return attention::run_corrected(descriptor, bias, columns, &sink);
-            });
+            },attention::pv_algorithm::legacy);
         const std::string name = "PV command path K=" + std::to_string(k);
         if (!check(name + " status", result.status == POTAL_OK && !result.fatal)) continue;
         bool exact = true;
@@ -814,7 +816,7 @@ void test_pv_execute() {
         [](const potal_stripe_gemm_desc &) { return planned_result{}; },
         [&](const potal_stripe_gemm_desc & descriptor, const int32_t * bias, size_t columns) {
             return attention::run_corrected(descriptor, bias, columns, &sink);
-        });
+        },attention::pv_algorithm::legacy);
     check("PV failed bias MVIN propagates without partial publication",
           result.status == POTAL_HW_BAD_COMMAND && g.out.storage == before && failed.bias_mvins == 0);
     potal_paired_session * fresh = nullptr;
@@ -1033,7 +1035,7 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
         for (size_t begin = 0; begin < m; begin += stripes.tile_I*POTAL_HW_DIM) {
             stream a;
             const size_t rows = std::min(m-begin,stripes.tile_I*POTAL_HW_DIM);
-            if (!check("PV real P preparation",attention::prepare_stream(g.a.t,h,0,begin,rows,role::pv,a) == POTAL_OK)) return;
+            if (!check("PV real P preparation",attention::prepare_stream(g.a.t,h,0,begin,rows,role::pv,a,attention::pv_algorithm::legacy) == POTAL_OK)) return;
             std::vector<int32_t> bias;
             const auto bias_status = attention::column_bias(b,bias);
             const bool bitplane = bias_status == POTAL_ERR_UNSUPPORTED;
@@ -1139,7 +1141,7 @@ void pv_bitplane_execute(size_t k, size_t m, size_t n, size_t heads, bool reject
         [&](const potal_stripe_gemm_desc & d, const int32_t * bias, size_t columns) {
             ++corrected_calls;
             return attention::run_corrected(d,bias,columns,&sink);
-        });
+        },attention::pv_algorithm::legacy);
     const std::string name = "PV H3-7C "+std::to_string(m)+"x"+std::to_string(n)+"x"+std::to_string(k)+
                              " heads="+std::to_string(heads);
     if (reject) {
@@ -1208,7 +1210,7 @@ void test_pv_bitplane_execute() {
                 }
                 return run_planned_stripe_gemm(session,d);
             },
-            [](const potal_stripe_gemm_desc &, const int32_t *, size_t) { return planned_result{}; });
+            [](const potal_stripe_gemm_desc &, const int32_t *, size_t) { return planned_result{}; },attention::pv_algorithm::legacy);
         check("PV later-plane failure preserves completed jobs and publication",
               calls == 2 && result.status != POTAL_OK && result.fatal == fatal &&
               result.pv_bitplane_stripes == 1 && result.pv_bitplane_jobs == 1 &&
@@ -1224,6 +1226,472 @@ void test_pv_bitplane_execute() {
                   std::strcmp(result.stage,"between_pv_bitplanes") == 0 &&
                   !emu.in_flight && emu.scales.empty() && emu.writes == emu.releases);
         }
+    }
+}
+
+// The checked-command subject uses the real C11 owner/Scale/LOOP/readback APIs.
+// It is separate from the ordinary planned runner, and never computes expected C.
+planned_result balanced_checked(const potal_stripe_gemm_desc & d, potal_test::attention_emulator & model) {
+    planned_result r;
+    prepared_stripe_gemm prepared;
+    r.status = prepare_stripe_gemm(d, prepared, &r.stage);
+    if (r.status != POTAL_OK) return r;
+    auto sink = model.sink();
+    potal_paired_session * session = nullptr;
+    r.status = potal_paired_session_open(&sink, &session);
+    if (r.status != POTAL_OK) return r;
+    auto accept = [&](potal_status s) { if (s != POTAL_OK) { r.status = s; throw s; } };
+    try {
+        accept(potal_paired_tlb_flush(session));
+        accept(potal_paired_fence(session));
+        r.tlb_flushes = 1;
+        uint32_t generation = 0;
+        for (size_t i = 0; i < d.m; i += d.tile_i*POTAL_HW_DIM)
+            for (size_t j = 0; j < d.n; j += d.tile_j*POTAL_HW_DIM) {
+                const size_t rows = std::min(size_t(d.m)-i,size_t(d.tile_i)*POTAL_HW_DIM);
+                const size_t cols = std::min(size_t(d.n)-j,size_t(d.tile_j)*POTAL_HW_DIM);
+                potal_acc_readback output{0,uint32_t((rows+POTAL_HW_DIM-1)/POTAL_HW_DIM),
+                    uint32_t((cols+POTAL_HW_DIM-1)/POTAL_HW_DIM),
+                    uint32_t((POTAL_HW_DIM-rows%POTAL_HW_DIM)%POTAL_HW_DIM),
+                    uint32_t((POTAL_HW_DIM-cols%POTAL_HW_DIM)%POTAL_HW_DIM),d.c+i*d.ldc+j,d.ldc};
+                for (size_t k = 0; k < d.k; k += d.tile_k*POTAL_HW_DIM) {
+                    potal_paired_loop_ws request{};
+                    auto & l = request.loop;
+                    l.a = d.a+i*d.lda+k; l.b = d.b+k*d.ldb+j;
+                    l.lda = d.lda; l.ldb = d.ldb;
+                    l.i_tiles = output.i_tiles; l.j_tiles = output.j_tiles;
+                    l.pad_i = output.pad_i; l.pad_j = output.pad_j;
+                    l.k_tiles = uint32_t(std::min(size_t(d.k)-k,size_t(d.tile_k)*POTAL_HW_DIM)/POTAL_HW_DIM);
+                    l.passes_per_block = 32/POTAL_HW_DIM;
+                    l.flags = k ? POTAL_GEMM_ACCUMULATE : 0;
+                    generation = generation%POTAL_GENERATION_MAX+1;
+                    l.scale_generation = generation;
+                    request.path = POTAL_PAIRED_MAIN;
+                    for (size_t b = 0; b < l.k_tiles/l.passes_per_block; ++b)
+                        for (size_t c = 0; c < cols; ++c) {
+                            accept(potal_paired_scale_write(session,(b*l.j_tiles+c/POTAL_HW_DIM),generation,
+                                c%POTAL_HW_DIM,d.carriers[(k/32+b)*d.carrier_stride+j+c]));
+                            ++r.report.scale_writes;
+                        }
+                    accept(potal_paired_loop_ws_issue(session,&request));
+                    ++r.report.loop_ws;
+                    accept(potal_paired_fence(session)); ++r.report.fences;
+                    for (size_t b = 0; b < l.k_tiles/l.passes_per_block; ++b)
+                        for (size_t c = 0; c < cols; ++c) {
+                            accept(potal_paired_scale_release(session,b*l.j_tiles+c/POTAL_HW_DIM,generation,c%POTAL_HW_DIM));
+                            ++r.report.scale_releases;
+                        }
+                }
+                accept(potal_paired_acc_readback_issue(session,&output));
+                accept(potal_paired_fence(session)); ++r.report.fences;
+            }
+        accept(potal_paired_session_close(session));
+        session = nullptr;
+        r.ok = true;
+    } catch (potal_status) {
+        r.stage = "balanced_checked";
+    }
+    if (session) {
+        const auto cleanup = potal_paired_session_cleanup(session);
+        const auto state = potal_paired_session_query(session);
+        r.fatal = cleanup != POTAL_OK || state.outstanding_loops || state.outstanding_readbacks || state.live_scale_slots;
+        (void)potal_paired_session_close(session);
+    }
+    return r;
+}
+
+std::string wide_text(golden::wide value) {
+    if (!value) return "0";
+    const bool negative = value < 0;
+    __uint128_t magnitude = negative ? __uint128_t(-(value+1))+1 : __uint128_t(value);
+    std::string text;
+    do { text.push_back(char('0'+magnitude%10)); magnitude /= 10; } while (magnitude);
+    if (negative) text.push_back('-');
+    std::reverse(text.begin(),text.end());
+    return text;
+}
+
+void pv_numeric_log(const std::string & name, const golden::pv_comparison & proof, int scale) {
+    for (const auto * v : {&proof.a,&proof.b}) {
+        std::printf("PV_NUMERIC case=%s provenance=oracle_derived branch=%d status=%d SCUpos=%zu SCUneg=%zu "
+                    "ACCpos=%zu ACCneg=%zu biasACCpos=%zu biasACCneg=%zu\n",name.c_str(),int(v->branch),int(v->status),
+                    v->counts.scu_positive,v->counts.scu_negative,v->counts.acc_positive,v->counts.acc_negative,
+                    v->counts.bias_acc_positive,v->counts.bias_acc_negative);
+        for (const auto & e : v->events) if (e.scu_positive || e.scu_negative || e.acc_positive || e.acc_negative)
+            std::printf("PV_SAT case=%s oracle_derived branch=%d batch=%zu qhead=%zu kvhead=%zu stripe=%zu "
+                        "row=%zu col=%zu limb=%zu Kstart=%zu K32=%zu carrier=%u Ipanel=%zu Jpanel=%zu Kpanel=%zu "
+                        "postK=%d raw=%s shifted=%s symbolic=%d SCU=%d prior=%d add=%s final=%d\n",name.c_str(),
+                        int(e.branch),e.context.batch,e.context.query_head,e.context.kv_head,e.context.stripe,
+                        e.row,e.column,e.limb,e.k_start,e.k32,e.carrier,e.context.i_panel,e.context.j_panel,e.k_panel,
+                        e.post_k_bias,wide_text(e.raw_dot).c_str(),wide_text(e.shifted_exact).c_str(),e.symbolic_shift,
+                        e.scu,e.previous_acc,wide_text(e.wide_add).c_str(),e.new_acc);
+    }
+    double maximum = 0, total = 0, ac = 0, bc = 0;
+    size_t comparable = 0;
+    for (size_t x = 0; x < proof.b.output.size(); ++x) {
+        const bool a_ok = proof.a.status == golden::pv_status::ok;
+        const auto b = proof.b.output[x];
+        const auto c = proof.c[x];
+        const float bf = float(std::ldexp(double(b),scale));
+        const float cf = float(std::ldexp(double(c),scale));
+        char af_text[64] = "N/A";
+        if (a_ok) std::snprintf(af_text,sizeof(af_text),"%a",float(std::ldexp(double(proof.a.output[x]),scale)));
+        std::printf("PV_VALUE case=%s index=%zu A=%s B=%lld C=%s AminusB=%s AminusC=%s BminusC=%s "
+                    "F32A=%s F32B=%a F32C=%a\n",name.c_str(),x,a_ok ? std::to_string(proof.a.output[x]).c_str() : "N/A",
+                    (long long)b,wide_text(c).c_str(),
+                    a_ok ? wide_text(golden::wide(proof.a.output[x])-b).c_str() : "N/A",
+                    a_ok ? wide_text(golden::wide(proof.a.output[x])-c).c_str() : "N/A",wide_text(golden::wide(b)-c).c_str(),af_text,bf,cf);
+        bc += std::abs(double(bf)-cf);
+        if (a_ok) {
+            const float af = float(std::ldexp(double(proof.a.output[x]),scale));
+            const double error = std::abs(double(af)-bf);
+            maximum = std::max(maximum,error); total += error; ac += std::abs(double(af)-cf); ++comparable;
+        }
+    }
+    std::printf("PV_ERROR case=%s denominator=%zu ABmax=%s ABmean=%s ACmean=%s BCmean=%g\n",name.c_str(),
+                comparable,comparable ? std::to_string(maximum).c_str() : "N/A",comparable ? std::to_string(total/comparable).c_str() : "N/A",
+                comparable ? std::to_string(ac/comparable).c_str() : "N/A",bc/proof.b.output.size());
+}
+
+void test_balanced_prepare() {
+    tensor p(GGML_TYPE_F32,257,256);
+    for (size_t i = 0; i < 256; ++i) {
+        for (size_t k = 0; k < 256; ++k) p.set(k,i,float(i*256+k)/65536);
+        p.set(256,i,65535.0f/65536);
+    }
+    stream a;
+    if (!check("B actual production all65536 prepare",attention::prepare_stream(p.t,0,0,0,256,role::pv,a,
+                   attention::pv_algorithm::balanced) == POTAL_OK)) return;
+    bool exact = a.scale == -16 && a.limb_count == 3 && a.algorithm == attention::pv_algorithm::balanced;
+    for (size_t i = 0; i < 256; ++i)
+        for (size_t k = 0; k < a.kp; ++k) {
+            const int code = k < 256 ? int(i*256+k) : k == 256 ? 65535 : 0;
+            int remaining = code, rebuilt = 0, place = 1;
+            exact &= a.codes[i*a.kp+k] == code;
+            for (size_t l = 0; l < attention::max_limbs; ++l) {
+                int digit = remaining%256;
+                if (digit >= 128) digit -= 256;
+                remaining = (remaining-digit)/256;
+                exact &= a.limbs[l][i*a.kp+k] == digit;
+                if (l < 3) { rebuilt += digit*place; place *= 256; }
+            }
+            exact &= rebuilt == code && remaining == 0;
+        }
+    check("B all65536 unchanged codes independent digits carry32640 zero positions padding",exact);
+    stream selected;
+    check("default PV preparation selects balanced encoding",
+          attention::prepare_stream(p.t,0,0,0,256,role::pv,selected) == POTAL_OK &&
+          selected.algorithm == attention::pv_algorithm::balanced && same_stream(a,selected));
+    tensor zero(GGML_TYPE_F32,1,1);
+    check("B allzero minimum one limb",attention::prepare_stream(zero.t,0,0,0,1,role::pv,a,
+          attention::pv_algorithm::balanced) == POTAL_OK && a.limb_count == 1);
+    tensor q(GGML_TYPE_F32,65,1);
+    q.fill(1);
+    stream q_legacy, q_balanced;
+    check("QK ignores PV selector including encoded stream tag",
+          attention::prepare_stream(q.t,0,0,0,1,role::qk,q_legacy,attention::pv_algorithm::legacy) == POTAL_OK &&
+          attention::prepare_stream(q.t,0,0,0,1,role::qk,q_balanced,attention::pv_algorithm::balanced) == POTAL_OK &&
+          same_stream(q_legacy,q_balanced) && q_balanced.algorithm == attention::pv_algorithm::legacy);
+}
+
+// Actual tensor preparation is the authority for each execution. Expected codes,
+// V, carriers, digits and arithmetic are checked separately before runner entry.
+void balanced_case(size_t k, int variant, bool half = false, size_t m = 1, size_t n = 1,
+                   size_t heads = 1, size_t repeat = 1) {
+    graph g(role::pv,k,n,m,true,heads,repeat,heads,repeat,
+            half ? GGML_TYPE_F16 : GGML_TYPE_F32,half ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    const int boundaries[] = {0,1,127,128,200,255,256,32639,32640,32767,32768,65535};
+    for (size_t b = 0; b < heads; ++b)
+        for (size_t h = 0; h < heads; ++h)
+            for (size_t j = 0; j < n; ++j)
+                for (size_t x = 0; x < k; ++x) {
+                    float v = (x%3 == 0 ? -1.0f : 1.0f)*(j%2 ? -1.0f : 1.0f);
+                    if (variant) {
+                        v = 0;
+                        if (x == 0) v = std::ldexp(1.0f,variant == 3 ? 32 : 24);
+                        if (x == 32) v = 1;
+                        if (variant == 2 && x == POTAL_HW_DIM) v = std::ldexp(1.0f,24);
+                        if (variant == 2 && x == 64) v = 1;
+                        if (variant >= 4) {
+                            v = 0;
+                            const size_t opposite = variant == 4 || variant == 8 ? 2 : POTAL_HW_DIM;
+                            const int shift = variant == 8 ? 200 : 24;
+                            // F32 bounds actual preparation to c<=126; the larger
+                            // symbolic cancellation is separately a reference fixture.
+                            const int bounded_shift = std::min(shift,100);
+                            if (x == 0) v = std::ldexp(variant == 6 ? -64.0f : 64.0f,bounded_shift);
+                            if (x == opposite) v = std::ldexp(variant == 6 ? 64.0f : -64.0f,bounded_shift);
+                            if (x == 64) v = 64;
+                            if (variant == 7) v = 0;
+                            if (variant == 9) {
+                                v = x == 0 || x == POTAL_HW_DIM ? std::ldexp(64.0f,24) :
+                                    x == 2*POTAL_HW_DIM ? -std::ldexp(64.0f,24) : x == 96 ? 64.0f : 0;
+                            }
+                            if (variant == 10 || variant == 11) {
+                                v = x == 0 ? (variant == 10 ? -std::ldexp(1.0f,31) : std::ldexp(1.0f,31)) :
+                                    x == 2 ? std::ldexp(64.0f,31) : x == 64 ? 64.0f : 0;
+                            }
+                        }
+                    }
+                    g.w.set(x,j,v,h,b);
+                }
+    for (size_t b = 0; b < heads*repeat; ++b)
+        for (size_t h = 0; h < heads*repeat; ++h)
+            for (size_t i = 0; i < m; ++i)
+                for (size_t x = 0; x < k; ++x) {
+                    float p = float(boundaries[(x+i)%12])/65536;
+                    if (half) p = x%2 ? 0.5f : 1.0f;
+                    if (variant) p = x == 0 || (variant == 2 && x == POTAL_HW_DIM) ? 128.0f/65536 : 0;
+                    if (variant >= 4) {
+                        const size_t opposite = variant == 4 || variant == 8 ? 2 : POTAL_HW_DIM;
+                        p = x == 0 || x == opposite ? 128.0f/65536 : 0;
+                        if (variant == 9) p = x == 0 || x == POTAL_HW_DIM || x == 2*POTAL_HW_DIM ? 1.0f/65536 : 0;
+                        if (variant == 10 || variant == 11) p = x == 0 ? 1.0f/65536 : 0;
+                    }
+                    // Anchor occupies a zero-weight position in saturated fixtures.
+                    if ((!variant && x+1 == k) || (variant && x == 1)) p = half ? 1.0f : 65535.0f/65536;
+                    if (variant == 13) p = 0;
+                    g.a.set(x,i,p,h,b);
+                }
+    struct job { stream a; stationary b; golden::pv_comparison proof; size_t limb; };
+    std::vector<job> jobs;
+    std::vector<float> expected(heads*repeat*heads*repeat*m*n);
+    std::vector<float> expected_a(expected.size());
+    bool a_admitted = true;
+    potal_tile_plan stripe;
+    if (!check("B stripe plan",potal_tile_select(m,n,(k+31)/32*32,32/POTAL_HW_DIM,&stripe) == POTAL_OK)) return;
+    const std::string name = "B-K"+std::to_string(k)+"-v"+std::to_string(variant)+"-m"+std::to_string(m)+
+                             "-n"+std::to_string(n)+"-half"+std::to_string(half);
+    bool metadata = true, numeric = true;
+    size_t stripe_count = 0;
+    for (size_t b = 0; b < heads*repeat; ++b)
+        for (size_t h = 0; h < heads*repeat; ++h) {
+            stationary w;
+            if (!check(name+" V prepare",attention::prepare_stationary(g.w.t,h/repeat,b/repeat,role::pv,w) == POTAL_OK)) return;
+            // Independently scan each block and quantize with RNE (input values are exact).
+            for (size_t j = 0; j < n; ++j) {
+                int base = INT_MAX;
+                std::vector<int> theta(w.kp/32,INT_MIN);
+                for (size_t block = 0; block < w.kp/32; ++block) {
+                    float peak = 0;
+                    for (size_t x = block*32; x < std::min(k,block*32+32); ++x)
+                        peak = std::max(peak,std::abs(g.w.get(x,j,h/repeat,b/repeat)));
+                    if (peak) { theta[block] = std::ilogb(peak)-6; base = std::min(base,theta[block]); }
+                }
+                metadata &= w.base[j] == (base == INT_MAX ? 0 : base);
+                for (size_t x = 0; x < w.kp; ++x) {
+                    const int t = theta[x/32];
+                    const int code = x >= k || t == INT_MIN ? 0 :
+                        std::clamp(int(std::nearbyint(std::ldexp(double(g.w.get(x,j,h/repeat,b/repeat)),-t))),-128,127);
+                    metadata &= w.limbs[0][x*n+j] == code;
+                    metadata &= w.carriers[x/32*n+j] == (t == INT_MIN ? POTAL_CARRIER_ZERO : uint32_t(t-base));
+                }
+            }
+            for (size_t begin = 0; begin < m; begin += stripe.tile_I*POTAL_HW_DIM) {
+                stream a;
+                const size_t rows = std::min(m-begin,stripe.tile_I*POTAL_HW_DIM);
+                if (!check(name+" P prepare",attention::prepare_stream(g.a.t,h,b,begin,rows,role::pv,a,
+                          attention::pv_algorithm::balanced) == POTAL_OK)) return;
+                float peak = 0;
+                for (size_t i = 0; i < rows; ++i)
+                    for (size_t x = 0; x < k; ++x) peak = std::max(peak,g.a.get(x,begin+i,h,b));
+                metadata &= a.scale == (peak ? std::ilogb(peak) : 0)-15;
+                for (size_t i = 0; i < rows; ++i)
+                    for (size_t x = 0; x < a.kp; ++x)
+                        metadata &= a.codes[i*a.kp+x] == (x >= k ? 0 :
+                            std::clamp(int(std::nearbyint(std::ldexp(double(g.a.get(x,begin+i,h,b)),-a.scale))),0,65535));
+                golden::pv_context context;
+                context.batch=b; context.query_head=h; context.kv_head=h/repeat;
+                context.stripe=begin/(stripe.tile_I*POTAL_HW_DIM); context.row_begin=begin;
+                auto proof = golden::compare_pv(a,w,context);
+                if (!check(name+" independent B/C representable",proof.b.status == golden::pv_status::ok &&
+                           proof.c_status == golden::pv_status::ok)) return;
+                ++stripe_count;
+                // Bind event locations to the same frozen, whole-K32 plan
+                // checked below against each actual descriptor. Arithmetic
+                // still derives only from original codes/V/carriers.
+                for (auto * value : {&proof.a,&proof.b})
+                    for (auto & event : value->events) {
+                        potal_tile_plan plan;
+                        if (potal_tile_select(rows,n,a.kp,32/POTAL_HW_DIM,&plan) != POTAL_OK) {
+                            metadata = false;
+                            continue;
+                        }
+                        plan.tile_K = std::min(plan.tile_K,a.kp/POTAL_HW_DIM);
+                        if (event.limb == 0)
+                            plan.tile_K = std::min(plan.tile_K,size_t(POTAL_HW_BANK_ROWS)/
+                                (std::max(plan.tile_I,plan.tile_J)*POTAL_HW_DIM));
+                        while (a.kp/POTAL_HW_DIM%plan.tile_K || plan.tile_K%(32/POTAL_HW_DIM)) --plan.tile_K;
+                        event.context.i_panel = (event.row-begin)/(plan.tile_I*POTAL_HW_DIM);
+                        event.context.j_panel = event.column/(plan.tile_J*POTAL_HW_DIM);
+                        event.context.panel_k = plan.tile_K*POTAL_HW_DIM;
+                        event.k_panel = (event.post_k_bias ? a.kp-1 : event.k_start)/event.context.panel_k;
+                    }
+                if (variant == 1 || variant == 2 || variant == 3 || variant == 5 || variant == 6 || variant == 11)
+                    numeric &= proof.b.counts.scu_positive+proof.b.counts.scu_negative > 0;
+                if (variant == 4 || variant == 7 || variant == 8 || variant == 10)
+                    numeric &= !proof.b.counts.clipped();
+                if (variant == 9)
+                    numeric &= proof.b.counts.acc_positive == 1 && !proof.b.counts.acc_negative &&
+                               !proof.b.counts.scu_positive && !proof.b.counts.scu_negative;
+                metadata &= a.limb_count == proof.b.limbs.size();
+                for (size_t l = 0; l < a.limb_count; ++l) metadata &= a.limbs[l] == proof.b.limbs[l];
+                numeric &= !proof.nonsaturating_comparable || proof.nonsaturating_equal;
+                a_admitted &= proof.a.status == golden::pv_status::ok;
+                std::vector<int64_t> reference;
+                numeric &= attention::reference(a,w,role::pv,reference) == POTAL_OK && reference == proof.b.output;
+                pv_numeric_log(name,proof,a.scale+w.base[0]);
+                for (size_t i = 0; i < rows; ++i)
+                    for (size_t j = 0; j < n; ++j)
+                        expected[((b*heads*repeat+h)*m+begin+i)*n+j] =
+                            float(std::ldexp(double(proof.b.output[i*n+j]),a.scale+w.base[j]));
+                if (proof.a.status == golden::pv_status::ok)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < n; ++j)
+                            expected_a[((b*heads*repeat+h)*m+begin+i)*n+j] =
+                                float(std::ldexp(double(proof.a.output[i*n+j]),a.scale+w.base[j]));
+                for (size_t l = 0; l < a.limb_count; ++l) jobs.push_back({a,w,proof,l});
+            }
+        }
+    check(name+" independent prepared metadata and nonsat equality",metadata && numeric);
+    if (m > 1024) check(name+" actual multiple production stripes",stripe_count > 1);
+    for (bool checked : {false,true}) {
+        potal_test::emulator model;
+        auto ops = model.ops();
+        potal_stripe_session session = {{&ops,0,{}}};
+        potal_test::attention_emulator commands;
+        size_t call = 0;
+        bool raw = true, descriptors = true, multi = false;
+        const auto r = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) {
+            if (call >= jobs.size()) { descriptors=false; return planned_result{}; }
+            const auto & job = jobs[call++];
+            descriptors &= d.work_kind == (job.limb ? POTAL_STRIPE_WORK_RESIDUAL : POTAL_STRIPE_WORK_MAIN) &&
+                           d.k == job.a.kp && d.m == job.a.rows && d.n == n;
+            potal_tile_plan plan;
+            if (potal_tile_select(d.m,d.n,d.k,32/POTAL_HW_DIM,&plan) != POTAL_OK) descriptors = false;
+            else {
+                plan.tile_K = std::min(plan.tile_K,size_t(d.k)/POTAL_HW_DIM);
+                if (!job.limb) plan.tile_K = std::min(plan.tile_K,size_t(POTAL_HW_BANK_ROWS)/
+                    (std::max(plan.tile_I,plan.tile_J)*POTAL_HW_DIM));
+                while (d.k/POTAL_HW_DIM%plan.tile_K || plan.tile_K%(32/POTAL_HW_DIM)) --plan.tile_K;
+                descriptors &= d.tile_i == plan.tile_I && d.tile_j == plan.tile_J && d.tile_k == plan.tile_K;
+            }
+            for (size_t i = 0; i < d.m; ++i)
+                for (size_t x = 0; x < d.lda; ++x)
+                    descriptors &= d.a[i*d.lda+x] == (x < job.a.kp ? job.proof.b.limbs[job.limb][i*job.a.kp+x] : 0);
+            for (size_t x = 0; x < d.k; ++x)
+                for (size_t j = 0; j < n; ++j)
+                    descriptors &= d.b[x*d.ldb+j] == job.b.limbs[0][x*n+j] &&
+                                   d.carriers[x/32*d.carrier_stride+j] == job.b.carriers[x/32*n+j];
+            multi |= d.tile_k*POTAL_HW_DIM < d.k;
+            const auto completed = checked ? balanced_checked(d,commands) : run_planned_stripe_gemm(session,d);
+            if (completed.ok)
+                for (size_t i = 0; i < d.m; ++i)
+                    for (size_t j = 0; j < n; ++j)
+                        {
+                            raw &= d.c[i*d.ldc+j] == job.proof.b.completed[job.limb][i*n+j];
+                            std::printf("PV_RAW case=%s runner=%s job=%zu limb=%zu row=%zu column=%zu "
+                                        "completed_C=%d independent_B=%d provenance=modelobserved\n",name.c_str(),
+                                        checked ? "checked" : "planned",call-1,job.limb,i,j,
+                                        d.c[i*d.ldc+j],job.proof.b.completed[job.limb][i*n+j]);
+                        }
+            return completed;
+        });
+        bool exact = true;
+        for (size_t b = 0; b < heads*repeat; ++b)
+            for (size_t h = 0; h < heads*repeat; ++h)
+                for (size_t i = 0; i < m; ++i)
+                    for (size_t j = 0; j < n; ++j) {
+                        const float got = g.out.get(j,i,h,b), want = expected[((b*heads*repeat+h)*m+i)*n+j];
+                        exact &= std::memcmp(&got,&want,4) == 0;
+                    }
+        check(name+(checked ? " checked" : " planned")+" default execution=B observedINT32 compositionalINT64 exactF32",
+              r.status == POTAL_OK && !r.fatal && raw && exact && descriptors && call == jobs.size());
+        check(name+" B no corrected bias or bitplanes and fenced Scale completion",
+              r.correction_jobs == 0 && r.bias_updates == 0 && r.pv_bitplane_jobs == 0 && r.pv_bitplane_stripes == 0 &&
+              r.scale_writes == r.scale_releases && commands.bias_mvins == 0 && commands.errors.empty() &&
+              !model.in_flight && model.scales.empty() && commands.scale_writes == commands.scale_releases);
+        if (k > 4096) check(name+" actual multi K panel",multi);
+        std::printf("PV_COST case=%s runner=%s command_declared jobs=%llu WS=%llu WRITE=%llu RELEASE=%llu "
+                    "reconstruct_s=%.9f timer=steady_clock_disjoint_completed_C_radix_only modelobserved_WS=%llu\n",
+                    name.c_str(),checked ? "checked" : "planned",(unsigned long long)r.jobs,(unsigned long long)r.loops,
+                    (unsigned long long)r.scale_writes,(unsigned long long)r.scale_releases,r.reconstruct_s,
+                    (unsigned long long)(checked ? commands.main_loops : model.loops));
+    }
+    potal_test::emulator legacy_model;
+    auto legacy_ops = legacy_model.ops();
+    potal_stripe_session legacy_session = {{&legacy_ops,0,{}}};
+    potal_test::attention_emulator legacy_commands;
+    auto legacy_sink = legacy_commands.sink();
+    g.out.fill(12345);
+    const auto untouched = g.out.storage;
+    const auto legacy = attention::execute(&g.out.t,
+        [&](const potal_stripe_gemm_desc & d) { return run_planned_stripe_gemm(legacy_session,d); },
+        [&](const potal_stripe_gemm_desc & d,const int32_t * bias,size_t columns) {
+            return attention::run_corrected(d,bias,columns,&legacy_sink);
+        },attention::pv_algorithm::legacy);
+    bool legacy_equal = true;
+    if (a_admitted)
+        for (size_t b = 0; b < heads*repeat; ++b)
+            for (size_t h = 0; h < heads*repeat; ++h)
+                for (size_t i = 0; i < m; ++i)
+                    for (size_t j = 0; j < n; ++j) {
+                        const float got = g.out.get(j,i,h,b), want = expected_a[((b*heads*repeat+h)*m+i)*n+j];
+                        legacy_equal &= std::memcmp(&got,&want,4) == 0;
+                    }
+    check(name+" explicit legacy execution matches A status and values",
+          a_admitted ? legacy.status == POTAL_OK && legacy_equal :
+          legacy.status == POTAL_ERR_UNSUPPORTED && g.out.storage == untouched);
+    std::printf("PV_COST case=%s runner=explicit_legacyA status=%d command_declared jobs=%llu WS=%llu "
+                "WRITE=%llu RELEASE=%llu bias=%llu bitplanes=%llu reconstruct_s=%.9f "
+                "timer=steady_clock_disjoint_completed_C_radix_only\n",name.c_str(),int(legacy.status),
+                (unsigned long long)legacy.jobs,(unsigned long long)legacy.loops,
+                (unsigned long long)legacy.scale_writes,(unsigned long long)legacy.scale_releases,
+                (unsigned long long)legacy.bias_updates,(unsigned long long)legacy.pv_bitplane_jobs,legacy.reconstruct_s);
+}
+
+void test_balanced() {
+    test_balanced_prepare();
+    for (size_t k : {1u,15u,16u,17u,31u,32u,33u,63u,64u,65u}) balanced_case(k,0);
+    balanced_case(65,0,true,3,19,2,2);
+    balanced_case(65,1); balanced_case(65,2); balanced_case(65,3);
+    for (int variant = 4; variant <= 11; ++variant) balanced_case(129,variant);
+    balanced_case(4097,0);
+    balanced_case(65,0,false,65,33);
+    balanced_case(65,0,false,1025,1);
+    balanced_case(129,13);
+    for (int seam = 0; seam < 6; ++seam) {
+        graph g(role::pv,65,1,1,false,1,1,1,1,GGML_TYPE_F32);
+        g.a.fill(65535.0f/65536); g.w.fill(1);
+        const auto before = g.out.storage;
+        potal_test::emulator model;
+        auto ops = model.ops();
+        potal_stripe_session session = {{&ops,0,{}}};
+        size_t calls = 0;
+        const auto result = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) {
+            if (++calls == 2) {
+                if (seam == 0) {
+                    planned_result failure;
+                    failure.status = POTAL_ERR_BAD_RESPONSE; failure.stage = "between_balanced_limbs";
+                    return failure;
+                }
+                if (seam == 1) model.fail_write_at = int(model.writes);
+                if (seam == 2) model.fail_issue = true;
+                if (seam == 3) model.fail_tlb = true;
+                if (seam == 4) model.fail_fence_at = int(model.fence_calls+1);
+                if (seam == 5) model.fail_release = true;
+            }
+            return run_planned_stripe_gemm(session,d);
+        },{},attention::pv_algorithm::balanced);
+        check("B between-limb failure seam "+std::to_string(seam)+" no partial publication",
+              calls == 2 && result.status != POTAL_OK && g.out.storage == before &&
+              result.correction_jobs == 0 && result.pv_bitplane_jobs == 0);
+        if (seam == 0)
+            check("B safe between-limb refusal leaves completed DMA clean",!result.fatal &&
+                  !model.in_flight && model.scales.empty() && model.writes == model.releases);
+        if (seam == 4)
+            check("B failed fence retains unknown DMA ownership without retry",result.fatal &&
+                  model.in_flight && !model.scales.empty() && session.ws.report.fatal);
     }
 }
 
@@ -1307,6 +1775,7 @@ int main() {
     test_pv_execute();
     test_pv_bitplane_reference();
     test_pv_bitplane_execute();
+    test_balanced();
     ggml_free(context);
     std::printf("POTAL_ATTENTION_TEST %s\n",failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

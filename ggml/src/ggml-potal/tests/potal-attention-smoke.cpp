@@ -359,16 +359,20 @@ void run_case(ggml_backend_t hardware, ggml_backend_t cpu, attention::role role,
         for (size_t h = 0; h < heads * repeat; ++h) {
             attention::stationary w;
             attention::stream a;
-            std::vector<int64_t> integers;
             const bool prepared = attention::prepare_stationary(*weight, h / repeat, b / (input_batches / batches), role, w) == POTAL_OK &&
                                   attention::prepare_stream(*input, h, b, 0, rows, role, a) == POTAL_OK;
-            if (!prepared || !golden::evaluate(a, w, role, integers)) {
+            if (!prepared) {
+                check("independent integer golden", false); return;
+            }
+            const auto comparison = golden::compare_pv(a, w, {}, false);
+            const auto & wanted = a.algorithm == attention::pv_algorithm::balanced ? comparison.b : comparison.a;
+            if (wanted.status != golden::pv_status::ok) {
                 check("independent integer golden", false); return;
             }
             for (size_t i = 0; i < rows; ++i)
                 for (size_t j = 0; j < n; ++j)
                     expected[((b * heads * repeat + h) * rows + i) * n + j] = float(std::ldexp(
-                        double(integers[i * n + j]), a.scale + int(w.base[j])));
+                        double(wanted.output[i * n + j]), a.scale + int(w.base[j])));
         }
     check("backend explicitly supports attention node", ggml_backend_supports_op(hardware, output));
     ggml_backend_potal_stats before{}, after{};
@@ -387,7 +391,11 @@ void run_case(ggml_backend_t hardware, ggml_backend_t cpu, attention::role role,
           after.attention_failed == before.attention_failed && after.attention_loop_ws > before.attention_loop_ws &&
           after.scale_writes - before.scale_writes == after.scale_releases - before.scale_releases &&
           (role == attention::role::qk ? after.attention_qk_limb_jobs > before.attention_qk_limb_jobs :
-                                        after.attention_bias_mvins > before.attention_bias_mvins));
+           attention::default_pv_algorithm == attention::pv_algorithm::legacy ?
+               after.attention_bias_mvins > before.attention_bias_mvins :
+               after.attention_bias_mvins == before.attention_bias_mvins &&
+               after.attention_pv_corrections == before.attention_pv_corrections &&
+               after.attention_limb_jobs > before.attention_limb_jobs));
     if (!exact) return;
     std::vector<float> hardware_output(got, got + count);
     check("independent CPU FP32 backend", ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
@@ -471,8 +479,8 @@ void qk_saturation(ggml_backend_t hardware, ggml_backend_t cpu) {
 
 bool pv_range() {
     // Historical shape and rejection class, not unrecorded H3-7 tensor values.
-    // Heads 0..10 keep the original path; head 11 has wide positive/negative
-    // biases. A normalized P row puts its large code in a zero-V microtile.
+    // Legacy heads 0..10 use bias; head 11 needs certified planes. Balanced
+    // uses three signed limbs throughout. The large P code is in a zero-V tile.
     constexpr size_t k = 288, n = 64, heads = 12;
     ggml_init_params params{4u << 20, nullptr, false};
     ggml_context_ptr context(ggml_init(params));
@@ -530,13 +538,18 @@ bool pv_range() {
             exact = exact && actual == std::ldexp(j % 2 ? -1.0f : 1.0f, -16);
         }
     }
-    const bool commands = result.jobs == 49 && result.pv_bitplane_stripes == 1 &&
+    const bool legacy = attention::default_pv_algorithm == attention::pv_algorithm::legacy;
+    const bool route_commands = legacy ?
+        result.jobs == 49 && result.pv_bitplane_stripes == 1 &&
         result.pv_bitplane_jobs == 16 && result.correction_jobs == 11 &&
-        result.bias_updates == 11*(64/POTAL_HW_DIM) &&
+        result.bias_updates == 11*(64/POTAL_HW_DIM) :
+        result.jobs == 3*heads && result.pv_bitplane_stripes == 0 &&
+        result.pv_bitplane_jobs == 0 && result.correction_jobs == 0 && result.bias_updates == 0;
+    const bool commands = route_commands &&
         result.qk_limb_jobs == 0 && result.loops >= result.jobs && result.fences >= result.loops &&
         result.scale_writes > 0 && result.scale_writes == result.scale_releases;
     check("PV range exact independently calculated F32 output", exact);
-    check("PV range old bias and new plane commands balanced", commands);
+    check("PV range selected route commands and Scale balanced", commands);
     std::printf("POTAL_ATTENTION_PV_RANGE M=1 N=%zu K=%zu heads=%zu "
                 "jobs=%llu bitplane_stripes=%llu bitplane_jobs=%llu corrections=%llu bias_mvins=%llu "
                 "loop_ws=%llu fences=%llu scale_writes=%llu scale_releases=%llu exact=%d status=%d\n",
