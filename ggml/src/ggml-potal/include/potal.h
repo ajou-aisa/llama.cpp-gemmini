@@ -373,6 +373,11 @@ potal_status potal_tiled_matmul_stripe(potal_stripe_session *session, const pota
 #define POTAL_FUNCT_RESIDENT_VIEW             28
 #define POTAL_FUNCT_LDB_ONLY                  29
 #define POTAL_FUNCT_STREAM                    30
+#define POTAL_FUNCT_INDEX_QUEUE_HEADER        32
+#define POTAL_FUNCT_INDEX_QUEUE_BEGIN         33
+#define POTAL_FUNCT_INDEX_QUEUE_PUSH          34
+#define POTAL_FUNCT_INDEX_QUEUE_SEAL          35
+#define POTAL_FUNCT_INDEX_QUEUE_APPLY         36
 #define POTAL_FUNCT_COUNTER                  126
 
 /* ---- H2 paired / indexed execution (potal_paired_*) ---------------------- */
@@ -577,11 +582,42 @@ typedef struct potal_paired_cmd_record {
 
 /* Returns the (simulated) hardware status of an xd command; POTAL_OK for the others. */
 typedef potal_status (*potal_paired_sink_fn)(void *ctx, const potal_paired_cmd_record *record);
+/* Queue replies are full64 protocol words, never potal_status values. */
+typedef potal_status (*potal_paired_queue_fn)(void *ctx, const potal_paired_cmd_record *record, uint64_t *reply);
 
 typedef struct potal_paired_sink {
     potal_paired_sink_fn cmd;
     void                *ctx;
+#ifdef __cplusplus
+    potal_paired_queue_fn queue = nullptr;
+#else
+    potal_paired_queue_fn queue;
+#endif
 } potal_paired_sink;
+
+typedef struct potal_index_queue_reply {
+    uint32_t status, reason, op, ticket, generation, count, pair, residency, owner;
+    uint64_t reserved;
+} potal_index_queue_reply;
+
+typedef struct potal_index_queue_result {
+    uint64_t raw;
+    potal_index_queue_reply reply;
+    uint32_t allocations; /* BEGIN attempts consumed, including an uncertain reply */
+} potal_index_queue_result;
+
+potal_index_queue_reply potal_index_queue_decode(uint64_t raw);
+potal_status potal_index_queue_reply_check(uint64_t raw, const potal_index_queue_reply *expected);
+/*
+ * Finite single-issuer experiment. First query/install snapshots exact FRESH=1
+ * and decimal BUDGET=1..255. These assert an externally exclusive fresh device
+ * lifetime; software cannot establish it. No reset, wrap, retry, or credit refund.
+ * Session close, Fence and Release never restore process BEGIN credits.
+ * Any transport/protocol failure quarantines the session and accelerator.
+ */
+uint32_t potal_index_queue_remaining(void);
+potal_status potal_index_queue_install(potal_paired_session *session, const potal_index_config *descriptor,
+    const uint32_t *entries, size_t count, potal_index_queue_result *result);
 
 typedef struct potal_paired_pair_status {
     uint32_t resident_b;    /* a Main LOOP_WS loaded the panel below */

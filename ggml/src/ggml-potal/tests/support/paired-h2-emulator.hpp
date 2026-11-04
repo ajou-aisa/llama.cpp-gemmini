@@ -13,6 +13,7 @@
 #include "potal_hw_params.h"
 #include "support/potal-emulator.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -78,13 +79,144 @@ struct h2_emulator {
     bool                                 scale_miss = false;
     uint32_t                             fail_funct = 0xFFFFFFFFu; // answer this xd funct with fail_status, once
     potal_status                         fail_status = POTAL_OK;
+    struct queue_slot {
+        bool live = false, sealed = false;
+        uint32_t generation = 0, ticket = 0, owner = 0, residency = 0, pair = 0;
+        uint64_t a = 0, b = 0;
+        std::vector<uint32_t> entries;
+    } queue_slots[2];
+    uint64_t queue_header_a = 0, queue_header_b = 0;
+    uint32_t queue_generation = 1, queue_tail = 0, queue_head = 0, queue_active = 0;
+    uint32_t queue_fault_reason = 0;
+    bool queue_staged = false, queue_filling = false, queue_exhausted = false;
+    uint64_t queue_allocations = 0, queue_applied = 0;
+    uint32_t queue_corrupt_funct = UINT32_MAX; // full64 fault injection after the genuine side effect
+    uint64_t queue_corrupt_mask = 0;
 
     void err(const std::string & e) {
         errors += e;
         errors += "; ";
     }
 
-    potal_paired_sink sink() { return { &h2_emulator::on_cmd, this }; }
+    potal_paired_sink sink() { return { &h2_emulator::on_cmd, this, &h2_emulator::on_queue }; }
+
+    static potal_status on_queue(void *ctx, const potal_paired_cmd_record *rec, uint64_t *reply) {
+        auto &e = *static_cast<h2_emulator *>(ctx);
+        e.records.push_back(*rec);
+        *reply = e.queue_command(*rec);
+        if (rec->funct == e.queue_corrupt_funct) {
+            *reply ^= e.queue_corrupt_mask;
+            e.queue_corrupt_funct = UINT32_MAX;
+        }
+        return POTAL_OK;
+    }
+
+    // Synchronous functional model: APPLY returns only after the scalar installer
+    // has successfully published every entry. No cycle/deadline claims are made.
+    uint64_t queue_command(const potal_paired_cmd_record &r) {
+        const uint32_t op = r.funct >= 32 && r.funct <= 36 ? r.funct - 32 : 7;
+        const auto diagnostic = [op](uint32_t status, uint32_t reason) {
+            return uint64_t(status) | (uint64_t(reason) << 4) | (uint64_t(op) << 8);
+        };
+        const auto fault = [&](uint32_t reason) {
+            queue_fault_reason = reason;
+            return diagnostic(7, reason);
+        };
+        const auto reply = [op](const queue_slot &s, uint32_t status, uint32_t reason, size_t count) {
+            return uint64_t(status) | (uint64_t(reason) << 4) | (uint64_t(op) << 8) |
+                (uint64_t(s.ticket) << 11) | (uint64_t(s.generation) << 12) | (uint64_t(count) << 20) |
+                (uint64_t(s.pair) << 27) | (uint64_t(s.residency) << 28) | (uint64_t(s.owner) << 36);
+        };
+        if (queue_fault_reason) return diagnostic(7, queue_fault_reason);
+        if (op == 7 || r.xd != 1) return fault(10);
+        if (op == 0) {
+            if (queue_staged || queue_filling) return fault(10);
+            queue_header_a = r.rs1;
+            queue_header_b = r.rs2;
+            queue_staged = true;
+            return diagnostic(9, 0);
+        }
+        if (op == 1) {
+            if (!queue_staged || (r.rs1 >> 17) || r.rs2) return fault(10);
+            if ((r.rs1 & 255) != 1) return fault(2);
+            queue_staged = false;
+            const uint32_t pair = (r.rs1 >> 16) & 1;
+            const potal_index_config cfg{pair, uint32_t(queue_header_a), uint32_t(queue_header_a >> 32),
+                uint32_t(queue_header_b), uint32_t(queue_header_b >> 32)};
+            if (potal_index_config_check(&cfg) != POTAL_OK || cfg.active_rows > 64) return diagnostic(2, 1);
+            if (queue_exhausted) return diagnostic(8, 3);
+            if (queue_slots[queue_tail].live) return diagnostic(1, 0);
+            auto &s = queue_slots[queue_tail];
+            s = queue_slot{};
+            s.live = true;
+            s.generation = queue_generation;
+            s.ticket = queue_tail;
+            s.owner = r.rs1 & 255;
+            s.residency = (r.rs1 >> 8) & 255;
+            s.pair = pair;
+            s.a = queue_header_a;
+            s.b = queue_header_b;
+            queue_active = queue_tail;
+            queue_tail ^= 1;
+            if (queue_generation == 255) queue_exhausted = true;
+            else ++queue_generation;
+            ++queue_allocations;
+            queue_filling = true;
+            return reply(s, 0, 0, 0);
+        }
+        if (queue_staged) return fault(10);
+        auto &active = queue_slots[queue_active];
+        if (op == 2) {
+            const size_t count = size_t(active.b >> 32);
+            if (!queue_filling || active.entries.size() >= count) return fault(5);
+            const uint32_t words[4] = {uint32_t(r.rs1), uint32_t(r.rs1 >> 32),
+                                      uint32_t(r.rs2), uint32_t(r.rs2 >> 32)};
+            const size_t lanes = std::min<size_t>(4, count - active.entries.size());
+            for (size_t i = 0; i < 4; ++i)
+                if (i < lanes ? words[i] >= uint32_t(active.b) : words[i] != 0) {
+                    queue_fault_reason = 5;
+                    return reply(active, 7, 5, active.entries.size());
+                }
+            active.entries.insert(active.entries.end(), words, words + lanes);
+            return reply(active, 9, 0, active.entries.size());
+        }
+        if (op == 3) {
+            if (r.rs1 || r.rs2) return fault(10);
+            if (!queue_filling || active.entries.size() != (active.b >> 32)) {
+                queue_fault_reason = 4;
+                return reply(active, 7, 4, active.entries.size());
+            }
+            active.sealed = true;
+            queue_filling = false;
+            return reply(active, 9, 0, active.entries.size());
+        }
+        if ((r.rs1 >> 26) || r.rs2) return fault(10);
+        queue_slot key;
+        key.ticket = r.rs1 & 1;
+        key.generation = (r.rs1 >> 1) & 255;
+        key.owner = (r.rs1 >> 9) & 255;
+        key.residency = (r.rs1 >> 17) & 255;
+        key.pair = (r.rs1 >> 25) & 1;
+        auto &s = queue_slots[key.ticket];
+        if (!s.live || key.generation != s.generation || key.owner != s.owner ||
+            key.residency != s.residency || key.pair != s.pair) return reply(key, 2, 2, 0);
+        if (!s.sealed) return reply(s, 3, 3, s.entries.size());
+        if (key.ticket != queue_head) return reply(s, 4, 3, s.entries.size());
+        // Installation must obey the same source/completion guards as scalar Index.
+        if (index_config(s.a, s.b) != POTAL_OK) {
+            queue_fault_reason = 8;
+            return reply(s, 7, 8, s.entries.size());
+        }
+        for (size_t i = 0; i < s.entries.size(); ++i)
+            if (index_write(i, s.entries[i]) != POTAL_OK) {
+                queue_fault_reason = 8;
+                return reply(s, 7, 8, s.entries.size());
+            }
+        s.live = false;
+        queue_head ^= 1;
+        ++queue_applied;
+        return reply(s, 6, 0, s.entries.size());
+    }
 
     static potal_status on_cmd(void * ctx, const potal_paired_cmd_record * rec) {
         return static_cast<h2_emulator *>(ctx)->command(*rec);

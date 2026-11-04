@@ -1063,6 +1063,7 @@ struct potal_paired_session {
     int observation_active, observation_in_call;
     uint64_t observation_b0_base;          /* retained across the early capability counter0 probe */
     int               failed;
+    int               queue_fatal;          /* unknown Queue obligation; never cleaned or reset */
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
     potal_status      error;
     const char       *error_stage;
@@ -1328,7 +1329,7 @@ potal_status potal_paired_session_close(potal_paired_session *s) {
      * A failed session with undrained work, or with scale entries it could not
      * release, leaves the accelerator state unknown: keep it owned.
      */
-    if (!outstanding && !live) {
+    if (!outstanding && !live && !s->queue_fatal) {
         paired_owner = 0;
     }
     if (s->scale_cpu_profile && status == POTAL_OK && !outstanding && !live && !s->index_open) {
@@ -1553,7 +1554,9 @@ potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, 
     return paired_scale_release_core(s, slot, generation, column);
 }
 
-potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
+static potal_status paired_index_admit(potal_paired_session *s, const potal_index_config *cfg) {
+    const potal_status ready = paired_ready(s);
+    if (ready != POTAL_OK) return ready;
     if (s && s->resident) return POTAL_ERR_BUSY;
     if (s && s->stream) {
         potal_status status = paired_ready(s);
@@ -1562,8 +1565,6 @@ potal_status potal_paired_index_config(potal_paired_session *s, const potal_inde
         if (status != POTAL_OK) return status;
     }
     if (s && s->h2) {
-        const potal_status ready = paired_ready(s);
-        if (ready != POTAL_OK) return ready;
         if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
         if (!cfg || cfg->pair >= POTAL_PAIRS) return POTAL_ERR_INVALID_ARGUMENT;
         const h2_panel_state *p = &s->h2->panel[cfg->pair];
@@ -1572,7 +1573,12 @@ potal_status potal_paired_index_config(potal_paired_session *s, const potal_inde
             cfg->source_k_rows != p->declaration.k_tiles * POTAL_HW_DIM)
             return POTAL_ERR_INVALID_ARGUMENT;
     }
-    return paired_index_config_core(s, cfg);
+    return POTAL_OK;
+}
+
+potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
+    const potal_status status = paired_index_admit(s, cfg);
+    return status == POTAL_OK ? paired_index_config_core(s, cfg) : status;
 }
 
 potal_status potal_paired_index_write(potal_paired_session *s, const potal_index_write *w) {
@@ -1583,6 +1589,157 @@ potal_status potal_paired_index_write(potal_paired_session *s, const potal_index
         if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
     }
     return paired_index_write_core(s, w);
+}
+
+/* Global, like paired_owner: calls are serialized by the sole process issuer. */
+static uint32_t queue_budget, queue_used;
+static int queue_admission_initialized;
+
+uint32_t potal_index_queue_remaining(void) {
+    if (!queue_admission_initialized) {
+        queue_admission_initialized = 1;
+        const char *fresh = getenv("POTAL_INDEX_QUEUE_FRESH");
+        const char *text = getenv("POTAL_INDEX_QUEUE_BUDGET");
+        /* Allocations already accepted earlier in this FPGA lifetime by other processes (operator-supplied;
+         * a wrong value fails closed on the first BEGIN reply). The budget is an absolute lifetime cap. */
+        const char *used = getenv("POTAL_INDEX_QUEUE_USED");
+        if (!fresh || strcmp(fresh, "1") != 0 || !text || !*text) return 0;
+        uint32_t value = 0, prior = 0;
+        for (const char *p = text; *p; ++p) {
+            if (*p < '0' || *p > '9') return 0;
+            value = value * 10 + (uint32_t)(*p - '0');
+            if (value > 255) return 0;
+        }
+        for (const char *p = used ? used : ""; *p; ++p) {
+            if (*p < '0' || *p > '9') return 0;
+            prior = prior * 10 + (uint32_t)(*p - '0');
+            if (prior > 255) return 0;
+        }
+        if (prior > value) return 0;
+        queue_budget = value;
+        queue_used = prior;
+    }
+    return queue_budget - queue_used;
+}
+
+potal_index_queue_reply potal_index_queue_decode(uint64_t r) {
+    const potal_index_queue_reply reply = {
+        r & 15, (r >> 4) & 15, (r >> 8) & 7, (r >> 11) & 1,
+        (r >> 12) & 255, (r >> 20) & 127, (r >> 27) & 1,
+        (r >> 28) & 255, (r >> 36) & 255, r >> 44
+    };
+    return reply;
+}
+
+potal_status potal_index_queue_reply_check(uint64_t raw, const potal_index_queue_reply *e) {
+    if (!e) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_index_queue_reply r = potal_index_queue_decode(raw);
+    return r.status == e->status && r.reason == e->reason && r.op == e->op &&
+        r.ticket == e->ticket && r.generation == e->generation && r.count == e->count &&
+        r.pair == e->pair && r.residency == e->residency && r.owner == e->owner &&
+        r.reserved == 0 && e->reserved == 0 ? POTAL_OK : POTAL_ERR_BAD_RESPONSE;
+}
+
+static potal_status queue_exchange(potal_paired_session *s, uint32_t funct, uint64_t a, uint64_t b,
+    const potal_index_queue_reply *expected, potal_index_queue_result *result) {
+    potal_status status = POTAL_OK;
+    uint64_t raw = 0;
+    ++s->commands;
+    if (s->h2) { s->h2->in_call = 1; s->h2->completion_certified = 0; }
+    if (s->stream) s->stream->in_call = 1;
+    if (s->sink.queue) {
+        const potal_paired_cmd_record rec = {funct, 1, a, b};
+        status = s->sink.queue(s->sink.ctx, &rec, &raw);
+    } else {
+#if defined(__riscv)
+        switch (funct) {
+            case 32: POTAL_ROCC_R_R_R(32, raw, a, b); break;
+            case 33: POTAL_ROCC_R_R_R(33, raw, a, b); break;
+            case 34: POTAL_ROCC_R_R_R(34, raw, a, b); break;
+            case 35: POTAL_ROCC_R_R_R(35, raw, a, b); break;
+            case 36: POTAL_ROCC_R_R_R(36, raw, a, b); break;
+        }
+#else
+        status = POTAL_ERR_NO_HARDWARE;
+#endif
+    }
+    if (s->h2) s->h2->in_call = 0;
+    if (s->stream) s->stream->in_call = 0;
+    result->raw = raw;
+    result->reply = potal_index_queue_decode(raw);
+    if (status == POTAL_OK) status = potal_index_queue_reply_check(raw, expected);
+    if (status != POTAL_OK) {
+        s->queue_fatal = 1;
+        if (s->h2) {
+            s->h2->status.unknown_completion = 1;
+            s->h2->status.quarantined = 1;
+        }
+        return paired_fail(s, status, "index_queue");
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_index_queue_install(potal_paired_session *s, const potal_index_config *cfg,
+    const uint32_t *entries, size_t count, potal_index_queue_result *result) {
+    if (!result) return POTAL_ERR_INVALID_ARGUMENT;
+    memset(result, 0, sizeof(*result));
+    potal_status status = paired_index_admit(s, cfg);
+    if (status != POTAL_OK) return status;
+    potal_rocc_cmd header;
+    status = potal_index_config_encode(cfg, &header);
+    if (status != POTAL_OK) return status;
+    if (!entries || count != cfg->active_rows) return POTAL_ERR_INVALID_ARGUMENT;
+    if (POTAL_HW_DIM != 32 || count > 64) return POTAL_ERR_UNSUPPORTED;
+    if (s->index_open) return POTAL_ERR_BUSY;
+    for (size_t i = 0; i < count; ++i) {
+        const potal_index_write w = {(uint32_t)i, entries[i]};
+        status = potal_index_write_check(cfg, &w);
+        if (status != POTAL_OK) return status;
+    }
+    if (!potal_index_queue_remaining()) return POTAL_ERR_CAPACITY;
+    /* A scalar-only sink must not silently fall through to real hardware. */
+    if (s->sink.cmd && !s->sink.queue) return POTAL_ERR_NO_HARDWARE;
+#if !defined(__riscv)
+    if (!s->sink.queue) return POTAL_ERR_NO_HARDWARE;
+#endif
+    potal_index_queue_reply expected = {9, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (s->h2) s->h2->status.control_pending = 1;
+    status = queue_exchange(s, 32, header.rs1, header.rs2, &expected, result);
+    if (status != POTAL_OK) return status;
+    expected.status = 0;
+    expected.op = 1;
+    expected.ticket = queue_used & 1;
+    expected.generation = queue_used + 1;
+    expected.pair = cfg->pair;
+    expected.owner = 1;
+    ++queue_used; /* Consume BEFORE BEGIN dispatch; uncertain replies never refund. */
+    result->allocations = 1;
+    status = queue_exchange(s, 33, 1 | ((uint64_t)cfg->pair << 16), 0, &expected, result);
+    if (status != POTAL_OK) return status;
+    s->pair[cfg->pair].index_valid = 0;
+    expected.status = 9;
+    expected.op = 2;
+    for (size_t i = 0; i < count; i += 4) {
+        uint32_t lane[4] = {0};
+        for (size_t j = 0; j < 4 && i+j < count; ++j) lane[j] = entries[i+j];
+        expected.count = (uint32_t)(count - i < 4 ? count : i + 4);
+        status = queue_exchange(s, 34, lane[0] | ((uint64_t)lane[1] << 32),
+            lane[2] | ((uint64_t)lane[3] << 32), &expected, result);
+        if (status != POTAL_OK) return status;
+    }
+    expected.op = 3;
+    status = queue_exchange(s, 35, 0, 0, &expected, result);
+    if (status != POTAL_OK) return status;
+    const uint64_t key = expected.ticket | ((uint64_t)expected.generation << 1) |
+        (UINT64_C(1) << 9) | ((uint64_t)cfg->pair << 25);
+    expected.op = 4;
+    expected.status = 6;
+    status = queue_exchange(s, 36, key, 0, &expected, result);
+    if (status != POTAL_OK) return status;
+    s->pair[cfg->pair].index = *cfg;
+    s->pair[cfg->pair].index_valid = 1; /* APPLIED, not READY/SEAL, publishes the table. */
+    if (s->h2) s->h2->status.control_pending = 0;
+    return POTAL_OK;
 }
 
 static potal_status paired_issue_program_view(potal_paired_session *s, const potal_gemm_ws_program *p,
@@ -1753,6 +1910,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
+    if (s->queue_fatal) return s->error; /* Fence cannot cancel a Queue obligation. */
     if (s->observation_in_call) return POTAL_ERR_BUSY;
     if (s->stream) return s->failed ? s->error : POTAL_ERR_BUSY;
     if (s->resident) return resident_ws_cleanup(s);
