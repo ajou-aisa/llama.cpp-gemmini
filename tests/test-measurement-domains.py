@@ -41,10 +41,10 @@ def isolated(code: str, *argv: str) -> None:
 # Canonical entry point
 
 @pytest.mark.parametrize("argv, script, arguments", [
-    (["performance", "--model", "models/gpt2/gpt2.Q8_HP1.gguf", "--precision", "a8w8", "--dim", "32"],
+    (["performance", "--model", "models/gpt2/gpt2.MXINT8.gguf", "--precision", "a8w8", "--dim", "32"],
      "run_cycle_evaluation.py",
-     ["--run", "performance", "--model", "models/gpt2/gpt2.Q8_HP1.gguf", "--precision", "a8w8", "--dim", "32",
-      "--output", f"runs/performance/{STAMP}-gpt2.Q8_HP1-a8w8-d32-hp1"]),
+     ["--run", "performance", "--model", "models/gpt2/gpt2.MXINT8.gguf", "--precision", "a8w8", "--dim", "32",
+      "--output", f"runs/performance/{STAMP}-gpt2.MXINT8-a8w8-d32-hp1"]),
     (["performance", "--smoke", "--model=m.gguf", "--timeline", "compact"], "run_cycle_evaluation.py",
      ["--run", "performance", "--smoke", "--model=m.gguf", "--timeline", "compact",
       "--output", f"runs/performance/{STAMP}-m-a8w8-d32-hp1-smoke"]),
@@ -271,15 +271,15 @@ for kind, raw_name in (("activation", "activation-quant-metrics.jsonl"), ("resid
 def test_one_model_manifest_identity_is_shared_while_builds_stay_separate(tmp_path: Path) -> None:
     import run_cycle_evaluation as runner
     from model_manifest import SCHEMA, model_entry
-    model, manifest = tmp_path / "gpt2.Q8_HP1.gguf", tmp_path / "model-manifest.json"
+    model, manifest = tmp_path / "gpt2.MXINT8.gguf", tmp_path / "model-manifest.json"
     model.write_bytes(b"frozen model bytes")
     write_json(manifest, {"schema": SCHEMA, "version": 1, "f16": {"sha256": "0" * 64},
-                          "quantized": {"Q8_HP1": {"sha256": sha256(model), "path": str(model), "gguf": {"quantization": "Q8_HP1"}}},
+                          "quantized": {"MXINT8": {"sha256": sha256(model), "path": str(model), "gguf": {"quantization": "MXINT8"}}},
                           "upstream": {"repository": "openai-community/gpt2", "revision": "r"}, "tokenizer": {"sha256": "t"}})
     # The performance runner resolves the model through model_manifest.model_entry ...
     assert runner.model_entry is model_entry
     entry = model_entry(manifest, model)
-    assert entry["artifact"] == "Q8_HP1" and entry["sha256"] == sha256(model)
+    assert entry["artifact"] == "MXINT8" and entry["sha256"] == sha256(model)
     # ... and so does the metric campaign, which accepts the same manifest.
     isolated('''
 import json
@@ -302,15 +302,15 @@ assert campaign.model_entry(args.model_manifest, model) == json.loads(sys.argv[3
 
 def identity_runs(root: Path, dim: int = 32, manifest: bool = True) -> list[Path]:
     """One finished run directory per domain: performance, timeline export, and two metric kinds."""
-    entry = {"artifact": "Q8_HP1", "manifest": {"sha256": "manifest"},
-             "gguf": {"general.architecture": "gpt2", "quantization": "MOSTLY_Q8_HP1"}} if manifest else None
+    entry = {"artifact": "MXINT8", "manifest": {"sha256": "manifest"},
+             "gguf": {"general.architecture": "gpt2", "quantization": "MOSTLY_MXINT8"}} if manifest else None
     sinks = {"activation_metrics": 0, "residual_metrics": 0, "scale_metrics": 0}
     performance, export = root / "performance", root / "timeline"
     for path in (performance / "build", export):
         path.mkdir(parents=True)
     write_json(performance / "performance.json", {"workload": {
         "profile": f"a8w8-d{dim}-hp1", "dataset": {"sha256": "data"},
-        "model": {"sha256": "model", "architecture": "gpt2", "quantization": "MOSTLY_Q8_HP1", "manifest": entry}}})
+        "model": {"sha256": "model", "architecture": "gpt2", "quantization": "MOSTLY_MXINT8", "manifest": entry}}})
     write_json(performance / "build/cycle-model.json", {"receipt": {"library": {"sha256": "library"}}})
     write_json(performance / "build/potal.json", {
         "receipt": {"kind": "potal-host", "semantic_options_sha256": "potal", "runner_sha256": "potal-binary"},

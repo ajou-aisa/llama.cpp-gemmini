@@ -148,6 +148,14 @@ bool ActivationMetadataView::theta(size_t local_stripe, int16_t & theta) const {
 }
 
 bool quantize(const ggml_tensor * src, ggml_gemmini_args_t & args) {
+    if (args.mxint_weight) {
+        args.act_quant.storage().emplace<block::Meta>();
+        if (!block::quantize_mxint(src, args)) {
+            reset_quantize_failure(args);
+            return false;
+        }
+        return true;
+    }
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
     default: {
@@ -231,6 +239,8 @@ bool dequantize_activation(float *                     dst,
                            size_t                      rows,
                            size_t                      cols,
                            const ggml_gemmini_args_t & args) {
+    if (args.mxint_weight)
+        return block::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
     default:

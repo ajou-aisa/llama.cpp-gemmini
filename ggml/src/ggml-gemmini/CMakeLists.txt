@@ -75,6 +75,7 @@ endfunction()
 
 set(GGML_GEMMINI_SOURCES
     ggml-gemmini.cpp
+    potal-sensitivity.cpp
     ops.cpp
     ggml-gemmini-buffer.cpp
     ggml-gemmini-geometry.hpp
@@ -111,7 +112,7 @@ set(GGML_GEMMINI_SOURCES
     dump/scale/scale_dump_stub.cpp
 )
 ggml_add_backend_library(ggml-gemmini ${GGML_GEMMINI_SOURCES})
-set_source_files_properties(matmul/attention.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+set_source_files_properties(matmul/attention.cpp potal-sensitivity.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 if (GGML_GEMMINI_CUDA_RTN OR GGML_GEMMINI_CUDA_RTN_ATTENTION)
@@ -134,7 +135,8 @@ if (GGML_GEMMINI_CUDA_CPU_EXACT)
     find_package(CUDAToolkit REQUIRED)
     add_library(ggml-gemmini-cuda-cpu-exact STATIC
         ../ggml-cuda/cpu-exact/ggml-cuda-cpu-exact.cu
-        ../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.cu)
+        ../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.cu
+        ../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.cu)
     set_target_properties(ggml-gemmini-cuda-cpu-exact PROPERTIES
         POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(ggml-gemmini-cuda-cpu-exact PRIVATE

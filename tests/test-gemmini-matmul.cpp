@@ -1868,7 +1868,10 @@ static bool test_attention() {
         std::fill_n(inputs.begin()+32, 32, 2.5f);
         for (size_t c = 64; c < 96; ++c)
             inputs[c] = std::ldexp(base + (c % 2 ? 1.4f : 0.6f), -rho);
-        const float expected = 280.0f + std::ldexp(64.0f, -rho);
+        // TOP2 aligns 81 to the next coarser exponent (41 * 2);
+        // TOP3 retains 81 at the third distinct exponent for all 32 values.
+        const float expected = 280.0f + std::ldexp(
+            GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 ? 32.0f : 64.0f, -rho);
         if (!attention_case({0, 96, 1, 1, 1, 1, 1, 1, 0, 0}, weights, inputs, {expected}))
             return false;
     }

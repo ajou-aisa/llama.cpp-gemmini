@@ -700,7 +700,7 @@ def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timel
             patch.object(runner, "clean_environment"), patch.object(runner, "host_facts", return_value={}), \
             patch.object(runner, "toolchain", return_value={}), patch.object(runner, "source_state", return_value={}), \
             patch.object(runner, "gguf_identity", return_value={"sha256": "model"}), \
-            patch.object(runner, "model_entry", return_value={"artifact": "Q8_HP1"}), \
+            patch.object(runner, "model_entry", return_value={"artifact": "MXINT8"}), \
             patch.object(runner, "reused_collection", return_value=(tmp_path, tmp_path, reuse)), \
             patch.object(runner, "build_all", return_value=builds), \
             patch.object(runner, "reconstruct_local", return_value=replay), \

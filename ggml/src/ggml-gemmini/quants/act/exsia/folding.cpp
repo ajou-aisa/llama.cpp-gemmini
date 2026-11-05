@@ -86,7 +86,7 @@ bool StripeFolding::run(Meta &                           meta,
         stripe.e_s               = stripe.e1;
         stripe.promote_top_block = false;
     } else {
-        stripe.e_s               = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 && stripe.e3 != neg_inf
+        stripe.e_s               = args.folding_anchor == 3 && stripe.e3 != neg_inf
                                        ? stripe.e3 : stripe.e2;
         stripe.promote_top_block = true;
     }

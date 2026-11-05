@@ -66,6 +66,7 @@
 #endif
 
 #include "ops.hpp"
+#include "potal-sensitivity.hpp"
 #if defined(GGML_GEMMINI_CUDA_RTN)
 #include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
 #endif
@@ -176,10 +177,12 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
             break;
         case GGML_OP_MUL_MAT: {
+            const bool collect = ggml::gemmini::sensitivity::profiling() || std::getenv("GGML_GEMMINI_ANCHOR_TRACE");
+            const auto sensitivity_start = collect ? ggml::gemmini::sensitivity::snapshot() : ggml::gemmini::sensitivity::Snapshot{};
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
             const auto * weight = node->src[0];
             if (gemmini_gpu::enabled() && ggml_hp1_scu_enabled() && weight && weight->data &&
-                (weight->type == GGML_TYPE_Q4_HP1 || weight->type == GGML_TYPE_Q8_HP1) && ggml_is_contiguous(weight)) {
+                (weight->type == GGML_TYPE_MXINT4 || weight->type == GGML_TYPE_MXINT8) && ggml_is_contiguous(weight)) {
                 const auto * storage = weight;
                 while (!storage->buffer && storage->view_src) storage = storage->view_src;
                 if (ggml::gemmini::is_gemmini_buffer(storage->buffer) &&
@@ -223,6 +226,13 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             } else {
                 ggml_backend_gemmini_mul_mat(ctx, node);
             }
+            if (collect) ggml::gemmini::sensitivity::observe(node, sensitivity_start, [&] {
+                if (ggml_gemmini_get_attention_role(node) != GGML_GEMMINI_ATTENTION_NONE) {
+                    ggml::gemmini::AttentionMetrics shadow_metrics;
+                    if (ggml::gemmini::attention_execute(node, shadow_metrics) != ggml::gemmini::rmd::RmdStatus::success)
+                        throw std::runtime_error("PoTal sensitivity attention replay failed");
+                } else ggml_backend_gemmini_mul_mat(ctx, node);
+            });
 #if CYCLE_SIM
             if (cycle_sim_context)
                 cycle_sim_context.session->ensure_healthy();

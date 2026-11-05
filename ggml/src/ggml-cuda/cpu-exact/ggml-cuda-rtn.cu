@@ -70,8 +70,8 @@ __device__ int q6_code(const uint8_t * b, int pos) {
     int high=(b[128+half*32+lane]>>(quadrant*2))&3;
     return (low|(high<<4))-32;
 }
-bool hp1_weight(ggml_type type) { return type==GGML_TYPE_Q4_HP1 || type==GGML_TYPE_Q8_HP1; }
-int weight_bits(ggml_type type) { return type==GGML_TYPE_Q4_0 || type==GGML_TYPE_Q4_HP1?4:type==GGML_TYPE_Q6_K?6:8; }
+bool mxint_weight(ggml_type type) { return type==GGML_TYPE_MXINT4 || type==GGML_TYPE_MXINT8; }
+int weight_bits(ggml_type type) { return type==GGML_TYPE_Q4_0 || type==GGML_TYPE_MXINT4?4:type==GGML_TYPE_Q6_K?6:8; }
 __global__ void decode_half(const uint8_t * source, __half * dest, size_t count, int bits) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if (i>=count) return;
@@ -86,27 +86,28 @@ __global__ void decode_half(const uint8_t * source, __half * dest, size_t count,
     int q=bits==4?int((b[2+k%16]>>(k<16?0:4))&15)-8:int(static_cast<int8_t>(b[2+k]));
     dest[i]=__float2half_rn(__half2float(*reinterpret_cast<const __half *>(b))*float(q));
 }
-// Match Gemmini BLOCK: F32 scale from double max/qmax, nearest-even double quotient.
-__global__ void quantize_activation(const float * x, int8_t * q, float * scales, size_t groups, int bits) {
+// MXINT weights select PoT scaling and ties-away; ordinary RTN retains BLOCK/RNE.
+__global__ void quantize_activation(const float * x, int8_t * q, float * scales, size_t groups, int bits, bool mxint) {
     size_t b=size_t(blockIdx.x)*blockDim.x/32+threadIdx.x/32;
     unsigned lane=threadIdx.x%32;
     if (b>=groups) return;
     float value=x[b*32+lane], a=isfinite(value)?fabsf(value):0.0f;
     for (int d=16;d;d/=2) a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
     int limit=bits==4?7:127;
-    float scale=a==0?1.0f:float(double(a)/double(limit));
-    int code=isfinite(value)?__double2int_rn(double(value)/double(scale)):0;
-    q[b*32+lane]=int8_t(max(-limit-1,min(limit,code)));
+    float scale=a==0?1.0f:mxint?ldexpf(1.0f,max(-127,ilogbf(a))-(bits-2)):float(double(a)/double(limit));
+    const double scaled=isfinite(value)?double(value)/double(scale):0.0;
+    int code=mxint?int(round(scaled)):__double2int_rn(scaled);
+    q[b*32+lane]=int8_t(max(mxint?-limit:-limit-1,min(limit,code)));
     if (!lane) scales[b]=scale;
 }
 // Integer products and ordered F64 scale restoration, with no fragment transfers to CPU.
 __global__ void block_matmul(const int8_t * a, const float * scales, const uint8_t * w,
-                             float * output, int m, int n, int k, int bits, bool hp1) {
+                             float * output, int m, int n, int k, int bits, bool mxint) {
     __shared__ int av[8][8], wv[32][8];
     __shared__ int subscale[32][2];
     __shared__ float as[8], ws[32];
     int t=threadIdx.y*32+threadIdx.x, row=blockIdx.y*8+threadIdx.y, col=blockIdx.x*32+threadIdx.x;
-    int blocks=k/32, stride=hp1?(bits==4?24:40):(bits==4?18:34);
+    int blocks=k/32, stride=mxint?(bits==4?24:40):(bits==4?18:34);
     double sum=0.0;
     for (int b=0;b<blocks;++b) {
         for (int i=t;i<40*8;i+=256) {
@@ -124,13 +125,13 @@ __global__ void block_matmul(const int8_t * a, const float * scales, const uint8
                     unsigned p=0;
                     for (int j=0;j<4;++j) {
                         int pos=group*4+j;
-                        const int offset=hp1?0:2;
+                        const int offset=mxint?0:2;
                         int v=bits==6?q6_code(wb,(b%8)*32+pos):bits==4?int((wb[offset+pos%16]>>(pos<16?0:4))&15)-8:int(static_cast<int8_t>(wb[offset+pos]));
                         p|=unsigned(uint8_t(v))<<(j*8);
                     }
                     packed=int(p);
                     if (!group) {
-                        if (hp1) {
+                        if (mxint) {
                             const int offset=bits==4?16:32;
                             const int exponent=*reinterpret_cast<const int16_t *>(wb+offset);
                             const float channel=*reinterpret_cast<const float *>(wb+offset+4);
@@ -201,7 +202,7 @@ bool ggml_cuda_rtn_supported(const ggml_tensor * op) {
     if (attention) return (w->type==GGML_TYPE_F16 || w->type==GGML_TYPE_F32) && w->nb[0]==ggml_type_size(w->type);
     if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x)) return false;
     return w->type==GGML_TYPE_F16 || ((w->type==GGML_TYPE_Q4_0 || w->type==GGML_TYPE_Q8_0) && w->ne[0]%32==0)
-        || (hp1_weight(w->type) && ggml_cuda_rtn_activation_bits()!=16 && w->ne[0]%32==0)
+        || (mxint_weight(w->type) && w->ne[0]%32==0)
         || (w->type==GGML_TYPE_Q6_K && w->ne[0]%256==0);
 }
 bool ggml_cuda_rtn_compute(ggml_tensor * op) {
@@ -210,6 +211,7 @@ bool ggml_cuda_rtn_compute(ggml_tensor * op) {
         if (!ggml_cuda_rtn_supported(op) || !op->data || !op->src[0]->data || !op->src[1]->data) throw std::runtime_error("Unsupported CUDA RTN tensor");
         r.init(); const auto * w=op->src[0]; const auto * x=op->src[1];
         int m=x->ne[1], n=w->ne[1], k=w->ne[0], bits=ggml_cuda_rtn_activation_bits();
+        if (mxint_weight(w->type) && bits==16) bits=weight_bits(w->type);
         r.output.reserve(ggml_nbytes(op));
         bool attention=x->ne[2]>1 || x->ne[3]>1;
         if (attention) {
@@ -229,8 +231,8 @@ bool ggml_cuda_rtn_compute(ggml_tensor * op) {
             size_t count=size_t(m)*k, groups=count/32;
             r.input.reserve(count*sizeof(float)); r.activation.reserve(count); r.scales.reserve(groups*sizeof(float));
             check(cudaMemcpyAsync(r.input.p,x->data,count*sizeof(float),cudaMemcpyHostToDevice,r.stream));
-            quantize_activation<<<(groups+7)/8,256,0,r.stream>>>(static_cast<const float *>(r.input.p),static_cast<int8_t *>(r.activation.p),static_cast<float *>(r.scales.p),groups,bits);
-            block_matmul<<<dim3((n+31)/32,(m+7)/8),dim3(32,8),0,r.stream>>>(static_cast<const int8_t *>(r.activation.p),static_cast<const float *>(r.scales.p),static_cast<const uint8_t *>(weights),static_cast<float *>(r.output.p),m,n,k,weight_bits(w->type),hp1_weight(w->type));
+            quantize_activation<<<(groups+7)/8,256,0,r.stream>>>(static_cast<const float *>(r.input.p),static_cast<int8_t *>(r.activation.p),static_cast<float *>(r.scales.p),groups,bits,mxint_weight(w->type));
+            block_matmul<<<dim3((n+31)/32,(m+7)/8),dim3(32,8),0,r.stream>>>(static_cast<const int8_t *>(r.activation.p),static_cast<const float *>(r.scales.p),static_cast<const uint8_t *>(weights),static_cast<float *>(r.output.p),m,n,k,weight_bits(w->type),mxint_weight(w->type));
         }
         check(cudaGetLastError());
         check(cudaMemcpyAsync(op->data,r.output.p,ggml_nbytes(op),cudaMemcpyDeviceToHost,r.stream));

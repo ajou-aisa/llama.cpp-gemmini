@@ -1,7 +1,11 @@
 #pragma once
 
 #include "common.h"
+#include "ggml-gemmini-matmul-config.hpp"
 #include "../../ggml/src/ggml-gemmini/ggml-gpu-cpu-exact.hpp"
+#include "../../ggml/src/ggml-gemmini/matmul/attention.hpp"
+#include "../../ggml/src/ggml-gemmini/potal-sensitivity.hpp"
+#include "../../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +21,7 @@ struct perplexity_cuda_cpu_exact_guard {
     uint64_t observed = 0, verified = 0;
     uint64_t observed_q6_heads = 0, cpu_q6_head_matmuls = 0;
     uint64_t gpu_q6_head_matmuls = 0;
+    uint64_t quant_before = 0, observed_qk = 0, observed_pv = 0, verified_quant = 0;
     bool active = false, failed = false;
     bool allow_q6_head = false;
     bool baseline_attention = false;
@@ -50,6 +55,17 @@ struct perplexity_cuda_cpu_exact_guard {
         const bool target = tensor->op == GGML_OP_MUL_MAT && tensor->src[0] &&
                             ggml_is_quantized(tensor->src[0]->type);
         const bool prior = guard.previous ? guard.previous(tensor, ask, guard.previous_data) : !ask;
+        const auto role = ggml_gemmini_get_attention_role(tensor);
+        if (role != GGML_GEMMINI_ATTENTION_NONE) {
+            if (ask) {
+                ++(role == GGML_GEMMINI_ATTENTION_QK ? guard.observed_qk : guard.observed_pv);
+                guard.quant_before = ggml::gemmini::attention_completed_nodes(role);
+                return true;
+            }
+            if (ggml::gemmini::attention_completed_nodes(role) == guard.quant_before +
+                (ggml::gemmini::sensitivity::profiling() ? 2 : 1)) ++guard.verified_quant;
+            else guard.failed = true;
+        }
         if (gemmini_gpu::attention_supported(tensor)) {
             if (ask) {
                 ++guard.observed_attention;
@@ -75,7 +91,7 @@ struct perplexity_cuda_cpu_exact_guard {
                 const bool hp1 = std::strcmp(EVALUATION_EXACT_COMPUTE, "INT") == 0 &&
                                  std::strcmp(EVALUATION_EXACT_ACTIVATION, "EXSIA") == 0;
                 const ggml_type expected = hp1
-                    ? (EVALUATION_EXACT_BITS == 4 ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1)
+                    ? (EVALUATION_EXACT_BITS == 4 ? GGML_TYPE_MXINT4 : GGML_TYPE_MXINT8)
                     : (EVALUATION_EXACT_BITS == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0);
                 guard.failed = guard.failed || (!q6_head && tensor->src[0]->type != expected);
                 return true;
@@ -101,6 +117,7 @@ struct perplexity_cuda_cpu_exact_guard {
         const bool ok = complete && tokens > 0 && !failed && observed > 0 &&
                         observed == verified && floats + ints > 0 &&
                         observed_attention == verified_attention &&
+                        observed_qk + observed_pv == verified_quant &&
                         observed_q6_heads == cpu_q6_head_matmuls + gpu_q6_head_matmuls &&
                         (!allow_q6_head || observed_q6_heads > 0);
         std::fprintf(stderr,
@@ -128,6 +145,28 @@ struct perplexity_cuda_cpu_exact_guard {
             (unsigned long long) (gemmini_gpu::attention_calls()-attention_start),
             (unsigned long long) observed_attention, (unsigned long long) verified_attention,
             baseline_attention ? "cuda_rtn_baseline" : "cpu_exact_gpu");
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+        const char * scope = std::getenv("GGML_GEMMINI_ATTENTION_SCOPE");
+        std::fprintf(stderr,
+            "POTAL_ATTENTION_PROOF {\"schema\":\"potal-attention-v1\",\"complete\":%s,"
+            "\"scope\":\"%s\",\"bits\":%d,\"anchor\":%d,\"block_size\":32,"
+            "\"backend\":\"%s\",\"qk_nodes\":%llu,\"pv_nodes\":%llu,"
+            "\"verified_nodes\":%llu}\n",
+            ok ? "true" : "false", scope ? scope : "both", EVALUATION_EXACT_BITS,
+            ggml::gemmini::attention_anchor(), ggml::gemmini::attention_execution_backend(),
+            (unsigned long long) observed_qk,
+            (unsigned long long) observed_pv, (unsigned long long) verified_quant);
+        if (ggml_cuda_potal_attention_enabled()) {
+            const auto a = ggml_cuda_potal_attention_get_stats();
+            std::fprintf(stderr,
+                "POTAL_ATTENTION_CUDA_PROOF {\"schema\":\"potal-attention-cuda-v1\",\"complete\":%s,"
+                "\"gemm\":\"cublas_int8_k32_scu\",\"main_dot_calls\":%llu,\"residual_dot_calls\":%llu,"
+                "\"gemm_batches\":%llu,\"fragments\":%llu}\n",
+                ok ? "true" : "false", (unsigned long long) a.main_dot_calls,
+                (unsigned long long) a.residual_dot_calls, (unsigned long long) a.gemm_batches,
+                (unsigned long long) a.fragments);
+        }
+#endif
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (ggml_hp1_scu_enabled()) {
             const auto s = ggml_cuda_hp1_scu_stats();
@@ -144,6 +183,6 @@ struct perplexity_cuda_cpu_exact_guard {
                 (unsigned long long)s.residual_shift_saturations, (unsigned long long)s.residual_acc_saturations);
         }
 #endif
-        return ok;
+        return ggml::gemmini::sensitivity::finish() && ok;
     }
 };

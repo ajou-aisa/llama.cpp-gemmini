@@ -1,4 +1,5 @@
 #include "attention.hpp"
+#include "../potal-sensitivity.hpp"
 
 #include "ggml-gemmini-matmul-config.hpp"
 #include "../ggml-gemmini-geometry.hpp"
@@ -9,13 +10,18 @@
 #include "../residual/rmd/rmd-bitmap-builder.hpp"
 #include "../residual/rmd/rmd-im2p-executor.hpp"
 #include "../residual/rmd/rmd-run-aware.hpp"
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "../../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#endif
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfenv>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -30,6 +36,7 @@ constexpr int code_bits = 2 * pe_bits;
 constexpr int radix = 1 << pe_bits;
 constexpr int zero_point = radix / 2;
 constexpr int16_t neg = std::numeric_limits<int16_t>::min();
+std::atomic<uint64_t> completed_qk{0}, completed_pv{0};
 
 void require(bool valid, RmdStatus status = RmdStatus::invalid_arguments) {
     if (!valid) throw status;
@@ -77,6 +84,10 @@ struct Stationary {
     std::vector<uint32_t> carriers;
     std::array<std::vector<int32_t>, 2> codes;
     std::vector<int64_t> colsum;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    mutable std::unique_ptr<ggml_cuda_potal_attention_weights,
+        decltype(&ggml_cuda_potal_attention_destroy)> gpu{nullptr, ggml_cuda_potal_attention_destroy};
+#endif
 };
 
 Stationary stationary(const ggml_tensor & t, size_t head, size_t batch, bool qk) {
@@ -138,7 +149,7 @@ struct StreamStripe {
 };
 
 StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t begin,
-                    size_t rows, size_t n, bool qk) {
+                    size_t rows, size_t n, bool qk, int selected_anchor) {
     const size_t k = t.ne[0], kp = rmd::align_up(k, bk), blocks = kp/bk;
     StreamStripe st{rows, kp, 0, std::vector<int8_t>(rows*kp), {}};
     std::vector<float> values(rows*kp);
@@ -175,10 +186,11 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
                                            , sample
 #endif
                                            ), RmdStatus::execution_failed);
-                scanner.update_stripe_top2_exp(stripe, exponents[i*blocks+b]);
+                scanner.update_stripe_top3_exp(stripe, exponents[i*blocks+b]);
             }
         }
-        const int16_t anchor = stripe.e2 != neg ? stripe.e2 : stripe.e1 != neg ? stripe.e1 : 0;
+        const int16_t anchor = selected_anchor == 3 && stripe.e3 != neg
+            ? stripe.e3 : stripe.e2 != neg ? stripe.e2 : stripe.e1 != neg ? stripe.e1 : 0;
         st.scale = anchor-meta.rho;
         for (size_t i = 0; i < rows; ++i)
             for (size_t c = 0; c < k; ++c) {
@@ -329,6 +341,39 @@ struct ScuGemm {
             }
     }
 #endif
+    static void cuda_dot(const int8_t * a, size_t rows, size_t stride, const Stationary & w,
+                         size_t pass, const QkRegion & region, std::vector<int64_t> & out,
+                         const std::vector<rmd::RunAwareRun> * runs = nullptr) {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (!w.gpu) {
+            w.gpu.reset(ggml_cuda_potal_attention_create(w.codes[0].data(),
+                w.codes[1].empty() ? nullptr : w.codes[1].data(), w.carriers.data(), w.n, w.kp, pe_bits));
+        }
+        std::vector<ggml_cuda_potal_attention_fragment> fragments;
+        if (runs) for (const auto & run : *runs) {
+            for (size_t offset = 0; offset < run.compact_k_count; offset += bk) {
+                ggml_cuda_potal_attention_fragment f{};
+                f.compact_begin = uint32_t(run.compact_k_begin+offset);
+                f.count = uint32_t(std::min(bk, run.compact_k_count-offset));
+                f.original_block = run.original_block_id;
+                for (size_t lane = 0; lane < f.count; ++lane)
+                    f.original_k[lane] = run.original_global_k_begin+run.original_local_k[offset+lane];
+                fragments.push_back(f);
+            }
+        }
+        std::vector<int32_t> values(rows*region.columns);
+        if (!w.gpu || !ggml_cuda_potal_attention_dot(w.gpu.get(), unsigned(pass), a, rows, stride,
+                region.column, region.columns, runs ? fragments.data() : nullptr, fragments.size(),
+                runs != nullptr, values.data())) {
+            std::fprintf(stderr, "PoTal CUDA attention: %s\n", ggml_cuda_potal_attention_error());
+            throw RmdStatus::execution_failed;
+        }
+        out.assign(values.begin(), values.end());
+#else
+        (void)a; (void)rows; (void)stride; (void)w; (void)pass; (void)region; (void)out; (void)runs;
+        throw RmdStatus::unsupported_route;
+#endif
+    }
     void run(const StreamStripe & st, const Stationary & w, size_t pass,
              const QkRegion & region, size_t begin, std::vector<int64_t> & out) {
 #if GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
@@ -356,6 +401,12 @@ struct ScuGemm {
         require(status == RmdStatus::success, status);
 #else
         (void)begin;
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (ggml_cuda_potal_attention_enabled()) {
+            cuda_dot(st.main.data()+region.row*st.kp, region.rows, st.kp, w, pass, region, out);
+            return;
+        }
+#endif
         software(st.main.data()+region.row*st.kp, region.rows, st.kp, w.codes[pass].data()+region.column,
                  region.columns, w.k, w.n, w.carriers.data()+region.column, out);
 #endif
@@ -377,6 +428,13 @@ struct ScuGemm {
         const auto status = rmd::detail::execute_im2p_run_aware(sim.get(), work, out, aggregate);
         require(status == RmdStatus::success, status);
 #else
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (ggml_cuda_potal_attention_enabled()) {
+            cuda_dot(request.activations.data()+region.row*request.k, region.rows, request.k,
+                     w, pass, region, out, &request.runs);
+            return;
+        }
+#endif
         software(request.activations.data()+region.row*request.k, region.rows, request.k,
                  w.codes[pass].data()+region.column, region.columns, request.k, request.n,
                  w.carriers.data()+region.column, out, &request.runs);
@@ -455,6 +513,21 @@ bool attention_supported(const ggml_tensor * op) {
            op->ne[0] == a.ne[1] && op->ne[1] == b.ne[1] && op->ne[2] == b.ne[2] && op->ne[3] == b.ne[3];
 }
 
+uint64_t attention_completed_nodes(ggml_gemmini_attention_role role) {
+    return (role == GGML_GEMMINI_ATTENTION_QK ? completed_qk : completed_pv).load();
+}
+
+int attention_anchor() {
+    return sensitivity::reported_anchor();
+}
+
+const char * attention_execution_backend() {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (ggml_cuda_potal_attention_enabled()) return "cuda_quantized_scu";
+#endif
+    return "cpu_quantized_scu";
+}
+
 rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
     if (!attention_supported(op)) return RmdStatus::unsupported_route;
     if (!op->data || !op->src[0]->data || !op->src[1]->data) return RmdStatus::invalid_arguments;
@@ -463,6 +536,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
         ScuGemm scu(op->name);
         const auto & a = *op->src[0];
         const auto & b = *op->src[1];
+        const int selected_anchor = sensitivity::anchor(op);
         const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
         const size_t rows = b.ne[1], n = a.ne[1], rs = stripe_rows(rows, n, b.ne[0]);
         const auto schedule = qk ? qk_schedule() : QkSchedule::full;
@@ -477,7 +551,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
                 for (size_t batch = ab*batch_repeat; batch < (ab+1)*batch_repeat; ++batch)
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
-                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk);
+                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk, selected_anchor);
                             multiply(scu, st, w, qk, begin, mask,
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }
@@ -487,6 +561,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
         ++(qk ? pending.qk_nodes : pending.pv_nodes);
         std::memcpy(op->data, staged.data(), staged.size()*sizeof(float));
         metrics = pending;
+        ++(qk ? completed_qk : completed_pv);
         return RmdStatus::success;
     } catch (RmdStatus status) {
         return status;
@@ -497,6 +572,18 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
     }
 }
 #else
+const char * attention_execution_backend() {
+    return "disabled";
+}
+
+int attention_anchor() {
+    return 0;
+}
+
+uint64_t attention_completed_nodes(ggml_gemmini_attention_role) {
+    return 0;
+}
+
 bool attention_supported(const ggml_tensor *) {
     return false;
 }

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Pack official Microsoft MXINT4/8 values into unchanged HP1 GGUF tensors."""
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["numpy", "torch", "packaging"]
+# ///
+# How to run: uv run --index https://download.pytorch.org/whl/cpu tools/quantize/mxint-hp1.py --help
+"""Pack official Microsoft MXINT4/8 values into MXINT4/8 GGUF tensors."""
 import argparse
 import ctypes
 import hashlib
@@ -34,23 +39,25 @@ def digest(path):
     return h.hexdigest()
 
 
-def official_reference(path):
+def official_reference(path, rounding="nearest"):
     """Use the same pinned upstream implementation as the MXINT experiments."""
     commit = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
     require(commit == REFERENCE_COMMIT, 'Wrong microxcaling revision: ' + commit)
-    require(not subprocess.check_output(['git', '-C', str(path), 'status', '--porcelain', '--untracked-files=no']),
+    require(rounding in ('nearest', 'even'), 'Unsupported rounding mode')
+    require(not subprocess.check_output(['git', '-c', 'core.autocrlf=true', '-c', 'core.fileMode=false',
+                                        '-C', str(path), 'status', '--porcelain', '--untracked-files=no']),
             'The official reference has tracked modifications')
     sys.path.insert(0, str(path.resolve()))
     from mx import MxSpecs
     from mx.mx_ops import quantize_mx_op
     specs = MxSpecs()
-    specs.update(scale_bits=8, block_size=32, shared_exp_method='max', round='even',
+    specs.update(scale_bits=8, block_size=32, shared_exp_method='max', round=rounding,
                  custom_cuda=False, mx_flush_fp32_subnorms=False)
 
     def quantize(weights, bits):
         with torch.no_grad():
             return quantize_mx_op(torch.from_numpy(weights), specs, elem_format=f'int{bits}',
-                                  axes=[-1], block_size=32, round='even').numpy()
+                                  axes=[-1], block_size=32, round=rounding).numpy()
     return quantize
 
 
@@ -78,7 +85,7 @@ def pack_reference(weights, values, bits):
     codes = code_values.astype(np.int16)
     limit = (1 << (bits - 1)) - 1
     require(np.array_equal(codes, code_values) and np.all(np.abs(codes) <= limit),
-            'Official values are not exactly representable by symmetric HP1 codes')
+            'Official values are not exactly representable by symmetric MXINT codes')
     # A sufficient absolute-prefix bound for main and signed residual-limb INT32 accumulation.
     weighted_l1 = np.ldexp(np.abs(codes).sum(axis=-1).astype(np.float64), np.where(zero, 0, offsets)).sum(axis=1)
     require(np.all(weighted_l1 * (1 << (bits - 1)) <= np.iinfo(np.int32).max), 'Unproved INT32 SCU bound')
@@ -110,12 +117,13 @@ def decode(raw, function):
     return values
 
 
-def convert(source, template, target, bits, mx_path, decoder_lib):
+def convert(source, template, target, bits, mx_path, decoder_lib, rounding="nearest"):
     source, template, target = (p.resolve() for p in (source, template, target))
+    require(rounding == 'nearest', 'MXINT W/A requires ties-away rounding')
     require(bits in (4, 8) and not target.exists(), 'Output must be a new MXINT4/8 model')
     report_path = target.with_suffix(target.suffix + '.mxint.json')
     require(not report_path.exists(), 'Output report already exists')
-    quantize = official_reference(mx_path)
+    quantize = official_reference(mx_path, rounding)
     library, c_decode = decoder(decoder_lib, bits)
     inputs = {str(p): digest(p) for p in (source, template, decoder_lib.resolve())}
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -143,8 +151,8 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
                         and original.data.tobytes() == tensor.data.tobytes(), 'F32 vector changed: ' + tensor.name)
                 vectors += 1
                 continue
-            require(original.tensor_type.name == 'F16' and tensor.tensor_type.name == f'Q{bits}_HP1',
-                    'Every matrix, including embedding/head, must be F16 -> HP1: ' + tensor.name)
+            require(original.tensor_type.name == 'F16' and tensor.tensor_type.name == f'MXINT{bits}',
+                    f'Every matrix, including embedding/head, must be F16 -> MXINT{bits}: ' + tensor.name)
             k = int(tensor.shape[0])
             require(k % 32 == 0, 'K must be divisible by 32')
             rows, blocks = int(tensor.n_elements) // k, k // 32
@@ -160,19 +168,20 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
                 count += values.size
             matrices += 1
             print(f'MXINT{bits}: {tensor.name}', flush=True)
-        require(matrices > 0, 'No HP1 matrices found')
+        require(matrices > 0, f'No MXINT{bits} matrices found')
         dst.data.flush()
         with partial.open('r+b') as f:
             os.fsync(f.fileno())
         require(all(digest(Path(p)) == sha for p, sha in inputs.items()), 'Conversion input changed')
-        official_reference(mx_path)
+        official_reference(mx_path, rounding)
         # Publish without overwriting a file created by another process.
         os.link(partial, target)
         report = dict(state='PASS', bits=bits, output=str(target), sha256=digest(target),
                       input_sha256=inputs, reference_commit=REFERENCE_COMMIT,
-                      scale_bits=8, block_size=32, rounding='even', shared_exp_method='max',
-                      storage=f'Q{bits}_HP1; channel PoT scale plus nonnegative block exponent offsets',
-                      tensor_policy='all matrices HP1; F32 vectors unchanged', matrices=matrices, vectors=vectors,
+                      scale_bits=8, block_size=32, rounding=rounding,
+                      tie_break='away_from_zero' if rounding == 'nearest' else 'to_even', shared_exp_method='max',
+                      storage=f'MXINT{bits}; channel PoT scale plus nonnegative block exponent offsets',
+                      tensor_policy=f'all matrices MXINT{bits}; F32 vectors unchanged', matrices=matrices, vectors=vectors,
                       weights=count, all_weights_c_decoder_exact=True, inference_changes=False,
                       int32_prefix_bound=True, int64_residual_bound=True)
         with report_path.open('x') as f:
@@ -188,15 +197,16 @@ def convert(source, template, target, bits, mx_path, decoder_lib):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True, help='Original F16 GGUF')
-    parser.add_argument('--template', type=Path, required=True, help='All-matrix HP1 GGUF produced by llama-quantize from this input')
+    parser.add_argument('--template', type=Path, required=True, help='All-matrix MXINT4/8 GGUF produced by llama-quantize from this input')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bits', type=int, choices=(4, 8), required=True)
     parser.add_argument('--mx-path', type=Path, required=True, help='Clean microsoft/microxcaling checkout at the documented commit')
-    parser.add_argument('--decoder-lib', type=Path, required=True, help='Built libggml-base.so with the existing HP1 decoder')
+    parser.add_argument('--decoder-lib', type=Path, required=True, help='Built libggml-base.so with the MXINT4/8 decoders (internal HP1 symbols)')
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.set_num_interop_threads(1)
-    print(json.dumps(convert(args.input, args.template, args.output, args.bits, args.mx_path, args.decoder_lib), indent=2))
+    print(json.dumps(convert(args.input, args.template, args.output, args.bits, args.mx_path, args.decoder_lib),
+                     indent=2))
 
 
 if __name__ == '__main__':

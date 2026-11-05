@@ -224,6 +224,40 @@ bool quant_case(size_t cols, act::ResidualRoute route) {
     return true;
 }
 
+bool mxint_tests() {
+    constexpr int bits = GGML_GEMMINI_ACTIVATION_BITS;
+    if (bits != 4 && bits != 8) return true;
+    const int32_t limit = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    const float step = std::ldexp(1.0f, -(bits - 2));
+    std::vector<float> source(32, 0.0f);
+    source[0] = 1.0f;
+    source[1] = 0.5f * step;
+    source[2] = -0.5f * step;
+    source[3] = -limit * step;
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    ggml_gemmini_args_t args{};
+    args.I = args.J = 1;
+    args.K = 32;
+    args.sA = 32;
+    args.mxint_weight = true;
+    if (!args.A.allocate(1, 32, bits) || !act::quantize(&tensor, args) ||
+        args.act_quant.kind() != act::MetaKind::block)
+        return false;
+    const auto & meta = std::get<block::Meta>(args.act_quant.storage());
+    if (meta.scales.size() != 1 || meta.scales[0] != step ||
+        !meta.rmd_packets.empty() || !meta.direct_residuals.empty() ||
+        args.A.get(0, 0) != 1 << (bits - 2) ||
+        args.A.get(0, 1) != 1 || args.A.get(0, 2) != -1 ||
+        args.A.get(0, 3) != -limit)
+        return false;
+    std::vector<float> restored(32);
+    return act::dequantize_activation(restored.data(), 32, 1, 1, 32, args) &&
+           restored[1] == step && restored[2] == -step &&
+           restored[3] == source[3];
+}
+
 bool quant_tests() {
     size_t cases = 0;
     for (size_t cols : {size_t{31}, size_t{32}, size_t{33}, size_t{64}, size_t{65}}) {
@@ -239,6 +273,10 @@ bool quant_tests() {
     }
     if (!isolation_test()) {
         std::fputs("FAIL quant: adjacent row/K block changed target block\n", stderr);
+        return false;
+    }
+    if (!mxint_tests()) {
+        std::fputs("FAIL quant: MXINT weight did not select block32 PoT/ties-away activation\n", stderr);
         return false;
     }
 

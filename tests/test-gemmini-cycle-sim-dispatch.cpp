@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
             ggml_init({2 * 1024 * 1024, nullptr, true}), ggml_free);
         require(bool(memory), "semantic fixture graph allocation");
         auto *weights = ggml_new_tensor_2d(memory.get(), GGML_GEMMINI_WEIGHT_BITS == 4
-            ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1, fixture.args.K, fixture.args.J);
+            ? GGML_TYPE_MXINT4 : GGML_TYPE_MXINT8, fixture.args.K, fixture.args.J);
         auto *activation = ggml_new_tensor_2d(memory.get(), GGML_TYPE_F32, fixture.args.K, fixture.args.I);
         auto *node = ggml_mul_mat(memory.get(), weights, activation);
         ggml_set_name(node, fixture.args.matmul_layer.c_str());
@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
         operation.layer = fixture.args.matmul_layer;
         operation.actual_backend = "Gemmini";
         operation.activation_type = "F32";
-        operation.weight_type = GGML_GEMMINI_WEIGHT_BITS == 4 ? "Q4_HP1" : "Q8_HP1";
+        operation.weight_type = GGML_GEMMINI_WEIGHT_BITS == 4 ? "MXINT4" : "MXINT8";
         operation.m = fixture.args.I; operation.n = fixture.args.J; operation.k = fixture.args.K;
         operation.target_eligible = true;
         operation.semantic_context = semantic::context_for(node);

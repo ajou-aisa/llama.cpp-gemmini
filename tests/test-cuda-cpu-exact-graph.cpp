@@ -57,7 +57,7 @@ struct head_observer {
 
 static std::vector<uint8_t> weights(ggml_type type, size_t k, size_t n) {
     std::vector<uint8_t> bytes(ggml_row_size(type,k)*n);
-    if (type == GGML_TYPE_Q4_HP1) {
+    if (type == GGML_TYPE_MXINT4) {
         std::vector<block_q4_hp1> blocks(k*n/32);
         for (size_t i=0; i<blocks.size(); ++i) {
             blocks[i].m=int16_t(i%3);
@@ -68,7 +68,7 @@ static std::vector<uint8_t> weights(ggml_type type, size_t k, size_t n) {
             for (size_t j=0; j<16; ++j) { blocks[i].qs[j]=uint8_t((i*53+j*19)&255); }
         }
         std::memcpy(bytes.data(),blocks.data(),bytes.size());
-    } else if (type == GGML_TYPE_Q8_HP1) {
+    } else if (type == GGML_TYPE_MXINT8) {
         std::vector<block_q8_hp1> blocks(k*n/32);
         for (size_t i=0; i<blocks.size(); ++i) {
             blocks[i].m=int16_t(i%3);
@@ -393,7 +393,7 @@ static void hp1_weight_buffer_lifetime(ggml_type type) {
     for (int generation=0;generation<2;++generation) {
         if (generation) {
             // Same host address, new model weights, retained backend.
-            if (type==GGML_TYPE_Q4_HP1) static_cast<block_q4_hp1 *>(address)[0].qs[0]^=7;
+            if (type==GGML_TYPE_MXINT4) static_cast<block_q4_hp1 *>(address)[0].qs[0]^=7;
             else static_cast<block_q8_hp1 *>(address)[0].qs[0]^=7;
         } else std::memcpy(address,packed.data(),packed.size());
         auto * buffer=ggml::gemmini::gemmini_buffer_from_host_ptr(address,packed.size());
@@ -434,7 +434,7 @@ int main() {
 #endif
         std::vector<ggml_type> types;
         if (TEST_CPU_EXACT_FLOAT) { types={GGML_TYPE_Q4_0,GGML_TYPE_Q8_0}; }
-        else if (TEST_CPU_EXACT_HP1) { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1}; }
+        else if (TEST_CPU_EXACT_HP1) { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_MXINT4 : GGML_TYPE_MXINT8}; }
         else { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0}; }
         for (ggml_type type : types) { fixture(type,1); fixture(type,5); }
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)

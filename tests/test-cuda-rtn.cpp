@@ -22,11 +22,11 @@ static int code(const ggml_tensor * w, int row, int k) {
 }
 static float scale(const ggml_tensor * w, int row, int block) {
     size_t b=size_t(row)*(w->ne[0]/32)+block;
-    if (w->type==GGML_TYPE_Q4_HP1) {
+    if (w->type==GGML_TYPE_MXINT4) {
         const auto & value=static_cast<const block_q4_hp1 *>(w->data)[b];
         return value.m==INT16_MIN?0.0f:std::ldexp(value.channel_scale,value.m);
     }
-    if (w->type==GGML_TYPE_Q8_HP1) {
+    if (w->type==GGML_TYPE_MXINT8) {
         const auto & value=static_cast<const block_q8_hp1 *>(w->data)[b];
         return value.m==INT16_MIN?0.0f:std::ldexp(value.channel_scale,value.m);
     }
@@ -40,12 +40,12 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
     auto * w=ggml_new_tensor_2d(ctx,type,k,n); auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,m);
     std::vector<float> values(size_t(n)*k);
     for (size_t i=0;i<values.size();++i) values[i]=std::sin(float(i)*0.013f)*0.7f;
-    const bool hp1=type==GGML_TYPE_Q4_HP1 || type==GGML_TYPE_Q8_HP1;
-    if (hp1) {
+    const bool mxint=type==GGML_TYPE_MXINT4 || type==GGML_TYPE_MXINT8;
+    if (mxint) {
         for (int c=0;c<n;++c) {
             for (int j=0;j<k;++j)
                 values[size_t(c)*k+j]=j<32?0.0f:std::ldexp(values[size_t(c)*k+j],(j/32+c)%7-3);
-            if (type==GGML_TYPE_Q4_HP1) {
+            if (type==GGML_TYPE_MXINT4) {
                 auto * blocks=static_cast<block_q4_hp1 *>(w->data)+size_t(c)*(k/32);
                 quantize_row_q4_hp1_ref(values.data()+size_t(c)*k,blocks,k);
                 dequantize_row_q4_hp1(blocks,values.data()+size_t(c)*k,k);
@@ -69,7 +69,7 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
     for (int i=0;i<m*k;++i) a[i]=i<32?0.0f:std::cos(float(i)*0.021f)*1.3f;
     // Exactly representable .5 ties in a block with a unit scale.
     if (m*k>=64) { std::fill(a+32,a+64,0.0f); a[32]=float((1<<(bits==16?7:bits-1))-1); a[33]=0.5f; a[34]=1.5f; a[35]=-0.5f; a[36]=-1.5f; }
-    if (hp1 && m*k>=96) a[64]=1e6f; // Absmax RTN must retain this range, without PoTal outlier selection.
+    if (mxint && m*k>=96) a[64]=1e6f; // MXINT retains this range without PoTal outlier selection.
     auto * out=ggml_mul_mat(ctx,w,x);
     require(ggml_cuda_rtn_supported(out),"dense unsupported");
     require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
@@ -104,11 +104,13 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
         } else for (int b=0;b<k/32;++b) {
             float largest=0; int limit=(1<<(bits-1))-1;
             for (int j=0;j<32;++j) largest=std::max(largest,std::fabs(a[size_t(r)*k+b*32+j]));
-            float s=largest==0?1.0f:float(double(largest)/limit); int dot=0;
+            float s=largest==0?1.0f:mxint?std::ldexp(1.0f,std::max(-127,std::ilogb(largest))-(bits-2)):
+                                      float(double(largest)/limit); int dot=0;
             float ws=type==GGML_TYPE_Q6_K?ggml_fp16_to_fp32(static_cast<block_q6_K *>(w->data)[size_t(c)*(k/256)+b/8].d):scale(w,c,b);
             for (int j=0;j<32;++j) {
-                int q=std::clamp(int(std::nearbyint(double(a[size_t(r)*k+b*32+j])/double(s))),-limit-1,limit);
-                int weight_code=(type==GGML_TYPE_Q6_K || hp1)?(ws==0?0:int(std::nearbyint(double(values[size_t(c)*k+b*32+j])/double(ws)))):code(w,c,b*32+j);
+                const double value=double(a[size_t(r)*k+b*32+j])/double(s);
+                int q=std::clamp(int(mxint?std::round(value):std::nearbyint(value)),mxint?-limit:-limit-1,limit);
+                int weight_code=(type==GGML_TYPE_Q6_K || mxint)?(ws==0?0:int(std::nearbyint(double(values[size_t(c)*k+b*32+j])/double(ws)))):code(w,c,b*32+j);
                 dot+=q*weight_code;
             }
             sum+=double(dot)*(double(ws)*double(s));
@@ -133,6 +135,30 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
         }
     }
     std::printf("PASS dense type=%s A%d m=%d n=%d k=%d max_error=%.9g\n",ggml_type_name(type),bits,m,n,k,max_error);
+    ggml_cuda_rtn_clear(); ggml_free(ctx);
+}
+static void mxint_ties_away(int bits, int requested_bits) {
+    setenv("GGML_CUDA_RTN_A_BITS",std::to_string(requested_bits).c_str(),1);
+    ggml_cuda_rtn_clear();
+    auto * ctx=ggml_init({size_t(1)<<20,nullptr,false}); require(ctx,"ties fixture context");
+    auto * w=ggml_new_tensor_2d(ctx,bits==4?GGML_TYPE_MXINT4:GGML_TYPE_MXINT8,32,1);
+    auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,10);
+    std::memset(w->data,0,ggml_nbytes(w)); std::memset(x->data,0,ggml_nbytes(x));
+    if (bits==4) {
+        auto & block=*static_cast<block_q4_hp1 *>(w->data);
+        std::memset(block.qs,0x88,sizeof(block.qs)); block.qs[0]=0x89; block.channel_scale=1;
+    } else { auto & block=*static_cast<block_q8_hp1 *>(w->data); block.qs[0]=1; block.channel_scale=1; }
+    const float below=std::nextafter(.5f,0.0f), above=std::nextafter(.5f,1.0f);
+    const float ties[]{.5f,1.5f,2.5f,-.5f,-1.5f,-2.5f,below,above,-below,-above};
+    const int expected[]{1,2,3,-1,-2,-3,0,1,0,-1};
+    const float step=std::ldexp(1.0f,-(bits-2));
+    auto * data=static_cast<float *>(x->data);
+    for (int row=0;row<10;++row) { data[row*32]=ties[row]*step; data[row*32+31]=1; }
+    auto * output=ggml_mul_mat(ctx,w,x);
+    require(ggml_cuda_rtn_supported(output),"MXINT weight must select quantized activation");
+    require(ggml_cuda_rtn_compute(output),ggml_cuda_rtn_error());
+    for (int row=0;row<10;++row)
+        require(static_cast<float *>(output->data)[row]==expected[row]*step,"MXINT activation PoT/ties-away mismatch");
     ggml_cuda_rtn_clear(); ggml_free(ctx);
 }
 static float value(const ggml_tensor * t,int k,int n,int h) {
@@ -161,9 +187,11 @@ static void attention(bool transposed) {
 int main(int argc, char ** argv) {
     benchmark_mode=argc==2 && (!std::strcmp(argv[1],"--benchmark") || !std::strcmp(argv[1],"--benchmark-large"));
     try {
-        if (benchmark_mode && !std::strcmp(argv[1],"--benchmark-large")) { dense(GGML_TYPE_Q4_HP1,4,512,2048,2048); return 0; }
+        if (benchmark_mode && !std::strcmp(argv[1],"--benchmark-large")) { dense(GGML_TYPE_MXINT4,4,512,2048,2048); return 0; }
+        mxint_ties_away(4,4); mxint_ties_away(8,8);
+        mxint_ties_away(4,16); mxint_ties_away(8,16);
         if (benchmark_mode) {
-            for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1})
+            for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_MXINT4,GGML_TYPE_MXINT8})
                 for (int bits:{4,8}) dense(type,bits,128,512,2048);
             return 0;
         }
@@ -171,10 +199,10 @@ int main(int argc, char ** argv) {
             dense(type,bits,9,35,64); dense(type,bits,17,65,896);
         }
         for (int bits:{4,8,16}) { dense(GGML_TYPE_Q6_K,bits,9,35,256); dense(GGML_TYPE_Q6_K,bits,17,67,2048); }
-        for (auto type:{GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1}) for (int bits:{4,8}) {
+        for (auto type:{GGML_TYPE_MXINT4,GGML_TYPE_MXINT8}) for (int bits:{4,8}) {
             dense(type,bits,9,35,64); dense(type,bits,17,65,896); dense(type,bits,9,67,2048);
         }
-        for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_Q4_HP1,GGML_TYPE_Q8_HP1})
+        for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_MXINT4,GGML_TYPE_MXINT8})
             for (int bits:{4,8}) dense(type,bits,9,521,64);
         dense(GGML_TYPE_F16,16,9,35,64); attention(false); attention(true);
         std::puts("PASS CUDA RTN scalar oracle, ties, zeros, tile tails, weight cache, Qwen K and GQA"); return 0;

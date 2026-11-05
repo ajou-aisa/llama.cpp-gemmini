@@ -8,7 +8,7 @@ struct perplexity_cuda_rtn_guard {
     ggml_backend_sched_eval_callback previous = nullptr;
     void * previous_data = nullptr;
     uint64_t observed = 0, verified = 0, before = 0, dense_start = 0, attention_start = 0;
-    uint64_t hp1_q4 = 0, hp1_q8 = 0;
+    uint64_t mxint4 = 0, mxint8 = 0;
     bool active = false, failed = false;
     static uint64_t calls() { return ggml_cuda_rtn_dense_calls() + ggml_cuda_rtn_attention_calls(); }
     void install(common_params & params) {
@@ -25,8 +25,8 @@ struct perplexity_cuda_rtn_guard {
         bool prior = g.previous ? g.previous(t, ask, g.previous_data) : !ask;
         if (t->op == GGML_OP_MUL_MAT) {
             if (ask && t->src[0]) {
-                g.hp1_q4 += t->src[0]->type == GGML_TYPE_Q4_HP1;
-                g.hp1_q8 += t->src[0]->type == GGML_TYPE_Q8_HP1;
+                g.mxint4 += t->src[0]->type == GGML_TYPE_MXINT4;
+                g.mxint8 += t->src[0]->type == GGML_TYPE_MXINT8;
             }
             if (ask) { ++g.observed; g.before = calls(); return true; }
             if (calls() == g.before + 1) ++g.verified;
@@ -39,11 +39,16 @@ struct perplexity_cuda_rtn_guard {
         if (!active) return true;
         auto dense = ggml_cuda_rtn_dense_calls() - dense_start, attention = ggml_cuda_rtn_attention_calls() - attention_start;
         bool ok = complete && tokens > 0 && !failed && observed > 0 && observed == verified && dense > 0 && attention > 0;
+        int activation_bits = ggml_cuda_rtn_activation_bits();
+        if (activation_bits == 16 && (mxint4 || mxint8)) {
+            ok = ok && !(mxint4 && mxint8);
+            activation_bits = mxint4 ? 4 : 8;
+        }
         std::fprintf(stderr,"CUDA_RTN_PROOF {\"complete\":%s,\"activation_bits\":%d,\"attention_bits\":16,\"block_size\":32,\"compensation\":false,\"scored_tokens\":%d,\"observed_matmuls\":%llu,\"verified_matmuls\":%llu,\"dense_gpu_calls\":%llu,\"attention_gpu_calls\":%llu}\n",
-            ok?"true":"false",ggml_cuda_rtn_activation_bits(),tokens,(unsigned long long)observed,(unsigned long long)verified,(unsigned long long)dense,(unsigned long long)attention);
-        if (hp1_q4 || hp1_q8)
-            std::fprintf(stderr,"RTN_WA_HP1_PROOF {\"activation\":\"BLOCK_RTN\",\"block_size\":32,\"outlier_selection\":false,\"stripe_folding\":false,\"residual\":false,\"q4_hp1_matmuls\":%llu,\"q8_hp1_matmuls\":%llu}\n",
-                         (unsigned long long)hp1_q4,(unsigned long long)hp1_q8);
+            ok?"true":"false",activation_bits,tokens,(unsigned long long)observed,(unsigned long long)verified,(unsigned long long)dense,(unsigned long long)attention);
+        if (mxint4 || mxint8)
+            std::fprintf(stderr,"MXINT_WA_PROOF {\"activation\":\"MXINT_POT\",\"rounding\":\"ties_away\",\"block_size\":32,\"outlier_selection\":false,\"stripe_folding\":false,\"residual\":false,\"mxint4_matmuls\":%llu,\"mxint8_matmuls\":%llu}\n",
+                         (unsigned long long)mxint4,(unsigned long long)mxint8);
         ggml_cuda_rtn_clear();
         return ok;
     }

@@ -1298,8 +1298,8 @@ static void print_usage() {
 
 static int test_retired_types() {
     static_assert(GGML_TYPE_Q4_0 == 2 && GGML_TYPE_Q8_0 == 8 && GGML_TYPE_Q8_H2 == 40 &&
-                  GGML_TYPE_Q8_HP1 == 41 && GGML_TYPE_Q8_HP2 == 42 && GGML_TYPE_Q8_CHANNEL == 43 &&
-                  GGML_TYPE_Q4_HP1 == 45 && GGML_TYPE_Q16_0 == 46 && GGML_TYPE_Q16_H1 == 47 &&
+                  GGML_TYPE_MXINT8 == 41 && GGML_TYPE_Q8_HP2 == 42 && GGML_TYPE_Q8_CHANNEL == 43 &&
+                  GGML_TYPE_MXINT4 == 45 && GGML_TYPE_Q16_0 == 46 && GGML_TYPE_Q16_H1 == 47 &&
                   GGML_TYPE_Q16_HP1 == 48 && GGML_TYPE_COUNT == 49, "serialized type IDs changed");
     bool ok = true;
     for (const int id : {39, 44, 0, 8}) {

@@ -512,6 +512,8 @@ list(INSERT _GEMMINI_TEST_WORKER_SOURCES 6
 # Direct backend symbols require a linkable backend, not a dlopen MODULE.
 if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
+    add_test(NAME gemmini_mxint_weight_routes_activation
+        COMMAND $<TARGET_FILE:gemmini_weight_formats> --case=mxint-graph)
     target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
     target_compile_definitions(gemmini_weight_formats PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
@@ -1709,7 +1711,7 @@ add_compile_definitions(
 
 # CUDA kernels used by the opt-in Gemmini host-graph path.
 if (GGML_GEMMINI_CUDA_CPU_EXACT)
-    foreach(_target test-cuda-cpu-exact-graph test-cuda-hp1-scu)
+    foreach(_target test-cuda-cpu-exact-graph test-cuda-hp1-scu test-cuda-potal-attention test-potal-sensitivity)
         add_executable(${_target} ${_target}.cpp)
         target_compile_features(${_target} PRIVATE cxx_std_17)
         target_compile_definitions(${_target} PRIVATE ${GGML_GEMMINI_COMPILE_DEFS}
@@ -1724,6 +1726,7 @@ if (GGML_GEMMINI_CUDA_CPU_EXACT)
             ggml-gemmini-cuda-cpu-exact ggml-cpu ggml-base ggml-gemmini-utils)
         add_test(NAME ${_target} COMMAND ${_target})
     endforeach()
+    add_test(NAME test-potal-sensitivity-invalid COMMAND test-potal-sensitivity 4)
     add_test(NAME test-cuda-hp1-scu-graph
         COMMAND ${CMAKE_COMMAND} -E env GGML_GEMMINI_HP1_SCU=1 $<TARGET_FILE:test-cuda-cpu-exact-graph>)
 endif()

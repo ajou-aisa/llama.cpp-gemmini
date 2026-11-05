@@ -119,11 +119,11 @@ def verify(log, job, chunks):
                         dense_gpu_calls=dense, attention_gpu_calls=attention)
         require(all(p.get(k) == v for k, v in expected.items()), 'Wrong RTN profile/CUDA coverage')
         if job['kind'] == 'rtn-mx':
-            h = proof('RTN_WA_HP1_PROOF')
-            require(h == dict(activation='BLOCK_RTN', block_size=32, outlier_selection=False,
+            h = proof('MXINT_WA_PROOF')
+            require(h == dict(activation='MXINT_POT', rounding='ties_away', block_size=32, outlier_selection=False,
                               stripe_folding=False, residual=False,
-                              q4_hp1_matmuls=dense if job['bits'] == 4 else 0,
-                              q8_hp1_matmuls=dense if job['bits'] == 8 else 0), 'Wrong no-compensation baseline')
+                              mxint4_matmuls=dense if job['bits'] == 4 else 0,
+                              mxint8_matmuls=dense if job['bits'] == 8 else 0), 'Wrong no-compensation baseline')
             result['hp1_proof'] = h
         else:
             require('RTN_WA_HP1_PROOF ' not in text, 'Unexpected HP1 weights in Q4_0/E4M3 job')
