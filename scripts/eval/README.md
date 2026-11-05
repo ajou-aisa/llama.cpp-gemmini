@@ -1,5 +1,11 @@
 # PoTal measurement scripts
 
+The Q4_HP1/Q8_HP1 artifact paths and IM2P.sim commands below document historical
+PoTal evaluations; they are not MXINT W/A runs. New MXINT4/MXINT8 weights use
+matching MXINT activation on the CPU Gemmini and CUDA RTN paths. IM2P_SIM rejects
+these types until its MXINT route is implemented. Archived HP1 files share the
+numeric GGUF type IDs but must not be treated as new MXINT weights.
+
 Run from the llama checkout with Python 3.11 or newer. One entry point, `scripts/eval/run_measurement.py`, is the
 measurement interface. It has exactly three domains, and the domains never run each other: a performance run does
 not collect metrics and a metric run does not replay or schedule.

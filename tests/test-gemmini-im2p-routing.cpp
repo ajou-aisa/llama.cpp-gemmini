@@ -518,6 +518,34 @@ bool run_matched_weight_gate_contract() {
     const auto exsia_q4           = gate_route(true, 4, true, true, 4);
     const auto exsia_q16          = gate_route(true, 16, true, true, 16);
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml_backend_t backend = ggml_backend_gemmini_init();
+    if (!check(backend != nullptr, "initialize MXINT rejection backend")) {
+        return false;
+    }
+    ggml_context * context =
+        ggml_init({ggml_tensor_overhead() * 5, nullptr, true});
+    if (!check(context != nullptr, "initialize MXINT rejection context")) {
+        ggml_backend_free(backend);
+        return false;
+    }
+    ggml_tensor * activation = ggml_new_tensor_2d(context, GGML_TYPE_F32, K, I);
+    bool mxint_rejected = true;
+    for (const ggml_type type : {GGML_TYPE_MXINT4, GGML_TYPE_MXINT8}) {
+        ggml_tensor * weight = ggml_new_tensor_2d(context, type, K, J);
+        ggml_tensor * output = ggml_mul_mat(context, weight, activation);
+        mxint_rejected =
+            check(!ggml_backend_supports_op(backend, output),
+                  "IM2P_SIM rejects MXINT weights without an MXINT activation route") &&
+            mxint_rejected;
+    }
+    ggml_free(context);
+    ggml_backend_free(backend);
+    if (!mxint_rejected) {
+        return false;
+    }
+#endif
+
     return check(q4.ok() == h1_supported, "non-RMD A4/H1 follows implementation") &&
            check(q16.ok() == h1_supported, "non-RMD A16/H1 follows implementation") &&
            check(!legacy_a4_q8.ok(), "non-RMD A4/Q8 is rejected as mixed width") &&
@@ -804,13 +832,13 @@ struct GraphCase {
             return false;
         }
 #if GGML_GEMMINI_WEIGHT_BITS == 4
-        ggml_tensor * weight            = ggml_new_tensor_2d(context, GGML_TYPE_Q4_HP1, K, J);
+        ggml_tensor * weight            = ggml_new_tensor_2d(context, GGML_TYPE_MXINT4, K, J);
         ggml_tensor * mismatched_weight = ggml_new_tensor_2d(context, GGML_TYPE_Q16_H1, K, J);
 #elif GGML_GEMMINI_WEIGHT_BITS == 16
         ggml_tensor * weight            = ggml_new_tensor_2d(context, GGML_TYPE_Q16_H1, K, J);
-        ggml_tensor * mismatched_weight = ggml_new_tensor_2d(context, GGML_TYPE_Q4_HP1, K, J);
+        ggml_tensor * mismatched_weight = ggml_new_tensor_2d(context, GGML_TYPE_MXINT4, K, J);
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
-        ggml_tensor * weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_HP1, K, J);
+        ggml_tensor * weight = ggml_new_tensor_2d(context, GGML_TYPE_MXINT8, K, J);
 #else
         ggml_tensor * weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_CHANNEL, K, J);
 #endif

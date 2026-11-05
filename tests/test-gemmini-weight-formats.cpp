@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-gemmini.h"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
@@ -75,8 +76,12 @@ bool round_trip(enum ggml_type type, float error_limit) {
             quantized.data() + row * row_size, decoded.data() + row * columns, columns);
     }
 
-    return check(max_abs_error(source, decoded) <= error_limit,
-                 "round-trip error exceeded format limit");
+    const float error = max_abs_error(source, decoded);
+    if (error > error_limit) {
+        std::fprintf(stderr, "FAIL: %s round-trip error %g exceeds %g\n",
+                     ggml_type_name(type), error, error_limit);
+    }
+    return check(error <= error_limit, "round-trip error exceeded format limit");
 }
 
 enum class Family : uint8_t {
@@ -321,6 +326,30 @@ bool test_q4_h0_matches_canonical_dequantization() {
              ok;
     }
     return ok;
+}
+
+bool test_reader_validation_cache() {
+    for (uint8_t bits : {uint8_t(4),uint8_t(8)}) {
+        ReaderFixture fixture(bits,Family::HP1);
+        fixture.args.weight_validation = std::make_shared<ggml_gemmini_args_t::WeightValidation>();
+        const auto plan = fixture.resolve();
+        if (!check(plan.valid && !fixture.args.weight_validation->accepted.empty(),"initial cached metadata validation")) return false;
+        const auto entries = fixture.args.weight_validation->accepted.size();
+        auto slice = fixture.args;
+        slice.I = 7;
+        if (!check(wreader::validate(slice,plan) == ReaderStatus::Success &&
+                   fixture.args.weight_validation->accepted.size() == entries,"operation slices share checked metadata")) return false;
+        slice.native_weight_bytes = 0;
+        if (!check(wreader::validate(slice,plan) != ReaderStatus::Success,"cached metadata still checks storage extent")) return false;
+        ReaderFixture other(bits,Family::HP1);
+        other.args.weight_validation = fixture.args.weight_validation;
+        if (bits == 4) other.q4_hp1.m = -1; else other.q8_hp1.m = -1;
+        if (!check(!other.resolve().valid,"different weight pointer cannot reuse validated metadata")) return false;
+        fixture.args.weight_validation = std::make_shared<ggml_gemmini_args_t::WeightValidation>();
+        if (bits == 4) fixture.q4_hp1.m = -1; else fixture.q8_hp1.m = -1;
+        if (!check(!fixture.resolve().valid,"new operation revalidates modified weights")) return false;
+    }
+    return true;
 }
 
 bool test_reader_failure_table() {
@@ -583,22 +612,25 @@ bool test_q4_hp1_mantissa_sweep_follows_paper_rule() {
                 source[j] = amax * 0.25f * static_cast<float>((j % 7) - 3) / 3.0f;
             }
             source[5] = amax;
+            source[6] = -amax;
 
             block_q4_hp1 quantized{};
             const bool   quantized_ok = quantize_row_q4_hp1_ref(source.data(), &quantized, QK4_HP);
             // The block max is 4 * mant steps: exact below 7.5, saturated to code 7 above.
             const long expected_code = 4.0f * mant < 7.5f ? std::lround(4.0f * mant) : 7;
             const int  code          = (quantized.qs[5] & 0x0F) - 8;
+            const int  negative_code = (quantized.qs[6] & 0x0F) - 8;
             if (!quantized_ok || std::ilogb(quantized.channel_scale) != std::ilogb(amax) - 2 ||
-                quantized.m != 0 || code != expected_code) {
+                quantized.m != 0 || code != expected_code || negative_code != -expected_code) {
                 if (failures < 4) {
                     std::fprintf(stderr,
-                                 "FAIL: Q4_HP1 mantissa sweep: amax=%g scale=%g m=%d code=%d "
+                                 "FAIL: MXINT4 mantissa sweep: amax=%g scale=%g m=%d code=%d negative_code=%d "
                                  "expected_code=%ld\n",
                                  amax,
                                  quantized.channel_scale,
                                  static_cast<int>(quantized.m),
                                  code,
+                                 negative_code,
                                  expected_code);
                 }
                 ++failures;
@@ -614,12 +646,15 @@ bool test_q4_hp1_mantissa_sweep_follows_paper_rule() {
 
 bool test_legacy_round_trips() {
     bool ok = true;
-    ok      = check(ggml_blck_size(GGML_TYPE_Q4_HP1) == 32, "Q4_HP1 block size") && ok;
+    ok      = check(GGML_TYPE_MXINT4 == 45 && GGML_TYPE_MXINT8 == 41,
+                    "MXINT public type IDs remain stable") && ok;
+    ok      = check(ggml_blck_size(GGML_TYPE_MXINT4) == 32, "MXINT4 block size") && ok;
     ok      = check(ggml_blck_size(GGML_TYPE_Q16_0) == 32, "Q16_0 block size") && ok;
     ok      = check(ggml_blck_size(GGML_TYPE_Q16_H1) == 32, "Q16_H1 block size") && ok;
     ok      = check(ggml_blck_size(GGML_TYPE_Q16_HP1) == 32, "Q16_HP1 block size") && ok;
 
-    ok = round_trip(GGML_TYPE_Q4_HP1, 2.5f) && ok;
+    ok = round_trip(GGML_TYPE_MXINT4, 2.5f) && ok;
+    ok = round_trip(GGML_TYPE_MXINT8, 0.13f) && ok;
     ok = test_q4_hp1_power_of_two_scale_follows_paper_rule() && ok;
     ok = test_q4_hp1_row_scale_follows_paper_rule() && ok;
     ok = test_q4_hp1_equal_ilogb_blocks_share_exponent() && ok;
@@ -631,9 +666,11 @@ bool test_legacy_round_trips() {
 }
 
 bool test_q4_hp1_loader_contract() {
-#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+#if (GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4) || \
+    (GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8)
+    constexpr ggml_type mxint_type = GGML_GEMMINI_WEIGHT_BITS == 4 ? GGML_TYPE_MXINT4 : GGML_TYPE_MXINT8;
     ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead() * 4,
+        /* .mem_size   = */ ggml_tensor_overhead() * 4 + ggml_graph_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -642,7 +679,7 @@ bool test_q4_hp1_loader_contract() {
         return false;
     }
 
-    ggml_tensor * weight     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_HP1, 32, 2);
+    ggml_tensor * weight     = ggml_new_tensor_2d(ctx, mxint_type, 32, 2);
     ggml_tensor * activation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
     ggml_tensor * op         = ggml_mul_mat(ctx, weight, activation);
 
@@ -653,9 +690,69 @@ bool test_q4_hp1_loader_contract() {
     const bool supported = ggml_backend_dev_supports_op(dev, op);
     weight->buffer       = nullptr;
     ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
 
-    return check(supported, "production GEMMINI rejects Q4_HP1 loader metadata");
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml_free(ctx);
+    return check(!supported, "IM2P_SIM must reject MXINT without an MXINT activation route");
+#else
+    if (!check(supported, "production GEMMINI rejects MXINT loader metadata")) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_gemmini_init();
+    if (!check(backend != nullptr, "initialize GEMMINI for MXINT graph")) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t tensors = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!check(tensors != nullptr, "allocate MXINT graph tensors")) {
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+        return false;
+    }
+
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+    std::array<block_q4_hp1, 2> encoded{};
+    for (auto & block : encoded) {
+        block.channel_scale = 1.0f;
+        std::fill(std::begin(block.qs), std::end(block.qs), uint8_t{0x88});
+        block.qs[0] = 0x89;
+        block.qs[1] = 0x87;
+    }
+#else
+    std::array<block_q8_hp1, 2> encoded{};
+    for (auto & block : encoded) {
+        block.channel_scale = 1.0f;
+        block.qs[0] = 1;
+        block.qs[1] = -1;
+    }
+#endif
+    ggml_backend_tensor_set(weight, encoded.data(), 0, sizeof(encoded));
+    std::array<float, 32> source{};
+    const float tie = GGML_GEMMINI_WEIGHT_BITS == 4 ? 2.25f : 2.265625f;
+    source[0] = tie;
+    source[1] = -tie;
+    source[2] = 3.0f;
+    ggml_backend_tensor_set(activation, source.data(), 0, sizeof(source));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, op);
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    std::array<float, 2> actual{};
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(op, actual.data(), 0, sizeof(actual));
+    }
+    const float expected = GGML_GEMMINI_WEIGHT_BITS == 4 ? 5.0f : 4.5625f;
+    const bool ok = check(status == GGML_STATUS_SUCCESS, "MXINT graph computes") &&
+                    check(std::fabs(actual[0] - expected) < 1e-5f &&
+                          std::fabs(actual[1] - expected) < 1e-5f,
+                          "MXINT weights select matching ties-away activation without residuals");
+    ggml_backend_buffer_free(tensors);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    return ok;
+#endif
 #else
     return true;
 #endif
@@ -665,6 +762,7 @@ enum class Selection {
     All,
     HappyTable,
     FailureTable,
+    MxintGraph,
     Invalid,
 };
 
@@ -681,6 +779,9 @@ Selection parse_selection(int argc, char ** argv) {
     if (std::strcmp(argv[1], "--case=failure-table") == 0) {
         return Selection::FailureTable;
     }
+    if (std::strcmp(argv[1], "--case=mxint-graph") == 0) {
+        return Selection::MxintGraph;
+    }
     return Selection::Invalid;
 }
 
@@ -689,7 +790,7 @@ Selection parse_selection(int argc, char ** argv) {
 int main(int argc, char ** argv) {
     const Selection selection = parse_selection(argc, argv);
     if (selection == Selection::Invalid) {
-        std::fputs("usage: gemmini_weight_formats [--case=happy-table|--case=failure-table]\n",
+        std::fputs("usage: gemmini_weight_formats [--case=happy-table|--case=failure-table|--case=mxint-graph]\n",
                    stderr);
         return 2;
     }
@@ -702,7 +803,11 @@ int main(int argc, char ** argv) {
         ok = test_q4_h0_matches_canonical_dequantization() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {
+        ok = test_reader_validation_cache() && ok;
         ok = test_reader_failure_table() && ok;
+    }
+    if (selection == Selection::MxintGraph) {
+        ok = test_q4_hp1_loader_contract() && ok;
     }
     if (ok) {
         const char * message =

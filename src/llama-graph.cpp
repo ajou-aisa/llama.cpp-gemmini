@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
@@ -1193,6 +1194,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              bool      v_trans,
              float     kq_scale) const {
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    const std::string attention_layer = q->name;
+#endif
   //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
   //const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -1250,12 +1254,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+        const char * scope = std::getenv("GGML_GEMMINI_ATTENTION_SCOPE");
+        if (!scope) scope = "both";
+        const bool quant_qk = strcmp(scope, "both") == 0 || strcmp(scope, "qk") == 0;
+        const bool quant_pv = strcmp(scope, "both") == 0 || strcmp(scope, "pv") == 0;
+        GGML_ASSERT(quant_qk || quant_pv || strcmp(scope, "none") == 0);
         const bool potal_attention = cparams.offload_kqv &&
             (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
             (v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16) && q->type == GGML_TYPE_F32;
         ggml_tensor * const potal_kq = kq;
-        if (potal_attention) {
+        if (potal_attention && quant_qk) {
             ggml_gemmini_set_attention_role(kq, GGML_GEMMINI_ATTENTION_QK);
+            ggml_format_name(kq,"qk-%s",attention_layer.c_str());
             kq->src[2] = kq_mask;
         }
 #endif
@@ -1294,8 +1304,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
-        if (potal_attention) {
-            ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
+        if (potal_attention && (quant_qk || quant_pv)) {
+            if (quant_pv) {
+                ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
+                ggml_format_name(kqv,"pv-%s",attention_layer.c_str());
+            }
             ggml_backend_t selected = nullptr;
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                 auto * backend = ggml_backend_sched_get_backend(sched, i);
@@ -1375,6 +1388,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
     //cb(k, "v", il);
 
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    ggml_format_name(q,"layer-%d",il);
+#endif
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, false, kq_scale);
 
     cb(cur, "kqv_out", il);
@@ -1513,6 +1529,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
 
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    ggml_format_name(q,"layer-%d",il);
+#endif
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
     cb(cur, "kqv_out", il);
 
@@ -1573,6 +1592,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
     //cb(k, "v", il);
 
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    ggml_format_name(q,"layer-%d",il);
+#endif
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, false, kq_scale);
 
     cb(cur, "kqv_out", il);

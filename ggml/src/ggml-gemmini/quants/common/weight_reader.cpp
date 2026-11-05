@@ -430,6 +430,23 @@ WeightReaderStatus validate(const ggml_gemmini_args_t &     args,
     if (plan.scales.cols == 0 || plan.scales.block_size != kBlockSize)
         return WeightReaderStatus::InvalidMetadata;
 
+    auto * cache = args.weight_format == Format::q4_hp1 || args.weight_format == Format::q8_hp1
+                      ? args.weight_validation.get() : nullptr;
+    std::unique_lock<std::mutex> lock;
+    ggml_gemmini_args_t::WeightValidation::Key key{};
+    if (cache) {
+        const bool q4 = args.weight_format == Format::q4_hp1;
+        key = std::make_tuple(reinterpret_cast<uintptr_t>(q4 ? static_cast<const void *>(args.q4_hp1_blocks)
+                                 : static_cast<const void *>(args.q8_hp1_blocks)),
+                              args.J,args.K,
+                              q4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row,
+                              q4 ? args.native_block_count : args.q8_hp1_block_count,
+                              args.native_weight_bytes,plan.scales.cols,int(args.weight_format),
+                              int(plan.scale_domain),plan.hp1_carriers);
+        lock = std::unique_lock<std::mutex>(cache->mutex);
+        if (cache->accepted.count(key)) return WeightReaderStatus::Success;
+    }
+
     for (size_t j = 0; j < args.J; ++j) {
         for (size_t block = 0; block < plan.scales.cols; ++block) {
             if (plan.hp1_carriers) {
@@ -443,6 +460,7 @@ WeightReaderStatus validate(const ggml_gemmini_args_t &     args,
             }
         }
     }
+    if (cache) cache->accepted.insert(key);
     return WeightReaderStatus::Success;
 }
 

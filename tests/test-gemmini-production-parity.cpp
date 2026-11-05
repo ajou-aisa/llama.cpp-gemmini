@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
             ggml_init({2 * 1024 * 1024, nullptr, true}), ggml_free);
         require(bool(memory), "semantic fixture graph allocation");
         auto *weights = ggml_new_tensor_2d(memory.get(), GGML_GEMMINI_WEIGHT_BITS == 4
-            ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1, fixture.args.K, fixture.args.J);
+            ? GGML_TYPE_MXINT4 : GGML_TYPE_MXINT8, fixture.args.K, fixture.args.J);
         auto *activation = ggml_new_tensor_2d(memory.get(), GGML_TYPE_F32, fixture.args.K, fixture.args.I);
         auto *node = ggml_mul_mat(memory.get(), weights, activation);
         ggml_set_name(node, fixture.args.matmul_layer.c_str());

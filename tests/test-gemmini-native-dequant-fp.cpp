@@ -25,11 +25,11 @@ constexpr float   TOLERANCE = 1e-5f;
 
 #if GGML_GEMMINI_WEIGHT_BITS == 4
 constexpr ggml_type H0_TYPE           = GGML_TYPE_Q4_0;
-constexpr ggml_type PRIMARY_TYPE      = GGML_TYPE_Q4_HP1;
+constexpr ggml_type PRIMARY_TYPE      = GGML_TYPE_MXINT4;
 constexpr int64_t   NATIVE_BLOCK_SIZE = QK4_0;
 #elif GGML_GEMMINI_WEIGHT_BITS == 8
 constexpr ggml_type H0_TYPE           = GGML_TYPE_Q8_0;
-constexpr ggml_type PRIMARY_TYPE      = GGML_TYPE_Q8_HP1;
+constexpr ggml_type PRIMARY_TYPE      = GGML_TYPE_MXINT8;
 constexpr ggml_type H2_TYPE           = GGML_TYPE_Q8_H2;
 constexpr int64_t   NATIVE_BLOCK_SIZE = QK8_0;
 #elif GGML_GEMMINI_WEIGHT_BITS == 16

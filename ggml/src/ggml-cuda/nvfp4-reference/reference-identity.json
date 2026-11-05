@@ -1,0 +1,13 @@
+{
+  "repository": "NVIDIA/Model-Optimizer",
+  "commit": "ff336e72129f5b2bae47fb2e3ff35112f1bdbc8d",
+  "path": "modelopt/torch/quantization/qtensor/nvfp4_tensor.py",
+  "sha256": "05d9749aa3d2c8329367643df5cd783ba5869c458dc4806b4842059d0baf1f24",
+  "recipe": "1D block16 dynamic max, RNE E2M1, clamped RNE E4M3FN scales, FP32 per-tensor decode scale",
+  "embedding": "original FP16 GET_ROWS",
+  "linear_weights_including_lm_head": "NVFP4 fake quantization",
+  "native_fp4": false,
+  "calibration_data": null,
+  "activation_global_scale": "per-GEMM input-tensor maximum",
+  "weight_global_scale": "per-weight-tensor maximum, cached once"
+}

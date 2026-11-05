@@ -1,8 +1,14 @@
+#if defined(GGML_GEMMINI_CUDA_RTN)
+#include "perplexity-cuda-rtn.hpp"
+#endif
 #include "arg.h"
 #include "common.h"
 #include "evaluation-workload.h"
 #include "log.h"
 #include "llama.h"
+#if defined(PERPLEXITY_CUDA_CPU_EXACT)
+#include "perplexity-cuda-cpu-exact.hpp"
+#endif
 
 #include <chrono>
 #include <algorithm>
@@ -28,6 +34,7 @@ struct results_perplexity {
     double                   ppl_value;
     std::vector<float>       logits;
     std::vector<float>       probs;
+    int                      evaluated_tokens = 0;
 };
 
 struct results_log_softmax {
@@ -110,22 +117,18 @@ static void process_logits(
     double & nll, double & nll2, float * logit_history, float * prob_history
 ) {
     std::mutex mutex;
+    std::vector<double> token_nll(n_token);
     int counter = 0;
-    auto compute = [&mutex, &counter, &nll, &nll2, logit_history, prob_history, n_vocab, logits, tokens, n_token] () {
-        double local_nll  = 0;
-        double local_nll2 = 0;
+    auto compute = [&mutex, &counter, &token_nll, logit_history, prob_history, n_vocab, logits, tokens, n_token] () {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
             int i = counter++;
             if (i >= n_token) {
-                nll += local_nll; nll2 += local_nll2;
                 break;
             }
             lock.unlock();
             const results_log_softmax results = log_softmax(n_vocab, logits + size_t(i)*n_vocab, tokens[i+1]);
-            const double v = -results.log_softmax;
-            local_nll += v;
-            local_nll2 += v*v;
+            token_nll[i] = -results.log_softmax;
 
             logit_history[i] = results.logit;
             prob_history[i]  = results.prob;
@@ -138,27 +141,32 @@ static void process_logits(
     for (auto & w : workers) {
         w.join();
     }
+    // Match the single-worker reduction order regardless of worker scheduling.
+    double local_nll  = 0;
+    double local_nll2 = 0;
+    for (double v : token_nll) {
+        local_nll += v;
+        local_nll2 += v*v;
+    }
+    nll += local_nll;
+    nll2 += local_nll2;
 }
 
 static void process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2) {
     std::mutex mutex;
+    std::vector<double> token_nll(n_token);
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &log_probs, &nll, &nll2, n_vocab, logits, tokens, n_token, nv] () {
-        double local_nll  = 0;
-        double local_nll2 = 0;
+    auto compute = [&mutex, &counter, &log_probs, &token_nll, n_vocab, logits, tokens, n_token, nv] () {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
             int i = counter++;
             if (i >= n_token) {
-                nll += local_nll; nll2 += local_nll2;
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + i*nv, tokens[i+1]);
-            local_nll += v;
-            local_nll2 += v*v;
+            token_nll[i] = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + i*nv, tokens[i+1]);
         }
     };
     for (auto & w : workers) {
@@ -168,6 +176,15 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
     for (auto & w : workers) {
         w.join();
     }
+    // Match the single-worker reduction order regardless of worker scheduling.
+    double local_nll  = 0;
+    double local_nll2 = 0;
+    for (double v : token_nll) {
+        local_nll += v;
+        local_nll2 += v*v;
+    }
+    nll += local_nll;
+    nll2 += local_nll2;
     out.write((const char *)log_probs.data(), n_token*nv*sizeof(uint16_t));
 }
 
@@ -436,7 +453,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
     }
     LOG("\n");
 
-    return {tokens, std::exp(nll / count), logit_history, prob_history};
+    return {tokens, std::exp(nll / count), logit_history, prob_history, count};
 }
 
 static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
@@ -582,6 +599,15 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+            // Optional validation artifact: unrounded scored logits, never used
+            // to compute PPL. Use this for explicit CPU/CUDA scored-logit comparisons.
+            if (const char * raw_path = std::getenv("GGML_PPL_RAW_LOGITS")) {
+                const auto mode = std::ios::binary | ((i == 0 && seq == 0) ? std::ios::trunc : std::ios::app);
+                std::ofstream raw(raw_path, mode);
+                raw.write(reinterpret_cast<const char *>(all_logits),
+                          size_t(n_ctx - 1 - first) * n_vocab * sizeof(float));
+                if (!raw) throw std::runtime_error("Cannot write raw PPL validation logits");
+            }
             if (!params.logits_file.empty()) {
                 process_logits(logits_stream, n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
@@ -633,7 +659,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     llama_batch_free(batch);
 
-    return {tokens, ppl, logit_history, prob_history};
+    return {tokens, ppl, logit_history, prob_history, count};
 }
 
 static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<float> & batch_logits, int n_batch, int n_vocab) {
@@ -1995,6 +2021,20 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+#if defined(GGML_GEMMINI_CUDA_RTN)
+    perplexity_cuda_rtn_guard rtn_guard;
+    rtn_guard.install(params);
+#endif
+#if defined(PERPLEXITY_CUDA_CPU_EXACT)
+    perplexity_cuda_cpu_exact_guard cpu_exact_guard;
+    try {
+        cpu_exact_guard.install(params);
+    } catch (const std::exception & error) {
+        LOG_ERR("%s: %s\n", __func__, error.what());
+        return 1;
+    }
+#endif
+
     // load the model and apply lora adapter, if any
     common_init_result llama_init = common_init_from_params(params);
 
@@ -2037,7 +2077,18 @@ int main(int argc, char ** argv) {
     LOG("\n");
     llama_perf_context_print(ctx);
 
+#if defined(PERPLEXITY_CUDA_CPU_EXACT)
+    const bool cpu_exact_ok = cpu_exact_guard.finish(evaluation_ok,
+                                                    results.evaluated_tokens);
+#else
+    const bool cpu_exact_ok = true;
+#endif
     llama_backend_free();
 
-    return evaluation_ok ? 0 : 1;
+#if defined(GGML_GEMMINI_CUDA_RTN)
+    const bool rtn_ok = rtn_guard.finish(evaluation_ok, results.evaluated_tokens);
+#else
+    const bool rtn_ok = true;
+#endif
+    return evaluation_ok && cpu_exact_ok && rtn_ok ? 0 : 1;
 }

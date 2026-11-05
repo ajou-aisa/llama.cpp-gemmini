@@ -46,7 +46,9 @@ static inline int32_t quantize_to_i32(float x, int16_t theta) {
     if (scaled >= max_i32)
         return std::numeric_limits<int32_t>::max();
 
-    return static_cast<int32_t>(std::lrint(scaled));
+    const int32_t truncated = static_cast<int32_t>(scaled);
+    const double fraction = scaled - static_cast<double>(truncated);
+    return truncated + int(fraction >= 0.5) - int(fraction <= -0.5);
 }
 
 static inline int64_t magnitude_i32(int32_t value) noexcept {
@@ -130,12 +132,17 @@ size_t validation_block_top2_exp_rescan_count() {
 }
 #endif
 
-void ExpScanner::update_stripe_top2_exp(StripeState & stripe, int16_t exp) {
+void ExpScanner::update_stripe_top3_exp(StripeState & stripe, int16_t exp) {
     if (exp > stripe.e1) {
+        stripe.e3 = stripe.e2;
         stripe.e2 = stripe.e1;
         stripe.e1 = exp;
-    } else if (exp < stripe.e1 && exp > stripe.e2)
+    } else if (exp < stripe.e1 && exp > stripe.e2) {
+        stripe.e3 = stripe.e2;
         stripe.e2 = exp;
+    } else if (exp < stripe.e2 && exp > stripe.e3) {
+        stripe.e3 = exp;
+    }
 }
 
 std::vector<int32_t> WideQuantizer::quantize_block(const std::vector<float> & x, int16_t theta_b) {

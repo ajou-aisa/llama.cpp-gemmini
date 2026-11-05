@@ -66,7 +66,7 @@ Outcome run(const std::filesystem::path &directory, const char *name, const char
         weights[index].m = static_cast<int16_t>(index % 3);
         std::fill(std::begin(weights[index].qs), std::end(weights[index].qs), uint8_t{0x99});
     }
-    const ggml_type type = GGML_TYPE_Q4_HP1;
+    const ggml_type type = GGML_TYPE_MXINT4;
 #else
     std::vector<block_q8_hp1> weights(J * (K / 32));
     for (size_t index = 0; index < weights.size(); ++index) {
@@ -74,7 +74,7 @@ Outcome run(const std::filesystem::path &directory, const char *name, const char
         weights[index].m = static_cast<int16_t>(index % 3);
         std::fill(std::begin(weights[index].qs), std::end(weights[index].qs), int8_t{1});
     }
-    const ggml_type type = GGML_TYPE_Q8_HP1;
+    const ggml_type type = GGML_TYPE_MXINT8;
 #endif
     Outcome outcome;
     std::shared_ptr<evaluation::Session> session;

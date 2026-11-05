@@ -190,11 +190,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         // 38 is retired; do not reuse.
         LLAMA_FTYPE_MOSTLY_Q8_H2         = 39, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_Q8_HP1        = 40,
+        LLAMA_FTYPE_MOSTLY_MXINT8        = 40,
         LLAMA_FTYPE_MOSTLY_Q8_HP2        = 41,
         LLAMA_FTYPE_MOSTLY_Q8_CHANNEL    = 42,
         // 43 is retired; do not reuse.
-        LLAMA_FTYPE_MOSTLY_Q4_HP1        = 44,
+        LLAMA_FTYPE_MOSTLY_MXINT4        = 44,
         LLAMA_FTYPE_MOSTLY_Q16_0         = 45,
         LLAMA_FTYPE_MOSTLY_Q16_H1        = 46,
         LLAMA_FTYPE_MOSTLY_Q16_HP1       = 47,

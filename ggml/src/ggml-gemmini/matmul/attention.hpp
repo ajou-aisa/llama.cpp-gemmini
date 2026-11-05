@@ -13,6 +13,9 @@ struct AttentionMetrics {
 };
 
 bool attention_supported(const ggml_tensor * op);
+uint64_t attention_completed_nodes(ggml_gemmini_attention_role role);
+int attention_anchor();
+const char * attention_execution_backend();
 // Signed INT4/INT8 GEMMs use the post-array SCU and INT32 accumulation across K;
 // the host applies only radix weights and the final stripe/column scale.
 // Both output and metrics are published only after the whole node succeeds.
