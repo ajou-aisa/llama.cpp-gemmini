@@ -1295,7 +1295,7 @@ void ggml_compute_forward_add(
                 ggml_compute_forward_add_non_quantized(params, dst);
             } break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_HP1:
+        case GGML_TYPE_MXINT4:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4345,14 +4345,14 @@ void ggml_compute_forward_get_rows(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_HP1:
+        case GGML_TYPE_MXINT4:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_Q8_H2:
-        case GGML_TYPE_Q8_HP1:
+        case GGML_TYPE_MXINT8:
         case GGML_TYPE_Q8_HP2:
         case GGML_TYPE_Q16_0:
         case GGML_TYPE_Q16_H1:
@@ -4989,7 +4989,7 @@ void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_HP1:
+        case GGML_TYPE_MXINT4:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:

@@ -245,9 +245,11 @@ struct StripeState {
         std::numeric_limits<int16_t>::min(); // top-1 distinct exponent among all blocks in a stripe
     int16_t e2 =
         std::numeric_limits<int16_t>::min(); // top-2 distinct exponent among all blocks in a stripe
+    int16_t e3 =
+        std::numeric_limits<int16_t>::min(); // top-3 distinct exponent among all blocks in a stripe
     int16_t e_s = std::numeric_limits<int16_t>::min(); // final scale exponent of a stripe
     bool    promote_top_block =
-        false; // set by StripeFolding when e2 != -inf; promotes top-1 exponent blocks to outliers
+        false; // promotes every block above the selected stripe anchor to outliers
 
     BitMask       outlier_mask; // bitmask indicating outlier positions in a stripe
     StripeScratch scratch;
@@ -338,6 +340,7 @@ struct StripePipelineSlot {
         stripe.row_end           = 0;
         stripe.e1                = neg_inf;
         stripe.e2                = neg_inf;
+        stripe.e3                = neg_inf;
         stripe.e_s               = neg_inf;
         stripe.promote_top_block = false;
         stripe.outlier_mask.rows = 0;
@@ -380,6 +383,7 @@ struct StripePipelineSlot {
         stripe.row_end           = r1;
         stripe.e1                = neg_inf;
         stripe.e2                = neg_inf;
+        stripe.e3                = neg_inf;
         stripe.e_s               = neg_inf;
         stripe.promote_top_block = false;
         assert(stripe.outlier_mask.rows >= rows);

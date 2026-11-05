@@ -54,6 +54,14 @@ As the models are currently fully loaded into memory, you will need adequate dis
 
 Several quantization methods are supported. They differ in the resulting model disk size and inference speed.
 
+### MXINT4 and MXINT8
+
+Use the `MXINT4` or `MXINT8` selector with `llama-quantize`. Both use blocks of 32 values, a power-of-two scale selected from the block maximum, and nearest rounding with ties away from zero. Integer codes are symmetric: [-7, 7] for MXINT4 and [-127, 127] for MXINT8.
+
+These public names replace Q4_HP1 and Q8_HP1 without changing their GGUF type IDs (45 and 41), file-type IDs (44 and 40), or block layouts (24 and 40 bytes). Internal HP1 block and decoder symbols remain unchanged. Archived Q4_HP1 files may contain the old -8 code and are not certified MXINT weights despite sharing the numeric type ID; do not use them as MXINT models. Newly quantized MXINT4 files never emit -8. Q16_HP1 is unchanged.
+
+For conversion through the Microsoft reference, use `mxint-hp1.py` with an all-matrix `MXINT4` or `MXINT8` template matching `--bits 4` or `--bits 8`. The converter pins microsoft/microxcaling revision `7bc41952de394f5cc5e782baf132e7c7542eb4e4` and requires nearest/ties-away rounding; older ties-to-even conversion cannot be emitted as MXINT W/A.
+
 *(outdated)*
 
 | Model | Measure      |    F16 |   Q4_0 |   Q4_1 |   Q5_0 |   Q5_1 |   Q8_0 |

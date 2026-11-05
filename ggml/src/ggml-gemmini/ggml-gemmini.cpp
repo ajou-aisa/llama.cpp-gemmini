@@ -19,6 +19,9 @@
 #include <tuple>
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "ggml-gpu-cpu-exact.hpp"
+#endif
 #include "ggml-gemmini-config.hpp"
 #include "ggml-gemmini-buffer.hpp"
 #include "ggml-backend-impl.h"
@@ -63,6 +66,10 @@
 #endif
 
 #include "ops.hpp"
+#include "potal-sensitivity.hpp"
+#if defined(GGML_GEMMINI_CUDA_RTN)
+#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#endif
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
@@ -93,6 +100,9 @@ static const char * ggml_backend_gemmini_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_gemmini_free(ggml_backend_t backend) {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    ggml_cuda_hp1_scu_clear_weights();
+#endif
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     delete ctx;
     delete backend;
@@ -167,6 +177,37 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
             break;
         case GGML_OP_MUL_MAT: {
+            const bool collect = ggml::gemmini::sensitivity::profiling() || std::getenv("GGML_GEMMINI_ANCHOR_TRACE");
+            const auto sensitivity_start = collect ? ggml::gemmini::sensitivity::snapshot() : ggml::gemmini::sensitivity::Snapshot{};
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            const auto * weight = node->src[0];
+            if (gemmini_gpu::enabled() && ggml_hp1_scu_enabled() && weight && weight->data &&
+                (weight->type == GGML_TYPE_MXINT4 || weight->type == GGML_TYPE_MXINT8) && ggml_is_contiguous(weight)) {
+                const auto * storage = weight;
+                while (!storage->buffer && storage->view_src) storage = storage->view_src;
+                if (ggml::gemmini::is_gemmini_buffer(storage->buffer) &&
+                    ggml_backend_buffer_get_usage(storage->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                    ggml_cuda_hp1_scu_cache_weights(weight->data,ggml_nbytes(weight));
+            }
+#endif
+#if defined(GGML_GEMMINI_CUDA_RTN)
+            if (ggml_cuda_rtn_enabled()) {
+                if (!ggml_cuda_rtn_compute(node)) {
+                    GGML_LOG_ERROR("CUDA RTN failed: %s\n", ggml_cuda_rtn_error());
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            }
+#endif
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+            if (gemmini_gpu::attention_supported(node)) {
+                if (!gemmini_gpu::attention(node)) {
+                    GGML_LOG_ERROR("%s attention failed: %s\n",gemmini_gpu::backend,gemmini_gpu::attention_error());
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            }
+#endif
 #if LOG_DUMP
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
             ggml::gemmini::log::dump_set_node_idx(node_idx);
@@ -185,6 +226,13 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             } else {
                 ggml_backend_gemmini_mul_mat(ctx, node);
             }
+            if (collect) ggml::gemmini::sensitivity::observe(node, sensitivity_start, [&] {
+                if (ggml_gemmini_get_attention_role(node) != GGML_GEMMINI_ATTENTION_NONE) {
+                    ggml::gemmini::AttentionMetrics shadow_metrics;
+                    if (ggml::gemmini::attention_execute(node, shadow_metrics) != ggml::gemmini::rmd::RmdStatus::success)
+                        throw std::runtime_error("PoTal sensitivity attention replay failed");
+                } else ggml_backend_gemmini_mul_mat(ctx, node);
+            });
 #if CYCLE_SIM
             if (cycle_sim_context)
                 cycle_sim_context.session->ensure_healthy();

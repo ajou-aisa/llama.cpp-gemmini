@@ -196,6 +196,58 @@ bool quantize(const ggml_tensor * src, ggml_gemmini_args_t & args) {
     return true;
 }
 
+bool quantize_mxint(const ggml_tensor * src, ggml_gemmini_args_t & args) {
+    if (src == nullptr || src->type != GGML_TYPE_F32 || !args.A.valid() ||
+        (args.A.bits != 4 && args.A.bits != 8) || args.I == 0 || args.K == 0 ||
+        args.K % kGroupSize != 0 || !args.activation_quant_geometry().ok())
+        return false;
+
+    auto * meta = std::get_if<Meta>(&args.act_quant.storage());
+    const float * data = ggml::gemmini::activation_data(src);
+    if (meta == nullptr || data == nullptr)
+        return false;
+
+    const size_t blocks_per_row = args.K / kGroupSize;
+    size_t scale_count = 0;
+    if (!checked_mul_size(args.I, blocks_per_row, scale_count))
+        return false;
+    meta->reset();
+    meta->run_id = next_block_run_id();
+    meta->rows = args.I;
+    meta->cols = args.K;
+    meta->scales.resize(scale_count);
+
+    const int32_t limit = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t block = 0; block < blocks_per_row; ++block) {
+            const size_t begin = row * args.K + block * kGroupSize;
+            float amax = 0.0f;
+            for (size_t lane = 0; lane < kGroupSize; ++lane) {
+                const float value = data[begin + lane];
+                if (!std::isfinite(value))
+                    return false;
+                amax = std::max(amax, std::fabs(value));
+            }
+            const float scale = amax == 0.0f
+                                    ? 1.0f
+                                    : std::ldexp(1.0f, std::max(-127, std::ilogb(amax)) -
+                                                           (args.A.bits - 2));
+            if (!std::isfinite(scale) || scale <= 0.0f)
+                return false;
+            meta->scales[row * blocks_per_row + block] = scale;
+            for (size_t lane = 0; lane < kGroupSize; ++lane) {
+                const double scaled = static_cast<double>(data[begin + lane]) / scale;
+                const int32_t code = scaled <= -limit ? -limit
+                                   : scaled >= limit ? limit
+                                                     : static_cast<int32_t>(std::round(scaled));
+                if (!args.A.set(row, block * kGroupSize + lane, code))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool dequantize_activation(float *                     dst,
                            size_t                      dst_row_stride,
                            size_t                      dst_col_stride,

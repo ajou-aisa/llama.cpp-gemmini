@@ -91,8 +91,8 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     }
 }
 
-// PoTal block scale rule for n-bit HP1 data: theta = ilogb(amax) - rho, rho = n - 2.
-// Q4_HP1: rho = 2 (Q8_HP1 uses 6, Q16_HP1 uses 14; same table in src/llama-quant.cpp).
+// Block32 MXINT scale rule: theta = ilogb(amax) - rho, rho = n - 2.
+// MXINT4: rho = 2 (MXINT8 uses 6, Q16_HP1 uses 14; same table in src/llama-quant.cpp).
 static inline int q4_hp1_block_exponent(float amax) {
     return ilogbf(amax) - 2;
 }
@@ -154,8 +154,8 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) (block_exponent - channel_exponent);
         for (int j = 0; j < QK4_HP/2; ++j) {
-            const int q0 = MIN(7, MAX(-8, (int) roundf(x[i*QK4_HP + j] / block_scale)));
-            const int q1 = MIN(7, MAX(-8, (int) roundf(x[i*QK4_HP + QK4_HP/2 + j] / block_scale)));
+            const int q0 = MIN(7, MAX(-7, (int) roundf(x[i*QK4_HP + j] / block_scale)));
+            const int q1 = MIN(7, MAX(-7, (int) roundf(x[i*QK4_HP + QK4_HP/2 + j] / block_scale)));
             y[i].qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
         }
     }
@@ -2359,7 +2359,7 @@ size_t quantize_q4_hp1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         }
     }
 
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_HP1, n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXINT4, n_per_row);
     char * qrow = (char *) dst;
     for (int64_t row = 0; row < nrow; ++row) {
         if (!quantize_row_q4_hp1_ref(src + row*n_per_row, (block_q4_hp1 *) qrow, n_per_row)) {
@@ -2578,7 +2578,7 @@ size_t quantize_q8_hp1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         }
     }
 
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_HP1, n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXINT8, n_per_row);
     char * qrow = (char *) dst;
     for (int64_t row = 0; row < nrow; ++row) {
         if (!quantize_row_q8_hp1_ref(src + row*n_per_row, (block_q8_hp1 *) qrow, n_per_row)) {
@@ -5650,7 +5650,7 @@ static bool validate_q8_hp_block(
     }
 
     if (channel_scale == 0.0f ||
-        (type == GGML_TYPE_Q8_HP1 && m < 0) ||
+        (type == GGML_TYPE_MXINT8 && m < 0) ||
         (type == GGML_TYPE_Q8_HP2 && (m < -6 || m > 8))) {
         fprintf(stderr, "ggml_validate_row_data: invalid signed m at block %zu\n", i);
         return false;
@@ -5828,7 +5828,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
             } break;
-        case GGML_TYPE_Q4_HP1:
+        case GGML_TYPE_MXINT4:
             {
                 const block_q4_hp1 * q = (const block_q4_hp1 *) data;
                 for (size_t i = 0; i < nb; ++i) {
@@ -5862,7 +5862,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     }
                 }
             } break;
-        case GGML_TYPE_Q8_HP1:
+        case GGML_TYPE_MXINT8:
             {
                 // Ponytail: per-call validation intentionally skipped — the upstream
                 // loader already produced and cached OK weights; re-validating per
@@ -5873,7 +5873,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_Q8_HP2:
             {
-                // Ponytail: same as Q8_HP1 — see comment above.
+                // Ponytail: same as MXINT8 — see comment above.
                 (void) data;
                 (void) nb;
             } break;

@@ -1,5 +1,6 @@
 llama_add_compile_flags()
 add_compile_definitions(GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE})
+add_compile_definitions(GGML_GEMMINI_EXSIA_STRIPE_ANCHOR=${GGML_GEMMINI_EXSIA_STRIPE_ANCHOR})
 
 add_executable(test-cycle-sim-reader test-cycle-sim-reader.cpp)
 target_compile_definitions(test-cycle-sim-reader PRIVATE LOG_CYCLE=${LOG_CYCLE} CYCLE_SIM=${CYCLE_SIM})
@@ -514,6 +515,8 @@ list(INSERT _GEMMINI_TEST_WORKER_SOURCES 6
 # Direct backend symbols require a linkable backend, not a dlopen MODULE.
 if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
+    add_test(NAME gemmini_mxint_weight_routes_activation
+        COMMAND $<TARGET_FILE:gemmini_weight_formats> --case=mxint-graph)
     target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
     target_compile_definitions(gemmini_weight_formats PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
@@ -1713,4 +1716,34 @@ if (GGML_POTAL)
                  COMMAND potal-gguf-load-test ${CMAKE_CURRENT_SOURCE_DIR}/../models/gpt2/gpt2.Q8_HP1.gguf)
         set_property(TEST potal-gguf-load-test PROPERTY SKIP_RETURN_CODE 77)
     endif()
+endif()
+
+# CUDA kernels used by the opt-in Gemmini host-graph path.
+if (GGML_GEMMINI_CUDA_CPU_EXACT)
+    foreach(_target test-cuda-cpu-exact-graph test-cuda-hp1-scu test-cuda-potal-attention test-potal-sensitivity)
+        add_executable(${_target} ${_target}.cpp)
+        target_compile_features(${_target} PRIVATE cxx_std_17)
+        target_compile_definitions(${_target} PRIVATE ${GGML_GEMMINI_COMPILE_DEFS}
+            TEST_CPU_EXACT_FLOAT=0
+            TEST_CPU_EXACT_HP1=$<STREQUAL:${GGML_GEMMINI_ACTIVATION_QUANT},EXSIA>
+            EVALUATION_EXACT_COMPUTE="${GGML_GEMMINI_COMPUTE_TYPE}"
+            EVALUATION_EXACT_ACTIVATION="${GGML_GEMMINI_ACTIVATION_QUANT}"
+            EVALUATION_EXACT_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+            EVALUATION_EXACT_DIM=${GGML_GEMMINI_DIM})
+        target_include_directories(${_target} PRIVATE ../ggml/src/ggml-gemmini ../ggml/src)
+        target_link_libraries(${_target} PRIVATE common ggml ggml-gemmini
+            ggml-gemmini-cuda-cpu-exact ggml-cpu ggml-base ggml-gemmini-utils)
+        add_test(NAME ${_target} COMMAND ${_target})
+    endforeach()
+    add_test(NAME test-potal-sensitivity-invalid COMMAND test-potal-sensitivity 4)
+    add_test(NAME test-cuda-hp1-scu-graph
+        COMMAND ${CMAKE_COMMAND} -E env GGML_GEMMINI_HP1_SCU=1 $<TARGET_FILE:test-cuda-cpu-exact-graph>)
+endif()
+if (GGML_GEMMINI_CUDA_RTN OR GGML_GEMMINI_CUDA_RTN_ATTENTION)
+    add_executable(test-cuda-rtn test-cuda-rtn.cpp)
+    target_compile_features(test-cuda-rtn PRIVATE cxx_std_17)
+    target_compile_options(test-cuda-rtn PRIVATE -fno-fast-math -ffp-contract=off)
+    target_include_directories(test-cuda-rtn PRIVATE ../ggml/src)
+    target_link_libraries(test-cuda-rtn PRIVATE ggml-cuda-rtn ggml-base)
+    add_test(NAME test-cuda-rtn COMMAND test-cuda-rtn)
 endif()

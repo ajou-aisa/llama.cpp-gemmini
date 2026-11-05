@@ -1,0 +1,96 @@
+{
+  "dataset": "wikitext-2-raw/wiki.test.raw",
+  "jobs": [
+    {
+      "id": "llama-top3-n4-both",
+      "kind": "potal",
+      "family": "llama3.2-1B",
+      "bits": 4,
+      "weight_bits": 4,
+      "anchor": 3,
+      "attention_scope": "both",
+      "full_chunks": 564,
+      "model": "models/llama_base/llama3.2-1B.MXINT4_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top3-a4/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "qwen-top3-n8-both",
+      "kind": "potal",
+      "family": "qwen2-0.5B",
+      "bits": 8,
+      "weight_bits": 8,
+      "anchor": 3,
+      "attention_scope": "both",
+      "full_chunks": 584,
+      "model": "models/qwen_base/qwen2-0.5B.MXINT8_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top3-a8/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "llama-top3-n8-both",
+      "kind": "potal",
+      "family": "llama3.2-1B",
+      "bits": 8,
+      "weight_bits": 8,
+      "anchor": 3,
+      "attention_scope": "both",
+      "full_chunks": 564,
+      "model": "models/llama_base/llama3.2-1B.MXINT8_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top3-a8/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "qwen-top2-n4-both",
+      "kind": "potal",
+      "family": "qwen2-0.5B",
+      "bits": 4,
+      "weight_bits": 4,
+      "anchor": 2,
+      "attention_scope": "both",
+      "full_chunks": 584,
+      "model": "models/qwen_base/qwen2-0.5B.MXINT4_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top2-a4/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "llama-top2-n4-both",
+      "kind": "potal",
+      "family": "llama3.2-1B",
+      "bits": 4,
+      "weight_bits": 4,
+      "anchor": 2,
+      "attention_scope": "both",
+      "full_chunks": 564,
+      "model": "models/llama_base/llama3.2-1B.MXINT4_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top2-a4/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "qwen-top2-n8-both",
+      "kind": "potal",
+      "family": "qwen2-0.5B",
+      "bits": 8,
+      "weight_bits": 8,
+      "anchor": 2,
+      "attention_scope": "both",
+      "full_chunks": 584,
+      "model": "models/qwen_base/qwen2-0.5B.MXINT8_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top2-a8/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    },
+    {
+      "id": "llama-top2-n8-both",
+      "kind": "potal",
+      "family": "llama3.2-1B",
+      "bits": 8,
+      "weight_bits": 8,
+      "anchor": 2,
+      "attention_scope": "both",
+      "full_chunks": 564,
+      "model": "models/llama_base/llama3.2-1B.MXINT8_RNE.HP1.gguf",
+      "binary": "/home/mojoi/build/potal-attention-cuda-top2-a8/bin/llama-perplexity",
+      "cuda_architectures": "86"
+    }
+  ]
+}

@@ -299,9 +299,9 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q4_HP1 &&
+            else if (new_type != GGML_TYPE_MXINT4 &&
                      new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H2 &&
-                     new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL &&
+                     new_type != GGML_TYPE_MXINT8 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL &&
                      new_type != GGML_TYPE_Q16_0 && new_type != GGML_TYPE_Q16_H1 && new_type != GGML_TYPE_Q16_HP1) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -549,8 +549,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
 }
 
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
-    const bool is_hp = new_type == GGML_TYPE_Q4_HP1 ||
-                       new_type == GGML_TYPE_Q8_HP1 ||
+    const bool is_hp = new_type == GGML_TYPE_MXINT4 ||
+                       new_type == GGML_TYPE_MXINT8 ||
                        new_type == GGML_TYPE_Q8_HP2 ||
                        new_type == GGML_TYPE_Q16_HP1;
     const size_t expected_size = (size_t) nrows * ggml_row_size(new_type, n_per_row);
@@ -620,13 +620,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     switch (params->ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: default_type = GGML_TYPE_Q4_0; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_HP1: default_type = GGML_TYPE_Q4_HP1; break;
+        case LLAMA_FTYPE_MOSTLY_MXINT4: default_type = GGML_TYPE_MXINT4; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: default_type = GGML_TYPE_Q4_1; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0: default_type = GGML_TYPE_Q5_0; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0: default_type = GGML_TYPE_Q8_0; break;
         case LLAMA_FTYPE_MOSTLY_Q8_H2: default_type = GGML_TYPE_Q8_H2; break;
-        case LLAMA_FTYPE_MOSTLY_Q8_HP1: default_type = GGML_TYPE_Q8_HP1; break;
+        case LLAMA_FTYPE_MOSTLY_MXINT8: default_type = GGML_TYPE_MXINT8; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP2: default_type = GGML_TYPE_Q8_HP2; break;
         case LLAMA_FTYPE_MOSTLY_Q8_CHANNEL: default_type = llama_quantize_default_type_for_ftype(ftype); break;
         case LLAMA_FTYPE_MOSTLY_Q16_0: default_type = GGML_TYPE_Q16_0; break;
@@ -1055,8 +1055,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
 
             const int64_t n_per_row = tensor->ne[0];
-            if (new_type == GGML_TYPE_Q4_HP1 ||
-                new_type == GGML_TYPE_Q8_HP1 ||
+            if (new_type == GGML_TYPE_MXINT4 ||
+                new_type == GGML_TYPE_MXINT8 ||
                 new_type == GGML_TYPE_Q8_HP2 ||
                 new_type == GGML_TYPE_Q16_HP1) {
                 const int64_t block_size = ggml_blck_size(new_type);
@@ -1076,8 +1076,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         row_amax = std::max(row_amax, std::fabs(value));
                     }
                     if (new_type != GGML_TYPE_Q8_HP2) {
-                        const int rho = new_type == GGML_TYPE_Q4_HP1 ? 2 :
-                                        new_type == GGML_TYPE_Q8_HP1 ? 6 : 14;
+                        const int rho = new_type == GGML_TYPE_MXINT4 ? 2 :
+                                        new_type == GGML_TYPE_MXINT8 ? 6 : 14;
                         for (int64_t block = 0; block < n_per_row; block += block_size) {
                             float block_amax = 0.0f;
                             for (int64_t column = 0; column < block_size; ++column) {

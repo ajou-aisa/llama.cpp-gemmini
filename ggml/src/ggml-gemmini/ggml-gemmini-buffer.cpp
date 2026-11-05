@@ -2,6 +2,12 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#endif
+#if defined(GGML_GEMMINI_CUDA_RTN) || defined(GGML_GEMMINI_CUDA_RTN_ATTENTION)
+#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -60,6 +66,15 @@ void gemmini_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    // Host addresses may be reused while the backend remains alive.
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        ggml_cuda_hp1_scu_clear_weights();
+#endif
+#if defined(GGML_GEMMINI_CUDA_RTN) || defined(GGML_GEMMINI_CUDA_RTN_ATTENTION)
+        ggml_cuda_rtn_clear();
+#endif
+    }
     delete context;
     buffer->context = nullptr;
 }

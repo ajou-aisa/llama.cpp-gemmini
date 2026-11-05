@@ -2085,10 +2085,10 @@ class GGMLQuantizationType(IntEnum):
     TQ1_0   = 34
     TQ2_0   = 35
     Q8_H2   = 40
-    Q8_HP1  = 41
+    MXINT8  = 41
     Q8_HP2  = 42
     Q8_CHANNEL = 43
-    Q4_HP1  = 45
+    MXINT4  = 45
     Q16_0   = 46
     Q16_H1  = 47
     Q16_HP1 = 48
@@ -2145,10 +2145,10 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ1_0         = 36  # except 1d tensors
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_Q8_H2         = 39  # except 1d tensors
-    MOSTLY_Q8_HP1        = 40
+    MOSTLY_MXINT8        = 40
     MOSTLY_Q8_HP2        = 41
     MOSTLY_Q8_CHANNEL    = 42
-    MOSTLY_Q4_HP1        = 44
+    MOSTLY_MXINT4        = 44
     MOSTLY_Q16_0         = 45
     MOSTLY_Q16_H1        = 46
     MOSTLY_Q16_HP1       = 47
@@ -2214,10 +2214,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q8_0:    (32, 2 + 32),
     GGMLQuantizationType.Q8_1:    (32, 4 + 4 + 32),
     GGMLQuantizationType.Q8_H2:   (32, 40),
-    GGMLQuantizationType.Q8_HP1:  (32, 40),
+    GGMLQuantizationType.MXINT8:  (32, 40),
     GGMLQuantizationType.Q8_HP2:  (32, 40),
     GGMLQuantizationType.Q8_CHANNEL: (1, 1),
-    GGMLQuantizationType.Q4_HP1:  (32, 24),
+    GGMLQuantizationType.MXINT4:  (32, 24),
     GGMLQuantizationType.Q16_0:   (32, 66),
     GGMLQuantizationType.Q16_H1:  (32, 76),
     GGMLQuantizationType.Q16_HP1: (32, 72),

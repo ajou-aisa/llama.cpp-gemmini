@@ -252,7 +252,7 @@ void prepare_activation(const ggml_tensor & tensor, size_t head, size_t batch, s
                                             , sample
 #endif
                                             ));
-                scanner.update_stripe_top2_exp(top, exponents[i * blocks + block]);
+                scanner.update_stripe_top3_exp(top, exponents[i * blocks + block]);
             }
         }
         const int16_t anchor = top.e2 != zero_exp ? top.e2 : top.e1 != zero_exp ? top.e1 : 0;

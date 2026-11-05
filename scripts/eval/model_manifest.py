@@ -6,8 +6,8 @@
 # How to run:
 #   python3 -B scripts/eval/model_manifest.py create --hf-dir models/gpt2/hf --hf-repo openai-community/gpt2 \
 #     --hf-revision SHA --f16 models/gpt2/gpt2.fp16.gguf --convert-argv '...' --converter-python .venv/bin/python \
-#     --quantizer build-arm64/bin/llama-quantize --quantized Q8_HP1=models/gpt2/gpt2.Q8_HP1.gguf --output model-manifest.json
-#   python3 -B scripts/eval/model_manifest.py verify --manifest model-manifest.json --model models/gpt2/gpt2.Q8_HP1.gguf
+#     --quantizer build-arm64/bin/llama-quantize --quantized MXINT8=models/gpt2/gpt2.MXINT8.gguf --output model-manifest.json
+#   python3 -B scripts/eval/model_manifest.py verify --manifest model-manifest.json --model models/gpt2/gpt2.MXINT8.gguf
 """Host-local model provenance: upstream checkpoint, conversion, quantization and GGUF identity of every artifact.
 
 A manifest freezes the model identity that performance and metric runs must share. It records how the files were

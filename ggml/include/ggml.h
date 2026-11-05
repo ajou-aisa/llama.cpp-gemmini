@@ -390,11 +390,12 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         // 39 is retired; do not reuse.
         GGML_TYPE_Q8_H2   = 40,
-        GGML_TYPE_Q8_HP1  = 41,
+        GGML_TYPE_MXINT8  = 41,
+        GGML_TYPE_Q8_HP1  = GGML_TYPE_MXINT8, // PoTal name of the same type (same block_q8_hp1 layout)
         GGML_TYPE_Q8_HP2  = 42,
         GGML_TYPE_Q8_CHANNEL = 43,
         // 44 is retired; do not reuse.
-        GGML_TYPE_Q4_HP1     = 45,
+        GGML_TYPE_MXINT4     = 45,
         GGML_TYPE_Q16_0      = 46,
         GGML_TYPE_Q16_H1     = 47,
         GGML_TYPE_Q16_HP1    = 48,

@@ -152,6 +152,34 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+option(GGML_GEMMINI_CUDA_CPU_EXACT           "ggml: CUDA A4/A8 compute inside the Gemmini CPU graph" OFF)
+option(GGML_GEMMINI_CUDA_RTN                 "ggml: CUDA RTN and FP16 matmuls inside the host graph" OFF)
+option(GGML_GEMMINI_CUDA_RTN_ATTENTION       "ggml: baseline CUDA FP attention with CPU-exact HP1 GEMM" OFF)
+if (GGML_GEMMINI_CUDA_RTN_ATTENTION AND NOT GGML_GEMMINI_CUDA_CPU_EXACT)
+    message(FATAL_ERROR "RTN attention reuse requires GGML_GEMMINI_CUDA_CPU_EXACT=ON")
+endif()
+if (GGML_GEMMINI_CUDA_RTN)
+    if (NOT GGML_GEMMINI OR GGML_GEMMINI_CUDA_CPU_EXACT OR GGML_CUDA OR GGML_METAL OR
+        GGML_BACKEND_DL OR GGML_GEMMINI_ENABLE_RMD OR GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+        message(FATAL_ERROR "CUDA RTN requires Gemmini, compensation/PoTal attention OFF, and other GPU backends OFF")
+    endif()
+endif()
+if (GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (NOT GGML_GEMMINI OR GGML_METAL OR GGML_CUDA OR GGML_BACKEND_DL)
+        message(FATAL_ERROR "CPU-exact CUDA requires GGML_GEMMINI=ON and other GPU backends and BACKEND_DL=OFF")
+    endif()
+    if (NOT GGML_GEMMINI_OPTION STREQUAL "CPU" OR CYCLE_SIM OR
+        NOT GGML_GEMMINI_COMPUTE_TYPE STREQUAL "INT" OR
+        NOT GGML_GEMMINI_ACTIVATION_BITS MATCHES "^(4|8)$" OR
+        NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL GGML_GEMMINI_WEIGHT_BITS)
+        message(FATAL_ERROR "CPU-exact CUDA supports CPU, CYCLE_SIM=OFF and matched INT A4W4/A8W8 profiles")
+    endif()
+    if (NOT GGML_GEMMINI_ACTIVATION_QUANT MATCHES "^(BLOCK|EXSIA)$" OR
+        NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" OR GGML_GEMMINI_DEQUANT_FP_TEST OR
+        (GGML_GEMMINI_ACTIVATION_QUANT STREQUAL "BLOCK" AND GGML_GEMMINI_ENABLE_RMD))
+        message(FATAL_ERROR "CPU-exact CUDA requires CPU-direct BLOCK (RMD OFF) or EXSIA, HARDWARE dispatch and DEQUANT_FP_TEST=OFF")
+    endif()
+endif()
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
