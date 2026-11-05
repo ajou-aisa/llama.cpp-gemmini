@@ -39,6 +39,54 @@ def active_seconds(status, execution):
     return max(0, time.time() - status['started_at'])
 
 
+def upstream_nvfp4_line(output: Path, public_fp32: bool = False) -> str | None:
+    folder = 'nvfp4-public-fp32' if public_fp32 else 'nvfp4-llama-policy'
+    status = read(output / folder / 'status.json')
+    if not status:
+        return None
+    parts = []
+    for name, entry in status.get('runs', {}).items():
+        state = entry['state']
+        if state not in ('DONE', 'FAILED') and not queue.alive(status):
+            state = 'FAILED'
+        detail = state
+        if state == 'DONE':
+            result = read(output / folder / name.lower() / 'result.json')
+            try:
+                checked = verify_upstream_result(output, name, entry['chunks'], public_fp32)
+                queue.require(result.get('ppl') == checked['ppl'], 'Native result differs from log')
+                detail = f'DONE {checked["chunks"]}/{entry["chunks"]} PPL={checked["ppl"]:.4f}'
+            except (OSError, ValueError, KeyError, RuntimeError):
+                detail = 'INVALID'
+        elif state == 'RUNNING':
+            try:
+                text = Path(entry['log']).read_text(errors='replace')
+            except OSError:
+                text = ''
+            rows = re.findall(r'^\s*(\d+)\s+([\d.eE+-]+)\s+[\d.eE+-]+\s+[\d.eE+-]+\s*$', text, re.M)
+            alive = queue.alive(entry)
+            detail = 'RUNNING' if alive else 'VERIFYING' if 'Final estimate:' in text else 'STOPPED'
+            if rows:
+                detail += f' {len(rows)}/{entry["chunks"]} PPL={rows[-1][1]}*'
+        parts.append(f'{name} {detail}')
+    label = 'NVFP4 public W4/A4 FP32: ' if public_fp32 else 'NVFP4 upstream llama policy: '
+    return label + ' | '.join(parts)
+
+
+def verify_upstream_result(output: Path, name: str, chunks: int, public_fp32: bool = False):
+    file = 'public-nvfp4-ppl.py' if public_fp32 else 'upstream-nvfp4-ppl.py'
+    folder = 'nvfp4-public-fp32' if public_fp32 else 'nvfp4-llama-policy'
+    spec = importlib.util.spec_from_file_location('native_nvfp4', Path(__file__).with_name(file))
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses resolves annotations through the module registry.
+    import sys
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    directory = output / folder / name.lower()
+    queue.require((directory / 'exit-status.txt').read_text().strip() == '0', 'Native run failed')
+    return module.verify(directory / 'ppl.log', chunks)
+
+
 def show(output, config):
     plan = read(output / 'plan.json') or read(config)
     status = read(output / 'status.json')
@@ -130,6 +178,12 @@ def show(output, config):
                 state = 'INVALID'
         print(f'{job["id"]:<27} {job["bits"]}/{job.get("weight_bits", job["bits"]):<3} {state:<11} {count:>9} {ppl:>11} {elapsed:>9} {eta:>9}')
     print(f'\nCompleted: {done}/{len(plan.get("jobs", []))} full runs. * = partial cumulative PPL.')
+    extra = upstream_nvfp4_line(output)
+    if extra:
+        print(extra)
+    public = upstream_nvfp4_line(output, public_fp32=True)
+    if public:
+        print(public)
     print('Ctrl+C closes this monitor only. No inference is started by this program.')
 
 
