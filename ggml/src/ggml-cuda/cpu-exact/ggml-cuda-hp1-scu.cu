@@ -37,6 +37,10 @@ struct runtime {
     std::mutex mutex;
     buffer a, w, offsets, events, c, counters;
     buffer packed_a, packed_w, exponents, fragments;
+    // One prepared immutable tile, held in the existing scratch buffers.
+    // Rows do not affect the packed weight layout; columns, K and width do.
+    const void * prepared_weights = nullptr;
+    unsigned prepared_cols = 0, prepared_k = 0, prepared_bits = 0, prepared_error = 0;
     std::map<uintptr_t,std::unique_ptr<buffer>> weights;
     size_t weight_bytes = 0;
     uint64_t weight_hits = 0;
@@ -56,8 +60,12 @@ const void * cached_weights(runtime & s, const void * source, size_t bytes) {
     ++s.weight_hits;
     return static_cast<const uint8_t *>(entry->second->p)+offset;
 }
-const void * device_weights(runtime & s, const void * source, size_t bytes) {
-    if (const auto * p = cached_weights(s,source,bytes)) return p;
+const void * device_weights(runtime & s, const void * source, size_t bytes, bool * immutable = nullptr) {
+    if (const auto * p = cached_weights(s,source,bytes)) {
+        if (immutable) *immutable = true;
+        return p;
+    }
+    if (immutable) *immutable = false;
     s.w.upload(source,bytes);
     return s.w.p;
 }
@@ -127,18 +135,25 @@ __global__ void accumulate_fragments(const int32_t * dots, const int * exponents
     if (adds) atomicAdd(&stats->adds,adds);
 }
 
-void gemm_main(runtime & s, const void * weights, unsigned rows, unsigned cols, unsigned k, unsigned bits) {
+unsigned gemm_main(runtime & s, const void * weights, unsigned rows, unsigned cols, unsigned k, unsigned bits,
+    bool immutable) {
     s.prepare_gemm();
     const unsigned pr = (rows+15)/16*16, pc = (cols+15)/16*16, blocks = k/32;
+    const bool prepared = immutable && s.prepared_weights == weights &&
+        s.prepared_cols == cols && s.prepared_k == k && s.prepared_bits == bits;
+    // Invalidate before any allocation or write can replace the cached layout.
+    if (!prepared) s.prepared_weights = nullptr;
     s.packed_a.reserve(size_t(pr)*k);
-    s.packed_w.reserve(size_t(pc)*k);
-    s.exponents.reserve(size_t(pc)*blocks*sizeof(int));
     s.fragments.reserve(size_t(pr)*pc*blocks*sizeof(int32_t));
     pack_activation_blocks<<<unsigned((size_t(pr)*k+255)/256),256>>>(
         static_cast<const int32_t *>(s.a.p),static_cast<int8_t *>(s.packed_a.p),rows,pr,k);
-    pack_weight_blocks<<<unsigned((size_t(pc)*k+255)/256),256>>>(
-        static_cast<const uint8_t *>(weights),static_cast<int8_t *>(s.packed_w.p),
-        static_cast<int *>(s.exponents.p),cols,pc,k,bits,static_cast<device_stats *>(s.counters.p),true);
+    if (!prepared) {
+        s.packed_w.reserve(size_t(pc)*k);
+        s.exponents.reserve(size_t(pc)*blocks*sizeof(int));
+        pack_weight_blocks<<<unsigned((size_t(pc)*k+255)/256),256>>>(
+            static_cast<const uint8_t *>(weights),static_cast<int8_t *>(s.packed_w.p),
+            static_cast<int *>(s.exponents.p),cols,pc,k,bits,static_cast<device_stats *>(s.counters.p),true);
+    }
     check(cudaGetLastError());
     const int32_t alpha = 1, beta = 0;
     check(cublasGemmStridedBatchedEx(s.blas,CUBLAS_OP_T,CUBLAS_OP_N,pc,pr,32,&alpha,
@@ -149,6 +164,7 @@ void gemm_main(runtime & s, const void * weights, unsigned rows, unsigned cols, 
     accumulate_fragments<<<unsigned((size_t(rows)*cols+255)/256),256>>>(
         static_cast<const int32_t *>(s.fragments.p),static_cast<const int *>(s.exponents.p),
         static_cast<int32_t *>(s.c.p),rows,cols,pr,pc,blocks,static_cast<device_stats *>(s.counters.p));
+    return prepared ? s.prepared_error : 0;
 }
 
 // DIM=B_K=32: each dp4a reduction is one hardware fragment. Preserve K order.
@@ -290,6 +306,7 @@ void ggml_cuda_hp1_scu_clear_weights() {
     if (!s.weights.empty()) std::fprintf(stderr,"HP1_SCU_WEIGHT_CACHE bytes=%zu tensors=%zu hits=%llu\n",
         s.weight_bytes,s.weights.size(),static_cast<unsigned long long>(s.weight_hits));
     s.weights.clear(); s.weight_bytes = 0; s.weight_hits = 0;
+    s.prepared_weights = nullptr;
 }
 const char * ggml_cuda_hp1_scu_error() { return error_text.c_str(); }
 ggml_hp1_scu_stats ggml_cuda_hp1_scu_stats() {
@@ -304,17 +321,29 @@ bool ggml_cuda_hp1_scu_main(const int32_t * a,const void * w,unsigned bits,
         const int limit=1 << (bits-1);
         for (size_t i=0;i<rows*k;++i) require(a[i]>=-limit && a[i]<limit,"Main code exceeds operand width");
         s.a.upload(a,rows*k*sizeof(*a));
-        const void * weights = device_weights(s,w,cols*(k/32)*(bits==4?24:40));
+        bool immutable = false;
+        const void * weights = device_weights(s,w,cols*(k/32)*(bits==4?24:40),&immutable);
         s.c.reserve(rows*cols*sizeof(*out)); s.counters.reserve(sizeof(device_stats));
         check(cudaMemset(s.counters.p,0,sizeof(device_stats)));
-        if (rows >= 8 && cols >= 16) {
-            gemm_main(s,weights,rows,cols,k,bits);
+        const bool gemm = rows >= 8 && cols >= 16;
+        unsigned validation_error = 0;
+        if (gemm) {
+            validation_error = gemm_main(s,weights,rows,cols,k,bits,immutable);
         } else {
             main_kernel<<<dim3((cols+15)/16,(rows+7)/8),dim3(16,8)>>>(
                 static_cast<int32_t *>(s.a.p),static_cast<const uint8_t *>(weights),static_cast<int32_t *>(s.c.p),
                 rows,cols,k,bits,static_cast<device_stats *>(s.counters.p));
         }
-        const auto st=finish(s);
+        auto st=finish(s);
+        // Packing only writes the metadata error flag. Replay it on every hit,
+        // including invalid inputs; saturation/fragment counters still run anew.
+        st.error |= validation_error;
+        if (gemm && immutable) {
+            // Publish only after finish has synchronized all preparation work.
+            s.prepared_weights = weights;
+            s.prepared_cols = cols; s.prepared_k = k; s.prepared_bits = bits;
+            s.prepared_error = st.error;
+        }
         require(!st.error,"Invalid HP1 carrier metadata");
         check(cudaMemcpy(out,s.c.p,rows*cols*sizeof(*out),cudaMemcpyDeviceToHost));
         ++s.totals.main_launches; s.totals.main_fragments+=st.fragments;

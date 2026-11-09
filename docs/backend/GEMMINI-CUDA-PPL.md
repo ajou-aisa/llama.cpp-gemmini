@@ -14,7 +14,8 @@ not a new optimized implementation.
 
 The historical PoTal runs used DIM=BK=32 and the Gemmini stripe geometry. Their default anchor
 is TOP2; TOP3 is a build option. The original separate main/residual FP scaling
-and FP32 merge are retained. The SCU kernels do not use Tensor Cores. Activation
+and FP32 merge are retained. Larger main dots use batched INT8 GEMM; SCU shifts,
+ordered saturation and residual reconstruction remain explicit. Activation
 preparation and the final merge remain on the CPU. Perplexity emits CUDA coverage
 and saturation proofs; its NLL reduction uses a deterministic token order.
 
@@ -49,13 +50,57 @@ It never launches model inference. Builds use one worker by default (`--jobs N`
 changes this). Logs are under `build-potal-cuda/<profile>/` as `configure.log`,
 `build.log`, and `verification.log`.
 
+For a compiler-only check while another job owns the GPU, add `--build-only`.
+This builds the executable and test targets without running numerical checks;
+its `BUILT` message is not a numerical pass. Run the same command without that
+flag once the GPU is available. Select TOP3 explicitly for both requested
+PoTal profiles:
+
+```bash
+bash scripts/experiment/build-potal-cuda.sh --bits 4 --anchor 3 --attention --build-only
+bash scripts/experiment/build-potal-cuda.sh --bits 8 --anchor 3 --attention --build-only
+bash scripts/experiment/build-potal-cuda.sh --rtn --build-only
+```
+
+The RTN CMake target includes the cached-weight implementation directly.
+FP16, MXINT and BLOCK/BLOCK execution does not need a separate RTN preload
+library or a library built against another machine's private build directory.
+Use each build's own executable and shared libraries together.
+
+## NVFP4 reconstruction builds
+
+NVFP4 remains an explicit preload over the RTN host backend. Build its FP16
+and FP32 reconstruction variants in separate directories:
+
+```bash
+bash scripts/experiment/build-nvfp4-reference.sh
+bash scripts/experiment/build-nvfp4-reference.sh \
+    "$PWD/build-potal-cuda/nvfp4-fp32" fp32
+```
+
+These commands compile only; GPU validation is a separate step. Their default
+output is `build-potal-cuda/nvfp4-<mode>` under the checkout, not a user-specific
+home directory. `NVFP4_CUDA_ARCH` defaults to `native`; set it to an nvcc
+architecture such as `sm_86` for a headless or cross-GPU build. This is separate
+from CMake's `CUDAARCHS=86` setting. `CUDA_HOME` and `CUDACXX` select the toolkit
+and compiler.
+
+For inference, launch from the selected NVFP4 output directory and set
+`LD_PRELOAD=./libggml-nvfp4-preload.so` with `GGML_CUDA_NVFP4=1`. Keep the
+RTN executable, model and corpus paths absolute. Use a subshell when changing
+the launch directory. An absolute preload path containing spaces is split by
+the loader even when its shell assignment is quoted. FP32 reconstruction
+uses FP32 operands and pedantic FP32 GEMM; FP16 reconstruction uses FP16
+operands and FP32 accumulation. Keep the selected mode, build identity and
+proof consistent between comparisons. Neither mode uses native FP4 GEMM.
+
 ## Optional quantized QK/PV
 
 Build the PoTal attention executor with `--attention`; the default build leaves it
 disabled:
 
 ```bash
-bash scripts/experiment/build-potal-cuda.sh --bits 4 --anchor 2 --attention
+bash scripts/experiment/build-potal-cuda.sh --bits 4 --anchor 3 --attention
 ```
 
 This sets `GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON`. In that binary,
@@ -70,12 +115,13 @@ FlashAttention disabled and KV offload enabled so the graph selects these nodes.
 This CUDA path is separate from `GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION`, which
 selects IM2P RTL rather than CUDA.
 
-MXINT4/MXINT8 weights now force block32 PoT/ties-away activation in Gemmini, even
-when a build selects EXSIA and a TOP2/TOP3 anchor. The earlier PoTal/EXSIA
-configurations are historical comparisons, not equivalent reruns with MXINT
-weights; do not relabel their results as pure MXINT W/A. For CUDA RTN, MXINT
-weights select MXINT activation even when `GGML_CUDA_RTN_A_BITS=16` is requested
-for floating attention.
+MXINT storage is also used by PoTal. In the Gemmini host path, an explicit
+EXSIA build retains EXSIA activation and its selected TOP2/TOP3 anchor; storage
+type alone does not identify the activation policy. In the custom CUDA RTN
+path, MXINT weights instead select block32 PoT/ties-away activation even when
+`GGML_CUDA_RTN_A_BITS=16` is requested for floating attention. Keep the build
+policy and runtime proofs with each result. Historical RNE-weight runs are not
+equivalent reruns of the current ties-away model files.
 
 ## Queue and monitor
 
@@ -226,3 +272,17 @@ activations on SM86), not the ModelOpt W4/A4 reference. Both models use context
 library requires trace verbosity in this revision; the runner retains it to
 verify that all layers were offloaded to CUDA. This logging flag changes no
 quantization or PPL policy.
+
+## Kernel dispatch and numerical scope
+
+The canonical cached RTN implementation uses a two-output-row register tile for
+BLOCK Q4_0/Q8_0 prefills with M >= 128 and N >= 512. Smaller matrices, MXINT and
+Q6 retain their existing cached arithmetic; no faster MXINT arithmetic is claimed.
+The tile reuses W loads without regrouping each output's K32 dots, scale products
+or ordered F64 additions. These dispatch sizes were measured on RTX 3070; native
+build support is not a promise of identical performance on every GPU.
+
+NVFP4's scale encoder uses an equivalent integer RNE conversion while keeping
+the independent CPU reference, scale convention and both reconstruction modes.
+Kernel-local improvements do not establish a full-model speedup. Verify complete
+coverage/output proofs and keep cold/cache creation separate from warm timing.

@@ -72,12 +72,19 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
     if (mxint && m*k>=96) a[64]=1e6f; // MXINT retains this range without PoTal outlier selection.
     auto * out=ggml_mul_mat(ctx,w,x);
     require(ggml_cuda_rtn_supported(out),"dense unsupported");
+    const auto cold_start=std::chrono::steady_clock::now();
     require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
+    const double cold_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-cold_start).count();
     if (benchmark_mode) {
         const auto start=std::chrono::steady_clock::now();
         for (int repeat=0;repeat<10;++repeat) require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
         const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/10;
-        std::printf("CUDA_RTN_BENCH type=%s A%d m=%d n=%d k=%d mean_ms=%.6f\n",ggml_type_name(type),bits,m,n,k,ms);
+        uint64_t hash=14695981039346656037ULL;
+        for (size_t i=0;i<ggml_nbytes(out);++i) {
+            hash^=static_cast<const unsigned char *>(out->data)[i]; hash*=1099511628211ULL;
+        }
+        std::printf("CUDA_RTN_BENCH type=%s A%d m=%d n=%d k=%d mean_ms=%.6f cold_ms=%.6f output_hash=%016llx\n",
+                    ggml_type_name(type),bits,m,n,k,ms,cold_ms,static_cast<unsigned long long>(hash));
     }
     // Exercise cache reuse with changed activations.
     a[m*k-1]*=-1;
@@ -121,10 +128,11 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
         if (bits!=16 && type!=GGML_TYPE_F16) require(expected==got,"RTN-WA differs from scalar BLOCK oracle");
         else {
             double tolerance=2e-4+std::fabs(expected)*2e-5;
-            if (type==GGML_TYPE_Q6_K) {
+            if (type==GGML_TYPE_Q6_K || (benchmark_mode && type==GGML_TYPE_F16)) {
                 // Q6 decode already has exact CPU-decoder/GEMM parity above.
-                // Cancellation in the longer Llama dot invalidates a fixed absolute
-                // threshold against F64: bound FP32 accumulation by gamma_k * sum|xy|.
+                // Long cancellation dots, including the F16 benchmark, need the
+                // F32 bound gamma_k * sum|xy| against F64. Benchmark output hashes
+                // are also compared byte-for-byte with the frozen implementation.
                 const double u=std::numeric_limits<float>::epsilon()/2.0;
                 tolerance=std::max(tolerance,(k*u)/(1-k*u)*absolute_products+u*std::fabs(sum));
             }
@@ -161,6 +169,43 @@ static void mxint_ties_away(int bits, int requested_bits) {
         require(static_cast<float *>(output->data)[row]==expected[row]*step,"MXINT activation PoT/ties-away mismatch");
     ggml_cuda_rtn_clear(); ggml_free(ctx);
 }
+static void mxint_scale_edges(int bits) {
+    setenv("GGML_CUDA_RTN_A_BITS",std::to_string(bits).c_str(),1);
+    auto * ctx=ggml_init({size_t(1)<<20,nullptr,false});
+    require(ctx,"scale fixture context");
+    auto * w=ggml_new_tensor_2d(ctx,bits==4?GGML_TYPE_MXINT4:GGML_TYPE_MXINT8,32,1);
+    auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,2);
+    auto * out=ggml_mul_mat(ctx,w,x);
+    const int limit=(1<<(bits-1))-1;
+    for (int we:{-149,-133,-24,-1,0,17,100,127}) {
+        const float ws=std::ldexp(1.0f,we);
+        std::memset(w->data,0,ggml_nbytes(w));
+        if (bits==4) {
+            auto & block=*static_cast<block_q4_hp1 *>(w->data);
+            std::memset(block.qs,0xff,sizeof(block.qs));
+            block.channel_scale=ws;
+        } else {
+            auto & block=*static_cast<block_q8_hp1 *>(w->data);
+            std::memset(block.qs,127,sizeof(block.qs));
+            block.channel_scale=ws;
+        }
+        for (int maximum_exponent:{-126,-63,-1,0,31,80,126}) {
+            const float as=std::ldexp(1.0f,maximum_exponent-(bits-2));
+            auto * input=static_cast<float *>(x->data);
+            std::fill(input,input+32,float(limit)*as);
+            std::fill(input+32,input+64,-float(limit)*as);
+            ggml_cuda_rtn_clear();
+            require(ggml_cuda_rtn_compute(out),ggml_cuda_rtn_error());
+            const double scale_product=double(ws)*double(as);
+            const float expected[]{float(double(32*limit*limit)*scale_product),
+                                   float(-double(32*limit*limit)*scale_product)};
+            require(std::memcmp(out->data,expected,sizeof(expected))==0,
+                    "MXINT scale extremes changed ordered-F64 output bits");
+        }
+    }
+    ggml_cuda_rtn_clear(); ggml_free(ctx);
+    std::printf("PASS MXINT%d signed scale extremes and F32 output boundaries\n",bits);
+}
 static float value(const ggml_tensor * t,int k,int n,int h) {
     auto * p=static_cast<const char *>(t->data)+k*t->nb[0]+n*t->nb[1]+h*t->nb[2];
     return t->type==GGML_TYPE_F16?ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(p)):half(*reinterpret_cast<const float *>(p));
@@ -190,7 +235,10 @@ int main(int argc, char ** argv) {
         if (benchmark_mode && !std::strcmp(argv[1],"--benchmark-large")) { dense(GGML_TYPE_MXINT4,4,512,2048,2048); return 0; }
         mxint_ties_away(4,4); mxint_ties_away(8,8);
         mxint_ties_away(4,16); mxint_ties_away(8,16);
+        mxint_scale_edges(4); mxint_scale_edges(8);
         if (benchmark_mode) {
+            dense(GGML_TYPE_F16,16,1,512,2048);
+            dense(GGML_TYPE_F16,16,128,512,2048);
             for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_MXINT4,GGML_TYPE_MXINT8})
                 for (int bits:{4,8}) dense(type,bits,128,512,2048);
             return 0;
@@ -204,6 +252,9 @@ int main(int argc, char ** argv) {
         }
         for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_MXINT4,GGML_TYPE_MXINT8})
             for (int bits:{4,8}) dense(type,bits,9,521,64);
+        // Cover the prefill tile with partial row/column blocks in regular CTest.
+        for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0}) for (int bits:{4,8})
+            dense(type,bits,129,515,64);
         dense(GGML_TYPE_F16,16,9,35,64); attention(false); attention(true);
         std::puts("PASS CUDA RTN scalar oracle, ties, zeros, tile tails, weight cache, Qwen K and GQA"); return 0;
     } catch (const std::exception & e) { std::fprintf(stderr,"FAIL %s\n",e.what()); return 1; }

@@ -17,7 +17,7 @@ static void require(bool valid, const char * message) {
     if (!valid) throw std::runtime_error(std::string(message)+": "+ggml_cuda_potal_attention_error());
 }
 
-static size_t check_case(unsigned bits, size_t rows, size_t columns, size_t k, bool compact) {
+static size_t check_case(unsigned bits, size_t rows, size_t columns, size_t k, bool compact, size_t dense_begin = 0) {
     std::mt19937 random(unsigned(rows*3+columns*13+k*17+bits));
     const int bound = 1 << (bits-1);
     std::vector<int32_t> low(k*columns), high(k*columns);
@@ -48,7 +48,7 @@ static size_t check_case(unsigned bits, size_t rows, size_t columns, size_t k, b
     }
     std::vector<int8_t> activations(rows*stride);
     for (auto & a : activations) a = int8_t(int(random()%(2*bound))-bound);
-    const size_t first = compact && columns > 4 ? 3 : 0, width = columns-first;
+    const size_t first = compact && columns > 4 ? 3 : dense_begin, width = columns-first;
     for (unsigned pass = 0; pass < 2; ++pass) {
         std::vector<int32_t> actual(rows*width), expected(rows*width);
         require(ggml_cuda_potal_attention_dot(w.get(), pass, activations.data(), rows, stride, first, width,
@@ -89,6 +89,9 @@ int main() {
             for (size_t columns : {1u, 7u, 33u, 65u}) for (size_t k : {32u, 64u, 160u})
                 for (bool compact : {false, true}) {
                     values += check_case(bits, rows, columns, k, compact); ++cases;
+                    if (!compact && columns > 4) {
+                        values += check_case(bits, rows, columns, k, false, 3); ++cases;
+                    }
                 }
         std::vector<int32_t> invalid(32, 8);
         uint32_t carrier = 0;

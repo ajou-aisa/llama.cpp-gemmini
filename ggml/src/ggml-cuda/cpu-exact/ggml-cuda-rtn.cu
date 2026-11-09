@@ -63,6 +63,10 @@ __global__ void pack_half(const char * source, __half * dest, size_t count, layo
     dest[i] = s.type == GGML_TYPE_F16 ? *reinterpret_cast<const __half *>(source+offset)
                                    : __float2half_rn(*reinterpret_cast<const float *>(source+offset));
 }
+__global__ void pack_contiguous_half(const float * source, __half * dest, size_t count) {
+    size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < count) dest[i] = __float2half_rn(source[i]);
+}
 // Read the existing GGML Q6_K layout; this does not quantize or alter model weights.
 __device__ int q6_code(const uint8_t * b, int pos) {
     int half=pos/128, quadrant=(pos%128)/32, lane=pos%32;
@@ -176,9 +180,17 @@ const void * model_weight(runtime & r, const ggml_tensor * w, bool half) {
 }
 void pack(runtime & r, const ggml_tensor * t, buffer & dest) {
     size_t bytes=ggml_nbytes(t), count=ggml_nelements(t);
-    r.staging.reserve(bytes); dest.reserve(count*sizeof(__half));
+    dest.reserve(count*sizeof(__half));
+    if (t->type==GGML_TYPE_F16 && ggml_is_contiguous(t)) {
+        check(cudaMemcpyAsync(dest.p,t->data,bytes,cudaMemcpyHostToDevice,r.stream));
+        return;
+    }
+    r.staging.reserve(bytes);
     check(cudaMemcpyAsync(r.staging.p,t->data,bytes,cudaMemcpyHostToDevice,r.stream));
-    pack_half<<<(count+255)/256,256,0,r.stream>>>(static_cast<const char *>(r.staging.p),static_cast<__half *>(dest.p),count,describe(t));
+    if (t->type==GGML_TYPE_F32 && ggml_is_contiguous(t))
+        pack_contiguous_half<<<(count+255)/256,256,0,r.stream>>>(static_cast<const float *>(r.staging.p),static_cast<__half *>(dest.p),count);
+    else
+        pack_half<<<(count+255)/256,256,0,r.stream>>>(static_cast<const char *>(r.staging.p),static_cast<__half *>(dest.p),count,describe(t));
 }
 void gemm(runtime & r, const void * w, const void * a, float * c, int m, int n, int k,
           long long sw=0, long long sa=0, int batch=1) {

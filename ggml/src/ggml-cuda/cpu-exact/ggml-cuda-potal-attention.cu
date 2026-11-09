@@ -194,19 +194,26 @@ bool ggml_cuda_potal_attention_dot(const ggml_cuda_potal_attention_weights * w, 
         pack_activations<<<unsigned((fragments*pr*32+255)/256),256>>>(
             static_cast<const int8_t *>(s.activations.data), static_cast<int8_t *>(s.packed_a.data),
             device_maps, unsigned(rows), pr, unsigned(stride), unsigned(fragments));
-        const void * packed_weights = pass ? w->packed_high.data : w->packed_low.data;
-        if (maps || column_begin != 0 || columns != w->columns) {
+        const auto * packed_weights = static_cast<const int8_t *>(pass ? w->packed_high.data : w->packed_low.data);
+        long long weight_batch_stride = static_cast<long long>(w->padded_columns)*32;
+        if (!maps && column_begin+pc <= w->padded_columns) {
+            // The stationary K32 layout already contains this column window.
+            // Padded output columns may read neighboring weights, but are discarded.
+            // Keep the original fragment stride instead of gathering every stripe.
+            packed_weights += column_begin*32;
+        } else {
             s.packed_w.reserve(fragments*pc*32);
             gather_weights<<<unsigned((fragments*pc*32+255)/256),256>>>(
                 static_cast<const int8_t *>(pass ? w->high.data : w->low.data),
                 static_cast<int8_t *>(s.packed_w.data), device_maps, unsigned(columns), pc,
                 w->columns, unsigned(column_begin), unsigned(fragments));
-            packed_weights = s.packed_w.data;
+            packed_weights = static_cast<const int8_t *>(s.packed_w.data);
+            weight_batch_stride = static_cast<long long>(pc)*32;
         }
         check(cudaGetLastError());
         const int32_t alpha = 1, beta = 0;
         check(cublasGemmStridedBatchedEx(s.blas, CUBLAS_OP_T, CUBLAS_OP_N, pc, pr, 32, &alpha,
-            packed_weights, CUDA_R_8I, 32, static_cast<long long>(pc)*32,
+            packed_weights, CUDA_R_8I, 32, weight_batch_stride,
             s.packed_a.data, CUDA_R_8I, 32, static_cast<long long>(pr)*32, &beta,
             s.dots.data, CUDA_R_32I, pc, static_cast<long long>(pc)*pr, int(fragments),
             CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));

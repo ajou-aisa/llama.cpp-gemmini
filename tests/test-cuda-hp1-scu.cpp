@@ -315,20 +315,27 @@ static void benchmark(unsigned bits) {
             for (size_t b = 0; b < k/32; ++b) w.exponent(c,b,int16_t((c+b)%4));
             for (size_t t = 0; t < k; ++t) w.code(c,t,int((c*37+t*19)%(2*limit))-limit);
         }
+        const auto cache_start = std::chrono::steady_clock::now();
         require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "benchmark weight cache");
+        const double cache_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-cache_start).count();
         counts observed;
         const auto expected = main_oracle(w,a,rows,observed);
         const auto run = [&] {
             require(ggml_cuda_hp1_scu_main(a.data(),w.data(),bits,rows,columns,k,output.data()), "benchmark main");
         };
-        for (int i = 0; i < 3; ++i) run();
+        double first_ms = 0;
+        const auto first_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) {
+            run();
+            if (!i) first_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-first_start).count();
+        }
         require(output == expected, "benchmark main integer mismatch");
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < 10; ++i) run();
         const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/10;
         require(output == expected, "benchmark repeated main integer mismatch");
-        std::printf("HP1_SCU_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1\n",
-                    bits,rows,columns,k,ms);
+        std::printf("HP1_SCU_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1 cache_ms=%.6f first_ms=%.6f\n",
+                    bits,rows,columns,k,ms,cache_ms,first_ms);
         std::vector<uint32_t> offsets(rows+1);
         std::vector<event> events;
         const int32_t residual = 3*(1 << bits);
@@ -351,15 +358,20 @@ static void benchmark(unsigned bits) {
                     offsets.data(),events.data(),events.size(),residual_output.data()) == status::success,
                     "benchmark residual");
         };
-        for (int i = 0; i < 3; ++i) residual_run();
+        double residual_first_ms = 0;
+        const auto residual_first_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) {
+            residual_run();
+            if (!i) residual_first_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-residual_first_start).count();
+        }
         require(residual_output == residual_expected, "benchmark residual integer mismatch");
         const auto residual_start = std::chrono::steady_clock::now();
         for (int i = 0; i < 10; ++i) residual_run();
         const double residual_ms = std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-residual_start).count()/10;
         require(residual_output == residual_expected, "benchmark repeated residual mismatch");
-        std::printf("HP1_SCU_RESIDUAL_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1\n",
-                    bits,rows,columns,k,residual_ms);
+        std::printf("HP1_SCU_RESIDUAL_BENCH bits=%u rows=%zu columns=%zu k=%zu mean_ms=%.6f exact=1 first_ms=%.6f\n",
+                    bits,rows,columns,k,residual_ms,residual_first_ms);
         ggml_cuda_hp1_scu_clear_weights();
     }
 }
@@ -371,6 +383,9 @@ static void cache_fixture(unsigned bits) {
         for (size_t t = 0; t < w.k; ++t) w.code(c,t,int((c+t)%7)-3);
     require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "register immutable weights");
     check_main(w,a,17);
+    a.back() = -1;
+    check_main(w,a,17);
+    check_main(w,a,9);
     counts observed;
     const auto expected = main_oracle(w,a,17,observed);
     std::vector<int32_t> tile(17*19);
@@ -384,6 +399,18 @@ static void cache_fixture(unsigned bits) {
     check_main(w,a,17);
     require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "re-register changed weights");
     check_main(w,a,17);
+    ggml_cuda_hp1_scu_clear_weights();
+    w.q4[0].padding[0] = w.q8[0].padding[0] = 1;
+    require(ggml_cuda_hp1_scu_cache_weights(w.data(),w.bytes()), "register invalid metadata fixture");
+    std::vector<int32_t> rejected(17*w.columns,-777);
+    const auto before = ggml_cuda_hp1_scu_stats();
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        require(!ggml_cuda_hp1_scu_main(a.data(),w.data(),bits,17,w.columns,w.k,rejected.data()) &&
+                std::all_of(rejected.begin(),rejected.end(),[](int32_t value) { return value == -777; }),
+                "cached invalid metadata changed output or was accepted");
+    }
+    require(ggml_cuda_hp1_scu_stats().main_launches == before.main_launches,
+            "cached invalid metadata published a successful launch");
     ggml_cuda_hp1_scu_clear_weights();
     std::printf("HP1_SCU cache bits=%u main residual subranges invalidation PASS\n",bits);
 }

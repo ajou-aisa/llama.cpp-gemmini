@@ -1,13 +1,15 @@
-NVFP4 dynamic-max numerical reference on RTX 3070 (sm_86)
+NVFP4 dynamic-max numerical reference on compatible CUDA GPUs
 
-This is NVFP4-format W4/A4 fake quantization, followed by FP16-input / FP32-accumulating
-cuBLAS GEMM. It does not use native Blackwell FP4 instructions, does not store a
-packed NVFP4 GGUF, and must not be reported as native NVFP4 throughput.
+This is NVFP4-format W4/A4 fake quantization followed by cuBLAS GEMM.
+The fp32 accuracy profile keeps reconstructed operands in FP32 and uses pedantic
+FP32 GEMM. The explicit fp16 compatibility profile rounds operands to FP16 before
+FP32 accumulation. Neither uses native Blackwell FP4 instructions or stores a
+packed NVFP4 GGUF; do not report either as native NVFP4 throughput.
 
 Reference: NVIDIA Model-Optimizer nvfp4_tensor.py, pinned commit and SHA256 in
-reference-identity.json. Official quantize/dequantize methods are executed unchanged
-by the CPU QA harness; only package storage and block-reduction integration helpers
-are supplied locally. The downloaded source retains its Apache-2.0 license header.
+reference-identity.json. The archived CPU QA executed official quantize/dequantize
+methods unchanged; only package storage and block-reduction integration helpers
+were supplied locally. The downloaded source retains its Apache-2.0 license header.
 Authoritative sources:
 https://github.com/NVIDIA/Model-Optimizer/blob/ff336e72129f5b2bae47fb2e3ff35112f1bdbc8d/modelopt/torch/quantization/qtensor/nvfp4_tensor.py
 https://nvidia.github.io/TransformerEngine/features/low_precision_training/nvfp4/nvfp4.html
@@ -22,7 +24,7 @@ Formula (all arithmetic steps FP32):
 Blocks contain 16 consecutive values along K. E2M1 magnitudes are
 0, 0.5, 1, 1.5, 2, 3, 4, 6. Ties select the even encoded ordinal.
 The tensor scale g is FP32. Both E4M3 normal and subnormal scales are supported.
-The fake-GEMM implementation casts Xhat to FP16 after the FP32 reconstruction.
+Only the fp16 compatibility profile casts Xhat to FP16 after reconstruction.
 
 Scope: every dense linear matrix including lm_head uses quantized weights and
 activations. Weight scales use the original FP16 tensor's maximum once, with cached
@@ -43,37 +45,46 @@ g=0; this extension intentionally differs. NaN/Inf inputs and global-scale under
 are rejected instead of silently producing a result. Zero blocks inside a nonzero
 tensor match the upstream raw_b=1 safety rule.
 
-Reproduce in Ubuntu-24.04 WSL (repository root = $repo):
-  bash "$repo/scripts/experiment/build-nvfp4-reference.sh"
-  /home/mojoi/.cache/nvfp4-reference-venv/bin/python \
-    "$repo/scripts/experiment/test-nvfp4-reference.py" --fetch
-CPU-only loader/interposition check:
-  /home/mojoi/.cache/nvfp4-reference-venv/bin/python \
-    "$repo/scripts/experiment/test-nvfp4-reference.py" \
-    --check-bindings /home/mojoi/build/potal-optimized-rtn/bin/llama-perplexity
-The isolated reference environment requires CPU-only torch; it does not require
-NumPy or NVIDIA Python packages. --fetch retrieves the exact pinned URL and verifies
-its digest, not the current upstream branch. Offline reruns omit --fetch.
+Build in Linux/WSL with a compatible NVIDIA driver and CUDA toolkit.
+Run from the repository root:
+  repo=$(pwd)
+  out="$repo/build-potal-cuda/nvfp4-fp32"
+  bash "$repo/scripts/experiment/build-potal-cuda.sh" --rtn --jobs 2 --build-only
+  bash "$repo/scripts/experiment/build-nvfp4-reference.sh" "$out" fp32
 
-Explicitly scheduled GPU vectors (load the RTN host ABI library first):
-  /home/mojoi/.cache/nvfp4-reference-venv/bin/python \
-    "$repo/scripts/experiment/test-nvfp4-reference.py" \
-    --gpu-library /home/mojoi/build/potal-nvfp4/libggml-nvfp4-preload.so \
-    --base-library /home/mojoi/build/potal-optimized-rtn/bin/libggml-gemmini.so
+The default GPU architecture is native. Set CUDAARCHS for the CMake RTN build
+and NVFP4_CUDA_ARCH for nvcc when explicitly targeting another architecture.
+CUDACXX and CUDA_HOME select a nondefault toolkit; GEMMINI_SW_PATH selects the
+external Gemmini software headers required by the regular backend build.
+The output directory contains libnvfp4-reference.so, libggml-nvfp4-preload.so
+and build-identity.json with mode, architecture and source/image hashes.
+Build success alone does not mean numerical verification passed.
 
-Build outputs and build-identity.json:
-  /home/mojoi/build/potal-nvfp4/
-QA output / pinned third-party snapshot (outside the Git repository):
-  /mnt/c/Users/mojoi/Projects/PoTal/experiment-tools/nvfp4-qa/
+The build script retains fp16 as its compatibility default. Select either mode
+explicitly and keep separate output directories. For fp16:
+  bash "$repo/scripts/experiment/build-nvfp4-reference.sh" \
+    "$repo/build-potal-cuda/nvfp4-fp16" fp16
 
-Queue interface: use the regular RTN build and original *.fp16.gguf model, with
+Use the complete PPL recipe in docs/backend/GEMMINI-CUDA-PPL.md with the regular
+RTN executable and original *.fp16.gguf model. Launch that complete command
+from "$out", with absolute executable/model/corpus paths, preferably in a
+subshell. Attach these environment values to it, not to unrelated commands:
   GGML_CUDA_RTN_A_BITS=4
   GGML_CUDA_NVFP4=1
-  LD_PRELOAD=/home/mojoi/build/potal-nvfp4/libggml-nvfp4-preload.so
-The regular CUDA_RTN_PROOF verifies graph-wide GPU coverage; its block_size=32 is a
-hardcoded observer field, not NVFP4 geometry. NVFP4_PROOF independently declares
-block_size=16, E4M3FN/FP32 scales, rounding, dense calls, weight tensor counts and
-non-native fake-GEMM implementation. Both proofs must pass, with dense calls
-(7*layers+1)*chunks and attention calls 2*layers*chunks. Loader relocation/binding
-evidence must also confirm the preload actually owns compute/counters/clear.
-No existing backend code is modified; new files plus opt-in LD_PRELOAD suffice.
+  LD_PRELOAD=./libggml-nvfp4-preload.so
+Quoting an absolute LD_PRELOAD path does not protect spaces from loader splitting.
+The fp32 profile has no intermediate FP16 operand rounding and uses no TF32 math.
+QK/VP attention retains the common FP16-input/FP32-accumulating path in both modes.
+
+CUDA_RTN_PROOF verifies graph-wide coverage; its block_size=32 is an observer
+field, not NVFP4 geometry. NVFP4_PROOF independently declares block_size=16,
+E4M3FN/FP32 scales, RNE, reconstruction/GEMM mode, dense calls, weight counts
+and the non-native implementation. Require both proofs and actual loader binding
+to the selected preload. The expected complete workload has dense calls
+(7*layers+1)*chunks and attention calls 2*layers*chunks.
+
+Archived official-source QA and loader reports were kept outside Git. Their
+machine-local directories are historical evidence, not portable prerequisites.
+The dedicated archived harness was removed after verification; changed source
+must be verified again. Full-corpus runs preserve their declared population;
+do not infer model quality or throughput from a one-chunk smoke run.

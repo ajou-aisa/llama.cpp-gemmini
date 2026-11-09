@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the existing CUDA PPL paths; no model conversion or inference.
 set -euo pipefail
-bits=8 anchor=2 jobs=1 rtn=OFF build_dir= quant_attention=OFF
+bits=8 anchor=2 jobs=1 rtn=OFF build_dir= quant_attention=OFF build_only=OFF
 while (( $# )); do
     case "$1" in
         --bits) bits=${2:?Missing bits}; shift 2 ;;
@@ -10,7 +10,8 @@ while (( $# )); do
         --build-dir) build_dir=${2:?Missing build directory}; shift 2 ;;
         --rtn) rtn=ON; shift ;;
         --attention) quant_attention=ON; shift ;;
-        --help) printf 'Usage: %s [--bits 4|8] [--anchor 2|3] [--attention] [--rtn] [--jobs N] [--build-dir DIR]\n' "$0"; exit 0 ;;
+        --build-only) build_only=ON; shift ;;
+        --help) printf 'Usage: %s [--bits 4|8] [--anchor 2|3] [--attention] [--rtn] [--build-only] [--jobs N] [--build-dir DIR]\n' "$0"; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -64,6 +65,10 @@ cmake -S "$root" -B "$build_dir" -G Ninja \
     -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON > "$build_dir/configure.log" 2>&1
 printf 'Building %s\n' "$profile"
 cmake --build "$build_dir" --target "${targets[@]}" -j "$jobs" > "$build_dir/build.log" 2>&1
+if [[ $build_only == ON ]]; then
+    printf 'BUILT: %s/bin/llama-perplexity (numerical checks not run)\n' "$build_dir"
+    exit 0
+fi
 printf 'Checking CUDA numerical contracts\n'
 OMP_NUM_THREADS=4 ctest --test-dir "$build_dir" --output-on-failure \
     -R '^test-cuda-(cpu-exact-graph|hp1-scu(-graph)?|rtn|potal-attention)$' > "$build_dir/verification.log" 2>&1
