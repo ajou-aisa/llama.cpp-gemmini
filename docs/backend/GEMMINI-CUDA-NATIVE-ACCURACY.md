@@ -4,6 +4,10 @@ Use a complete checkout of this branch, not individual CUDA files. Build fresh
 binaries on the destination machine. Model GGUFs, datasets, CUDA toolkit and
 Gemmini software headers are separate inputs.
 
+Start with the [team handoff](GEMMINI-CUDA-OPTIMIZATION-HANDOFF.md) for the
+selected source scope, build order and exact validation matrix. Follow the
+[numerical policy](ROUNDING_POLICY.md) when preparing matching checkpoints.
+
 ## Build the backends
 
 Run from the repository root on Linux or CUDA-capable WSL:
@@ -22,8 +26,8 @@ bash scripts/experiment/build-nvfp4-reference.sh \
 
 `--build-only` compiles without CUDA tests or model inference. See
 `GEMMINI-CUDA-PPL.md` for the existing numerical checks, profile environments
-and PPL commands. The WikiText-2 recipe
-is unchanged. The NVFP4 helper only builds; FP32 and FP16 reconstruction modes
+and PPL commands. The WikiText-2 recipe is unchanged.
+The NVFP4 helper only builds; FP32 and FP16 reconstruction modes
 remain different numerical profiles.
 
 ## Build the native accuracy frontends
@@ -81,8 +85,8 @@ ARC-Challenge, BoolQ and OpenBookQA under `../datasets/accuracy`. The second
 constructs one real zero-shot request group per task with the pinned harness;
 it does not score models. Preserve that harness's task prompts, continuation
 boundary handling, `process_results` and aggregation when connecting the native
-frontends. This package does not implement the newly requested token/response
-cache runner or claim a complete seven-task native evaluation.
+frontends. This package does not implement a token/response cache runner
+or a complete seven-task native evaluation.
 
 The build helpers have been exercised against existing backend builds.
 The selected images had 16/20 complete model equivalence pairs at handoff;
