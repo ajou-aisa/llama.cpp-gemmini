@@ -4,7 +4,7 @@
 # dependencies = ["numpy", "torch", "packaging"]
 # ///
 # How to run: uv run --index https://download.pytorch.org/whl/cpu tools/quantize/mxint-hp1.py --help
-"""Pack official Microsoft MXINT4/8 values into MXINT4/8 GGUF tensors."""
+"""Pack official Microsoft MXINT4/8 values with RN ties-to-even by default."""
 import argparse
 import ctypes
 import hashlib
@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Literal
 
 import numpy as np
 import torch
@@ -39,7 +40,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def official_reference(path, rounding="nearest"):
+def official_reference(path, rounding: Literal["nearest", "even"] = "even"):
     """Use the same pinned upstream implementation as the MXINT experiments."""
     commit = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
     require(commit == REFERENCE_COMMIT, 'Wrong microxcaling revision: ' + commit)
@@ -117,9 +118,10 @@ def decode(raw, function):
     return values
 
 
-def convert(source, template, target, bits, mx_path, decoder_lib, rounding="nearest"):
+def convert(source, template, target, bits, mx_path, decoder_lib,
+            rounding: Literal["nearest", "even"] = "even"):
     source, template, target = (p.resolve() for p in (source, template, target))
-    require(rounding == 'nearest', 'MXINT W/A requires ties-away rounding')
+    require(rounding in ('nearest', 'even'), 'Unsupported MXINT rounding mode')
     require(bits in (4, 8) and not target.exists(), 'Output must be a new MXINT4/8 model')
     report_path = target.with_suffix(target.suffix + '.mxint.json')
     require(not report_path.exists(), 'Output report already exists')
@@ -202,10 +204,13 @@ def main():
     parser.add_argument('--bits', type=int, choices=(4, 8), required=True)
     parser.add_argument('--mx-path', type=Path, required=True, help='Clean microsoft/microxcaling checkout at the documented commit')
     parser.add_argument('--decoder-lib', type=Path, required=True, help='Built libggml-base.so with the MXINT4/8 decoders (internal HP1 symbols)')
+    parser.add_argument('--rounding', choices=('even', 'nearest'), default='even',
+                        help='even: RN ties-to-even (default); nearest: historical ties-away')
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.set_num_interop_threads(1)
-    print(json.dumps(convert(args.input, args.template, args.output, args.bits, args.mx_path, args.decoder_lib),
+    print(json.dumps(convert(args.input, args.template, args.output, args.bits, args.mx_path,
+                             args.decoder_lib, rounding=args.rounding),
                      indent=2))
 
 

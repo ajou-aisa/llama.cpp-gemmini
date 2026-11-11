@@ -55,6 +55,9 @@ bool StripeFolding::run(Meta &                           meta,
                         std::vector<int32_t> &           residual,
                         residual::TimedResidualCapture & rmd_builder) {
     const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+#if !EXSIA_VALIDATION
+    (void)residual;
+#endif
 #if GGML_GEMMINI_RESIDUAL_METRICS
     if (args.evaluation_context)
         args.evaluation_context->main_stripe(
@@ -139,9 +142,10 @@ bool StripeFolding::run(Meta &                           meta,
                 const int32_t q_shifted =
                     detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
                 const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                // Outliers and promoted top blocks keep their low limb in the dense operand and
-                // carry the higher limbs as residual; every other position saturates.
-                const auto [q8, residual_i32] = unit_clip_.clip_with_residual(q_shifted, outlier);
+                // Keep a low limb only when the higher limbs have a compensation consumer.
+                // With RMD disabled, outliers follow the same saturation rule as other values.
+                const bool decompose = outlier && GGML_GEMMINI_ENABLE_RMD;
+                const auto [q8, residual_i32] = unit_clip_.clip_with_residual(q_shifted, decompose);
 
                 if (col < args.K)
                     if (!args.A.set(r, col, q8))
@@ -155,9 +159,11 @@ bool StripeFolding::run(Meta &                           meta,
                 stripe.selected_positions += outlier;
                 stripe.residual_nnz += residual_i32 != 0;
 #endif
+#if EXSIA_VALIDATION
                 const size_t global_idx = r * state.K_padded + col;
                 GGML_ASSERT(global_idx < residual.size());
                 residual[global_idx] = residual_i32;
+#endif
 
 #if GGML_GEMMINI_ENABLE_RMD
                 if (outlier && residual_i32 != 0 &&

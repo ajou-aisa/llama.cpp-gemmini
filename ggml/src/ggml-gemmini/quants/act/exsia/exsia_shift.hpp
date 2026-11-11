@@ -18,15 +18,15 @@ static int32_t round_shift_right_i32(int32_t q, int shift) {
     if (shift <= 0)
         return q;
     if (shift >= 32)
-        return shift == 32 && q == std::numeric_limits<int32_t>::min() ? -1 : 0;
+        return 0;
 
-    const int64_t x      = q;
-    const int64_t offset = int64_t{1} << (shift - 1);
-
-    if (x >= 0)
-        return static_cast<int32_t>((x + offset) >> shift);
-
-    return static_cast<int32_t>(-(((-x) + offset) >> shift));
+    const int64_t magnitude = q < 0 ? -static_cast<int64_t>(q) : q;
+    const int64_t quotient = magnitude >> shift;
+    const int64_t remainder = magnitude & ((int64_t{1} << shift) - 1);
+    const int64_t half = int64_t{1} << (shift - 1);
+    const int64_t rounded = quotient +
+        int(remainder > half || (remainder == half && (quotient & 1) != 0));
+    return static_cast<int32_t>(q < 0 ? -rounded : rounded);
 }
 
 static inline int32_t shift_q_i32(int32_t q, int16_t delta_theta) {

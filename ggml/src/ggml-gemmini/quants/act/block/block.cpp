@@ -5,6 +5,7 @@
 #include "../../../residual/rmd/rmd-compose.hpp"
 #include "../../common/tensor_util.hpp"
 #include "../../common/math.hpp"
+#include "../../common/rounding.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,7 +41,7 @@ int32_t quantize_value(float value, float scale) {
         return std::numeric_limits<int32_t>::min();
     if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
         return std::numeric_limits<int32_t>::max();
-    return static_cast<int32_t>(std::nearbyint(scaled));
+    return round_nearest_even_i32(scaled);
 }
 
 bool quantize_block(const float *                                   data,
@@ -239,7 +240,7 @@ bool quantize_mxint(const ggml_tensor * src, ggml_gemmini_args_t & args) {
                 const double scaled = static_cast<double>(data[begin + lane]) / scale;
                 const int32_t code = scaled <= -limit ? -limit
                                    : scaled >= limit ? limit
-                                                     : static_cast<int32_t>(std::round(scaled));
+                                                     : round_nearest_even_i32(scaled);
                 if (!args.A.set(row, block * kGroupSize + lane, code))
                     return false;
             }

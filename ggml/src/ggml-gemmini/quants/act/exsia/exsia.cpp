@@ -445,16 +445,18 @@ bool ExSIA::run(Meta &                  meta,
     meta.rmd_packets.clear();
     meta.direct_residuals.clear();
 
-    // Dense residual matrix is a global output, sized to the full padded activation.
+#if EXSIA_VALIDATION
+    // Validation snapshots the residual matrix over the full padded activation.
     // Each stripe writes its own disjoint global row range (K_padded stride).
     size_t padded_elem_count = 0;
     if (!checked_mul_size(args.I, state_.K_padded, padded_elem_count))
         return fail(ExSIAState::FailureCode::InvalidInput);
+    state_.residual.assign(padded_elem_count, 0);
+#endif
 
     release_vector(state_.x_f32);
     release_vector(state_.q_wide);
     release_vector(state_.block_exp);
-    state_.residual.assign(padded_elem_count, 0);
 
     for (StripePipelineSlot & slot : pipeline_slots_) {
         slot.rmd_builder.select(args.residual_route);
@@ -548,7 +550,7 @@ bool ExSIA::run(Meta &                  meta,
                 slot.stripe_idx);
             return false;
         }
-        event.activation_metadata   = StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
+        event.activation_metadata   = StripeMetadataSnapshot{slot.stripe.e_s, meta.rho, meta.sigma, theta};
         event.quantization_start    = slot.quantization_start;
         event.quantization_end      = slot.quantization_end;
         event.quantization_start_ns = slot.quantization_start_ns;
