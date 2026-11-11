@@ -14,6 +14,35 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_gemmini_init(void);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_gemmini_reg(void);
 
+#if defined(GGML_GEMMINI_PB)
+enum ggml_gemmini_pb_node_type {
+    GGML_GEMMINI_PB_Q,
+    GGML_GEMMINI_PB_K,
+    GGML_GEMMINI_PB_V,
+    GGML_GEMMINI_PB_OUTPUT,
+    GGML_GEMMINI_PB_FFN_GATE,
+    GGML_GEMMINI_PB_FFN_UP,
+    GGML_GEMMINI_PB_FFN_DOWN,
+    GGML_GEMMINI_PB_LM_HEAD,
+    GGML_GEMMINI_PB_QK,
+    GGML_GEMMINI_PB_PV,
+    GGML_GEMMINI_PB_OTHER,
+    GGML_GEMMINI_PB_NODE_TYPE_COUNT,
+};
+
+struct ggml_gemmini_pb_counters {
+    uint64_t nodes;
+    uint64_t k_blocks;
+    uint64_t int32_elements;
+    uint64_t fallback_count;
+};
+
+// Process-wide counters; read/reset between sequential single-hart invocations.
+GGML_BACKEND_API bool ggml_gemmini_pb_get_counters(
+    enum ggml_gemmini_pb_node_type type, struct ggml_gemmini_pb_counters * counters);
+GGML_BACKEND_API void ggml_gemmini_pb_reset_counters(void);
+#endif
+
 struct ggml_gemmini_attention_stats {
     uint64_t qk_nodes, pv_nodes, main_dots, residual_dots;
     uint64_t main_fragments, residual_fragments, add_ops, raw_cycles;

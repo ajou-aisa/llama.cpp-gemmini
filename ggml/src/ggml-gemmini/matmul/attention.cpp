@@ -1,4 +1,7 @@
 #include "attention.hpp"
+#if defined(GGML_GEMMINI_PB)
+#include "../pb/pb-attention.hpp"
+#endif
 #include "../potal-sensitivity.hpp"
 
 #include "ggml-gemmini-matmul-config.hpp"
@@ -26,6 +29,29 @@
 #include <stdexcept>
 
 namespace ggml::gemmini {
+#if defined(GGML_GEMMINI_PB)
+namespace {
+uint64_t pb_completed_qk = 0, pb_completed_pv = 0;
+}
+bool attention_supported(const ggml_tensor * op) {
+    return pb::attention_supported(op);
+}
+uint64_t attention_completed_nodes(ggml_gemmini_attention_role role) {
+    return role == GGML_GEMMINI_ATTENTION_QK ? pb_completed_qk : pb_completed_pv;
+}
+int attention_anchor() { return 0; }
+const char * attention_execution_backend() { return "gemmini_pb"; }
+rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
+    const auto status = pb::execute_attention(op);
+    if (status != pb::Status::success)
+        return status == pb::Status::allocation_failure ? rmd::RmdStatus::allocation_failure :
+                                                        rmd::RmdStatus::invalid_arguments;
+    const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
+    ++(qk ? metrics.qk_nodes : metrics.pv_nodes);
+    ++(qk ? pb_completed_qk : pb_completed_pv);
+    return rmd::RmdStatus::success;
+}
+#else
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
 namespace {
 using rmd::RmdStatus;
@@ -592,4 +618,5 @@ rmd::RmdStatus attention_execute(ggml_tensor *, AttentionMetrics &) {
     return rmd::RmdStatus::unsupported_route;
 }
 #endif
+#endif // GGML_GEMMINI_PB
 } // namespace ggml::gemmini

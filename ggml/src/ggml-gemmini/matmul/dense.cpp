@@ -1,5 +1,8 @@
 #include <gemmini/trace-context.hpp>
 #include "dense.hpp"
+#if defined(GGML_GEMMINI_PB)
+#include "../pb/pb-exec.hpp"
+#endif
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
 #include "../ggml-gpu-cpu-exact.hpp"
 #endif
@@ -759,6 +762,16 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
 }
 
 MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> stripe_id = {}) {
+#if defined(GGML_GEMMINI_PB)
+    (void)stripe_id;
+    test_detail::observe_dense_dispatch();
+    const auto pb_status = pb::execute_linear(args);
+    if (pb_status == pb::Status::success) {
+        test_detail::observe_backend_dispatch(false);
+        return MatMulStatus::success;
+    }
+    return MatMulStatus::invalid_contract;
+#endif
 #if LOG_CYCLE
     gemmini_cycle_record_v2 ws_identity{};
     ws_identity.interval.layer = args.matmul_layer.c_str();

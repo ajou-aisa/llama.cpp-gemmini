@@ -71,6 +71,9 @@
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
 #include "ggml-gpu-cpu-exact.hpp"
 #endif
+#if defined(GGML_GEMMINI_PB_Q8_0)
+#include "pb/pb-exec.hpp"
+#endif
 
 namespace {
 constexpr bool
@@ -968,9 +971,28 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
     if (ggml_is_empty(dst)) {
         return;
     }
+#if defined(GGML_GEMMINI_PB)
+#if defined(GGML_GEMMINI_PB_Q8_0)
+    constexpr ggml_type pb_weight_type = GGML_TYPE_Q8_0;
+#else
+    constexpr ggml_type pb_weight_type = GGML_TYPE_MXINT8;
+#endif
+    if (dst->src[0]->type != pb_weight_type || dst->src[1]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        GGML_ABORT("Gemmini-PB: node '%s' is unsupported: weight '%s' type %s, activation type %s",
+                   dst->name, dst->src[0]->name, ggml_type_name(dst->src[0]->type), ggml_type_name(dst->src[1]->type));
+    }
+#endif
     if (!gemmini_shared_weight_contract(dst)) {
         GGML_ABORT("Gemmini MUL_MAT shared-weight contract failed");
     }
+#if defined(GGML_GEMMINI_PB_Q8_0)
+    const auto pb_status = ggml::gemmini::pb::execute_linear_q8_0(
+        *dst, resolve_backend_matmul_layer(ctx->model_arch, dst->src[0]->name, dst->src[1]->name, dst->name).c_str());
+    if (pb_status != ggml::gemmini::pb::Status::success) {
+        GGML_ABORT("Gemmini-PB: node '%s' failed (status=%d)", dst->name, static_cast<int>(pb_status));
+    }
+    return;
+#endif
     setup_gemmini_log_outputs_if_needed();
 #if LOG_CYCLE
     const auto rmd_telemetry_invocation_start = ggml::gemmini::read_matmul_cpu_sample();
@@ -2283,12 +2305,21 @@ bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t         dev,
                op->src[0]->type == GGML_TYPE_Q8_CHANNEL && op->src[1]->type == GGML_TYPE_I32;
     }
 
+#if defined(GGML_GEMMINI_PB)
+    case GGML_OP_FLASH_ATTN_EXT:
+        return true;
+#endif
+
     case GGML_OP_MUL_MAT: {
         if (ggml_gemmini_get_attention_role(op) != GGML_GEMMINI_ATTENTION_NONE)
             return ggml::gemmini::attention_supported(op);
         if (ggml_is_empty(op)) {
             return true;
         }
+#if defined(GGML_GEMMINI_PB)
+        // An unsupported matmul must fail by name at execution, never move to the CPU.
+        return true;
+#endif
         const struct ggml_tensor * a = op->src[0]; // W
         const struct ggml_tensor * b = op->src[1]; // x
         if (a == nullptr || b == nullptr)

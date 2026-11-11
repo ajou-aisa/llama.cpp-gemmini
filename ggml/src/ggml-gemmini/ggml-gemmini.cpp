@@ -244,6 +244,11 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
 #endif
             break;
         }
+#if defined(GGML_GEMMINI_PB)
+        case GGML_OP_FLASH_ATTN_EXT:
+            GGML_LOG_ERROR("Gemmini-PB: node '%s' is unsupported: flash attention bypasses QK and PV\n", node->name);
+            return GGML_STATUS_FAILED;
+#endif
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

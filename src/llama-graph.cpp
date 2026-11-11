@@ -4,6 +4,9 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-kv-cache.h"
+#if defined(GGML_GEMMINI_PB)
+#include "ggml-gemmini.h"
+#endif
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
 #include "ggml-gemmini.h"
 #endif
@@ -1249,6 +1252,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+#if defined(GGML_GEMMINI_PB)
+        ggml_tensor * const pb_kq = kq;
+        ggml_set_name(kq, "gemmini_pb_qk");
+        ggml_gemmini_set_attention_role(kq, GGML_GEMMINI_ATTENTION_QK);
+        kq->src[2] = kq_mask;
+#else
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
         const bool potal_attention = cparams.offload_kqv &&
             (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
@@ -1259,6 +1268,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kq->src[2] = kq_mask;
         }
 #endif
+#endif // GGML_GEMMINI_PB
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
@@ -1293,6 +1303,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+#if defined(GGML_GEMMINI_PB)
+        ggml_set_name(kqv, "gemmini_pb_pv");
+        ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
+        ggml_backend_t selected = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            auto * backend = ggml_backend_sched_get_backend(sched, i);
+            if (strcmp(ggml_backend_name(backend), "GEMMINI") == 0) {
+                selected = backend;
+                break;
+            }
+        }
+        if (!selected || !ggml_backend_supports_op(selected, pb_kq) || !ggml_backend_supports_op(selected, kqv))
+            GGML_ABORT("Gemmini-PB attention unsupported: QK=%s PV=%s", pb_kq->name, kqv->name);
+        ggml_backend_sched_set_tensor_backend(sched, pb_kq, selected);
+        ggml_backend_sched_set_tensor_backend(sched, kqv, selected);
+#else
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
         if (potal_attention) {
             ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
@@ -1315,6 +1341,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_backend_sched_set_tensor_backend(sched, kqv, selected);
         }
 #endif
+#endif // GGML_GEMMINI_PB
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
