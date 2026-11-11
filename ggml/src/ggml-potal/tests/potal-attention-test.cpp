@@ -326,9 +326,11 @@ void test_reference() {
           got == std::vector<int64_t>{778899});
 }
 
-// ExSIA quantize_to_i32 rounding: ties round half away from zero, whatever the FP rounding mode.
-int round_half_away(double x) {
-    return int(x < 0 ? -std::floor(-x + 0.5) : std::floor(x + 0.5));
+// ExSIA quantize_to_i32 rounding: ties round half to even, whatever the FP rounding mode.
+int round_half_even(double x) {
+    const double f = std::floor(x);
+    const double d = x - f;
+    return int(d > 0.5 || (d == 0.5 && std::fmod(f, 2.0) != 0.0) ? f + 1 : f);
 }
 
 bool limbs_match(const stream & a, role r) {
@@ -433,8 +435,8 @@ void test_prepare() {
         const auto status = attention::prepare_stream(ties.t,0,0,0,1,role::pv,p,attention::pv_algorithm::legacy);
         check("P quantization restores caller rounding", std::fegetround() == mode);
         if (check("prepare P ties",status == POTAL_OK))
-            check("P ties round half away from zero, unsigned upper carry", p.scale == -15 && p.codes.size() == 32 &&
-                  p.codes[0] == 1 && p.codes[1] == 2 && p.codes[2] == 3 && p.codes[3] == 4 &&
+            check("P ties round half to even, unsigned upper carry", p.scale == -15 && p.codes.size() == 32 &&
+                  p.codes[0] == 0 && p.codes[1] == 2 && p.codes[2] == 2 && p.codes[3] == 4 &&
                   p.codes[4] == 32768 && limbs_match(p,role::pv));
         tensor qties(GGML_TYPE_F32,32,1);
         qties.fill(1);
@@ -446,9 +448,9 @@ void test_prepare() {
         const auto qstatus = attention::prepare_stream(qties.t,0,0,0,1,role::qk,q);
         check("Q quantization restores caller rounding",std::fegetround() == mode);
         if (check("prepare Q ties",qstatus == POTAL_OK))
-            check("Q signed ties round half away from zero",q.scale == -14 && q.codes.size() == 32 &&
-                  q.codes[0] == 16385 && q.codes[1] == 16386 &&
-                  q.codes[2] == -16385 && q.codes[3] == -16386 && limbs_match(q,role::qk));
+            check("Q signed ties round half to even",q.scale == -14 && q.codes.size() == 32 &&
+                  q.codes[0] == 16384 && q.codes[1] == 16386 &&
+                  q.codes[2] == -16384 && q.codes[3] == -16386 && limbs_match(q,role::qk));
     }
     check("restore original rounding mode", saved_round != -1 && std::fesetround(saved_round) == 0);
     tensor pclip(GGML_TYPE_F32,1,1);
@@ -1502,7 +1504,7 @@ void balanced_case(size_t k, int variant, bool half = false, size_t m = 1, size_
                 for (size_t x = 0; x < w.kp; ++x) {
                     const int t = theta[x/32];
                     const int code = x >= k || t == INT_MIN ? 0 :
-                        std::clamp(round_half_away(std::ldexp(double(g.w.get(x,j,h/repeat,b/repeat)),-t)),-128,127);
+                        std::clamp(round_half_even(std::ldexp(double(g.w.get(x,j,h/repeat,b/repeat)),-t)),-128,127);
                     metadata &= w.limbs[0][x*n+j] == code;
                     metadata &= w.carriers[x/32*n+j] == (t == INT_MIN ? POTAL_CARRIER_ZERO : uint32_t(t-base));
                 }
@@ -1519,7 +1521,7 @@ void balanced_case(size_t k, int variant, bool half = false, size_t m = 1, size_
                 for (size_t i = 0; i < rows; ++i)
                     for (size_t x = 0; x < a.kp; ++x)
                         metadata &= a.codes[i*a.kp+x] == (x >= k ? 0 :
-                            std::clamp(round_half_away(std::ldexp(double(g.a.get(x,begin+i,h,b)),-a.scale)),0,65535));
+                            std::clamp(round_half_even(std::ldexp(double(g.a.get(x,begin+i,h,b)),-a.scale)),0,65535));
                 golden::pv_context context;
                 context.batch=b; context.query_head=h; context.kv_head=h/repeat;
                 context.stripe=begin/(stripe.tile_I*POTAL_HW_DIM); context.row_begin=begin;
