@@ -15,13 +15,9 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::quants::act::exsia {
 class OutlierMarker {
   public:
-    // mark outliers in a stripe based on the final stripe scale exponent and a bitmask, setting the
-    // corresponding bits in the bitmask for outlier positions
-    void mark_outlier(StripeState &   stripe,
-                      size_t          row,
-                      size_t          blk_idx,
-                      size_t          blk_size,
-                      const BitMask & d_mask) const;
+    // mark columns [col_begin, col_end) of a stripe row as outliers (compensation targets) with
+    // whole-word writes; used for blocks above the anchor exponent, whose valid columns all compensate
+    void mark_valid_range(StripeState & stripe, size_t row, size_t col_begin, size_t col_end) const;
 };
 
 class ResidualClipper {
