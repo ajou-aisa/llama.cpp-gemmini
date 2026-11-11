@@ -3,10 +3,13 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/act/block/block.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/exsia/local.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cfenv>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -16,6 +19,93 @@ namespace act = ggml::gemmini::quants::act;
 namespace block = ggml::gemmini::quants::act::block;
 
 namespace {
+
+bool rn_tests() {
+    namespace exsia = act::exsia;
+    const int previous = std::fegetround();
+    struct RestoreRounding {
+        int mode;
+        ~RestoreRounding() { std::fesetround(mode); }
+    } restore{previous};
+    if (previous == -1) return false;
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> values = {
+        0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f,
+        std::nextafter(0.5f, 0.0f), std::nextafter(0.5f, inf),
+        std::nextafter(-0.5f, 0.0f), std::nextafter(-0.5f, -inf),
+        std::nextafter(1.5f, 0.0f), std::nextafter(1.5f, inf),
+        std::nextafter(-1.5f, 0.0f), std::nextafter(-1.5f, -inf),
+        std::nextafter(2.5f, 0.0f), std::nextafter(2.5f, inf),
+        std::nextafter(-2.5f, 0.0f), std::nextafter(-2.5f, -inf),
+        -2147483648.0f, 2147483648.0f, 2147483520.0f, -2147483520.0f
+    };
+    const std::vector<int32_t> expected = {
+        0, 0, 2, -2, 2, -2, 0, 1, 0, -1, 1, 2, -1, -2, 2, 3, -2, -3,
+        INT32_MIN, INT32_MAX, 2147483520, -2147483520
+    };
+    struct ShiftCase { int32_t value; int shift; int32_t expected; };
+    const ShiftCase shifts[] = {
+        {1, 1, 0}, {-1, 1, 0}, {3, 1, 2}, {-3, 1, -2},
+        {5, 1, 2}, {-5, 1, -2}, {7, 1, 4}, {-7, 1, -4},
+        {1, 2, 0}, {2, 2, 0}, {3, 2, 1}, {-1, 2, 0}, {-2, 2, 0}, {-3, 2, -1},
+        {5, 2, 1}, {6, 2, 2}, {7, 2, 2}, {-5, 2, -1}, {-6, 2, -2}, {-7, 2, -2},
+        {INT32_MIN, 1, -1073741824}, {INT32_MAX, 1, 1073741824},
+        {INT32_MIN, 31, -1}, {INT32_MAX, 31, 1},
+        {INT32_MIN, 32, 0}, {INT32_MAX, 32, 0}, {INT32_MIN, 33, 0},
+        {INT32_MIN, 32768, 0}, {INT32_MIN, 0, INT32_MIN}
+    };
+    bool ok = true;
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        if (std::fesetround(mode) != 0) return false;
+        exsia::WideQuantizer quantizer;
+        const auto actual = quantizer.quantize_block(values, 0);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (actual[i] != expected[i]) {
+                std::fprintf(stderr, "FAIL RN wide mode=%d lane=%zu got=%d expected=%d\n",
+                             mode, i, actual[i], expected[i]);
+                ok = false;
+            }
+        }
+        for (const auto & c : shifts) {
+            const auto actual_shift = exsia::detail::shift_q_i32(c.value, static_cast<int16_t>(-c.shift));
+            if (actual_shift != c.expected) {
+                std::fprintf(stderr, "FAIL RN shift mode=%d q=%d shift=%d got=%d expected=%d\n",
+                             mode, c.value, c.shift, actual_shift, c.expected);
+                ok = false;
+            }
+        }
+        // Power-of-two scales make these inputs exact in every caller rounding mode.
+        for (bool mxint : {false, true}) {
+            const int bits = GGML_GEMMINI_ACTIVATION_BITS;
+            const float step = mxint ? std::ldexp(1.0f, -(bits - 2)) : 1.0f;
+            std::vector<float> source(32, mxint ? 1.0f :
+                static_cast<float>(ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX));
+            for (size_t i = 0; i < 18; ++i) source[i] = values[i] * step;
+            ggml_tensor tensor{};
+            tensor.type = GGML_TYPE_F32;
+            tensor.data = source.data();
+            ggml_gemmini_args_t args{};
+            args.I = args.J = 1;
+            args.K = args.sA = 32;
+            args.act_quant.storage().emplace<block::Meta>();
+            if (!args.A.allocate(1, 32, bits) ||
+                !(mxint ? block::quantize_mxint(&tensor, args) : block::quantize(&tensor, args)))
+                return false;
+            const auto & meta = std::get<block::Meta>(args.act_quant.storage());
+            if (meta.scales[0] != step) return false;
+            for (size_t i = 0; i < 18; ++i) {
+                if (args.A.get(0, i) != expected[i]) {
+                    std::fprintf(stderr, "FAIL RN block mxint=%d mode=%d lane=%zu got=%d expected=%d\n",
+                                 mxint, mode, i, args.A.get(0, i), expected[i]);
+                    ok = false;
+                }
+            }
+        }
+        if (std::fegetround() != mode) return false;
+    }
+    if (ok) std::puts("RN: wide/BLOCK/MXINT ties, adjacent floats, shifts/extrema and four fenv modes passed");
+    return ok;
+}
 
 bool metadata_tests() {
     ggml_gemmini_args_t args{};
@@ -249,12 +339,12 @@ bool mxint_tests() {
     if (meta.scales.size() != 1 || meta.scales[0] != step ||
         !meta.rmd_packets.empty() || !meta.direct_residuals.empty() ||
         args.A.get(0, 0) != 1 << (bits - 2) ||
-        args.A.get(0, 1) != 1 || args.A.get(0, 2) != -1 ||
+        args.A.get(0, 1) != 0 || args.A.get(0, 2) != 0 ||
         args.A.get(0, 3) != -limit)
         return false;
     std::vector<float> restored(32);
     return act::dequantize_activation(restored.data(), 32, 1, 1, 32, args) &&
-           restored[1] == step && restored[2] == -step &&
+           restored[1] == 0.0f && restored[2] == 0.0f &&
            restored[3] == source[3];
 }
 
@@ -276,7 +366,7 @@ bool quant_tests() {
         return false;
     }
     if (!mxint_tests()) {
-        std::fputs("FAIL quant: MXINT weight did not select block32 PoT/ties-away activation\n", stderr);
+        std::fputs("FAIL quant: MXINT weight did not select block32 PoT/RN activation\n", stderr);
         return false;
     }
 
@@ -325,6 +415,8 @@ bool quant_tests() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--rn") == 0) return rn_tests() ? 0 : 1;
+    if (!rn_tests()) return 1;
     bool metadata = argc == 1;
     bool quant = argc == 1;
     for (int i = 1; i < argc; ++i) {

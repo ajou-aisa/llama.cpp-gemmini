@@ -743,11 +743,11 @@ bool test_q4_hp1_loader_contract() {
     if (status == GGML_STATUS_SUCCESS) {
         ggml_backend_tensor_get(op, actual.data(), 0, sizeof(actual));
     }
-    const float expected = GGML_GEMMINI_WEIGHT_BITS == 4 ? 5.0f : 4.5625f;
+    const float expected = GGML_GEMMINI_WEIGHT_BITS == 4 ? 4.0f : 4.5f;
     const bool ok = check(status == GGML_STATUS_SUCCESS, "MXINT graph computes") &&
                     check(std::fabs(actual[0] - expected) < 1e-5f &&
                           std::fabs(actual[1] - expected) < 1e-5f,
-                          "MXINT weights select matching ties-away activation without residuals");
+                          "MXINT weights select matching RN activation without residuals");
     ggml_backend_buffer_free(tensors);
     ggml_backend_free(backend);
     ggml_free(ctx);

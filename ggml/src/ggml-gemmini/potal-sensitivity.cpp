@@ -200,7 +200,7 @@ bool finish() {
     auto & config = settings();
     const bool ok = config.used.size() == config.policy.size();
     nlohmann::json result{{"schema","potal-anchor-policy-v1"},{"complete",ok},
-        {"rounding","ties_away"},
+        {"rounding","ties_even"},
         {"default_anchor",config.fallback},{"policy_keys",config.policy.size()},
         {"used_policy_keys",config.used.size()},{"profiling",profiling()}};
     std::fprintf(stderr,"POTAL_ANCHOR_POLICY_PROOF %s\n",result.dump().c_str());

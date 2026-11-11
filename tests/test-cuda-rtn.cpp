@@ -109,7 +109,7 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
             float ws=type==GGML_TYPE_Q6_K?ggml_fp16_to_fp32(static_cast<block_q6_K *>(w->data)[size_t(c)*(k/256)+b/8].d):scale(w,c,b);
             for (int j=0;j<32;++j) {
                 const double value=double(a[size_t(r)*k+b*32+j])/double(s);
-                int q=std::clamp(int(mxint?std::round(value):std::nearbyint(value)),mxint?-limit:-limit-1,limit);
+                int q=std::clamp(int(std::nearbyint(value)),mxint?-limit:-limit-1,limit);
                 int weight_code=(type==GGML_TYPE_Q6_K || mxint)?(ws==0?0:int(std::nearbyint(double(values[size_t(c)*k+b*32+j])/double(ws)))):code(w,c,b*32+j);
                 dot+=q*weight_code;
             }
@@ -137,28 +137,32 @@ static void dense(ggml_type type, int bits, int m, int n, int k) {
     std::printf("PASS dense type=%s A%d m=%d n=%d k=%d max_error=%.9g\n",ggml_type_name(type),bits,m,n,k,max_error);
     ggml_cuda_rtn_clear(); ggml_free(ctx);
 }
-static void mxint_ties_away(int bits, int requested_bits) {
+static void mxint_ties_even(int bits, int requested_bits) {
     setenv("GGML_CUDA_RTN_A_BITS",std::to_string(requested_bits).c_str(),1);
     ggml_cuda_rtn_clear();
     auto * ctx=ggml_init({size_t(1)<<20,nullptr,false}); require(ctx,"ties fixture context");
     auto * w=ggml_new_tensor_2d(ctx,bits==4?GGML_TYPE_MXINT4:GGML_TYPE_MXINT8,32,1);
-    auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,10);
+    auto * x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,18);
     std::memset(w->data,0,ggml_nbytes(w)); std::memset(x->data,0,ggml_nbytes(x));
     if (bits==4) {
         auto & block=*static_cast<block_q4_hp1 *>(w->data);
         std::memset(block.qs,0x88,sizeof(block.qs)); block.qs[0]=0x89; block.channel_scale=1;
     } else { auto & block=*static_cast<block_q8_hp1 *>(w->data); block.qs[0]=1; block.channel_scale=1; }
-    const float below=std::nextafter(.5f,0.0f), above=std::nextafter(.5f,1.0f);
-    const float ties[]{.5f,1.5f,2.5f,-.5f,-1.5f,-2.5f,below,above,-below,-above};
-    const int expected[]{1,2,3,-1,-2,-3,0,1,0,-1};
+    const float ties[]{.5f,1.5f,2.5f,-.5f,-1.5f,-2.5f};
+    const int expected[][3]{{0,0,1},{1,2,2},{2,2,3},{-1,0,0},{-2,-2,-1},{-3,-2,-2}};
     const float step=std::ldexp(1.0f,-(bits-2));
     auto * data=static_cast<float *>(x->data);
-    for (int row=0;row<10;++row) { data[row*32]=ties[row]*step; data[row*32+31]=1; }
+    for (int tie=0;tie<6;++tie) for (int side=0;side<3;++side) {
+        const float value=side==1?ties[tie]:std::nextafter(ties[tie],side==0?
+            -std::numeric_limits<float>::infinity():std::numeric_limits<float>::infinity());
+        data[(tie*3+side)*32]=value*step; data[(tie*3+side)*32+31]=1;
+    }
     auto * output=ggml_mul_mat(ctx,w,x);
     require(ggml_cuda_rtn_supported(output),"MXINT weight must select quantized activation");
     require(ggml_cuda_rtn_compute(output),ggml_cuda_rtn_error());
-    for (int row=0;row<10;++row)
-        require(static_cast<float *>(output->data)[row]==expected[row]*step,"MXINT activation PoT/ties-away mismatch");
+    for (int tie=0;tie<6;++tie) for (int side=0;side<3;++side)
+        require(static_cast<float *>(output->data)[tie*3+side]==expected[tie][side]*step,
+                "MXINT activation PoT/RN exact or adjacent tie mismatch");
     ggml_cuda_rtn_clear(); ggml_free(ctx);
 }
 static float value(const ggml_tensor * t,int k,int n,int h) {
@@ -188,8 +192,8 @@ int main(int argc, char ** argv) {
     benchmark_mode=argc==2 && (!std::strcmp(argv[1],"--benchmark") || !std::strcmp(argv[1],"--benchmark-large"));
     try {
         if (benchmark_mode && !std::strcmp(argv[1],"--benchmark-large")) { dense(GGML_TYPE_MXINT4,4,512,2048,2048); return 0; }
-        mxint_ties_away(4,4); mxint_ties_away(8,8);
-        mxint_ties_away(4,16); mxint_ties_away(8,16);
+        mxint_ties_even(4,4); mxint_ties_even(8,8);
+        mxint_ties_even(4,16); mxint_ties_even(8,16);
         if (benchmark_mode) {
             for (auto type:{GGML_TYPE_Q4_0,GGML_TYPE_Q8_0,GGML_TYPE_MXINT4,GGML_TYPE_MXINT8})
                 for (int bits:{4,8}) dense(type,bits,128,512,2048);

@@ -425,11 +425,14 @@ int32_t shift_q_oracle(int32_t q, int16_t delta_theta) {
             shifted, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()));
     }
     if (delta_theta < 0) {
-        const int     shift  = std::min<int>(-delta_theta, 31);
-        const int64_t value  = q;
-        const int64_t offset = int64_t{1} << (shift - 1);
-        return static_cast<int32_t>(value >= 0 ? (value + offset) >> shift
-                                               : -(((-value) + offset) >> shift));
+        // An int32 scaled down by a power of two is exact in double until
+        // underflow, where its nearest integer is already zero.
+        const double scaled = std::ldexp(static_cast<double>(q), delta_theta);
+        const double lower = std::floor(scaled);
+        const double fraction = scaled - lower;
+        const bool increment =
+            fraction > 0.5 || (fraction == 0.5 && std::fmod(lower, 2.0) != 0.0);
+        return static_cast<int32_t>(lower + int(increment));
     }
     return q;
 }
@@ -465,6 +468,11 @@ bool run_exsia_shift_regression() {
         for (int delta = -31; delta <= 31; ++delta) {
             if (!check_shift_value(q, static_cast<int16_t>(delta))) {
                 return check(false, "int32 extrema shifts preserve numeric and bit output");
+            }
+        }
+        for (const int delta : {-32768, -33, -32, 32, 33, 32767}) {
+            if (!check_shift_value(q, static_cast<int16_t>(delta))) {
+                return check(false, "wide exponent shifts follow RN and signed saturation");
             }
         }
     }

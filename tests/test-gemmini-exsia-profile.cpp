@@ -17,20 +17,215 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace {
 
 using namespace ggml::gemmini::quants::act::exsia;
-
-constexpr std::array<uint64_t, 4> kStageSentinels{100001, 100003, 100007, 100009};
 
 bool check(bool value, const char * message) {
     if (!value)
         std::fprintf(stderr, "FAIL: %s\n", message);
     return value;
 }
+
+bool test_folding_loss_counts(const std::filesystem::path & output) {
+    constexpr int32_t lo = std::numeric_limits<int32_t>::min();
+    constexpr int32_t hi = std::numeric_limits<int32_t>::max();
+    struct Block {
+        int16_t delta;
+        std::vector<int32_t> input;
+        std::vector<int32_t> shifted;
+    };
+    // Independent RN examples: ties round to even; exact -2^31
+    // remains representable, whereas -2^32 overflows even with the helper clamp.
+    const std::array<Block, 7> blocks{{
+        {-1, {0, 1, -1, 2, -2, 3, -3}, {0, 0, 0, 1, -1, 2, -2}},
+        {-2, {0, 1, -1, 2, -2, 3, -3, 6, -6}, {0, 0, 0, 0, 0, 1, -1, 2, -2}},
+        {1, {0, 1073741823, -1073741824, 1073741824, -1073741825, hi, lo},
+            {0, 2147483646, lo, hi, lo, hi, lo}},
+        {31, {0, -1, 1, -2, 2}, {0, lo, hi, lo, hi}},
+        {32, {0, -1, 1}, {0, lo, hi}},
+        {-32, {lo, hi, 1, -1, 0}, {0, 0, 0, 0, 0}},
+        {-33, {lo, hi, 1, -1, 0, 2, -2}, {0, 0, 0, 0, 0, 0, 0}},
+    }};
+    ggml_gemmini_args_t args{};
+    args.I = args.J = 1;
+    args.K = 6 * BLOCK_SIZE + 7;
+    if (!args.A.allocate(1, args.K, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    Meta meta;
+    meta.theta.resize(1);
+    ExSIAState state;
+    state.B_size = BLOCK_SIZE;
+    state.K_padded = blocks.size() * BLOCK_SIZE;
+    state.blocks_per_row = blocks.size();
+    StripeState stripe;
+    stripe.row_end = 1;
+    stripe.e1 = 0;
+    if (!stripe.outlier_mask.resize(1, state.K_padded))
+        return false;
+    std::vector<int32_t> wide(state.K_padded, 0), residual(state.K_padded, 0);
+    std::vector<int16_t> exponents;
+    std::vector<int32_t> expected(args.K, 0);
+    for (size_t b = 0; b < blocks.size(); ++b) {
+        exponents.push_back(blocks[b].delta);
+        for (size_t i = 0; i < blocks[b].input.size(); ++i) {
+            wide[b * BLOCK_SIZE + i] = blocks[b].input[i];
+            expected[b * BLOCK_SIZE + i] = std::clamp(
+                blocks[b].shifted[i],
+                int32_t{ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN},
+                int32_t{ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX});
+        }
+    }
+    // Nonzero padding would inflate both right counters if it were included.
+    std::fill(wide.begin() + args.K, wide.end(), 1);
+    ggml::gemmini::residual::TimedResidualCapture capture;
+    StripeFolding folding;
+    nlohmann::json observed = nlohmann::json::array();
+    for (const bool empty : {false, true}) {
+        if (empty)
+            std::fill(wide.begin(), wide.end(), 0);
+        if (!folding.run(meta, state, stripe, args, 0, wide, exponents, residual, capture))
+            return false;
+        for (size_t col = 0; col < args.K; ++col)
+            if (!check(args.A.get(0, col) == (empty ? 0 : expected[col]),
+                       "folding preserves independently specified signed rounding and saturation"))
+                return false;
+#if EXSIA_STAGE_PROFILE_ENABLED
+        if (!check(stripe.right_shift_elements == (empty ? 0 : 24) &&
+                       stripe.right_shift_zeroed_elements == (empty ? 0 : 16) &&
+                       stripe.left_shift_saturated_elements == (empty ? 0 : 9),
+                   "exact logical folding loss counts exclude padding and reset on reuse"))
+            return false;
+#endif
+        observed.push_back({{"dense", *args.A.bytes}, {"residual", residual}, {"theta", meta.theta}});
+    }
+    if (!output.empty())
+        std::ofstream(output) << observed.dump() << '\n';
+    return true;
+}
+
+bool test_folding_profile_reset(const std::filesystem::path & detail_path,
+                                const std::filesystem::path & output) {
+    using ggml::gemmini::residual::ResidualRoute;
+    constexpr size_t rows = 2 * DIM + 1, columns = 3 * BLOCK_SIZE + 3;
+    std::vector<float> source(rows * columns);
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = 1;
+    args.K = args.sA = columns;
+    args.tile_I = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.matmul_layer = "folding-loss-reset";
+    args.folding_anchor = 3;
+    if (!args.A.allocate(rows, columns, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    ExSIA quantizer;
+    Meta meta;
+    nlohmann::json observed = nlohmann::json::array();
+    for (const auto route : {ResidualRoute::ws_packet, ResidualRoute::cpu_direct}) {
+        args.residual_route = route;
+        for (const bool empty : {false, true}) {
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t c = 0; c < columns; ++c)
+                    source[r * columns + c] =
+                        empty ? 0.0f
+                        : c < BLOCK_SIZE ? (c % 2 ? -1099511627776.0f : 1099511627776.0f)
+                        : c < 2 * BLOCK_SIZE ? 0x1p10f
+                        : c < 3 * BLOCK_SIZE ? 0.25f : 0x1p-20f;
+            if (!check(quantizer.run(meta, &tensor, args), "folding reset fixture quantizes") ||
+                !gemmini_log_cycle_flush())
+                return false;
+            const auto & state = quantizer.state();
+#if EXSIA_STAGE_PROFILE_ENABLED
+            size_t emitted = 0;
+            std::ifstream input(detail_path);
+            for (std::string line; std::getline(input, line);) {
+                const auto event = nlohmann::json::parse(line);
+                if (event.value("record_type", "") != "EXSIA_WORKLOAD" ||
+                    event.value("layer", "") != args.matmul_layer ||
+                    event.value("run_id", nlohmann::json()) != *meta.run_id)
+                    continue;
+                const size_t index = event.at("stripe_id");
+                const auto & profile = state.profile_snapshot.stripes.at(index);
+                // Uniform magnitudes retain each block exponent. TOP3 e3=-2
+                // shifts e=40 beyond INT32 and the three e=-20 tail codes to zero.
+                const size_t right = empty ? 0 : 3 * (profile.row_end - profile.row_start);
+                const size_t saturated =
+                    empty ? 0 : BLOCK_SIZE * (profile.row_end - profile.row_start);
+                if (!check(event.at("right_shift_elements") == right &&
+                               event.at("right_shift_zeroed_elements") == right &&
+                               event.at("left_shift_saturated_elements") == saturated &&
+                               profile.right_shift_elements == right &&
+                               profile.right_shift_zeroed_elements == right &&
+                               profile.left_shift_saturated_elements == saturated,
+                           "runtime publishes exact counts per stripe and resets between runs"))
+                    return false;
+                ++emitted;
+            }
+            if (!check(emitted == 3, "all stripes emit folding loss counters"))
+                return false;
+#else
+            (void)detail_path;
+#endif
+            nlohmann::json packets = nlohmann::json::array(), direct = nlohmann::json::array();
+            for (const auto & packet : meta.rmd_packets) {
+                if (!packet)
+                    continue;
+                nlohmann::json blocks = nlohmann::json::array();
+                for (const auto & block : packet->blocks) {
+                    nlohmann::json groups = nlohmann::json::array();
+                    for (const auto & group : block.groups)
+                        groups.push_back({group.lane_positions, group.row_offsets, group.row_ids,
+                                          group.k_mask, group.padded_k_count, group.activation_offset,
+                                          group.activation_byte_offset, group.activation_byte_count});
+                    blocks.push_back({block.block_id, block.global_k_begin, block.compact_k_count,
+                                      block.padded_k_count, block.active_lane_mask,
+                                      block.active_lane_count, block.lane_ids, block.lane_k_masks,
+                                      block.k_index_offset, block.activation_offset,
+                                      block.activation_byte_offset, block.activation_byte_count,
+                                      block.output_value_offset, block.rows_padded,
+                                      block.lane_stride_values, groups});
+                }
+                packets.push_back({packet->version, packet->digit_bits, packet->lane_capacity,
+                                   static_cast<uint8_t>(packet->digit_storage), packet->stripe_id,
+                                   packet->row_begin, packet->row_count, packet->logical_k,
+                                   packet->logical_j, packet->j_padded, packet->block_size,
+                                   packet->array_dim, packet->activation_value_count,
+                                   packet->residual_event_count, packet->residual_min,
+                                   packet->residual_max, packet->required_planes, packet->digit_nnz,
+                                   packet->active_original_rows, packet->active_original_rows_valid,
+                                   packet->residual_observations_valid, packet->total_output_values,
+                                   packet->k_indices, packet->stacked_activation.signed_int8,
+                                   packet->stacked_activation.signed_int16, blocks});
+            }
+            for (const auto & payload : meta.direct_residuals) {
+                if (!payload)
+                    continue;
+                nlohmann::json events = nlohmann::json::array();
+                for (const auto & event : payload->events)
+                    events.push_back({event.local_row, event.original_k, event.residual});
+                direct.push_back({payload->stripe_id, payload->row_begin, payload->row_count,
+                                  payload->logical_k, payload->logical_j, events});
+            }
+            observed.push_back({{"dense", *args.A.bytes}, {"residual", state.residual},
+                                {"theta", meta.theta}, {"packets", packets}, {"direct", direct}});
+        }
+    }
+    if (!output.empty())
+        std::ofstream(output) << observed.dump() << '\n';
+    return true;
+}
+
+#if EXSIA_STAGE_PROFILE_ENABLED
+constexpr std::array<uint64_t, 4> kStageSentinels{100001, 100003, 100007, 100009};
 
 ProfileInterval interval(uint64_t cycles, uint64_t owner, uint64_t generation) {
 #if !defined(__linux__) || !defined(__aarch64__)
@@ -59,6 +254,38 @@ ProfileInterval interval(uint64_t cycles, uint64_t owner, uint64_t generation) {
 #endif
     result.valid = true;
     return result;
+}
+
+bool test_outliers_saturate_without_residual_compensation() {
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = 32;
+    if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    Meta meta;
+    meta.theta.resize(1);
+    ExSIAState state;
+    state.B_size = args.K;
+    state.K_padded = args.K;
+    state.blocks_per_row = 1;
+    StripeState stripe;
+    stripe.row_end = 1;
+    stripe.e1 = 0;
+    if (!stripe.outlier_mask.resize(1, args.K))
+        return false;
+    stripe.outlier_mask.set(0, 0);
+    stripe.outlier_mask.set(0, 1);
+    std::vector<int32_t> wide(args.K, 0), residual(args.K, 0);
+    wide[0] = (int32_t{1} << GGML_GEMMINI_ACTIVATION_BITS) - 1;
+    wide[1] = -wide[0];
+    ggml::gemmini::residual::TimedResidualCapture capture;
+    StripeFolding folding;
+    if (!folding.run(meta, state, stripe, args, 0, wide, {0}, residual, capture))
+        return false;
+    return check(args.A.get(0, 0) == ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX &&
+                     args.A.get(0, 1) == ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN,
+                 "RMD OFF saturates both outlier signs instead of retaining their low limbs");
 }
 
 StripeProfileRecord worker_fixture() {
@@ -465,8 +692,10 @@ bool test_workload_and_recompute(const std::filesystem::path & detail_path,
                            "recomputation"))
                     return false;
                 if (!check(
-                        index == 2 ? selected == 0 && nnz == 0 : selected > nnz && nnz > 0,
-                        "selected positions differ from nnz and zero residual stripe is retained"))
+                        index == 2 ? selected == 0 && nnz == 0
+                                   : GGML_GEMMINI_ENABLE_RMD ? selected > nnz && nnz > 0
+                                                            : selected > 0 && nnz == 0,
+                        "selection and residual counts follow RMD policy, including empty stripes"))
                     return false;
                 ++workloads;
             }
@@ -817,9 +1046,27 @@ bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::pa
     return true;
 }
 
+#endif
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--folding-loss") {
+        const std::filesystem::path output(argv[2]);
+        const auto detail = output.string() + ".detail.jsonl";
+        std::filesystem::remove(detail);
+#if defined(_WIN32)
+        if (_putenv_s("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail.c_str()) != 0)
+            return 1;
+#else
+        if (setenv("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail.c_str(), 1) != 0)
+            return 1;
+#endif
+        if (!ggml::gemmini::log::cycle.set_output_path((output.string() + ".cycle.jsonl").c_str(), true))
+            return 1;
+        return test_folding_loss_counts(output.string() + ".integer.json") &&
+               test_folding_profile_reset(detail, output) ? 0 : 1;
+    }
+#if EXSIA_STAGE_PROFILE_ENABLED
     if (argc == 3 && std::string(argv[1]) == "--origin-order") {
         using namespace ggml::gemmini;
         using namespace ggml::gemmini::quants::act::exsia::detail;
@@ -925,14 +1172,17 @@ int main(int argc, char ** argv) {
     if (setenv("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail_path.string().c_str(), 1) != 0)
         return 1;
 #endif
-    const bool ok = test_each_configured_worker_keeps_individual_provenance() &&
+    const bool ok = test_folding_loss_counts({}) &&
+                    test_outliers_saturate_without_residual_compensation() &&
+                    test_each_configured_worker_keeps_individual_provenance() &&
                     test_worker_failure_is_local_to_that_worker() &&
                     test_structural_eligibility_is_individual() &&
                     test_stage_aggregation_preserves_missing_and_invalid_samples() &&
                     test_stage_sum_overflow_is_not_complete() && test_full_origin_context_reset() &&
                     test_workload_and_recompute(detail_path, cycle_path) &&
                     test_invalid_run_keeps_caller_cpu(cycle_path) &&
-                    test_three_stripe_publication_and_worker_profiles(detail_path, cycle_path);
+                    test_three_stripe_publication_and_worker_profiles(detail_path, cycle_path) &&
+                    test_folding_profile_reset(detail_path, {});
     if (ok && argc == 1) {
         std::filesystem::remove(detail_path);
         std::filesystem::remove(cycle_path);
@@ -941,4 +1191,7 @@ int main(int argc, char ** argv) {
         std::printf("PASS: ExSIA individual worker provenance workers=%zu\n",
                     EXSIA_LOCAL_WORKER_COUNT);
     return ok ? 0 : 1;
+#else
+    return 2;
+#endif
 }

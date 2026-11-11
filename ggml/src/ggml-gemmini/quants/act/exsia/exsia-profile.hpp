@@ -254,8 +254,11 @@ struct StripeProfileRecord {
     size_t                                                team_size = 1;
 #if EXSIA_STAGE_PROFILE_ENABLED
     StripeCycleStats stats;
-    uint64_t         selected_positions = 0;
-    uint64_t         residual_nnz       = 0;
+    uint64_t         selected_positions           = 0;
+    uint64_t         residual_nnz                  = 0;
+    uint64_t         right_shift_elements          = 0;
+    uint64_t         right_shift_zeroed_elements   = 0;
+    uint64_t         left_shift_saturated_elements = 0;
 #endif
 };
 

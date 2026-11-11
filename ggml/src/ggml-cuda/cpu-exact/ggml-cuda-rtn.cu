@@ -86,7 +86,7 @@ __global__ void decode_half(const uint8_t * source, __half * dest, size_t count,
     int q=bits==4?int((b[2+k%16]>>(k<16?0:4))&15)-8:int(static_cast<int8_t>(b[2+k]));
     dest[i]=__float2half_rn(__half2float(*reinterpret_cast<const __half *>(b))*float(q));
 }
-// MXINT weights select PoT scaling and ties-away; ordinary RTN retains BLOCK/RNE.
+// MXINT weights select PoT scaling; MXINT and ordinary BLOCK use RN ties-to-even.
 __global__ void quantize_activation(const float * x, int8_t * q, float * scales, size_t groups, int bits, bool mxint) {
     size_t b=size_t(blockIdx.x)*blockDim.x/32+threadIdx.x/32;
     unsigned lane=threadIdx.x%32;
@@ -96,7 +96,7 @@ __global__ void quantize_activation(const float * x, int8_t * q, float * scales,
     int limit=bits==4?7:127;
     float scale=a==0?1.0f:mxint?ldexpf(1.0f,max(-127,ilogbf(a))-(bits-2)):float(double(a)/double(limit));
     const double scaled=isfinite(value)?double(value)/double(scale):0.0;
-    int code=mxint?int(round(scaled)):__double2int_rn(scaled);
+    int code=__double2int_rn(scaled);
     q[b*32+lane]=int8_t(max(mxint?-limit:-limit-1,min(limit,code)));
     if (!lane) scales[b]=scale;
 }

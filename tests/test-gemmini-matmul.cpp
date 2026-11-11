@@ -1858,7 +1858,7 @@ static bool test_attention_mask() {
 
 static bool test_attention() {
     using ggml::gemmini::quants::act::exsia::detail::shift_q_i32;
-    if (!expect(shift_q_i32(INT32_MIN, -32) == -1 && shift_q_i32(INT32_MIN, -33) == 0 &&
+    if (!expect(shift_q_i32(INT32_MIN, -32) == 0 && shift_q_i32(INT32_MIN, -33) == 0 &&
                 shift_q_i32(INT32_MAX, -32) == 0 && shift_q_i32(-3, -1) == -2,
                 "wide right-shift boundaries")) return false;
     {
