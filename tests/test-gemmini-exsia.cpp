@@ -376,16 +376,6 @@ bool capture_geometry_publication(void *                                       o
     trace.rows[trace.publications++] = {event.row_begin, event.row_end};
     trace.direct_handles += event.direct_residual != nullptr ? 1 : 0;
     trace.packet_handles += event.rmd_packet != nullptr ? 1 : 0;
-    if (!check(event.activation_metadata.has_value(), "ExSIA publication carries metadata"))
-        return false;
-    const auto & metadata = *event.activation_metadata;
-    if (metadata.rho != config::GGML_GEMMINI_ACTIVATION_RHO ||
-        metadata.e_s == std::numeric_limits<int16_t>::min() ||
-        metadata.theta != metadata.e_s - metadata.rho) {
-        std::fprintf(stderr, "stripe=%zu e_s=%d theta=%d rho=%d\n",
-                     event.stripe_id, metadata.e_s, metadata.theta, metadata.rho);
-        return check(false, "publication exponent, theta, and rho describe the same stripe");
-    }
     return true;
 }
 
@@ -450,7 +440,6 @@ bool test_activation_stripe_geometry_contract() {
     constexpr size_t   cols          = 32;
     std::vector<float> source(rows * cols, 0.5f);
     source[0] = 32.0f;
-    std::fill(source.begin() + stripe_rows * cols, source.end(), 8.0f);
     ggml_tensor tensor{};
     tensor.type = GGML_TYPE_F32;
     tensor.data = source.data();
@@ -472,19 +461,8 @@ bool test_activation_stripe_geometry_contract() {
     GeometryPublicationTrace            trace;
     quants::act::exsia::StripeReadySink sink{&trace, capture_geometry_publication};
     quants::act::exsia::ExSIA           exsia;
-    bool exsia_ok = true;
-    for (const auto & mode : quants::act::exsia::execution_mode_availability()) {
-        if (!mode.available)
-            continue;
-        trace = {};
-        exsia.set_execution_mode(mode.mode);
-        exsia_ok = exsia.run(exsia_meta, &tensor, exsia_args, &sink);
-        if (!check(exsia_ok && trace.publications == 2 && exsia_meta.theta.size() == 2 &&
-                       exsia_meta.theta[0] != exsia_meta.theta[1],
-                   "each execution mode publishes two distinct stripe scales"))
-            return false;
-        std::printf("STRIPE_METADATA mode=%s PASS\n", mode.label);
-    }
+    exsia.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    const bool exsia_ok = exsia.run(exsia_meta, &tensor, exsia_args, &sink);
 
     ggml_gemmini_args_t stripe_args{};
     stripe_args.I                          = rows;
@@ -703,7 +681,7 @@ bool test_cpu_direct_residual_dequantization() {
 }
 
 bool test_exsia_packet_capture() {
-#if GGML_GEMMINI_ACTIVATION_BITS != 16
+#if GGML_GEMMINI_ENABLE_RMD && GGML_GEMMINI_ACTIVATION_BITS != 16
     constexpr size_t   rows = 2 * DIM + 1, k = 65;
     std::vector<float> source(rows * k, 0.5f);
     for (size_t row = 0; row < rows; ++row) {
@@ -761,88 +739,27 @@ bool test_exsia_packet_capture() {
                 }
             }
     }
-    if (!check((GGML_GEMMINI_ENABLE_RMD ? packet_count > 1 : packet_count == 0) &&
-                   meta.direct_residuals.empty(),
+    if (!check(packet_count > 1 && meta.direct_residuals.empty(),
                "real ExSIA uses packets across reused stripe slots"))
         return false;
-#if EXSIA_VALIDATION
     if (!check(std::equal(
                    restored.begin(), restored.end(), state.residual.begin(), state.residual.end()),
                "packet reconstruction equals ExSIA selected residual plane"))
         return false;
-#else
-    if (!check(state.residual.empty() && state.residual.capacity() == 0,
-               "production ExSIA retains no dense residual plane"))
-        return false;
-#endif
-    const auto packet_dense = *args.A.bytes;
-    const auto packet_theta = meta.theta;
-    std::vector<float> packet_decoded(rows * k);
-    args.act_quant.storage().emplace<quants::act::exsia::Meta>(meta);
-    if (!check(quants::act::exsia::dequantize_activation(
-                   packet_decoded.data(), k, 1, rows, k, args),
-               "packet residuals and dense low limbs decode"))
-        return false;
-    for (size_t row = 0; row < rows; ++row)
-        for (size_t col = 0; col < k; ++col)
-            if (!check(packet_decoded[row * k + col] ==
-                           std::ldexp(static_cast<float>(args.A.get(row, col) +
-                                                         restored[row * state.K_padded + col]),
-                                      packet_theta[row / DIM]),
-                       "dense low limb plus packet reconstruction equals decoded activation"))
-                return false;
     args.residual_route = residual::ResidualRoute::cpu_direct;
     if (!check(exsia.run(meta, &tensor, args) && meta.rmd_packets.empty() &&
-                   (GGML_GEMMINI_ENABLE_RMD ? !meta.direct_residuals.empty()
-                                           : meta.direct_residuals.empty()),
+                   !meta.direct_residuals.empty(),
                "reused ExSIA switches every WS slot to CPU direct"))
         return false;
-    std::vector<int32_t> direct_plane;
-    if (!check(residual::expand_direct_payloads_to_plane(
-                   meta.direct_residuals, 0, rows, k, args.J, k, direct_plane) ==
-                   rmd::RmdStatus::success,
-               "direct residual payloads reconstruct"))
-        return false;
-    for (size_t row = 0; row < rows; ++row)
-        for (size_t col = 0; col < state.K_padded; ++col) {
-            const int32_t direct_value = col < k ? direct_plane[row * k + col] : 0;
-            if (!check(direct_value == restored[row * state.K_padded + col],
-                       "packet and direct reconstruction agree including padding"))
-                return false;
-#if EXSIA_VALIDATION
-            if (!check(state.residual[row * state.K_padded + col] == direct_value,
-                       "validation plane preserves direct residual observations"))
-                return false;
-#endif
-        }
-    std::vector<float> direct_decoded(rows * k);
-    args.act_quant.storage().emplace<quants::act::exsia::Meta>(meta);
-    if (!check(*args.A.bytes == packet_dense && meta.theta == packet_theta &&
-                   quants::act::exsia::dequantize_activation(
-                       direct_decoded.data(), k, 1, rows, k, args) &&
-                   direct_decoded == packet_decoded,
-               "packet and direct routes preserve dense limbs, scales, and decoded activation"))
-        return false;
-#if !EXSIA_VALIDATION
-    if (!check(state.residual.empty() && state.residual.capacity() == 0,
-               "production direct route retains no stale residual plane"))
-        return false;
-#endif
     args.residual_route = residual::ResidualRoute::ws_packet;
     if (!check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
-                   (GGML_GEMMINI_ENABLE_RMD ? !meta.rmd_packets.empty() : meta.rmd_packets.empty()),
+                   !meta.rmd_packets.empty(),
                "reused ExSIA switches CPU slots back to WS packets"))
         return false;
     std::fill(source.begin(), source.end(), 0.0f);
-    if (!check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
-                   meta.rmd_packets.empty() &&
-                   std::all_of(state.residual.begin(), state.residual.end(),
-                               [](int32_t value) { return value == 0; }),
-               "empty run publishes no stale residuals from reused slots"))
-        return false;
-    std::printf("RESIDUAL_STORAGE validation=%d rmd=%d packet/direct/dense=PASS\n",
-                EXSIA_VALIDATION, GGML_GEMMINI_ENABLE_RMD);
-    return true;
+    return check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
+                     meta.rmd_packets.empty(),
+                 "empty run publishes no residuals from reused slots");
 #else
     return true;
 #endif

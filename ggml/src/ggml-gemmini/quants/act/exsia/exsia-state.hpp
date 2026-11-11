@@ -254,11 +254,8 @@ struct StripeState {
     BitMask       outlier_mask; // bitmask indicating outlier positions in a stripe
     StripeScratch scratch;
 #if EXSIA_STAGE_PROFILE_ENABLED
-    uint64_t selected_positions           = 0; // final logical mask positions, including zero residuals
-    uint64_t residual_nnz                  = 0;
-    uint64_t right_shift_elements          = 0;
-    uint64_t right_shift_zeroed_elements   = 0;
-    uint64_t left_shift_saturated_elements = 0;
+    uint64_t selected_positions = 0; // final logical mask positions, including zero residuals
+    uint64_t residual_nnz       = 0;
 #endif
 
     size_t row_count() const {

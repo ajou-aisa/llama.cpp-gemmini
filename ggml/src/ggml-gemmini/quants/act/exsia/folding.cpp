@@ -67,11 +67,8 @@ bool StripeFolding::run(Meta &                           meta,
     evaluation::observe_dense_scu(args, stripe_idx, stripe.row_count());
 #endif
 #if EXSIA_STAGE_PROFILE_ENABLED
-    stripe.selected_positions           = 0;
-    stripe.residual_nnz                  = 0;
-    stripe.right_shift_elements          = 0;
-    stripe.right_shift_zeroed_elements   = 0;
-    stripe.left_shift_saturated_elements = 0;
+    stripe.selected_positions = 0;
+    stripe.residual_nnz       = 0;
 #endif
 #if GGML_GEMMINI_ENABLE_RMD
     rmd_builder.reset(stripe_idx,
@@ -159,24 +156,6 @@ bool StripeFolding::run(Meta &                           meta,
                     args.evaluation_context->position(r, col, outlier, residual_i32 != 0);
 #endif
 #if EXSIA_STAGE_PROFILE_ENABLED
-                if (col < args.K) {
-                    const int32_t q = stripe_q_wide[padded_idx];
-                    if (delta_theta_b < 0 && q != 0) {
-                        ++stripe.right_shift_elements;
-                        stripe.right_shift_zeroed_elements += q_shifted == 0;
-                    } else if (delta_theta_b > 0) {
-                        // Compare the mathematical shift, including deltas beyond the
-                        // result helper's clamp. Equality at INT32_MIN is not overflow.
-                        if (delta_theta_b >= 32) {
-                            stripe.left_shift_saturated_elements += q != 0;
-                        } else {
-                            const int64_t factor = int64_t{1} << delta_theta_b;
-                            stripe.left_shift_saturated_elements +=
-                                q > std::numeric_limits<int32_t>::max() / factor ||
-                                q < std::numeric_limits<int32_t>::min() / factor;
-                        }
-                    }
-                }
                 stripe.selected_positions += outlier;
                 stripe.residual_nnz += residual_i32 != 0;
 #endif

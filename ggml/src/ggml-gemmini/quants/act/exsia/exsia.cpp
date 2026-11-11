@@ -529,11 +529,8 @@ bool ExSIA::run(Meta &                  meta,
                                      ) {
         (void)measure_stripe_ready_handoff;
 #if EXSIA_STAGE_PROFILE_ENABLED
-        profile->selected_positions           = slot.stripe.selected_positions;
-        profile->residual_nnz                  = slot.stripe.residual_nnz;
-        profile->right_shift_elements          = slot.stripe.right_shift_elements;
-        profile->right_shift_zeroed_elements   = slot.stripe.right_shift_zeroed_elements;
-        profile->left_shift_saturated_elements = slot.stripe.left_shift_saturated_elements;
+        profile->selected_positions = slot.stripe.selected_positions;
+        profile->residual_nnz       = slot.stripe.residual_nnz;
 #endif
         if (sink == nullptr || sink->on_ready == nullptr)
             return true;

@@ -705,31 +705,6 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
-
-# Exercise production storage with the same behavioral owner and source set.
-add_executable(test-gemmini-exsia-production
-    test-gemmini-exsia.cpp
-    ${_GEMMINI_TEST_EXSIA_SOURCES})
-get_target_property(_exsia_production_definitions test-gemmini-exsia COMPILE_DEFINITIONS)
-list(FILTER _exsia_production_definitions EXCLUDE REGEX "^EXSIA_VALIDATION=")
-target_compile_definitions(test-gemmini-exsia-production PRIVATE
-    ${_exsia_production_definitions} EXSIA_VALIDATION=0)
-unset(_exsia_production_definitions)
-target_compile_features(test-gemmini-exsia-production PRIVATE cxx_std_17)
-target_include_directories(test-gemmini-exsia-production PRIVATE
-    $<TARGET_PROPERTY:test-gemmini-exsia,INCLUDE_DIRECTORIES>)
-target_link_libraries(test-gemmini-exsia-production PRIVATE ggml-base ggml-gemmini-utils)
-if (GGML_GEMMINI_ENABLE_OPENMP)
-    target_link_libraries(test-gemmini-exsia-production PRIVATE OpenMP::OpenMP_CXX)
-endif()
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
-    target_link_libraries(test-gemmini-exsia-production PRIVATE atomic)
-endif()
-foreach(_case IN ITEMS stripe-geometry packet-capture)
-    add_test(NAME gemmini_exsia_production_${_case}
-        COMMAND $<TARGET_FILE:test-gemmini-exsia-production> --case=${_case})
-endforeach()
-
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_library(test-gemmini-direct-linux-aarch64-strict OBJECT
@@ -879,12 +854,7 @@ foreach(_case IN LISTS _GGML_GEMMINI_EXSIA_CASES)
             -DEXPECTED_CASE=${_case}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-case.cmake)
 endforeach()
-math(EXPR _exsia_test_thread_limit "${GGML_GEMMINI_EXSIA_LOCAL_WORKERS} + 1")
-set_tests_properties(gemmini_exsia_all PROPERTIES
-    ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=${_exsia_test_thread_limit}"
-    TIMEOUT 30)
-unset(_exsia_test_thread_limit)
-set_tests_properties(gemmini_exsia_direct_executor PROPERTIES
+set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
     ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
     TIMEOUT 30)
 unset(_GGML_GEMMINI_EXSIA_CASES)

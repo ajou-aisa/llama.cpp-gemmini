@@ -807,11 +807,7 @@ FailureCode flush_profile(const ProfileConfig &                    config,
               << profile.stats.p3_replay_count + profile.stats.forced_recompute_count
               << ",\"forced_recomputed_blocks\":" << profile.stats.forced_recompute_count
               << ",\"selected_positions\":" << profile.selected_positions
-              << ",\"residual_nnz\":" << profile.residual_nnz
-              << ",\"right_shift_elements\":" << profile.right_shift_elements
-              << ",\"right_shift_zeroed_elements\":" << profile.right_shift_zeroed_elements
-              << ",\"left_shift_saturated_elements\":" << profile.left_shift_saturated_elements
-              << ",\"host_timing\":"
+              << ",\"residual_nnz\":" << profile.residual_nnz << ",\"host_timing\":"
               << cycle::serialize_host_timing(profile.stripe_total.start_ns,
                                               profile.stripe_total.end_ns,
                                               profile.stripe_total.start_tid,
