@@ -5,6 +5,7 @@
 #include "residual/stripe-residual.hpp"
 
 #include "potal_hw_params.h"
+#include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
 #include "quants/act/quantize.hpp"
@@ -23,6 +24,10 @@
 #include <new>
 #include <utility>
 #include <thread>
+
+#if defined(__linux__)
+#    include <sched.h>
+#endif
 
 namespace ggml::potal {
 
@@ -146,6 +151,8 @@ struct stripe_run::slot {
     uint64_t                      folding_commit_ns     = 0;
     uint32_t                      submit_edge = 0;
     uint32_t                      final_edge = 0;
+    // Strict issuer: the job prepare_job built while RESERVED; the consumer takes it.
+    std::shared_ptr<stripe_work>  prepared;
 
     ~slot() {
         std::free(a);
@@ -176,6 +183,21 @@ struct stripe_run::stripe_work {
     pipeline_counts counts;
     stripe_completion done;
     bool paired_route = false;
+    // prepare_paired's plans (the request points at them until the stripe retires).
+    potal_paired_geometry   diagnostic_hw;
+    potal_tile_plan         diagnostic_main;
+    potal_tile_plan         j8k8_main;
+    potal_tile_plan         selected_main;
+    const potal_tile_plan * paired_main = nullptr;
+    bool                    diagnostic_index = false;
+    potal_paired_prepared   job; // strict issuer: plan, staging, Queue entries made by the producer
+};
+
+struct stripe_run::prep_outcome {
+    bool         ok     = false;
+    const char * stage  = nullptr;
+    potal_status status = POTAL_OK;
+    std::string  detail;
 };
 
 void stripe_run::timeline(unsigned stage, unsigned event, size_t stripe, size_t buffer, uint32_t edge) const {
@@ -529,14 +551,21 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
         s->quantization_end_ns   = e.quantization_end_ns;
         s->folding_commit_ns     = e.folding_commit_ns;
         const bool copied        = copy_activation_rows(producer_args, e.row_begin, rows, s->a, lda_);
+        // Strict issuer: this producer thread (hart 3) prepares the whole job before READY.
+        prep_outcome prepared;
+        prepared.ok = true;
+        if (copied && cfg_.strict_issuer) prepared.ok = prepare_job(*s, prepared);
 
         lock.lock();
-        if (!copied || failed_) {
+        if (!copied || !prepared.ok || failed_) {
             s->state = slot_state::free;
             s->packet.reset();
+            s->prepared.reset(); // nothing was issued: its DMA buffers are free again
             outstanding_--;
             if (!copied) {
                 fail_locked("submit", POTAL_OK, false, "the stripe's activation codes are not readable");
+            } else if (!prepared.ok) {
+                fail_locked(prepared.stage, prepared.status, false, prepared.detail);
             }
             return false;
         }
@@ -597,6 +626,7 @@ consume_outcome stripe_run::consume(const planned_runner & exec) {
 consume_outcome stripe_run::consume(const owner_runners & runners) {
     consume_outcome out;
     std::thread finalizer;
+    issuer_thread_.store(std::this_thread::get_id(), std::memory_order_release);
     if (cfg_.hart_roles) {
         const uint64_t start_mono = ::potal::timeline::mono_if_on();
         std::string why;
@@ -624,9 +654,11 @@ consume_outcome stripe_run::consume(const owner_runners & runners) {
         stripe_event begin{ stripe_event_kind::main_begin };
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            timeline(20, 3);
+            // Strict issuer: waiting for the next prepared job is issuer.wait_job (64).
+            const unsigned wait_stage = cfg_.strict_issuer ? 64 : 20;
+            timeline(wait_stage, 3);
             cv_.wait(lock, [this] { return failed_ || !ready_.empty() || (closing_ && ready_.empty()); });
-            timeline(20, 4);
+            timeline(wait_stage, 4);
             if (failed_ || ready_.empty()) {
                 break; // failed: READY stripes are dropped, nothing new starts
             }
@@ -714,9 +746,214 @@ void stripe_run::merge_counts(const pipeline_counts & n) {
         counts_.paired_residual_pitch_padding_bytes += n.paired_residual_pitch_padding_bytes;
         counts_.paired_residual_valid_bytes += n.paired_residual_valid_bytes;
         counts_.paired_residual_load_bytes_declared += n.paired_residual_load_bytes_declared;
+        counts_.prepares_on_issuer_thread += n.prepares_on_issuer_thread;
+        counts_.prepares_on_issuer_cpu += n.prepares_on_issuer_cpu;
+        counts_.prepares_on_producer += n.prepares_on_producer;
         counts_.scale_s += n.scale_s;
         counts_.issue_s += n.issue_s;
         counts_.fence_s += n.fence_s;
+}
+
+stripe_run::prep_outcome stripe_run::prepare_paired(slot & s, stripe_work & work, bool has_paired_runner) {
+    prep_outcome out;
+    const auto refuse = [&out](const char * stage, potal_status status, bool, std::string detail) {
+        out.stage  = stage;
+        out.status = status;
+        out.detail = std::move(detail);
+        return out;
+    };
+    const size_t rows = s.row_end - s.row_begin;
+    pipeline_counts & n = work.counts;
+    auto & decoded = work.decoded;
+    auto & routing = work.routing;
+    auto & paired_rc = work.paired_rc;
+    auto & diagnostic_hw = work.diagnostic_hw;
+    auto & diagnostic_main = work.diagnostic_main;
+    auto & j8k8_main = work.j8k8_main;
+    auto & selected_main = work.selected_main;
+    const potal_tile_plan *& paired_main = work.paired_main;
+    bool & diagnostic_index = work.diagnostic_index;
+    bool & paired_route = work.paired_route;
+    paired_main = &plan_;
+    {
+        const bool on_issuer = std::this_thread::get_id() == issuer_thread_.load(std::memory_order_acquire);
+        n.prepares_on_issuer_thread += on_issuer ? 1 : 0;
+        n.prepares_on_producer += on_issuer ? 0 : 1;
+#if defined(__linux__)
+        n.prepares_on_issuer_cpu += cfg_.hart_roles && sched_getcpu() == cfg_.role_cpus[0] ? 1 : 0;
+#endif
+    }
+        role_span preparing(cfg_, 21, s.stripe_id, s.index);
+        const char * profile_env = std::getenv("POTAL_PAIRED_PROFILE");
+        const bool profile = profile_env != nullptr && std::strcmp(profile_env, "1") == 0;
+        emit(advance(s, slot_state::paired_prepare, stripe_event_kind::paired_prepare_begin));
+        if (!has_paired_runner) {
+            return refuse("paired", POTAL_ERR_UNSUPPORTED, false,
+                          "paired route configured, but the accelerator owner runs no paired stripes");
+        }
+        const char * index_entries = std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
+        if (index_entries != nullptr) {
+            const char * window_diag = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
+            diagnostic_hw = potal_paired_hw_geometry();
+            if (std::strcmp(index_entries, "16") != 0 || window_diag == nullptr ||
+                std::strcmp(window_diag, "1") != 0 || diagnostic_hw.dim != 16 || diagnostic_hw.index_entries < 16) {
+                return refuse("paired_plan", POTAL_ERR_INVALID_ARGUMENT, false,
+                              "POTAL_PAIRED_DIAG_INDEX_ENTRIES requires value 16, POTAL_PAIRED_WINDOW_DIAG=1 and DIM16");
+            }
+            diagnostic_index = true;
+        }
+        const auto decode_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (s.packet) {
+            role_span decode_span(cfg_, 23, s.stripe_id, s.index);
+            const rmd::RmdStatus dec = residual::decode_packet(*s.packet, w_, decoded);
+            if (dec != rmd::RmdStatus::success) {
+                return refuse("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(dec));
+            }
+        }
+        potal_paired_tile_plan    tile;
+        std::string               why;
+        const char * j8k8_env = std::getenv("POTAL_PAIRED_J8K8_FFN");
+        const bool j8k8_ffn = j8k8_env != nullptr && std::strcmp(j8k8_env, "1") == 0;
+        if (j8k8_ffn) {
+            const potal_status frozen = potal_frozen_plan(rows, n_, k_, 1, 8, 8, 1, &j8k8_main);
+            if (frozen != POTAL_OK) {
+                return refuse("paired_plan", frozen, false,
+                              "POTAL_PAIRED_J8K8_FFN: frozen Main plan rejected");
+            }
+            paired_main = &j8k8_main;
+        }
+        ::potal::timeline::scoped_span plan_span(cfg_.hart_roles && ::potal::timeline::active(),
+            ::potal::timeline::stage::prep_plan, cfg_.timeline_run, cfg_.timeline_layer, (uint32_t) s.stripe_id,
+            ::potal::timeline::no_id);
+        const auto plan_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const double decode_ms = profile ? std::chrono::duration<double, std::milli>(plan_start - decode_start).count() : 0;
+        potal_paired_status ps;
+        if (cfg_.paired_auto_jk) {
+            ps = potal_paired_select_jk(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                         cfg_.paired_ktile_scale_reuse, selected_main, tile, routing, &why);
+            paired_main = &selected_main;
+        } else {
+            ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                           tile, routing, &why);
+        }
+        if (ps == potal_paired_status::ok && diagnostic_index) {
+            // Smaller Index Windows must not enlarge the normal paired Main K panel.
+            diagnostic_main = tile.main;
+            paired_main = &diagnostic_main;
+            diagnostic_hw.index_entries = 16;
+            ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
+                                          tile, routing, &why, diagnostic_hw);
+        }
+        plan_span.close();
+        if (ps != potal_paired_status::ok && (cfg_.paired_auto_jk || j8k8_ffn || !potal_paired_capacity_refusal(ps))) {
+            return refuse("paired_plan", POTAL_OK, false,
+                          std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
+        }
+        paired_route = ps == potal_paired_status::ok;
+        if (!paired_route && (cfg_.paired_ktile_scale_reuse ||
+                              cfg_.paired_stream != potal_paired_stream_mode::off)) {
+            return refuse("paired_plan", POTAL_ERR_UNSUPPORTED, false,
+                          "explicit K-tile request cannot use Serial fallback: " + why);
+        }
+        if (profile) {
+            const double plan_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - plan_start).count();
+            std::fprintf(stderr, "[POTAL_PLAN_PROFILE] run_id=%llu stripe=%zu fallback=%d status=%s decode_ms=%.6f plan_ms=%.6f\n",
+                         (unsigned long long) s.run_id, s.stripe_id, paired_route ? 0 : 1,
+                         potal_paired_status_name(ps), decode_ms, plan_ms);
+        }
+        const std::string refusal =
+            paired_route ? std::string() : std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why;
+        if (paired_route && !decoded.rows.empty()) {
+            role_span alloc_span(cfg_, 25, s.stripe_id, s.index);
+            paired_rc.p = dma_alloc(align_up(decoded.rows.size(), HW_DIM) * ldc_ * sizeof(int32_t));
+            if (paired_rc.p == nullptr) {
+                return refuse("alloc", POTAL_OK, false, "out of memory for the paired Residual C");
+            }
+        }
+        stripe_event ev = paired_route ? event_of(stripe_event_kind::paired_prepare_end, s)
+                                       : advance(s, slot_state::main_running, stripe_event_kind::paired_prepare_end);
+        ev.route       = paired_route ? "paired" : "serial_fallback";
+        ev.detail      = paired_route ? nullptr : refusal.c_str();
+        ev.rows        = decoded.rows.size();
+        ev.cols        = n_;
+        ev.k_compact   = decoded.k_compact;
+        ev.k_execution = paired_route ? tile.fragments.size() * HW_DIM : 0;
+        ev.runs        = decoded.runs.size();
+        emit(ev);
+        n.paired_fallback_stripes += paired_route ? 0 : 1;
+    out.ok = true;
+    return out;
+}
+
+bool stripe_run::prepare_job(slot & s, prep_outcome & out) {
+    role_span job_span(cfg_, 66, s.stripe_id, s.index);
+    if (cfg_.role_checkpoint && !cfg_.role_checkpoint("prepare_job", s.stripe_id)) {
+        out.stage  = "prepare_job";
+        out.detail = "stripe " + std::to_string(s.stripe_id) + ": checkpoint refused";
+        return false;
+    }
+    auto work = std::make_shared<stripe_work>();
+    out = prepare_paired(s, *work, true);
+    if (!out.ok) return false;
+    out.ok = false;
+    if (!work->paired_route) {
+        out.stage  = "strict_issuer";
+        out.status = POTAL_ERR_UNSUPPORTED;
+        out.detail = "stripe " + std::to_string(s.stripe_id) +
+                     ": the strict issuer runs paired stripes only (a serial fallback would plan on hart 0)";
+        return false;
+    }
+    potal_paired_request pq = paired_request(s, *work);
+    // The planner validated work->routing for exactly these inputs in prepare_paired (paired_route).
+    const char * reuse_env = std::getenv("GGML_POTAL_PLAN_VALIDATED_REUSE");
+    pq.plan_validated = reuse_env != nullptr && (std::strcmp(reuse_env, "ON") == 0 || std::strcmp(reuse_env, "1") == 0);
+    const char * stage = nullptr;
+    std::string  why;
+    const potal_paired_status st = potal_paired_prepare(pq, std::move(work->routing), work->job, &stage, &why);
+    if (st != potal_paired_status::ok) {
+        out.stage  = "prepare_job";
+        out.status = POTAL_OK;
+        out.detail = "stripe " + std::to_string(s.stripe_id) + ": POTAL_PAIRED_" + potal_paired_status_name(st) +
+                     " step=" + (stage != nullptr ? stage : "-") + ": " + why;
+        return false;
+    }
+    s.prepared = std::move(work);
+    out.ok = true;
+    return true;
+}
+
+potal_paired_request stripe_run::paired_request(const slot & s, stripe_work & work) const {
+    potal_paired_request pq;
+    pq.run_id       = s.run_id;
+    pq.stripe_id    = s.stripe_id;
+    pq.row_begin    = s.row_begin;
+    pq.rows         = s.row_end - s.row_begin;
+    pq.n            = n_;
+    pq.k            = k_;
+    pq.main_plan    = work.paired_main;
+    pq.a            = s.a;
+    pq.lda          = lda_;
+    pq.weight       = &w_;
+    pq.residual     = work.decoded.rows.empty() ? nullptr : &work.decoded;
+    pq.c_main       = s.c;
+    pq.ldc_main     = ldc_;
+    pq.c_residual   = static_cast<int32_t *>(work.paired_rc.p);
+    pq.ldc_residual = ldc_;
+    pq.tlb_flush    = true;
+    pq.plan         = &work.routing; // validated again by the executor, never re-planned
+    pq.hw           = work.diagnostic_index ? &work.diagnostic_hw : nullptr;
+    pq.conservative_fences = cfg_.paired_conservative_fences;
+    pq.ktile_scale_reuse = cfg_.paired_ktile_scale_reuse;
+    pq.next_k_prefetch = cfg_.paired_next_k_prefetch;
+    pq.early_k_prefetch = cfg_.paired_early_k_prefetch;
+    pq.stream = cfg_.paired_stream;
+    pq.hw_timeline = cfg_.hw_timeline;
+    pq.hw_node = cfg_.hw_node;
+    pq.hw_timeline_run = cfg_.timeline_run;
+    pq.hw_layer = cfg_.timeline_layer;
+    pq.hw_phase = cfg_.hw_phase;
+    return pq;
 }
 
 stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const owner_runners & runners) {
@@ -727,7 +964,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
     // Keep the serial path's stack-owned scratch; only ROLES transfers ownership.
     std::optional<stripe_work> serial_work;
     std::shared_ptr<stripe_work> role_work;
-    if (cfg_.hart_roles) role_work = std::make_shared<stripe_work>();
+    if (cfg_.hart_roles) role_work = s.prepared ? std::move(s.prepared) : std::make_shared<stripe_work>();
     else serial_work.emplace();
     stripe_work * work = cfg_.hart_roles ? role_work.get() : &*serial_work;
     pipeline_counts & n = work->counts;
@@ -776,150 +1013,30 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
 
         auto & req = work->req;
         auto & decoded = work->decoded;
-        auto & routing = work->routing;
         auto & paired = work->paired;
         auto & paired_rc = work->paired_rc;
-        potal_paired_geometry           diagnostic_hw;
-        potal_tile_plan                 diagnostic_main;
-        potal_tile_plan                 j8k8_main;
-        potal_tile_plan                 selected_main;
-        const potal_tile_plan *         paired_main = &plan_;
-        bool                            diagnostic_index = false;
 
-        // 0. Paired route (cfg_.paired): decode the packet, plan Main + Residual
-        //    (potal_paired_plan_stripe, CPU, before any command) and choose the
-        //    route. A capacity refusal runs the serial route below and is
-        //    reported as serial_fallback; any other refusal fails the stripe.
+        // 0. Paired route (cfg_.paired): prepare_paired (decode, plan, Residual C) on this
+        //    thread, or, strict issuer, already done with the executor job by the producer
+        //    before READY (s.prepared, prepare_job).
         bool & paired_route = work->paired_route;
-        if (cfg_.paired) {
-            role_span preparing(cfg_, 21, s.stripe_id, s.index);
-            const char * profile_env = std::getenv("POTAL_PAIRED_PROFILE");
-            const bool profile = profile_env != nullptr && std::strcmp(profile_env, "1") == 0;
-            emit(advance(s, slot_state::paired_prepare, stripe_event_kind::paired_prepare_begin));
-            if (!runners.paired) {
-                return failed("paired", POTAL_ERR_UNSUPPORTED, false,
-                              "paired route configured, but the accelerator owner runs no paired stripes");
-            }
-            const char * index_entries = std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES");
-            if (index_entries != nullptr) {
-                const char * window_diag = std::getenv("POTAL_PAIRED_WINDOW_DIAG");
-                diagnostic_hw = potal_paired_hw_geometry();
-                if (std::strcmp(index_entries, "16") != 0 || window_diag == nullptr ||
-                    std::strcmp(window_diag, "1") != 0 || diagnostic_hw.dim != 16 || diagnostic_hw.index_entries < 16) {
-                    return failed("paired_plan", POTAL_ERR_INVALID_ARGUMENT, false,
-                                  "POTAL_PAIRED_DIAG_INDEX_ENTRIES requires value 16, POTAL_PAIRED_WINDOW_DIAG=1 and DIM16");
-                }
-                diagnostic_index = true;
-            }
-            const auto decode_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            if (s.packet) {
-                role_span decode_span(cfg_, 23, s.stripe_id, s.index);
-                const rmd::RmdStatus dec = residual::decode_packet(*s.packet, w_, decoded);
-                if (dec != rmd::RmdStatus::success) {
-                    return failed("residual_prepare", POTAL_OK, false, rmd::rmd_status_message(dec));
-                }
-            }
-            potal_paired_tile_plan    tile;
-            std::string               why;
-            const char * j8k8_env = std::getenv("POTAL_PAIRED_J8K8_FFN");
-            const bool j8k8_ffn = j8k8_env != nullptr && std::strcmp(j8k8_env, "1") == 0;
-            if (j8k8_ffn) {
-                const potal_status frozen = potal_frozen_plan(rows, n_, k_, 1, 8, 8, 1, &j8k8_main);
-                if (frozen != POTAL_OK) {
-                    return failed("paired_plan", frozen, false,
-                                  "POTAL_PAIRED_J8K8_FFN: frozen Main plan rejected");
-                }
-                paired_main = &j8k8_main;
-            }
-            ::potal::timeline::scoped_span plan_span(cfg_.hart_roles && ::potal::timeline::active(),
-                ::potal::timeline::stage::prep_plan, cfg_.timeline_run, cfg_.timeline_layer, (uint32_t) s.stripe_id,
-                ::potal::timeline::no_id);
-            const auto plan_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const double decode_ms = profile ? std::chrono::duration<double, std::milli>(plan_start - decode_start).count() : 0;
-            potal_paired_status ps;
-            if (cfg_.paired_auto_jk) {
-                ps = potal_paired_select_jk(plan_, rows, n_, k_, s.packet ? &decoded : nullptr,
-                                             cfg_.paired_ktile_scale_reuse, selected_main, tile, routing, &why);
-                paired_main = &selected_main;
-            } else {
-                ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
-                                               tile, routing, &why);
-            }
-            if (ps == potal_paired_status::ok && diagnostic_index) {
-                // Smaller Index Windows must not enlarge the normal paired Main K panel.
-                diagnostic_main = tile.main;
-                paired_main = &diagnostic_main;
-                diagnostic_hw.index_entries = 16;
-                ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
-                                              tile, routing, &why, diagnostic_hw);
-            }
-            plan_span.close();
-            if (ps != potal_paired_status::ok && (cfg_.paired_auto_jk || j8k8_ffn || !potal_paired_capacity_refusal(ps))) {
-                return failed("paired_plan", POTAL_OK, false,
-                              std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why);
-            }
-            paired_route = ps == potal_paired_status::ok;
-            if (!paired_route && (cfg_.paired_ktile_scale_reuse ||
-                                  cfg_.paired_stream != potal_paired_stream_mode::off)) {
-                return failed("paired_plan", POTAL_ERR_UNSUPPORTED, false,
-                              "explicit K-tile request cannot use Serial fallback: " + why);
-            }
-            if (profile) {
-                const double plan_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - plan_start).count();
-                std::fprintf(stderr, "[POTAL_PLAN_PROFILE] run_id=%llu stripe=%zu fallback=%d status=%s decode_ms=%.6f plan_ms=%.6f\n",
-                             (unsigned long long) s.run_id, s.stripe_id, paired_route ? 0 : 1,
-                             potal_paired_status_name(ps), decode_ms, plan_ms);
-            }
-            const std::string refusal =
-                paired_route ? std::string() : std::string("POTAL_PAIRED_") + potal_paired_status_name(ps) + ": " + why;
-            if (paired_route && !decoded.rows.empty()) {
-                role_span alloc_span(cfg_, 25, s.stripe_id, s.index);
-                paired_rc.p = dma_alloc(align_up(decoded.rows.size(), HW_DIM) * ldc_ * sizeof(int32_t));
-                if (paired_rc.p == nullptr) {
-                    return failed("alloc", POTAL_OK, false, "out of memory for the paired Residual C");
-                }
-            }
-            stripe_event ev = paired_route ? event_of(stripe_event_kind::paired_prepare_end, s)
-                                           : advance(s, slot_state::main_running, stripe_event_kind::paired_prepare_end);
-            ev.route       = paired_route ? "paired" : "serial_fallback";
-            ev.detail      = paired_route ? nullptr : refusal.c_str();
-            ev.rows        = decoded.rows.size();
-            ev.cols        = n_;
-            ev.k_compact   = decoded.k_compact;
-            ev.k_execution = paired_route ? tile.fragments.size() * HW_DIM : 0;
-            ev.runs        = decoded.runs.size();
-            emit(ev);
-            n.paired_fallback_stripes += paired_route ? 0 : 1;
+        if (cfg_.paired && !cfg_.strict_issuer) {
+            prep_outcome p = prepare_paired(s, *work, static_cast<bool>(runners.paired));
+            if (!p.ok) return failed(p.stage, p.status, false, p.detail);
+        }
+        if (cfg_.strict_issuer && (!paired_route || !work->job.ready || !runners.paired)) {
+            return failed("strict_issuer", POTAL_ERR_INVALID_ARGUMENT, false,
+                          "stripe reached the issuer without a prepared paired job or paired runner");
         }
 
         if (paired_route) {
             // 1+2. Main and Residual GEMMs as one paired execution on the owner thread:
             //      planned again (deterministic), staged, issued, read back, drained.
-            potal_paired_request pq;
-            pq.run_id       = s.run_id;
-            pq.stripe_id    = s.stripe_id;
-            pq.row_begin    = s.row_begin;
-            pq.rows         = rows;
-            pq.n            = n_;
-            pq.k            = k_;
-            pq.main_plan    = paired_main;
-            pq.a            = s.a;
-            pq.lda          = lda_;
-            pq.weight       = &w_;
-            pq.residual     = decoded.rows.empty() ? nullptr : &decoded;
-            pq.c_main       = s.c;
-            pq.ldc_main     = ldc_;
-            pq.c_residual   = static_cast<int32_t *>(paired_rc.p);
-            pq.ldc_residual = ldc_;
-            pq.tlb_flush    = true;
-            pq.plan         = &routing; // validated again by the executor, never re-planned
-            pq.hw           = diagnostic_index ? &diagnostic_hw : nullptr;
-            pq.conservative_fences = cfg_.paired_conservative_fences;
-            pq.ktile_scale_reuse = cfg_.paired_ktile_scale_reuse;
-            pq.next_k_prefetch = cfg_.paired_next_k_prefetch;
-            pq.early_k_prefetch = cfg_.paired_early_k_prefetch;
-            pq.stream = cfg_.paired_stream;
+            potal_paired_request pq = paired_request(s, *work);
+            if (cfg_.strict_issuer) {
+                pq.plan     = nullptr; // moved into the prepared job by potal_paired_prepare (hart 3)
+                pq.prepared = &work->job;
+            }
             emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
             const potal_paired_status pst = runners.paired(pq, paired);
             gemm_fatal                    = gemm_fatal || paired.fatal;
@@ -1416,11 +1533,28 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         r.detail = std::move(detail);
         return r;
     };
+    ::potal::timeline::scoped_span prenode(::potal::timeline::active(), ::potal::timeline::stage::pipe_prenode, 0, 0,
+                                           ::potal::timeline::no_id, ::potal::timeline::no_id);
     pipeline_config run_cfg = cfg;
+    issuer_cpu_exclusion caller_off_issuer; // strict issuer: the caller stays off hart 0 for this node
     bool roles_invalid = false;
     const bool roles_requested = hart_roles_requested(roles_invalid);
     run_cfg.hart_roles = cfg.hart_roles || roles_requested;
     if (roles_invalid) return refuse("options", "GGML_POTAL_HART_ROLES must be ON/OFF/1/0");
+    bool strict_invalid = false;
+    run_cfg.strict_issuer = cfg.strict_issuer || strict_issuer_requested(strict_invalid);
+    if (strict_invalid) return refuse("options", "GGML_POTAL_STRICT_ISSUER must be ON/OFF/1/0");
+    bool hw_invalid = false;
+    const bool hw_requested = ::potal::hw_window::requested(hw_invalid);
+    if (hw_invalid) return refuse("options", "GGML_POTAL_STRICT_HW_TIMELINE must be ON/OFF/1/0");
+    if (run_cfg.strict_issuer &&
+        (!run_cfg.hart_roles || !cfg.paired || cfg.paired_stream != potal_paired_stream_mode::off ||
+         std::getenv("POTAL_PAIRED_STAGE_DIAG") != nullptr || std::getenv("POTAL_PAIRED_DIAG_INDEX_ENTRIES") != nullptr ||
+         std::getenv("POTAL_PAIRED_WINDOW_DIAG") != nullptr)) {
+        r.status = POTAL_ERR_UNSUPPORTED;
+        return refuse("options", "GGML_POTAL_STRICT_ISSUER requires ROLES and the paired route, with stream mode and "
+                                 "the paired stage/window diagnostics OFF");
+    }
     if (run_cfg.hart_roles && args.residual_route != ggml::gemmini::residual::ResidualRoute::ws_packet)
         return refuse("options", "ROLES requires STRIPE_PIPELINE+WS");
     const char * auto_env = std::getenv("POTAL_PAIRED_AUTO_JK");
@@ -1497,8 +1631,13 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
 
     std::shared_ptr<stripe_run> run;
     std::string                 why;
-    if (run_cfg.hart_roles && !find_role_cpus(run_cfg.role_cpus, why))
-        return refuse("hart_map", why);
+    if (run_cfg.hart_roles) {
+        ::potal::timeline::scoped_span cpu_map(::potal::timeline::active(), ::potal::timeline::stage::role_cpu_map, 0,
+                                               0, ::potal::timeline::no_id, ::potal::timeline::no_id);
+        if (!(run_cfg.strict_issuer ? cached_role_cpus(run_cfg.role_cpus, why) : find_role_cpus(run_cfg.role_cpus, why)))
+            return refuse("hart_map", why);
+        if (run_cfg.strict_issuer && !caller_off_issuer.begin(why)) return refuse("caller_affinity", why);
+    }
     if (run_cfg.hart_roles && ::potal::timeline::enabled()) {
         ::potal::timeline::register_thread(::potal::timeline::role::caller, -1, -1);
         run_cfg.timeline_run = ::potal::timeline::begin_run(
@@ -1506,12 +1645,20 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
             args.I == 1 ? ::potal::timeline::phase::decode : ::potal::timeline::phase::prefill,
             run_cfg.timeline_layer);
     }
+    if (hw_requested && run_cfg.strict_issuer &&
+        (!::potal::timeline::enabled() || ::potal::timeline::detail::g_rec.load(std::memory_order_relaxed))) {
+        run_cfg.hw_phase = uint8_t(args.I == 1 ? ::potal::timeline::phase::decode : ::potal::timeline::phase::prefill);
+        run_cfg.hw_node = ::potal::hw_window::begin_node(run_cfg.timeline_run, run_cfg.timeline_layer, run_cfg.hw_phase,
+                                                         uint32_t(args.I), run_cfg.layer.c_str());
+        run_cfg.hw_timeline = run_cfg.hw_node != 0;
+    }
     struct end_timeline {
         const pipeline_config & cfg;
         ~end_timeline() {
             if (cfg.hart_roles && ::potal::timeline::enabled()) ::potal::timeline::end_run(cfg.timeline_run);
         }
     } timeline_run{run_cfg};
+    prenode.close();
     role_span node_span(run_cfg, 1);
     ::potal::timeline::scoped_span setup_span(run_cfg.hart_roles && ::potal::timeline::active(),
         ::potal::timeline::stage::node_setup, run_cfg.timeline_run, run_cfg.timeline_layer,

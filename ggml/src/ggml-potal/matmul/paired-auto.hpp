@@ -433,6 +433,13 @@ potal_paired_status potal_validate_execution_plan(const potal_paired_execution_p
                                                   const residual::decoded_packet * residual, std::string * why,
                                                   const potal_paired_geometry & hw = potal_paired_hw_geometry());
 
+// Test seam: potal_validate_execution_plan with the Scale-overlap scan mode chosen by
+// the caller (live_scan: only the live windows, as GGML_POTAL_PLAN_LIVE_SCAN=ON does)
+// instead of the cached environment value. Same status and *why in both modes.
+potal_paired_status potal_validate_execution_plan_mode(const potal_paired_execution_plan & plan,
+                                                       const residual::decoded_packet * residual, std::string * why,
+                                                       const potal_paired_geometry & hw, bool live_scan);
+
 std::string potal_paired_op_text(const potal_paired_op & op);
 
 // Structural counts, not cycles or a latency prediction.
@@ -485,6 +492,8 @@ potal_paired_status potal_paired_select_jk(
 
 enum class potal_paired_stream_mode : uint8_t { off, bounded, continuous, continuous_early };
 
+struct potal_paired_prepared;
+
 struct potal_paired_request {
     uint64_t run_id    = 0; // identity, recorded only
     size_t   stripe_id = 0;
@@ -516,11 +525,29 @@ struct potal_paired_request {
     // consecutive-original-block Residual windows read their live Main Scale
     // allocation; their logical release becomes a checked global Fence.
     bool                    ktile_scale_reuse = false;
+    // Opt-in, also by GGML_POTAL_WINDOW_SCALE_ISSUE: Scale windows go through the
+    // window calls of potal.h. The command stream does not change.
+    bool                    window_scale_issue = false;
     bool                    next_k_prefetch = false; // explicit managed-H2 load admission; publication still requires global drain
     bool                    early_k_prefetch = false; // capability-gated original LdB, Main then admission then extra Fence
     potal_observation_counter_fn early_counter = nullptr; // software sink only; hardware reads COUNTER directly
     potal_paired_stream_mode stream = potal_paired_stream_mode::off;
     potal_observation_counter_fn stream_counter = nullptr; // test sink capability; hardware uses COUNTER
+    // H3-8I-25S strict issuer: the plan, staging and Queue entries potal_paired_prepare made
+    // on a producer thread. potal_paired_matmul_auto moves them out (no validation, copy or
+    // packing on the issuer) and leaves the object not ready. nullptr: prepared here.
+    potal_paired_prepared * prepared = nullptr;
+    // H3-8I-25T opt-in (GGML_POTAL_PLAN_VALIDATED_REUSE=ON, set by the stripe pipeline): req.plan was
+    // returned ok by potal_paired_plan_stripe / potal_paired_select_jk for this same main plan, rows, n,
+    // k, residual and geometry, which validate it (potal_make_execution_plan). potal_paired_prepare then
+    // reuses that validation result instead of running potal_validate_execution_plan a second time.
+    bool plan_validated = false;
+    // H3-8I-25AC, strict Linear only (trace/hw-window.hpp): re-arm the early-event window per Fence.
+    // Adds COUNTER_OP only. A trace failure disables the trace and leaves this request's work alone.
+    bool hw_timeline = false;
+    uint32_t hw_node = 0, hw_timeline_run = 0, hw_layer = 0;
+    uint8_t hw_phase = 0;
+    potal_observation_counter_fn hw_counter = nullptr; // software sink only; hardware reads COUNTER directly
 };
 
 struct potal_paired_counts {
@@ -571,6 +598,9 @@ class potal_paired_staging {
     potal_paired_staging() = default;
     potal_paired_staging(const potal_paired_staging &) = delete;
     potal_paired_staging & operator=(const potal_paired_staging &) = delete;
+    // Ownership of the DMA buffer moves (prepared on hart 3, issued on hart 0); the source is empty.
+    potal_paired_staging(potal_paired_staging && other) noexcept;
+    potal_paired_staging & operator=(potal_paired_staging && other) noexcept;
     ~potal_paired_staging();
 
     void           abandon(); // after a fatal failure: the accelerator may still read it
@@ -587,6 +617,27 @@ class potal_paired_staging {
     int8_t * buffer_ = nullptr;
     size_t   bytes_  = 0;
 };
+
+// H3-8I-25S. Everything potal_paired_matmul_auto does before its first session access,
+// done ahead of issue on a producer thread: the request checks, potal_validate_execution_plan
+// of req.plan, the plan itself (moved, never copied), the Residual staging, the Queue entries
+// with the Index window count, and the K-tile Scale owners. Session state (the generation,
+// the Queue budget, session idle/failed, Scale/Index liveness) stays with the issuer.
+struct potal_paired_prepared {
+    bool                        ready = false; // a successful potal_paired_prepare; cleared when consumed
+    potal_paired_tile_plan      tile;
+    potal_paired_execution_plan plan;
+    potal_paired_staging        staging;
+    std::vector<uint32_t>       queue_entries;  // resident_k of every plan Index entry, slot order
+    size_t                      index_windows = 0; // index_program ops: the Queue allocations needed
+    std::vector<size_t>         scale_owner;    // K-tile Scale reuse only
+};
+
+// req.plan must be given (the plan made to choose the route); it is moved into `out`
+// (req.plan is left valid but unspecified). Stream mode and the window diagnostics are
+// refused. On failure `out` is not ready and *stage / *why say why.
+potal_paired_status potal_paired_prepare(const potal_paired_request & req, potal_paired_execution_plan && plan,
+                                         potal_paired_prepared & out, const char ** stage, std::string * why);
 
 // Packs the decoded digits into `out` as the plan's Index entries order them;
 // invalid_argument when the plan has no residual, the packet has no digits or an

@@ -3,6 +3,7 @@
 #include "potal_hw_params.h"
 
 #include "residual/rmd/rmd-builder.hpp"
+#include "trace/timeline.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -85,6 +86,132 @@ bool finite_bits(double value) {
     return (observed & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
+// H3-8I-25T opt-in GGML_POTAL_FAST_DECODE=ON: the digit rows of decode_packet with the checks of
+// rmd::read_packet_digit / read_group_digit evaluated once per (run, lane) instead of once per digit.
+// Every check either holds for the whole (run, lane) or the function returns false, and the caller
+// then runs the per-digit reference loop, so a malformed packet reports exactly the reference status.
+// On true, out.rows / out.digits equal the reference loop's (same digits, same lane-major row order).
+bool fast_decode_requested() {
+    const char * env = std::getenv("GGML_POTAL_FAST_DECODE");
+    return env != nullptr && (std::strcmp(env, "ON") == 0 || std::strcmp(env, "1") == 0);
+}
+
+// rmd-builder.cpp checked_activation_sizes (file-local there): one group's payload values and bytes.
+bool activation_sizes(uint8_t digit_bits, size_t packed_rows, size_t padded_k_count, size_t & values, size_t & bytes) {
+    const size_t group_rows = align_up(packed_rows, rmd::kArrayDim);
+    if (group_rows == 0 || __builtin_mul_overflow(group_rows, padded_k_count, &values)) return false;
+    if (digit_bits == 4 || digit_bits == 8) {
+        bytes = values;
+        return true;
+    }
+    return digit_bits == 16 && !__builtin_mul_overflow(values, sizeof(int16_t), &bytes);
+}
+
+bool fast_decode_rows(const rmd::StripePacket & packet, const std::vector<size_t> & offset, size_t k_compact,
+                      const rmd::BalancedRadixContract & radix, decoded_packet & out) {
+    if (packet.digit_storage != rmd::DigitStorage::signed_int8 || !packet.stacked_activation.signed_int16.empty() ||
+        packet.stacked_activation.signed_int8.size() != packet.activation_value_count || radix.radix == 0 ||
+        packet.lane_capacity != radix.lane_capacity || packet.row_count == 0) {
+        return false;
+    }
+    const size_t rows = packet.row_count;
+    const size_t runs = packet.blocks.size();
+    const int8_t * payload = packet.stacked_activation.signed_int8.data();
+    // Per (lane, run): the digits of every source row, -1 = no digit of this lane in this run.
+    struct lane_run {
+        bool                 present = false;
+        std::vector<int64_t> row_base; // per source row: payload index of its group row, or -1 (absent row)
+        std::vector<int32_t> k_slot;   // per compact k: group K rank, or -1 (absent K)
+    };
+    std::vector<lane_run> lr((size_t) packet.lane_capacity * runs);
+    for (uint8_t lane = 0; lane < packet.lane_capacity; ++lane) {
+        for (size_t r = 0; r < runs; ++r) {
+            const rmd::BlockDescriptor & block = packet.blocks[r];
+            const int                    pos   = lane_position(block, lane);
+            if (pos < 0) continue;
+            // read_packet_digit: argument and group checks.
+            if ((size_t) pos >= block.active_lane_count || rows > block.rows_padded ||
+                block.compact_k_count > block.padded_k_count) {
+                return false;
+            }
+            const rmd::LaneGroupDescriptor * g  = nullptr;
+            size_t                           gl = 0;
+            for (const rmd::LaneGroupDescriptor & group : block.groups) {
+                for (size_t i = 0; i < group.lane_positions.size(); ++i) {
+                    if (group.lane_positions[i] == pos) {
+                        if (g != nullptr) return false;
+                        g  = &group;
+                        gl = i;
+                    }
+                }
+            }
+            if (g == nullptr) return false;
+            lane_run & e = lr[(size_t) lane * runs + r];
+            e.k_slot.assign(block.compact_k_count, -1);
+            for (size_t k = 0; k < block.compact_k_count; ++k) {
+                const size_t index = (size_t) block.k_index_offset + k;
+                if (index >= packet.k_indices.size() || packet.k_indices[index] >= rmd::kBlockSize) return false;
+                const uint32_t bit = uint32_t{ 1 } << packet.k_indices[index];
+                if ((g->k_mask & bit) != 0) e.k_slot[k] = __builtin_popcount(g->k_mask & (bit - 1));
+                if ((size_t) std::max<int32_t>(e.k_slot[k], 0) >= g->padded_k_count) return false;
+            }
+            // read_group_digit: group metadata and payload extent checks.
+            if (gl >= g->lane_positions.size() || block.active_lane_count == 0 ||
+                block.active_lane_count > radix.lane_capacity ||
+                block.rows_padded != align_up(packet.row_count, rmd::kArrayDim) ||
+                g->lane_positions.size() > radix.lane_capacity || g->lane_positions[gl] >= block.active_lane_count ||
+                block.lane_ids[g->lane_positions[gl]] >= radix.lane_capacity ||
+                (block.active_lane_mask & static_cast<uint16_t>(1u << block.lane_ids[g->lane_positions[gl]])) == 0) {
+                return false;
+            }
+            size_t values = 0, bytes = 0, value_end = 0, byte_end = 0;
+            if (!activation_sizes(packet.digit_bits, g->row_ids.size(), g->padded_k_count, values, bytes) ||
+                g->activation_byte_count != bytes || __builtin_add_overflow((size_t) g->activation_offset, values, &value_end) ||
+                __builtin_add_overflow((size_t) g->activation_byte_offset, bytes, &byte_end) ||
+                value_end > packet.activation_value_count || g->activation_byte_offset != g->activation_offset ||
+                g->row_offsets.front() != 0 || g->row_offsets[g->lane_positions.size()] != g->row_ids.size()) {
+                return false;
+            }
+            const size_t first = g->row_offsets[gl], last = g->row_offsets[gl + 1];
+            if (first >= last || last > g->row_ids.size()) return false;
+            // Every value a read can reach lies in [activation_offset, value_end): check the digit range once.
+            for (size_t v = g->activation_offset; v < value_end; ++v) {
+                if (payload[v] < radix.digit_min || payload[v] > radix.digit_max) return false;
+            }
+            e.row_base.assign(rows, -1);
+            for (size_t i = first; i < last; ++i) {
+                const size_t src = g->row_ids[i];
+                if (src >= rows || (i > first && g->row_ids[i] <= g->row_ids[i - 1])) return false;
+                e.row_base[src] = (int64_t) (g->activation_offset + i * g->padded_k_count);
+            }
+            e.present = true;
+        }
+    }
+    std::vector<int8_t> row(k_compact);
+    for (uint8_t lane = 0; lane < packet.lane_capacity; ++lane) {
+        for (size_t src = 0; src < rows; ++src) {
+            std::fill(row.begin(), row.end(), int8_t{ 0 });
+            bool active = false;
+            for (size_t r = 0; r < runs; ++r) {
+                const lane_run & e = lr[(size_t) lane * runs + r];
+                if (!e.present || e.row_base[src] < 0) continue; // no digit or an absent row: zeros
+                const int8_t * base = payload + e.row_base[src];
+                int8_t *       dst  = row.data() + offset[r];
+                for (size_t k = 0; k < e.k_slot.size(); ++k) {
+                    if (e.k_slot[k] < 0) continue;
+                    dst[k] = base[e.k_slot[k]];
+                    active = active || dst[k] != 0;
+                }
+            }
+            if (active) {
+                out.rows.push_back({ lane, (uint32_t) src });
+                out.digits.insert(out.digits.end(), row.begin(), row.end());
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -145,9 +272,15 @@ rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight 
 #endif
     const decode_profile profile(packet.stripe_id);
     out = decoded_packet{};
-    if (rmd::validate_packet(packet) != rmd::RmdStatus::success) {
-        return rmd::RmdStatus::invalid_packet;
+    {
+        ::potal::timeline::scoped_span span(::potal::timeline::active(), ::potal::timeline::stage::decode_validate, 0,
+                                            0, (uint32_t) packet.stripe_id, ::potal::timeline::no_id);
+        if (rmd::validate_packet(packet) != rmd::RmdStatus::success) {
+            return rmd::RmdStatus::invalid_packet;
+        }
     }
+    ::potal::timeline::scoped_span rows_span(::potal::timeline::active(), ::potal::timeline::stage::decode_rows, 0, 0,
+                                             (uint32_t) packet.stripe_id, ::potal::timeline::no_id);
     if (packet.digit_bits != digit_bits) {
         return rmd::RmdStatus::unsupported_route; // PoTal is A8W8
     }
@@ -180,6 +313,13 @@ rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, const hp1_weight 
     }
 
     // Rows: lane-major, then source row; one compact digit row each.
+    if (fast_decode_requested()) {
+        if (fast_decode_rows(packet, offset, out.k_compact, radix, out)) {
+            return out.rows.empty() ? rmd::RmdStatus::invalid_packet : rmd::RmdStatus::success;
+        }
+        out.rows.clear(); // a hoisted check failed: the reference loop reports the exact status
+        out.digits.clear();
+    }
     std::vector<int8_t> row(out.k_compact);
     for (uint8_t lane = 0; lane < packet.lane_capacity; ++lane) {
         for (size_t src = 0; src < packet.row_count; ++src) {

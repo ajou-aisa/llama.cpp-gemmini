@@ -21,6 +21,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <thread>
 
 namespace {
 
@@ -405,6 +406,20 @@ void test_prepare() {
             check("zero Q codes and padding",s.codes.size() == 128 &&
                   std::all_of(s.codes.begin(),s.codes.end(),[](int32_t v) { return v == 0; }) &&
                   limbs_match(s,role::qk));
+        // Blocks 1, 2 and 4 have three distinct exponents 0, 1, 2: the Q anchor is the stripe
+        // anchor rank (TOP2 -> 1, TOP3 -> 0), and every code is 2^(block - anchor + 14).
+        tensor ranks(GGML_TYPE_F32,96,1);
+        for (size_t k = 0; k < 96; ++k) ranks.set(k,0,float(1u << (k/32)));
+        stream ranked;
+        if (check("prepare Q with three block exponents",
+                  attention::prepare_stream(ranks.t,0,0,0,1,role::qk,ranked) == POTAL_OK)) {
+            const int anchor = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 ? 0 : 1;
+            bool exact = ranked.scale == anchor - 14 && ranked.codes.size() == 96;
+            for (size_t k = 0; exact && k < 96; ++k)
+                exact = ranked.codes[k] == int32_t(1) << (int(k/32) - anchor + 14);
+            check("Q anchor follows GGML_GEMMINI_EXSIA_STRIPE_ANCHOR=" +
+                      std::to_string(GGML_GEMMINI_EXSIA_STRIPE_ANCHOR), exact && limbs_match(ranked,role::qk));
+        }
     }
 
     tensor ties(GGML_TYPE_F32,32,1);
@@ -1764,6 +1779,126 @@ void test_contract() {
 
 } // namespace
 
+
+// H3-8I-25V: execute_strict (five-hart pipeline; here unpinned host threads and a test owner thread)
+// equals execute() bitwise, keeps every CPU numeric step off the owner thread, and fails closed.
+struct plain_runner {
+    potal_test::emulator emu;
+    potal_ws_ops ops = emu.ops();
+    potal_stripe_session session = {{&ops,0,{}}};
+    uint64_t calls = 0, fail_at = UINT64_MAX;
+    bool fail_fatal = false;
+    planned_result run(const potal_stripe_gemm_desc & d) {
+        planned_result r = run_planned_stripe_gemm(session,d);
+        if (++calls == fail_at) {
+            r.ok = false;
+            r.fatal = fail_fatal;
+            r.status = POTAL_ERR_BAD_RESPONSE;
+            r.stage = "injected";
+        }
+        return r;
+    }
+};
+
+struct thread_owner final : ggml::potal::stripe_owner {
+    plain_runner * runner = nullptr;
+    bool refuse = false;
+    std::thread thread;
+    std::thread::id id;
+    bool start(ggml::potal::stripe_consumer consume, std::string & why, potal_status & status) override {
+        if (refuse) {
+            why = "test owner refuses";
+            status = POTAL_ERR_NO_HARDWARE;
+            return false;
+        }
+        thread = std::thread([this, consume] {
+            id = std::this_thread::get_id();
+            ggml::potal::owner_runners runners;
+            runners.planned = [this](const potal_stripe_gemm_desc & d) { return runner->run(d); };
+            (void) consume(runners);
+        });
+        return true;
+    }
+    void join() override {
+        if (thread.joinable()) thread.join();
+    }
+};
+
+void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repeat, ggml_type wt, ggml_type at,
+                 uint32_t seed) {
+    graph g(r,k,n,m,false,heads,repeat,1,1,wt,at);
+    uint32_t s = seed;
+    const auto next = [&s] { s = s * 1664525u + 1013904223u; return s >> 8; };
+    for (size_t h = 0; h < heads; ++h)
+        for (size_t j = 0; j < n; ++j)
+            for (size_t x = 0; x < k; ++x)
+                g.w.set(x,j,std::ldexp(float(int(next() % 255) - 127) / 64.0f,int(next() % 5) - 2),h,0);
+    for (size_t h = 0; h < heads*repeat; ++h)
+        for (size_t i = 0; i < m; ++i)
+            for (size_t x = 0; x < k; ++x) {
+                const float u = float(next() % 65536) / 65535.0f;
+                // QK: per-block magnitudes over several exponents (anchor rank, outliers, upper limbs).
+                g.a.set(x,i,r == role::pv ? u : std::ldexp(u - 0.5f,int((x/32 + i + next() % 3) % 7) - 2),h,0);
+            }
+    const std::string name = std::string(r == role::qk ? "strict QK " : "strict PV ") + std::to_string(k) + "x" +
+                             std::to_string(m) + "x" + std::to_string(n) + " heads " + std::to_string(heads) + "x" +
+                             std::to_string(repeat);
+    plain_runner sequential;
+    const auto want = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) { return sequential.run(d); });
+    if (!check(name + " sequential reference executes", want.status == POTAL_OK)) return;
+    const auto expected = g.out.storage;
+    g.out.fill(12345.0f);
+    plain_runner pipelined;
+    thread_owner owner;
+    owner.runner = &pipelined;
+    const std::array<int, 5> cpus{{-1,-1,-1,-1,-1}};
+    const auto got = attention::execute_strict(&g.out.t, owner, cpus, false);
+    check(name + " executes", got.status == POTAL_OK && !got.fatal);
+    check(name + " bitwise equal to execute()", g.out.storage == expected);
+    check(name + " same GEMMs and command counts", got.jobs == want.jobs && got.loops == want.loops &&
+          got.fences == want.fences && got.scale_writes == want.scale_writes &&
+          got.scale_releases == want.scale_releases && got.residual_jobs == want.residual_jobs &&
+          got.qk_limb_jobs == want.qk_limb_jobs && pipelined.calls == sequential.calls);
+    check(name + " no CPU numeric step on the owner thread", got.strict_tasks > 0 &&
+          got.cpu_work_on_issuer_thread == 0 && got.cpu_work_on_issuer_cpu == 0);
+    check(name + " balanced scales, no live DMA", pipelined.emu.writes == pipelined.emu.releases &&
+          pipelined.emu.scales.empty() && !pipelined.emu.in_flight);
+    for (bool fatal : {false, true}) {
+        g.out.fill(12345.0f);
+        const auto untouched = g.out.storage;
+        plain_runner failing;
+        failing.fail_at = (sequential.calls + 1) / 2;
+        failing.fail_fatal = fatal;
+        thread_owner failing_owner;
+        failing_owner.runner = &failing;
+        const auto failed = attention::execute_strict(&g.out.t, failing_owner, cpus, false);
+        check(name + (fatal ? " fatal" : " nonfatal") + " injected failure propagates, nothing published",
+              failed.status != POTAL_OK && failed.fatal == fatal && g.out.storage == untouched);
+    }
+}
+
+void test_strict_pipeline() {
+    strict_case(role::qk, 64, 1, 40, 2, 7, GGML_TYPE_F16, GGML_TYPE_F32, 11);     // Qwen2-like decode QK
+    strict_case(role::pv, 40, 1, 64, 2, 7, GGML_TYPE_F16, GGML_TYPE_F32, 12);     // Qwen2-like decode PV
+    strict_case(role::qk, 64, 70, 70, 2, 2, GGML_TYPE_F16, GGML_TYPE_F32, 13);    // prefill, several stripes
+    strict_case(role::pv, 70, 70, 64, 2, 2, GGML_TYPE_F16, GGML_TYPE_F32, 14);
+    strict_case(role::qk, 129, 33, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F16, 15);   // odd K and rows
+    strict_case(role::pv, 129, 130, 33, 1, 3, GGML_TYPE_F32, GGML_TYPE_F32, 16);
+    graph legacy(role::pv,32,3,2);
+    plain_runner unused;
+    thread_owner owner;
+    owner.runner = &unused;
+    const std::array<int, 5> cpus{{-1,-1,-1,-1,-1}};
+    const auto refused = attention::execute_strict(&legacy.out.t, owner, cpus, false, attention::pv_algorithm::legacy);
+    check("strict legacy PV refused before any command", refused.status == POTAL_ERR_UNSUPPORTED && unused.calls == 0);
+    thread_owner refusing;
+    refusing.refuse = true;
+    refusing.runner = &unused;
+    const auto unavailable = attention::execute_strict(&legacy.out.t, refusing, cpus, false);
+    check("strict unavailable owner refused, nothing published", unavailable.status == POTAL_ERR_NO_HARDWARE &&
+          unused.calls == 0);
+}
+
 int main() {
     // Initialize GGML's F16 conversion tables without constructing a backend.
     const ggml_init_params params = {1u << 20,nullptr,true};
@@ -1781,6 +1916,7 @@ int main() {
     test_pv_bitplane_reference();
     test_pv_bitplane_execute();
     test_balanced();
+    test_strict_pipeline();
     ggml_free(context);
     std::printf("POTAL_ATTENTION_TEST %s\n",failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

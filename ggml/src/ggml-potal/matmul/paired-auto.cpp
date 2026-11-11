@@ -3,6 +3,7 @@
 // their Index Windows (paired-auto.hpp). No RoCC command, no hardware access.
 
 #include "paired-auto.hpp"
+#include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
@@ -13,6 +14,9 @@
 
 #include <algorithm>
 #include <chrono>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -1053,13 +1057,15 @@ struct validator {
     const residual::decoded_packet *    residual;
     const potal_paired_geometry &       hw;
     std::string *                       why;
+    const bool                          live_scan; // Scale-overlap check against the live windows only
 
     validator(const potal_paired_execution_plan & p, const residual::decoded_packet * r, const potal_paired_geometry & g,
-              std::string * w) :
+              std::string * w, bool live = false) :
         plan(p),
         residual(r),
         hw(g),
-        why(w) {}
+        why(w),
+        live_scan(live) {}
 
     bool fail(const potal_paired_op & op, const std::string & rule) {
         explain(why, "op " + num(op.id) + " " + potal_paired_op_name(op.kind) + ": " + rule);
@@ -1128,6 +1134,8 @@ struct validator {
         // Scale windows.
         std::vector<int> window_state(plan.scale_windows.size(), 0); // 0 unprogrammed, 1 live, 2 released
         std::vector<size_t> window_consumer(plan.scale_windows.size(), no_index);
+        // live_scan: the indices o with window_state[o] == 1, ascending.
+        std::vector<size_t> live_windows;
         size_t last_generation = 0;
         // ACC identities: bank 0 / 1 x epoch.
         std::vector<acc_identity_state> acc0(tile.j_groups), acc1(tile.j_groups);
@@ -1212,10 +1220,22 @@ struct validator {
                     } else if (w.slot_base != 0 || w.blocks != panel.k_tiles / tile.passes_per_block) {
                         return fail(op, "Main scale window does not describe its panel");
                     }
-                    for (size_t o = 0; o < plan.scale_windows.size(); ++o) {
-                        const potal_paired_scale_window & x = plan.scale_windows[o];
-                        if (window_state[o] == 1 && x.slot_base < w.slot_base + w.slots && w.slot_base < x.slot_base + x.slots) {
-                            return fail(op, "scale slots overwritten while window " + num(o) + " is live");
+                    if (live_scan) {
+                        // Same predicate, same ascending order: the first overlapping live window is the same.
+                        for (const size_t o : live_windows) {
+                            const potal_paired_scale_window & x = plan.scale_windows[o];
+                            if (x.slot_base < w.slot_base + w.slots && w.slot_base < x.slot_base + x.slots) {
+                                return fail(op, "scale slots overwritten while window " + num(o) + " is live");
+                            }
+                        }
+                        live_windows.insert(std::lower_bound(live_windows.begin(), live_windows.end(), op.scale_window),
+                                            op.scale_window);
+                    } else {
+                        for (size_t o = 0; o < plan.scale_windows.size(); ++o) {
+                            const potal_paired_scale_window & x = plan.scale_windows[o];
+                            if (window_state[o] == 1 && x.slot_base < w.slot_base + w.slots && w.slot_base < x.slot_base + x.slots) {
+                                return fail(op, "scale slots overwritten while window " + num(o) + " is live");
+                            }
                         }
                     }
                     window_state[op.scale_window] = 1;
@@ -1233,6 +1253,9 @@ struct validator {
                         return fail(op, "release before its consumer completed");
                     }
                     window_state[op.scale_window] = 2;
+                    if (live_scan) {
+                        live_windows.erase(std::lower_bound(live_windows.begin(), live_windows.end(), op.scale_window));
+                    }
                     complete_upto                 = i + 1; // accepted only after every older command drained
                     break;
                 }
@@ -1502,22 +1525,55 @@ struct validator {
     }
 };
 
-} // namespace
+// GGML_POTAL_PLAN_LIVE_SCAN, read once per process: ON or 1 enables the live-window
+// Scale-overlap scan; unset, OFF, 0 and any other value keep the full scan.
+bool plan_live_scan_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("GGML_POTAL_PLAN_LIVE_SCAN");
+        return v != nullptr && (std::strcmp(v, "ON") == 0 || std::strcmp(v, "1") == 0);
+    }();
+    return enabled;
+}
 
-potal_paired_status potal_validate_execution_plan(const potal_paired_execution_plan & plan,
-                                                  const residual::decoded_packet * residual, std::string * why,
-                                                  const potal_paired_geometry & hw) try {
-#if defined(POTAL_PLANNING_DIAGNOSTICS)
-    planning_profile::Scope planning_validation(planning_profile::Site::execution_validate, planning_profile::Component::validation);
-#endif
+// GGML_POTAL_WINDOW_SCALE_ISSUE, read once per process: ON or 1 issues each Scale
+// window through the window calls of potal.h. Unset, OFF, 0 and any other value
+// keep the per-column calls. The command stream is the same either way.
+bool window_scale_issue_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("GGML_POTAL_WINDOW_SCALE_ISSUE");
+        return v != nullptr && (std::strcmp(v, "ON") == 0 || std::strcmp(v, "1") == 0);
+    }();
+    return enabled;
+}
+
+potal_paired_status validate_execution_plan(const potal_paired_execution_plan & plan,
+                                            const residual::decoded_packet * residual, std::string * why,
+                                            const potal_paired_geometry & hw, bool live_scan) try {
     if (why != nullptr) {
         why->clear();
     }
-    validator v(plan, residual, hw, why);
+    validator v(plan, residual, hw, why, live_scan);
     return v.run() ? potal_paired_status::ok : potal_paired_status::invalid_execution_plan;
 } catch (const std::bad_alloc &) {
     explain(why, "out of memory");
     return potal_paired_status::allocation_failure;
+}
+
+} // namespace
+
+potal_paired_status potal_validate_execution_plan(const potal_paired_execution_plan & plan,
+                                                  const residual::decoded_packet * residual, std::string * why,
+                                                  const potal_paired_geometry & hw) {
+#if defined(POTAL_PLANNING_DIAGNOSTICS)
+    planning_profile::Scope planning_validation(planning_profile::Site::execution_validate, planning_profile::Component::validation);
+#endif
+    return validate_execution_plan(plan, residual, why, hw, plan_live_scan_enabled());
+}
+
+potal_paired_status potal_validate_execution_plan_mode(const potal_paired_execution_plan & plan,
+                                                       const residual::decoded_packet * residual, std::string * why,
+                                                       const potal_paired_geometry & hw, bool live_scan) {
+    return validate_execution_plan(plan, residual, why, hw, live_scan);
 }
 
 // ---- execution (H3-2B) -------------------------------------------------------------------
@@ -1530,6 +1586,65 @@ void potal_paired_staging::abandon() {
     buffer_ = nullptr; // leaked on purpose: the accelerator may still read it
     bytes_  = 0;
 }
+
+potal_paired_staging::potal_paired_staging(potal_paired_staging && other) noexcept :
+    windows(std::move(other.windows)), rows(other.rows), buffer_(other.buffer_), bytes_(other.bytes_) {
+    other.buffer_ = nullptr;
+    other.bytes_  = 0;
+    other.rows    = 0;
+    other.windows.clear();
+}
+
+potal_paired_staging & potal_paired_staging::operator=(potal_paired_staging && other) noexcept {
+    if (this != &other) {
+        std::free(buffer_);
+        windows       = std::move(other.windows);
+        rows          = other.rows;
+        buffer_       = other.buffer_;
+        bytes_        = other.bytes_;
+        other.buffer_ = nullptr;
+        other.bytes_  = 0;
+        other.rows    = 0;
+        other.windows.clear();
+    }
+    return *this;
+}
+
+namespace {
+
+// K-tile Scale reuse: the physical Main owner of every logical Residual Scale window
+// (itself when not aliased). Plan-only; computed before issue.
+std::vector<size_t> compute_scale_owner(const potal_paired_execution_plan & plan, const potal_paired_tile_plan & tile) {
+    std::vector<size_t> scale_owner(plan.scale_windows.size());
+    for (const auto & w : plan.scale_windows) {
+        scale_owner[w.index] = w.index;
+        if (!w.residual) continue;
+        const auto & residency = plan.residencies[w.residency];
+        const size_t owner = plan.ops[residency.main_gemm_op].scale_window;
+        const auto & main = plan.scale_windows[owner];
+        const auto & panel = tile.panels[residency.panel];
+        const auto & window = panel.windows[w.window];
+        const size_t first = tile.fragments[window.fragment_begin].block_id;
+        if (main.residency != w.residency || main.j_tiles != w.j_tiles ||
+            main.program_op >= w.program_op || main.release_op <= w.release_op ||
+            first < panel.block_begin) continue;
+        const size_t offset = first - panel.block_begin;
+        if (offset > main.blocks || w.blocks > main.blocks - offset) continue;
+        bool consecutive = window.fragment_end - window.fragment_begin == w.blocks;
+        for (size_t f = window.fragment_begin; consecutive && f < window.fragment_end; ++f) {
+            consecutive = tile.fragments[f].block_id == first + f - window.fragment_begin;
+        }
+        size_t slot_offset = 0, slots = 0, base = 0, end = 0;
+        if (!consecutive || !mul(offset, w.j_tiles, slot_offset) ||
+            !mul(w.blocks, w.j_tiles, slots) || !add(main.slot_base, slot_offset, base) ||
+            !add(base, slots, end) || end > main.slot_base + main.slots ||
+            end > POTAL_HW_SCALE_ENTRIES) continue;
+        scale_owner[w.index] = owner;
+    }
+    return scale_owner;
+}
+
+} // namespace
 
 potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan & plan,
                                                const residual::decoded_packet & residual, potal_paired_staging & out,
@@ -1655,6 +1770,8 @@ struct executor {
     std::vector<uint32_t>         hw_generation; // per scale window
     std::vector<size_t>           scale_owner; // opt-in: physical Main owner of a logical Residual window
     bool                         index_queue = false;
+    bool                         strict      = false; // req.prepared: record issuer.wait_hw around drains
+    bool                         window_scale = false; // Scale windows through the window calls of potal.h
     std::vector<uint32_t>         queue_entries; // prepared before issue
     // Read once on the executing thread: unregistered threads (serial route) record nothing,
     // and per-entry spans exist only in the detail profile.
@@ -1668,7 +1785,7 @@ struct executor {
         const uint64_t *               counter;
         uint64_t                       before;
         op_span(const executor & ex, int stage, size_t op, const uint64_t * c, uint64_t fixed_work) :
-            span(ex.tl_on && stage != 0, static_cast<::potal::timeline::stage>(stage), uint32_t(ex.req.run_id),
+            span(ex.tl_on && !::potal::timeline::detail::g_coarse && stage != 0, static_cast<::potal::timeline::stage>(stage), uint32_t(ex.req.run_id),
                  ::potal::timeline::no_id, uint32_t(ex.req.stripe_id),
                  op == no_index ? ::potal::timeline::no_id : uint32_t(op)),
             counter(c), before(c ? *c : 0) {
@@ -1687,7 +1804,7 @@ struct executor {
     template<class F>
     potal_status timeline_call(::potal::timeline::stage stage, size_t op, uint64_t work, F && call,
                               const uint32_t *reply_status = nullptr) {
-        if (!tl_on) return call();
+        if (!tl_on || ::potal::timeline::detail::g_coarse) return call(); // acc.* spans: not in coarse
         const uint32_t tile = op == no_index ? ::potal::timeline::no_id : uint32_t(op);
         const uint32_t pair = op == no_index ? ::potal::timeline::no_id : uint32_t(report.plan.ops[op].pair);
         ::potal::timeline::record(stage, ::potal::timeline::event::begin, 0, uint32_t(req.run_id),
@@ -1700,8 +1817,224 @@ struct executor {
     }
 
     potal_status issue_fence() {
-        return timeline_call(::potal::timeline::stage::acc_fence, current_op, 0,
+        if (hwt.on) hwt.fence_before = potal_paired_hw_cycle();
+        const potal_status st = timeline_call(::potal::timeline::stage::acc_fence, current_op, 0,
             [&] { return potal_paired_fence(session); });
+        if (hwt.on) hwt.fence_after = potal_paired_hw_cycle();
+        return st;
+    }
+
+    // H3-8I-25AC GGML_POTAL_STRICT_HW_TIMELINE: one early-event window per Fence. A window opens at a
+    // drained point and the next accepted Fence freezes it, so every command issued in between owns
+    // it. Reads and the next arm run after that Fence reply and before the next original command.
+    struct hw_timeline_state {
+        bool     on = false, open = false;
+        uint64_t arm_before = 0, arm_after = 0, fence_before = 0, fence_after = 0, stripe_begin = 0;
+        uint32_t seq = 0, windows = 0;
+        size_t   first_op = 0;
+        uint64_t main_loops = 0, residual_loops = 0, readbacks = 0, scale_writes = 0, scale_releases = 0,
+                 index_configs = 0, index_writes = 0;
+        int      cpu = -1;
+    } hwt;
+
+    void hw_disable(const char * stage, potal_status status) {
+        hwt.on   = false;
+        hwt.open = false;
+        ::potal::hw_window::note_failure(stage, int(status));
+    }
+
+    void hw_stripe_begin() {
+        namespace hwn = ::potal::hw_window;
+        if (!req.hw_timeline || hwn::disabled()) return;
+        if (!strict || streaming() || req.next_k_prefetch || req.early_k_prefetch || index_queue || hw.dim != POTAL_HW_DIM) {
+            hw_disable("route", POTAL_ERR_UNSUPPORTED);
+            return;
+        }
+        const bool probe = hwn::take_probe();
+        potal_status st = potal_paired_hw_trace_enable(session, req.hw_counter, probe ? 1 : 0);
+        hwn::count_commands(probe ? 2 : 0);
+        if (st != POTAL_OK) {
+            hw_disable("enable", st);
+            return;
+        }
+        uint64_t ignored = 0;
+        if (hwn::take_counter_config()) {
+            for (uint32_t i = 0; st == POTAL_OK && i < hwn::counter_count; ++i) {
+                st = potal_paired_hw_counter(session, (uint64_t(hwn::counter_events[i]) << 12) | (uint64_t(i) << 4) | 8, &ignored);
+                hwn::count_commands(1);
+            }
+        }
+        if (st == POTAL_OK) st = potal_paired_hw_counter(session, 1, &ignored);
+        hwn::count_commands(1);
+        if (st != POTAL_OK) {
+            hw_disable("counter_setup", st);
+            return;
+        }
+        hwt.on = true;
+        hwt.stripe_begin = potal_paired_hw_cycle();
+#if defined(__linux__)
+        hwt.cpu = sched_getcpu();
+#endif
+        hw_arm();
+    }
+
+    void hw_arm() {
+        const potal_status st = potal_paired_hw_trace_arm(session, &hwt.arm_before, &hwt.arm_after);
+        ::potal::hw_window::count_commands(1);
+        if (st != POTAL_OK) {
+            hw_disable("arm", st);
+            return;
+        }
+        const potal_paired_counts & c = report.counts;
+        hwt.open = true;
+        hwt.first_op = last_op;
+        hwt.main_loops = c.main_loop_ws;
+        hwt.residual_loops = c.residual_loop_ws;
+        hwt.readbacks = c.readbacks;
+        hwt.scale_writes = c.scale_writes;
+        hwt.scale_releases = c.scale_releases;
+        hwt.index_configs = c.index_configs;
+        hwt.index_writes = c.index_writes;
+    }
+
+    // Identity and composition of the open window, from the plan and the commands issued since its arm.
+    void hw_fill_window(::potal::hw_window::record & r) const {
+        namespace hwn = ::potal::hw_window;
+        const potal_paired_counts & c = report.counts;
+        r.node_id = req.hw_node;
+        r.timeline_run = req.hw_timeline_run;
+        r.layer_id = req.hw_layer;
+        r.stripe_id = uint32_t(req.stripe_id);
+        r.window_seq = hwt.seq;
+        r.phase = req.hw_phase;
+        r.cpu = hwt.cpu;
+        r.first_op = uint32_t(hwt.first_op);
+        r.last_op = uint32_t(last_op);
+        r.j_group = hwn::no_id;
+        r.panel = hwn::no_id;
+        r.main_loops = uint32_t(c.main_loop_ws - hwt.main_loops);
+        r.residual_loops = uint32_t(c.residual_loop_ws - hwt.residual_loops);
+        r.readbacks = uint32_t(c.readbacks - hwt.readbacks);
+        r.scale_writes = uint32_t(c.scale_writes - hwt.scale_writes);
+        r.scale_releases = uint32_t(c.scale_releases - hwt.scale_releases);
+        r.index_configs = uint32_t(c.index_configs - hwt.index_configs);
+        r.index_writes = uint32_t(c.index_writes - hwt.index_writes);
+        r.cycle_arm_before = hwt.arm_before;
+        r.cycle_arm_after = hwt.arm_after;
+        uint32_t planned_main = 0, planned_residual = 0;
+        for (size_t i = hwt.first_op; i < last_op && i < report.plan.ops.size(); ++i) {
+            const potal_paired_op & op = report.plan.ops[i];
+            const bool is_main = op.kind == potal_paired_op_kind::main_gemm;
+            if (!is_main && op.kind != potal_paired_op_kind::residual_gemm) continue;
+            planned_main += is_main ? 1 : 0;
+            planned_residual += is_main ? 0 : 1;
+            if (r.panel == hwn::no_id) {
+                r.panel = uint32_t(op.panel);
+                r.j_group = uint32_t(op.j_group);
+                r.pair = uint8_t(op.pair);
+            }
+        }
+        const bool agrees = planned_main == r.main_loops && planned_residual == r.residual_loops;
+        const hwn::window_label label = hwn::label_window(r.main_loops, r.residual_loops, agrees);
+        r.kind = uint8_t(label.k);
+        r.confidence = uint8_t(label.c);
+    }
+
+    potal_status hw_read_fields(::potal::hw_window::record & r) {
+        namespace hwn = ::potal::hw_window;
+        uint32_t reads = 0;
+        potal_status read_status = POTAL_OK;
+        const auto read = [&](uint32_t position, uint32_t field) {
+            ++reads;
+            read_status = potal_paired_hw_trace_read(session, field, &r.field[position]);
+            if (read_status != POTAL_OK) return false;
+            r.read_mask = uint16_t(r.read_mask | (1u << position));
+            return true;
+        };
+        bool ok = read(hwn::f_flags, hwn::trace_flags);
+        if (ok) {
+            const uint64_t flags = r.field[hwn::f_flags];
+            if ((flags & hwn::flag_armed) != 0 || (flags & hwn::flag_seen_fence_accept) == 0) r.status |= hwn::st_not_frozen;
+            if ((flags & hwn::flag_overflow) != 0) r.status |= hwn::st_overflow;
+            const uint64_t pair0 = hwn::flag_seen_mac0 | hwn::flag_seen_b0 | hwn::flag_seen_dma0;
+            const uint64_t pair1 = hwn::flag_seen_mac1 | hwn::flag_seen_b1 | hwn::flag_seen_dma1;
+            if (r.panel == hwn::no_id && (flags & pair1) != 0 && (flags & pair0) == 0) r.pair = 1;
+            if ((flags & (r.pair != 0 ? pair0 : pair1)) != 0) r.status |= hwn::st_other_pair;
+            const hwn::field_map & m = hwn::pair_fields[r.pair != 0 ? 1 : 0];
+            ok = read(hwn::f_start, hwn::trace_start) && read(hwn::f_end, hwn::trace_end);
+            if (ok && (flags & hwn::flag_seen_busy) != 0)
+                ok = read(hwn::f_busy_first, hwn::trace_busy_first) && read(hwn::f_busy_last, hwn::trace_busy_last);
+            if (ok && (flags & (r.pair != 0 ? hwn::flag_seen_mac1 : hwn::flag_seen_mac0)) != 0)
+                ok = read(hwn::f_mac_first, m.mac_first) && read(hwn::f_mac_last, m.mac_last) &&
+                     read(hwn::f_mac_cycles, m.mac_cycles);
+            if (ok && (flags & (r.pair != 0 ? hwn::flag_seen_b1 : hwn::flag_seen_b0)) != 0)
+                ok = read(hwn::f_bwrite_first, m.bwrite_first) && read(hwn::f_bwrite_last, m.bwrite_last);
+            if (ok && (flags & (r.pair != 0 ? hwn::flag_seen_dma1 : hwn::flag_seen_dma0)) != 0)
+                ok = read(hwn::f_bdma_first, m.bdma_first) && read(hwn::f_bdma_last, m.bdma_last);
+        }
+        hwn::count_commands(reads);
+        return read_status;
+    }
+
+    void hw_close_window() {
+        namespace hwn = ::potal::hw_window;
+        hwt.open = false;
+        hwn::record * r = hwn::acquire_window();
+        if (r == nullptr) {
+            hwt.on = false;
+            return;
+        }
+        *r = hwn::record{};
+        hw_fill_window(*r);
+        r->cycle_fence_before = hwt.fence_before;
+        r->cycle_fence_after = hwt.fence_after;
+        ++hwt.seq;
+        ++hwt.windows;
+        const potal_status read_status = hw_read_fields(*r);
+        r->cycle_read_end = potal_paired_hw_cycle();
+        if (read_status != POTAL_OK) {
+            r->status |= hwn::st_read_failed;
+            hw_disable("read", read_status);
+        }
+    }
+
+    void hw_stripe_end() {
+        namespace hwn = ::potal::hw_window;
+        hwt.on = false;
+        hwn::stripe_record * s = hwn::acquire_stripe();
+        if (s == nullptr) return;
+        *s = hwn::stripe_record{};
+        s->node_id = req.hw_node;
+        s->timeline_run = req.hw_timeline_run;
+        s->stripe_id = uint32_t(req.stripe_id);
+        s->windows = hwt.windows;
+        s->cycle_begin = hwt.stripe_begin;
+        uint64_t ignored = 0;
+        potal_status st = potal_paired_hw_counter(session, 4, &ignored);
+        hwn::count_commands(1);
+        for (uint32_t i = 0; st == POTAL_OK && i < hwn::counter_count; ++i) {
+            st = potal_paired_hw_counter(session, uint64_t(i) << 4, &s->counter[i]);
+            hwn::count_commands(1);
+        }
+        if (st == POTAL_OK) {
+            st = potal_paired_hw_counter(session, 2, &ignored);
+            hwn::count_commands(1);
+        }
+        s->cycle_end = potal_paired_hw_cycle();
+        if (st != POTAL_OK) {
+            s->status = 1;
+            hw_disable("counter_read", st);
+        }
+    }
+
+    void hw_after_fence(bool final_drain) {
+        if (hwt.open) hw_close_window();
+        if (!hwt.on) return;
+        if (final_drain) {
+            hw_stripe_end();
+        } else {
+            hw_arm();
+        }
     }
 
     potal_status issue_readback(const potal_acc_readback & r, size_t op) {
@@ -1881,6 +2214,15 @@ struct executor {
     double index_s = 0, main_issue_s = 0, residual_issue_s = 0, readback_s = 0;
 
     ~executor() {
+        if (hwt.open) {
+            namespace hwn = ::potal::hw_window;
+            hwt.open = false;
+            if (hwn::record * r = hwn::acquire_window()) {
+                *r = hwn::record{};
+                hw_fill_window(*r);
+                r->status = hwn::st_aborted;
+            }
+        }
         if (!profile) return;
         if (plan_start != exec_clock::time_point{}) plan_s += seconds_since(plan_start);
         std::fprintf(stderr,
@@ -2596,10 +2938,20 @@ struct executor {
     }
     size_t group_pad_j(size_t g) const { return g + 1 == report.tile.j_groups ? report.tile.pad_J : 0; }
 
+    // Strict issuer: the issuer is blocked until the accelerator drains (wait events, direct stamps).
+    void hw_wait(::potal::timeline::event e) const {
+        if (strict && tl_on)
+            ::potal::timeline::record(::potal::timeline::stage::issuer_wait_hw, e, 0, uint32_t(req.run_id),
+                ::potal::timeline::no_id, uint32_t(req.stripe_id), ::potal::timeline::no_id,
+                ::potal::timeline::no_id, 0, 0);
+    }
+
     potal_status fence_now(window_kind kind = window_kind::completion_fence) {
         const auto         t  = time_now();
         auto * record = window_begin(kind, current_op);
+        hw_wait(::potal::timeline::event::wait_begin);
         const potal_status st = issue_fence();
+        hw_wait(::potal::timeline::event::wait_end);
         window_end(record, st);
         report.counts.fence_s += seconds_since(t);
         if (st != POTAL_OK) {
@@ -2608,6 +2960,7 @@ struct executor {
         report.counts.fences++;
         report.counts.drains++;
         drained_upto = last_op;
+        if (hwt.on) hw_after_fence(kind == window_kind::final_drain);
         return POTAL_OK;
     }
 
@@ -2619,33 +2972,7 @@ struct executor {
 
     void prepare_scale_reuse() {
         if (!req.ktile_scale_reuse) return;
-        const auto & plan = report.plan;
-        scale_owner.resize(plan.scale_windows.size());
-        for (const auto & w : plan.scale_windows) {
-            scale_owner[w.index] = w.index;
-            if (!w.residual) continue;
-            const auto & residency = plan.residencies[w.residency];
-            const size_t owner = plan.ops[residency.main_gemm_op].scale_window;
-            const auto & main = plan.scale_windows[owner];
-            const auto & panel = report.tile.panels[residency.panel];
-            const auto & window = panel.windows[w.window];
-            const size_t first = report.tile.fragments[window.fragment_begin].block_id;
-            if (main.residency != w.residency || main.j_tiles != w.j_tiles ||
-                main.program_op >= w.program_op || main.release_op <= w.release_op ||
-                first < panel.block_begin) continue;
-            const size_t offset = first - panel.block_begin;
-            if (offset > main.blocks || w.blocks > main.blocks - offset) continue;
-            bool consecutive = window.fragment_end - window.fragment_begin == w.blocks;
-            for (size_t f = window.fragment_begin; consecutive && f < window.fragment_end; ++f) {
-                consecutive = report.tile.fragments[f].block_id == first + f - window.fragment_begin;
-            }
-            size_t slot_offset = 0, slots = 0, base = 0, end = 0;
-            if (!consecutive || !mul(offset, w.j_tiles, slot_offset) ||
-                !mul(w.blocks, w.j_tiles, slots) || !add(main.slot_base, slot_offset, base) ||
-                !add(base, slots, end) || end > main.slot_base + main.slots ||
-                end > POTAL_HW_SCALE_ENTRIES) continue;
-            scale_owner[w.index] = owner;
-        }
+        scale_owner = compute_scale_owner(report.plan, report.tile);
     }
 
     potal_paired_status prepare_prefetch() {
@@ -2857,6 +3184,18 @@ struct executor {
         return potal_paired_status::ok;
     }
 
+    // The window calls' descriptor, when this window can use them: the empty and
+    // out-of-range shapes keep the per-column loops.
+    bool scale_columns(const potal_paired_scale_window & w, size_t pad_j, uint32_t generation,
+                       potal_paired_scale_columns & columns) const {
+        if (!window_scale || w.blocks == 0 || w.blocks > POTAL_SCALE_ENTRIES || w.j_tiles == 0 ||
+            w.j_tiles > POTAL_SCALE_ENTRIES || w.slot_base >= POTAL_SCALE_ENTRIES || pad_j >= hw.dim) {
+            return false;
+        }
+        columns = { uint32_t(w.slot_base), uint32_t(w.blocks), uint32_t(w.j_tiles), uint32_t(hw.dim - pad_j), generation };
+        return true;
+    }
+
     potal_paired_status scale_program(const potal_paired_op & op) {
         const potal_paired_scale_window & w   = report.plan.scale_windows[op.scale_window];
         const potal_paired_k_panel &      pan = report.tile.panels[op.panel];
@@ -2873,6 +3212,23 @@ struct executor {
         const size_t col_base = op.j_group * report.tile.tile_J * hw.dim;
         const size_t pad_j    = group_pad_j(op.j_group);
         const auto   t        = time_now();
+        potal_paired_scale_columns columns;
+        if (scale_columns(w, pad_j, gen, columns)) {
+            const uint32_t * block_carriers[POTAL_SCALE_ENTRIES];
+            for (size_t b = 0; b < w.blocks; ++b) {
+                const size_t block = w.residual ? report.tile.fragments[pan.windows[op.window].fragment_begin + b].block_id
+                                                : pan.block_begin + b;
+                block_carriers[b] = req.weight->carriers + block * req.weight->cstride + col_base;
+            }
+            uint64_t written = 0;
+            const potal_status st = potal_paired_scale_write_columns(session, &columns, block_carriers, &written);
+            report.issued = true;
+            report.counts.scale_writes += written;
+            const double elapsed = seconds_since(t);
+            report.counts.scale_s += elapsed;
+            if (profile) scale_write_s += elapsed;
+            return st == POTAL_OK ? potal_paired_status::ok : hw_fail("scale_write", st, &op);
+        }
         for (size_t b = 0; b < w.blocks; ++b) {
             // Main: scale block of the panel; Residual: the fragment's original block.
             const size_t block = w.residual ? report.tile.fragments[pan.windows[op.window].fragment_begin + b].block_id
@@ -2914,12 +3270,38 @@ struct executor {
         const potal_paired_scale_window & w     = report.plan.scale_windows[op.scale_window];
         const size_t                      pad_j = group_pad_j(op.j_group);
         const auto                        t     = time_now();
+        potal_paired_scale_columns columns;
+        if (scale_columns(w, pad_j, hw_generation[w.index], columns)) {
+            // The window's first release is accepted only after every older command drained.
+            hw_wait(::potal::timeline::event::wait_begin);
+            potal_status st = issue_scale_release(columns.slot_base, columns.generation, 0);
+            hw_wait(::potal::timeline::event::wait_end);
+            if (st == POTAL_OK) {
+                report.counts.scale_releases++;
+                uint64_t released = 0;
+                st = potal_paired_scale_release_columns(session, &columns, 1, &released);
+                report.counts.scale_releases += released;
+            }
+            const double elapsed = seconds_since(t);
+            report.counts.scale_s += elapsed;
+            if (profile) scale_release_s += elapsed;
+            if (st != POTAL_OK) {
+                return hw_fail("scale_release", st, &op);
+            }
+            report.counts.drains++;
+            drained_upto = last_op;
+            return potal_paired_status::ok;
+        }
         for (size_t b = 0; b < w.blocks; ++b) {
             for (size_t j = 0; j < w.j_tiles; ++j) {
                 const size_t valid = hw.dim - (j + 1 == w.j_tiles ? pad_j : 0);
                 for (size_t c = 0; c < valid; ++c) {
+                    // The window's first release is accepted only after every older command drained.
+                    const bool first = b == 0 && j == 0 && c == 0;
+                    if (first) hw_wait(::potal::timeline::event::wait_begin);
                     const potal_status st = issue_scale_release((uint32_t) (w.slot_base + b * w.j_tiles + j),
                                                                        hw_generation[w.index], (uint32_t) c);
+                    if (first) hw_wait(::potal::timeline::event::wait_end);
                     if (st != POTAL_OK) {
                         const double elapsed = seconds_since(t);
                         report.counts.scale_s += elapsed;
@@ -3381,10 +3763,17 @@ potal_paired_status potal_paired_plan_stripe(const potal_tile_plan & main, size_
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
     planning_profile::Root planning_root(planning_profile::Phase::route, rows, n, k);
 #endif
-    const potal_paired_status st = potal_make_tile_plan(main, rows, n, k, residual, tile, why, hw);
+    potal_paired_status st;
+    {
+        ::potal::timeline::scoped_span span(::potal::timeline::active(), ::potal::timeline::stage::plan_tile, 0, 0,
+                                            ::potal::timeline::no_id, ::potal::timeline::no_id);
+        st = potal_make_tile_plan(main, rows, n, k, residual, tile, why, hw);
+    }
     if (st != potal_paired_status::ok) {
         return st;
     }
+    ::potal::timeline::scoped_span span(::potal::timeline::active(), ::potal::timeline::stage::plan_exec, 0, 0,
+                                        ::potal::timeline::no_id, ::potal::timeline::no_id);
     return potal_make_execution_plan(tile, tile.residual ? residual : nullptr, plan, why, hw);
 }
 
@@ -3704,6 +4093,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
     ex.measure = !ex.streaming() && !(timing && std::strcmp(timing, "0") == 0);
     const char * queue = std::getenv("GGML_POTAL_INDEX_QUEUE");
     ex.index_queue = queue && std::strcmp(queue, "ON") == 0;
+    ex.strict = req.prepared != nullptr;
+    ex.window_scale = (req.window_scale_issue || window_scale_issue_enabled()) && !ex.tl_detail && !ex.streaming() &&
+                      hw.dim == POTAL_HW_DIM;
     const char * window_option = std::getenv("POTAL_INDEX_WINDOW_PROFILE");
     ex.window_profile = window_option && std::strcmp(window_option, "1") == 0;
     if (ex.window_profile) {
@@ -3785,6 +4177,36 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         //    plan, validated again and checked against this request.
         std::string         why;
         potal_paired_status st = potal_paired_status::ok;
+        if (req.prepared != nullptr) {
+            // Strict issuer: the producer validated, planned and staged this request
+            // (potal_paired_prepare). Only ownership moves here; the Queue budget is session state.
+            potal_paired_prepared & p = *req.prepared;
+            if (!p.ready || ex.streaming() || req.plan != nullptr) {
+                return ex.fail(potal_paired_status::invalid_argument, "prepared",
+                               "prepared job not ready, stream mode or a second plan", POTAL_OK);
+            }
+            p.ready      = false;
+            report.plan  = std::move(p.plan);
+            report.tile  = std::move(p.tile);
+            ex.staging   = std::move(p.staging);
+            ex.scale_owner = std::move(p.scale_owner);
+            if (report.tile.rows != req.rows || report.tile.n != req.n || report.tile.k != req.k ||
+                report.tile.residual != has_residual ||
+                (req.ktile_scale_reuse && ex.scale_owner.size() != report.plan.scale_windows.size())) {
+                return ex.fail(potal_paired_status::invalid_argument, "prepared",
+                               "the prepared job describes another request", POTAL_OK);
+            }
+            if (ex.index_queue) {
+                const uint32_t remaining = potal_index_queue_remaining();
+                if (!remaining || p.index_windows > remaining)
+                    return ex.fail(potal_paired_status::execution_failed, "index_queue_preflight",
+                                   "request exceeds admitted process Queue budget", POTAL_ERR_CAPACITY);
+                if (p.queue_entries.size() != report.plan.index_entries.size())
+                    return ex.fail(potal_paired_status::invalid_argument, "prepared",
+                                   "prepared Queue entries differ from the plan", POTAL_OK);
+                ex.queue_entries = std::move(p.queue_entries);
+            }
+        } else {
         if (req.plan != nullptr) {
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
             planning_profile::Scope planning_match(planning_profile::Site::supplied_match, planning_profile::Component::validation);
@@ -3868,6 +4290,7 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         }
 
         if (ex.profile) ex.pack_s = seconds_since(pack_start);
+        }
 
         // 3. The session must be idle: nothing outstanding, no open Index transaction, not failed.
         const potal_paired_session_status q = potal_paired_session_query(session);
@@ -3882,7 +4305,7 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
 
         // Specialize only Scale lowering, after validating the immutable H2 plan.
         // No allocation or alias proof is deferred until after command effects.
-        ex.prepare_scale_reuse();
+        if (req.prepared == nullptr) ex.prepare_scale_reuse();
         if (ex.streaming()) {
             const uint64_t before = ex.cost_now();
             st = ex.prepare_stream();
@@ -3894,6 +4317,7 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             return ex.fail(potal_paired_status::invalid_argument, "index_window_profile",
                            "record capacity overflow", POTAL_ERR_UNSUPPORTED);
 
+        ex.hw_stripe_begin();
         // 4. TLB maintenance before the first DMA of this stripe (the session is drained).
         if (req.tlb_flush) {
             ::potal::timeline::scoped_span tlb_span(ex.tl_on, ::potal::timeline::stage::exec_tlb_flush, tl_run,
@@ -3928,6 +4352,69 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         return ex.on_exception(potal_paired_status::allocation_failure, "allocation");
     } catch (...) {
         return ex.on_exception(potal_paired_status::execution_failed, "exception");
+    }
+}
+
+potal_paired_status potal_paired_prepare(const potal_paired_request & req, potal_paired_execution_plan && plan,
+                                         potal_paired_prepared & out, const char ** stage, std::string * why) {
+    out.ready = false;
+    const auto refuse = [&](potal_paired_status st, const char * s, std::string detail) {
+        if (stage != nullptr) *stage = s;
+        if (why != nullptr && why->empty()) *why = std::move(detail);
+        return st;
+    };
+    try {
+        const potal_paired_geometry hw = req.hw != nullptr ? *req.hw : potal_paired_hw_geometry();
+        const bool has_residual =
+            req.residual != nullptr && !(req.residual->rows.empty() && req.residual->runs.empty());
+        if (req.stream != potal_paired_stream_mode::off) {
+            return refuse(potal_paired_status::invalid_argument, "prepare", "stream mode prepares its own actions");
+        }
+        if (req.main_plan == nullptr || req.rows == 0 || req.n == 0 || req.k == 0 || hw.dim == 0) {
+            return refuse(potal_paired_status::invalid_argument, "request", "missing plan or empty shape");
+        }
+        if (has_residual && req.residual->digits.empty()) {
+            return refuse(potal_paired_status::invalid_argument, "request", "residual digits missing");
+        }
+        const potal_paired_tile_plan & t       = plan.tile;
+        const size_t                   i_tiles = (req.rows + hw.dim - 1) / hw.dim;
+        if (t.rows != req.rows || t.n != req.n || t.k != req.k || t.tile_J != req.main_plan->tile_J ||
+            t.tile_K_main != req.main_plan->tile_K || t.tile_I != std::min(req.main_plan->tile_I, i_tiles) ||
+            t.residual != has_residual) {
+            return refuse(potal_paired_status::invalid_argument, "plan", "the given plan describes another request");
+        }
+        potal_paired_status st = potal_paired_status::ok;
+        if (!req.plan_validated) {
+            ::potal::timeline::scoped_span validate(::potal::timeline::active(), ::potal::timeline::stage::prep_validate,
+                uint32_t(req.run_id), ::potal::timeline::no_id, uint32_t(req.stripe_id), ::potal::timeline::no_id);
+            st = potal_validate_execution_plan(plan, has_residual ? req.residual : nullptr, why, hw);
+        }
+        if (st != potal_paired_status::ok) {
+            return refuse(st, "plan", "plan validation");
+        }
+        out.tile = plan.tile;
+        out.plan = std::move(plan);
+        out.index_windows = size_t(std::count_if(out.plan.ops.begin(), out.plan.ops.end(), [](const potal_paired_op & op) {
+            return op.kind == potal_paired_op_kind::index_program;
+        }));
+        out.queue_entries.clear();
+        out.queue_entries.reserve(out.plan.index_entries.size());
+        for (const auto & entry : out.plan.index_entries) out.queue_entries.push_back(uint32_t(entry.resident_k));
+        out.staging = potal_paired_staging{};
+        if (out.tile.residual) {
+            ::potal::timeline::scoped_span pack(::potal::timeline::active(), ::potal::timeline::stage::exec_pack_residual,
+                uint32_t(req.run_id), ::potal::timeline::no_id, uint32_t(req.stripe_id), ::potal::timeline::no_id);
+            st = potal_paired_pack_residual(out.plan, *req.residual, out.staging, why, hw, false);
+            if (st != potal_paired_status::ok) {
+                return refuse(st, "pack", "residual staging");
+            }
+        }
+        out.scale_owner.clear();
+        if (req.ktile_scale_reuse) out.scale_owner = compute_scale_owner(out.plan, out.tile);
+        out.ready = true;
+        return potal_paired_status::ok;
+    } catch (const std::bad_alloc &) {
+        return refuse(potal_paired_status::allocation_failure, "allocation", "out of memory while preparing");
     }
 }
 

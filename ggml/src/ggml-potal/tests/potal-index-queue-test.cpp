@@ -160,7 +160,7 @@ struct output {
 
 output execute(const paired_fixture &f, const potal_tile_plan &main, const residual::decoded_packet &d,
                h2_emulator &e, bool queue, bool prefetch = false,
-               potal_paired_stream_mode stream = potal_paired_stream_mode::off) {
+               potal_paired_stream_mode stream = potal_paired_stream_mode::off, bool prepared = false) {
     output out;
     const size_t ldc = align_up(f.N, PD);
     std::unique_ptr<int32_t, dma_deleter> cm(static_cast<int32_t *>(dma_alloc(PD * ldc * sizeof(int32_t))));
@@ -180,6 +180,22 @@ output execute(const paired_fixture &f, const potal_tile_plan &main, const resid
     req.next_k_prefetch = prefetch;
     req.stream = stream;
     req.stream_counter = stream != potal_paired_stream_mode::off ? h2_emulator::on_counter : nullptr;
+    // H3-8I-25S strict issuer: plan + potal_paired_prepare first (producer side), then the
+    // executor only consumes the prepared job.
+    potal_paired_tile_plan tile;
+    potal_paired_execution_plan plan;
+    potal_paired_prepared job;
+    if (prepared) {
+        std::string why;
+        const char * stage = nullptr;
+        if (potal_paired_plan_stripe(main, f.M, f.N, f.K, d.rows.empty() ? nullptr : &d, tile, plan, &why) !=
+                potal_paired_status::ok ||
+            potal_paired_prepare(req, std::move(plan), job, &stage, &why) != potal_paired_status::ok) {
+            out.report.status = potal_paired_status::invalid_argument;
+            return out;
+        }
+        req.prepared = &job;
+    }
     const auto sink = e.sink();
     const auto status = potal_paired_run_session(req, &sink, out.report);
     if (status == potal_paired_status::ok) {
@@ -227,6 +243,15 @@ bool paired_cases(bool preflight) {
             b.report.counts.queue_allocations != b.report.plan.index_programs ||
             a.report.counts.queue_allocations != 0 || b.report.counts.index_configs != 0 ||
             b.report.counts.index_writes != 0 || !scalar.errors.empty() || !queue.errors.empty()) return false;
+        // Strict issuer: the prepared job issues the same commands on both Index paths.
+        const auto pq = execute(f, main, d, queue, true, false, potal_paired_stream_mode::off, true);
+        const auto ps = execute(f, main, d, scalar, false, false, potal_paired_stream_mode::off, true);
+        if (pq.report.status != potal_paired_status::ok || ps.report.status != potal_paired_status::ok ||
+            pq.main != a.main || pq.residual != a.residual || ps.main != a.main || ps.residual != a.residual ||
+            pq.report.counts.queue_allocations != b.report.counts.queue_allocations ||
+            pq.report.counts.index_writes != 0 || ps.report.counts.index_writes != a.report.counts.index_writes ||
+            ps.report.counts.scale_writes != a.report.counts.scale_writes || !queue.errors.empty() ||
+            !scalar.errors.empty()) return false;
         if (kind == 0) {
             const auto c = execute(f, main, d, queue, true, true);
             const auto s = execute(f, main, d, queue, true, false, potal_paired_stream_mode::bounded);

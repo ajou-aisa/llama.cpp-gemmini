@@ -6,6 +6,11 @@
 //   overflow  POTAL_TIMELINE_EVENTS=64: drops past capacity, overflow flag
 //   main      4 recording threads (caller, fold, issuer, finalizer) with
 //             handoff edges; flushed CSV content checked
+//   reuse     POTAL_TIMELINE_REUSE=1: two sequential same-role threads share one slot
+//   noreuse   the same threads without it: two slots
+//   gate      set_recording(false) drops records, keeps runs and anchors
+//   coarse    POTAL_TIMELINE_PROFILE=coarse: op_profile() off, META profile=coarse
+//   capi      the C API (ggml-potal.h): model marks, recording gate, stats, flush
 // The main trace goes to $POTAL_TIMELINE when set (for timeline_parse.py),
 // else to a fresh temporary directory.
 #include "trace/timeline.hpp"
@@ -31,6 +36,16 @@
 #include <vector>
 
 extern char ** environ;
+
+// The C API of ggml/include/ggml-potal.h, defined in trace/timeline.cpp (this target does not
+// see the ggml include directory).
+extern "C" {
+void ggml_backend_potal_timeline_mark(int stage_id, int event, uint32_t index, uint64_t work);
+void ggml_backend_potal_timeline_set_recording(bool on);
+bool ggml_backend_potal_timeline_flush(void);
+bool ggml_backend_potal_timeline_stats(uint64_t * events, uint64_t * dropped, uint32_t * overflowed_threads,
+                                       uint32_t * threads);
+}
 
 namespace tl = potal::timeline;
 
@@ -169,6 +184,10 @@ void finalizer_thread(uint32_t run, handoff_queue & from_issuer, bool & ok) {
 int child_disabled() {
     CHECK(!tl::enabled());
     CHECK(tl::register_thread(tl::role::caller, 0, 0) == tl::no_slot);
+    CHECK(!tl::op_profile());
+    ggml_backend_potal_timeline_mark(81, 1, 0, 0);
+    CHECK(!ggml_backend_potal_timeline_stats(nullptr, nullptr, nullptr, nullptr));
+    CHECK(!ggml_backend_potal_timeline_flush());
     CHECK(tl::begin_run(tl::op_type::linear, tl::phase::decode, 1) == 0);
     CHECK(tl::next_edge_id() == 0);
     for (int i = 0; i < 1000; ++i) {
@@ -216,6 +235,7 @@ int child_main() {
     }
     CHECK(tl::register_thread(tl::role::caller, -1, -1) == 0);
     CHECK(tl::register_thread(tl::role::caller, -1, -1) == 0);
+    CHECK(tl::op_profile());  // window profile: per-op accelerator spans on
     const uint32_t run = tl::begin_run(tl::op_type::linear, tl::phase::decode, 7);
     CHECK(run != 0);
     tl::record(stage::node_total, event::begin, 0, run, 7, tl::no_id, 0, 0, 0, 0);
@@ -307,6 +327,148 @@ int child_main() {
     return g_failures == 0 ? 0 : 1;
 }
 
+void same_role_worker(uint32_t base, uint32_t n) {
+    tl::register_thread(tl::role::exsia_fold, -1, -1);
+    for (uint32_t i = 0; i < n; ++i) {
+        tl::record(stage::exsia_local, event::instant, 0, 0, 0, base + i, 0, 0, 0, 0);
+    }
+}
+
+int child_reuse(bool expect_reuse) {
+    const char * path = std::getenv("POTAL_TIMELINE");
+    CHECK(tl::enabled() && path != nullptr);
+    if (path == nullptr) {
+        return 1;
+    }
+    CHECK(tl::register_thread(tl::role::caller, -1, -1) == 0);
+    std::thread a(same_role_worker, 0, 3);
+    a.join();
+    std::thread b(same_role_worker, 100, 2);
+    b.join();
+    const tl::stats_t s = tl::stats();
+    CHECK(s.threads == (expect_reuse ? 2u : 3u) && s.events == 5 && s.dropped == 0);
+    CHECK(tl::reuse_count() == (expect_reuse ? 1u : 0u));
+    CHECK(tl::flush());
+    const std::string text = slurp(path);
+    CHECK(expect_reuse ? text.find(",reuse_count=1\n") != std::string::npos
+                       : text.find("reuse_count") == std::string::npos);
+    CHECK(rows_of(path, "T").size() == (expect_reuse ? 2u : 3u));
+    std::map<std::string, std::vector<std::pair<long, long>>> by_slot;  // slot -> (seq, stripe)
+    for (const auto & e : rows_of(path, "E")) {
+        by_slot[e[3]].emplace_back(std::atol(e[2].c_str()), std::atol(e[11].c_str()));
+    }
+    if (expect_reuse) {
+        CHECK(by_slot.size() == 1 && by_slot.count("1"));
+        const auto & v = by_slot["1"];
+        const std::vector<std::pair<long, long>> want = { { 0, 0 }, { 1, 1 }, { 2, 2 }, { 3, 100 }, { 4, 101 } };
+        CHECK(v == want);
+        int registers = 0, exits = 0;
+        for (const auto & an : rows_of(path, "A")) {
+            if (an[1] == "1") {
+                registers += an[3] == "register";
+                exits += an[3] == "thread_exit";
+            }
+        }
+        CHECK(registers == 2 && exits == 2);
+    } else {
+        CHECK(by_slot.size() == 2 && by_slot["1"].size() == 3 && by_slot["2"].size() == 2);
+        CHECK(by_slot["2"].size() == 2 && by_slot["2"][0].first == 0 && by_slot["2"][1].first == 1);
+    }
+    return g_failures == 0 ? 0 : 1;
+}
+
+int child_gate() {
+    const char * path = std::getenv("POTAL_TIMELINE");
+    CHECK(tl::enabled() && path != nullptr);
+    if (path == nullptr) {
+        return 1;
+    }
+    CHECK(tl::register_thread(tl::role::caller, -1, -1) == 0);
+    tl::record(stage::node_total, event::instant, 0, 0, 0, 1, 0, 0, 0, 0);
+    tl::set_recording(false);
+    for (int i = 0; i < 5; ++i) {
+        tl::record(stage::node_total, event::instant, 0, 0, 0, 2, 0, 0, 0, 0);
+    }
+    std::thread stray([] { tl::record(stage::node_total, event::instant, 0, 0, 0, 3, 0, 0, 0, 0); });
+    stray.join();
+    const uint32_t run = tl::begin_run(tl::op_type::linear, tl::phase::decode, 3);
+    CHECK(run != 0);
+    tl::anchor();
+    tl::end_run(run);
+    tl::set_recording(true);
+    tl::record(stage::node_total, event::instant, 0, 0, 0, 4, 0, 0, 0, 0);
+    const tl::stats_t s = tl::stats();
+    CHECK(s.threads == 1 && s.events == 2 && s.dropped == 0 && s.unregistered == 0);
+    CHECK(tl::flush());
+    const auto e = rows_of(path, "E");
+    CHECK(e.size() == 2 && e[0][11] == "1" && e[1][11] == "4" && e[1][2] == "1");
+    std::map<std::string, int> kinds;
+    for (const auto & an : rows_of(path, "A")) {
+        ++kinds[an[3]];
+    }
+    CHECK(kinds["register"] == 1 && kinds["run_begin"] == 1 && kinds["explicit"] == 1 && kinds["run_end"] == 1);
+    CHECK(rows_of(path, "R").size() == 1);
+    return g_failures == 0 ? 0 : 1;
+}
+
+int child_coarse() {
+    const char * path = std::getenv("POTAL_TIMELINE");
+    CHECK(tl::enabled() && path != nullptr);
+    if (path == nullptr) {
+        return 1;
+    }
+    CHECK(!tl::op_profile());  // unregistered
+    CHECK(tl::register_thread(tl::role::caller, -1, -1) == 0);
+    CHECK(tl::active() && !tl::op_profile() && !tl::detail_profile());
+    CHECK(tl::flush());
+    CHECK(slurp(path).find(",profile=coarse,") != std::string::npos);
+    return g_failures == 0 ? 0 : 1;
+}
+
+int child_capi() {
+    const char * path = std::getenv("POTAL_TIMELINE");
+    CHECK(tl::enabled() && path != nullptr);
+    if (path == nullptr) {
+        return 1;
+    }
+    ggml_backend_potal_timeline_mark(81, 1, 0, 0);   // registers this thread as caller, cpu -1
+    ggml_backend_potal_timeline_mark(82, 1, 0, 0);
+    ggml_backend_potal_timeline_mark(82, 2, 0, 9);
+    ggml_backend_potal_timeline_mark(83, 1, 0, 0);
+    ggml_backend_potal_timeline_mark(84, 7, 0, 42);
+    ggml_backend_potal_timeline_mark(83, 2, 0, 0);
+    ggml_backend_potal_timeline_mark(80, 1, 0, 0);   // rejected: stage outside 81..84
+    ggml_backend_potal_timeline_mark(85, 1, 0, 0);   // rejected
+    ggml_backend_potal_timeline_mark(83, 3, 0, 0);   // rejected: event
+    ggml_backend_potal_timeline_set_recording(false);
+    ggml_backend_potal_timeline_mark(83, 1, 1, 0);   // dropped by the gate
+    ggml_backend_potal_timeline_set_recording(true);
+    ggml_backend_potal_timeline_mark(81, 2, 0, 0);
+    uint64_t events = 0, dropped = 1;
+    uint32_t overflowed = 1, threads = 0;
+    CHECK(ggml_backend_potal_timeline_stats(&events, &dropped, &overflowed, &threads));
+    CHECK(events == 7 && dropped == 0 && overflowed == 0 && threads == 1);
+    CHECK(ggml_backend_potal_timeline_flush());
+    const std::string text = slurp(path);
+    CHECK(text.find("S,81,model.inference\n") != std::string::npos);
+    CHECK(text.find("S,82,model.prefill\n") != std::string::npos);
+    CHECK(text.find("S,83,model.decode\n") != std::string::npos);
+    CHECK(text.find("S,84,model.token\n") != std::string::npos);
+    const auto t = rows_of(path, "T");
+    CHECK(t.size() == 1 && t[0][2] == "caller" && t[0][4] == "-1");
+    const auto e = rows_of(path, "E");
+    const std::vector<std::string> stages = { "81", "82", "82", "83", "84", "83", "81" };
+    const std::vector<std::string> evs    = { "1", "1", "2", "1", "7", "2", "2" };
+    CHECK(e.size() == stages.size());
+    for (size_t i = 0; i < e.size() && i < stages.size(); ++i) {
+        CHECK(e[i][4] == stages[i] && e[i][5] == evs[i] && e[i][11] == "0");
+    }
+    if (e.size() == stages.size()) {
+        CHECK(e[2][15] == "9" && e[4][15] == "42");
+    }
+    return g_failures == 0 ? 0 : 1;
+}
+
 int spawn_child(const char * mode, const std::vector<std::string> & extra_env) {
     std::vector<std::string> env;
     for (char ** e = environ; *e != nullptr; ++e) {
@@ -348,6 +510,21 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--child=main") == 0) {
         return child_main();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--child=reuse") == 0) {
+        return child_reuse(true);
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--child=noreuse") == 0) {
+        return child_reuse(false);
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--child=gate") == 0) {
+        return child_gate();
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--child=coarse") == 0) {
+        return child_coarse();
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--child=capi") == 0) {
+        return child_capi();
+    }
 
     std::string main_path;
     if (const char * p = std::getenv("POTAL_TIMELINE"); p != nullptr && *p != '\0') {
@@ -371,6 +548,22 @@ int main(int argc, char ** argv) {
     CHECK(rc_disabled == 0);
     CHECK(rc_overflow == 0);
     CHECK(rc_main == 0);
+    struct extra_mode {
+        const char *             name;
+        std::vector<std::string> env;
+    };
+    const std::vector<extra_mode> extra = {
+        { "reuse", { "POTAL_TIMELINE=" + main_path + ".reuse.csv", "POTAL_TIMELINE_REUSE=1" } },
+        { "noreuse", { "POTAL_TIMELINE=" + main_path + ".noreuse.csv" } },
+        { "gate", { "POTAL_TIMELINE=" + main_path + ".gate.csv" } },
+        { "coarse", { "POTAL_TIMELINE=" + main_path + ".coarse.csv", "POTAL_TIMELINE_PROFILE=coarse" } },
+        { "capi", { "POTAL_TIMELINE=" + main_path + ".capi.csv" } },
+    };
+    for (const extra_mode & m : extra) {
+        const int rc = spawn_child(m.name, m.env);
+        CHECK(rc == 0);
+        std::printf("potal-timeline-test: [%s] %s rc=%d\n", rc == 0 ? "PASS" : "FAIL", m.name, rc);
+    }
 
     const std::string text     = slurp(main_path);
     const uint32_t    expected = kStripes * (7 + 8 + 6) + 4;

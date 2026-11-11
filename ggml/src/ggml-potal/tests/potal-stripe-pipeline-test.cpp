@@ -65,6 +65,7 @@
 #include "support/stripe-golden.hpp"
 #include "support/stripe-owner.hpp"
 #include "support/paired-h2-emulator.hpp"
+#include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
 #include "quants/act/exsia/types.hpp"
@@ -352,7 +353,8 @@ struct recorder {
 // its chain. packets: the stripes that must carry the residual steps
 // (nullptr: the stripes that show a residual_prepare_begin).
 std::string order_violation(recorder & rec, size_t capacity, size_t stripes, bool complete,
-                            const std::set<size_t> * packets = nullptr, bool roles = false, bool paired = false) {
+                            const std::set<size_t> * packets = nullptr, bool roles = false, bool paired = false,
+                            bool strict = false) {
     const std::vector<recorder::rec> ev = rec.events();
     std::vector<uint64_t>            seqs;
     for (const recorder::rec & r : ev) {
@@ -402,6 +404,9 @@ std::string order_violation(recorder & rec, size_t capacity, size_t stripes, boo
         if (paired)
             chain = {kind::folding_commit, kind::submit_accepted, kind::main_begin, kind::paired_prepare_begin,
                      kind::paired_prepare_end, kind::paired_begin, kind::paired_end};
+        if (strict) // H3-8I-25S: the producer prepares the job before READY
+            chain = {kind::folding_commit, kind::paired_prepare_begin, kind::paired_prepare_end,
+                     kind::submit_accepted, kind::main_begin, kind::paired_begin, kind::paired_end};
         if (residual) {
             if (!paired)
                 chain.insert(chain.end(), { kind::residual_prepare_begin, kind::residual_prepare_end,
@@ -565,7 +570,8 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recorder & rec,
                         const std::function<void(ggml_gemmini_args_t &, const stripe_event &)> & producer_hook = {},
                         bool measure_timing = true, bool roles = false,
-                        const std::function<bool(const char *, size_t)> & checkpoint = {}, bool paired = false) {
+                        const std::function<bool(const char *, size_t)> & checkpoint = {}, bool paired = false,
+                        bool strict = false) {
     ggml_gemmini_args_t args;
     run_result          r;
     if (!nd.args_for(args)) {
@@ -583,6 +589,7 @@ run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recor
     cfg.measure_timing = measure_timing;
     cfg.hart_roles = roles;
     cfg.paired = paired;
+    cfg.strict_issuer = strict;
     cfg.role_checkpoint = checkpoint;
     cfg.observer     = [&](const stripe_event & ev) {
         rec.on(ev);
@@ -594,9 +601,13 @@ run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recor
     uint32_t generation = 0;
     paired_runner paired_exec;
     if (paired) {
-        paired_exec = [&](const potal_paired_request & request, potal_paired_report & report) {
+        bool hw_invalid = false;
+        const bool hw_timeline = ::potal::hw_window::requested(hw_invalid);
+        h2->hw_trace_mode = hw_timeline;
+        paired_exec = [&, hw_timeline](const potal_paired_request & request, potal_paired_report & report) {
             auto q = request;
             q.generation = &generation;
+            if (hw_timeline) q.hw_counter = potal_test::h2_emulator::on_counter;
             const auto sink = h2->sink();
             return potal_paired_run_session(q, &sink, report);
         };
@@ -1338,12 +1349,13 @@ void test_jsonl_order() {
 }
 
 // Five CPU roles use the same independent scalar goldens as the default path.
-bool roles_values(node & nd, const golden_node & g, recorder & rec, const run_result & result, bool paired = false) {
+bool roles_values(node & nd, const golden_node & g, recorder & rec, const run_result & result, bool paired = false,
+                  bool strict = false) {
     bool ok = result.report.ok && bitwise(nd.dst(), g.want) &&
               result.report.completions.size() == nd.stripes();
     const auto packets = g.packet_stripes();
     ok = ok && order_violation(rec, result.report.counts.max_outstanding_semantic,
-                               nd.stripes(), true, &packets, true, paired).empty();
+                               nd.stripes(), true, &packets, true, paired, strict).empty();
     for (size_t s = 0; s < nd.stripes(); ++s) {
         const size_t rb = s * nd.plan.tile_I * D, re = std::min(nd.M, rb + nd.plan.tile_I * D);
         ok = ok && rec.main_c[s] == g.main_c(nd, rb, re);
@@ -1543,9 +1555,152 @@ void test_roles(bool timeline_only) {
     else unsetenv("GGML_POTAL_HART_ROLES");
 }
 
+// H3-8I-25T GGML_POTAL_FAST_DECODE: every packet decodes to the reference's runs, rows and digits,
+// and a corrupted packet reports the reference status.
+void test_fast_decode() {
+    if (!options::compensation) {
+        std::printf("[SKIP] FAST_DECODE needs compensation=ON (residual packets)\n");
+        return;
+    }
+    size_t packets = 0, mismatches = 0, digits = 0;
+    const auto same = [](const residual::decoded_packet & a, const residual::decoded_packet & b) {
+        if (a.k_compact != b.k_compact || a.digits != b.digits || a.rows.size() != b.rows.size() ||
+            a.runs.size() != b.runs.size()) return false;
+        for (size_t i = 0; i < a.rows.size(); ++i)
+            if (a.rows[i].lane != b.rows[i].lane || a.rows[i].source_row != b.rows[i].source_row) return false;
+        for (size_t i = 0; i < a.runs.size(); ++i)
+            if (a.runs[i].block_id != b.runs[i].block_id || a.runs[i].local_k != b.runs[i].local_k) return false;
+        return true;
+    };
+    for (uint32_t seed = 300; seed < 308; ++seed) {
+        node nd(4 * D + D / 2, 64, 64, seed, seed % 2 ? 400.0f : 90.0f);
+        if (!nd.ok || potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) != POTAL_OK) {
+            ++mismatches;
+            continue;
+        }
+        golden_node g(nd);
+        for (const auto & entry : g.packets) {
+            const grmd::StripePacket & packet = *entry.second;
+            residual::decoded_packet ref, fast;
+            unsetenv("GGML_POTAL_FAST_DECODE");
+            const auto rs = residual::decode_packet(packet, nd.weight, ref);
+            setenv("GGML_POTAL_FAST_DECODE", "ON", 1);
+            const auto fs = residual::decode_packet(packet, nd.weight, fast);
+            ++packets;
+            digits += ref.digits.size();
+            if (rs != fs || !same(ref, fast)) ++mismatches;
+            grmd::StripePacket broken = packet; // a payload extent the validator refuses
+            if (!broken.blocks.empty() && !broken.blocks[0].groups.empty()) broken.blocks[0].groups[0].activation_offset += 1;
+            unsetenv("GGML_POTAL_FAST_DECODE");
+            const auto rb = residual::decode_packet(broken, nd.weight, ref);
+            setenv("GGML_POTAL_FAST_DECODE", "ON", 1);
+            const auto fb = residual::decode_packet(broken, nd.weight, fast);
+            if (rb != fb || rb == grmd::RmdStatus::success) ++mismatches;
+        }
+    }
+    unsetenv("GGML_POTAL_FAST_DECODE");
+    check("FAST_DECODE equals the reference decode on " + std::to_string(packets) + " packets (" +
+              std::to_string(digits) + " digits) and on corrupted copies",
+          packets > 0 && mismatches == 0);
+}
+
+// H3-8I-25S strict issuer: hart 3 (inside submit) decodes, plans and stages every paired stripe;
+// hart 0 only issues. Same scalar goldens as ROLES; the per-run preparation counters prove where
+// the work ran, and ROLES without strict is the negative control.
+void test_strict(bool timeline_only = false) {
+    if (!options::compensation) {
+        std::printf("[SKIP] STRICT needs compensation=ON (the paired route)\n");
+        return;
+    }
+    check("STRICT native map has five available CPUs", roles_host_map());
+    if (failures) return;
+    const char * old = std::getenv("GGML_POTAL_HART_ROLES");
+    const std::string saved = old ? old : "";
+    const bool had_old = old != nullptr;
+    setenv("GGML_POTAL_HART_ROLES", "ON", 1);
+    const size_t rounds = timeline_only ? 3 : 12;
+    const char * fast_env = std::getenv("GGML_POTAL_FAST_DECODE");
+    const bool   fast = fast_env != nullptr && std::strcmp(fast_env, "ON") == 0;
+    for (size_t run = 0; run < rounds; ++run) {
+        const size_t stripes = timeline_only ? 4 + run % 2 : run % 3 == 0 ? 1 : run % 3 == 1 ? 2 : 5;
+        const size_t capacity = timeline_only ? 2 : 1 + run % 2;
+        node nd((stripes - 1) * D + D / 2, 64, 64, (uint32_t) (177 + run), 400.0f);
+        check("STRICT fixture plan", nd.ok &&
+              potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) == POTAL_OK);
+        golden_node g(nd);
+        gated_runner runner;
+        recorder rec;
+        roles_probe probe;
+        rec.hook = [&](const stripe_event & ev) { probe.observe(ev); };
+        const auto result = run_pipeline(nd, capacity, runner, rec, {}, true, true,
+            [&](const char * stage, size_t s) { return probe.checkpoint(stage, s); }, true, true);
+        const pipeline_counts & c = result.report.counts;
+        check("STRICT" + std::string(fast ? " FAST_DECODE" : "") + " cap=" + std::to_string(capacity) +
+                  " stripes=" + std::to_string(stripes) + " run=" + std::to_string(run) +
+                  ": golden, prepare before READY on hart 3, zero preparations on hart 0",
+              g.ok && roles_values(nd, g, rec, result, true, true) && probe.valid && probe.joined() &&
+                  c.prepares_on_issuer_thread == 0 && c.prepares_on_issuer_cpu == 0 &&
+                  c.prepares_on_producer == nd.stripes() && c.paired_stripes == nd.stripes());
+    }
+    if (!timeline_only) {
+        node nd(4 * D + D / 2, 64, 64, 191, 400.0f);
+        check("STRICT control fixture", nd.ok &&
+              potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) == POTAL_OK);
+        golden_node g(nd);
+        gated_runner runner;
+        recorder rec;
+        const auto result = run_pipeline(nd, 2, runner, rec, {}, true, true, {}, true, false);
+        const pipeline_counts & c = result.report.counts;
+        check("STRICT control: ROLES paired without strict prepares every stripe on the issuer thread",
+              result.report.ok && bitwise(nd.dst(), g.want) && c.prepares_on_issuer_thread == nd.stripes() &&
+                  c.prepares_on_producer == 0);
+        for (size_t capacity : {size_t(1), size_t(2)}) {
+            gated_runner fail_runner;
+            recorder fail_rec;
+            roles_probe probe;
+            probe.failure = "prepare_job";
+            fail_rec.hook = [&](const stripe_event & ev) { probe.observe(ev); };
+            const auto failed = run_pipeline(nd, capacity, fail_runner, fail_rec, {}, true, true,
+                [&](const char * st, size_t s) { return probe.checkpoint(st, s); }, true, true);
+            check("STRICT failure prepare_job cap=" + std::to_string(capacity) +
+                      ": no partial commit, joined, sticky failure, nothing of stripe 1 issued",
+                  !failed.report.ok && failed.committed_untouched && probe.joined() && probe.injected &&
+                      failed.report.stage != nullptr && std::string(failed.report.stage) == "prepare_job" &&
+                      fail_rec.seq(kind::run_commit) < 0 && fail_rec.seq(kind::main_begin, 1) < 0);
+        }
+        ggml_gemmini_args_t args;
+        potal_test::refusing_owner owner;
+        pipeline_config cfg;
+        cfg.residual = options::compensation;
+        cfg.paired = true;
+        cfg.strict_issuer = true;
+        setenv("GGML_POTAL_HART_ROLES", "OFF", 1);
+        pipeline_report refused = nd.args_for(args) ? run_stripe_pipeline(nd.x, args, nd.weight, nd.plan, cfg, owner)
+                                                    : pipeline_report{};
+        check("STRICT without ROLES refuses before any work",
+              !refused.ok && refused.stage != nullptr && std::string(refused.stage) == "options");
+        setenv("GGML_POTAL_HART_ROLES", "ON", 1);
+        cfg.paired_ktile_scale_reuse = true;
+        cfg.paired_stream = potal_paired_stream_mode::continuous;
+        ggml_gemmini_args_t args2;
+        refused = nd.args_for(args2) ? run_stripe_pipeline(nd.x, args2, nd.weight, nd.plan, cfg, owner)
+                                     : pipeline_report{};
+        check("STRICT with stream mode refuses before any work",
+              !refused.ok && refused.stage != nullptr && std::string(refused.stage) == "options");
+    }
+    if (had_old) setenv("GGML_POTAL_HART_ROLES", saved.c_str(), 1);
+    else unsetenv("GGML_POTAL_HART_ROLES");
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--strict-timeline") == 0) {
+        test_strict(true);
+        if (::potal::timeline::enabled()) check("STRICT timeline flush", ::potal::timeline::flush());
+        std::printf("POTAL_STRIPE_STRICT_TIMELINE %s\n", failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--roles-timeline") == 0) {
         test_roles(true);
         if (::potal::timeline::enabled()) check("ROLES timeline flush", ::potal::timeline::flush());
@@ -1644,6 +1799,13 @@ int main(int argc, char ** argv) {
         }
         test_jsonl_order();
         test_roles(false);
+        test_strict();
+        test_fast_decode();
+        setenv("GGML_POTAL_FAST_DECODE", "ON", 1); // the strict pipeline again with both H3 optimizations
+        setenv("GGML_POTAL_PLAN_VALIDATED_REUSE", "ON", 1);
+        test_strict();
+        unsetenv("GGML_POTAL_FAST_DECODE");
+        unsetenv("GGML_POTAL_PLAN_VALIDATED_REUSE");
     }
     if (failures != 0) {
         std::printf("POTAL_STRIPE_PIPELINE_TEST FAIL (%d)\n", failures);

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <mutex>
 
 #if defined(__linux__)
 #    include <pthread.h>
@@ -164,6 +165,80 @@ bool pin_role_cpu(int cpu, std::string & err) {
     (void) cpu;
     err = "ROLES requires Linux thread affinity";
     return false;
+#endif
+}
+
+bool strict_issuer_requested(bool & invalid) {
+    invalid = false;
+    const char * value = std::getenv("GGML_POTAL_STRICT_ISSUER");
+    if (value == nullptr || *value == '\0') return false;
+    std::string v(value);
+    for (char & ch : v) ch = (char) std::toupper((unsigned char) ch);
+    if (v == "ON" || v == "1") return true;
+    if (v == "OFF" || v == "0") return false;
+    invalid = true;
+    return false;
+}
+
+bool cached_role_cpus(std::array<int, 5> & cpus, std::string & err) {
+    static std::mutex         m;
+    static bool               done = false, ok = false;
+    static std::array<int, 5> map{{-1, -1, -1, -1, -1}};
+    static std::string        why;
+    std::lock_guard<std::mutex> lock(m);
+    if (!done) {
+        ok   = find_role_cpus(map, why);
+        done = true;
+    }
+    if (!ok) {
+        err = why;
+        return false;
+    }
+    cpus = map;
+    return true;
+}
+
+bool issuer_cpu_exclusion::begin(std::string & err) {
+#if defined(__linux__)
+    static_assert(sizeof(cpu_set_t) <= sizeof(saved_), "cpu_set_t does not fit the saved mask");
+    std::array<int, 5> cpus;
+    if (!cached_role_cpus(cpus, err)) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int rc = pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        err = std::string("reading the caller affinity failed: ") + std::strerror(rc);
+        return false;
+    }
+    std::memcpy(saved_, &set, sizeof(set));
+    if (!CPU_ISSET(cpus[0], &set)) return true; // already off hart 0: nothing to restore
+    CPU_CLR(cpus[0], &set);
+    if (CPU_COUNT(&set) == 0) CPU_SET(cpus[3], &set); // was pinned to hart 0 alone: the preparer's CPU
+    rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        err = std::string("excluding the issuer CPU failed: ") + std::strerror(rc);
+        return false;
+    }
+    active_ = true;
+    const int running = sched_getcpu();
+    if (running == cpus[0]) {
+        err = "caller still on the issuer CPU " + std::to_string(running) + " after exclusion";
+        return false;
+    }
+    return true;
+#else
+    err = "strict issuer requires Linux thread affinity";
+    return false;
+#endif
+}
+
+issuer_cpu_exclusion::~issuer_cpu_exclusion() {
+#if defined(__linux__)
+    if (active_) {
+        cpu_set_t set;
+        std::memcpy(&set, saved_, sizeof(set));
+        (void) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    }
 #endif
 }
 

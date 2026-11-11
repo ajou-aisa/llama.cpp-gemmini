@@ -4,7 +4,11 @@
 // output. Wall time is CLOCK_MONOTONIC around ggml_backend_graph_compute only.
 //
 //   potal-pipeline-bench --m=M --n=N --k=K [--outlier=F] [--blocks=B] [--repeat=R] [--seed=S]
-//                        [--modes=serial,roles,queue,roles+queue]
+//                        [--modes=serial,roles,queue,roles+queue,strict,strict+queue] [--warmup=W] [--stop-on-fail]
+// strictopt / strictopt+queue: strict with the H3-8I-25T H3 optimizations (fast decode, plan validation reuse).
+// strict / strict+queue: ROLES with GGML_POTAL_STRICT_ISSUER=ON; a run also fails when any paired
+// preparation ran on the issuer thread or CPU (BENCH_ROLE prints the per-run counters).
+// A mode may carry a paired scheduling variant: <mode>@{ktile,prefetch,early,bounded,cont,contearly}.
 // Modes set GGML_POTAL_HART_ROLES and GGML_POTAL_INDEX_QUEUE per run (read per call by the backend).
 // Queue modes need POTAL_INDEX_QUEUE_FRESH/BUDGET (and USED for a later process in the same FPGA lifetime).
 // Lines: BENCH_CONFIG, BENCH (one per run), BENCH_SUMMARY (per mode), BENCH_VERDICT PASS|FAIL.
@@ -19,6 +23,7 @@
 #include "matmul/tiling.hpp"
 #include "potal.h"
 #include "support/stripe-golden.hpp"
+#include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
 #include "ggml-gemmini/matmul/options.hpp"
@@ -115,7 +120,43 @@ struct mode {
     std::string name;
     bool        roles = false;
     bool        queue = false;
+    bool        strict = false; // GGML_POTAL_STRICT_ISSUER (H3-8I-25S): roles with an issuer-only hart 0
+    bool        opt = false;    // H3-8I-25T H3 optimizations: GGML_POTAL_FAST_DECODE + GGML_POTAL_PLAN_VALIDATED_REUSE
+    std::string variant;  // paired scheduling: "" (default route), ktile, prefetch, early, bounded, cont, contearly
 };
+
+// Paired scheduling env for one mode (read per node by the backend). Every variant
+// keeps the CPU golden; refused combinations are never built here.
+void apply_variant(const std::string & v) {
+    const bool ktile = !v.empty();
+    setenv("GGML_POTAL_PAIRED_KTILE", ktile ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_PREFETCH", v == "prefetch" || v == "early" ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_EARLY_PREFETCH", v == "early" ? "ON" : "OFF", 1);
+    setenv("GGML_POTAL_PAIRED_STREAM", v == "bounded" ? "BOUNDED" : v == "cont" ? "CONTINUOUS" :
+                                        v == "contearly" ? "CONTINUOUS_EARLY" : "OFF", 1);
+}
+
+// CLOCK_MONOTONIC versus CLINT mtime (rdtime) on this boot: mono = 1000 * mtime + D for a
+// 1 MHz clocksource. When two MONOTONIC reads around one rdtime are equal, all three come
+// from the same mtime tick and D is exact. Test-only epoch marker (H3-8I-25R).
+void epoch_marker(const char * tag) {
+#if defined(__riscv)
+    for (int tries = 1; tries <= 4000; ++tries) {
+        const int64_t a = mono_ns();
+        uint64_t      m;
+        asm volatile("rdtime %0" : "=r"(m));
+        const int64_t b = mono_ns();
+        if (a == b || tries == 4000) {
+            std::printf("BENCH_EPOCH tag=%s exact=%d tries=%d mono_a_ns=%" PRId64 " mono_b_ns=%" PRId64
+                        " mtime=%" PRIu64 " d_ns=%" PRId64 "\n",
+                        tag, a == b ? 1 : 0, tries, a, b, m, a - (int64_t) (m * 1000));
+            return;
+        }
+    }
+#else
+    std::printf("BENCH_EPOCH tag=%s unsupported=1\n", tag);
+#endif
+}
 
 bool parse_modes(const std::string & list, std::vector<mode> & out) {
     size_t pos = 0;
@@ -124,13 +165,29 @@ bool parse_modes(const std::string & list, std::vector<mode> & out) {
         const std::string item = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
         mode m;
         m.name = item;
-        if (item == "serial") {
-        } else if (item == "roles") {
+        const size_t at = item.find('@');
+        const std::string base = item.substr(0, at);
+        if (at != std::string::npos) {
+            m.variant = item.substr(at + 1);
+            if (m.variant != "ktile" && m.variant != "prefetch" && m.variant != "early" && m.variant != "bounded" &&
+                m.variant != "cont" && m.variant != "contearly")
+                return false;
+        }
+        if (base == "serial") {
+        } else if (base == "roles") {
             m.roles = true;
-        } else if (item == "queue") {
+        } else if (base == "queue") {
             m.queue = true;
-        } else if (item == "roles+queue") {
+        } else if (base == "roles+queue") {
             m.roles = m.queue = true;
+        } else if (base == "strict") {
+            m.roles = m.strict = true;
+        } else if (base == "strict+queue") {
+            m.roles = m.strict = m.queue = true;
+        } else if (base == "strictopt") {
+            m.roles = m.strict = m.opt = true;
+        } else if (base == "strictopt+queue") {
+            m.roles = m.strict = m.opt = m.queue = true;
         } else {
             return false;
         }
@@ -166,6 +223,8 @@ bool select_pipeline_mode() {
 
 int main(int argc, char ** argv) {
     int64_t     M = 128, N = 768, K = 768, repeat = 3, warmup = 0;
+    bool        stop_on_fail = false;
+    bool        hw_selftest = false;
     float       outlier = 400.0f;
     int         blocks  = 2;
     unsigned    seed    = 20261104;
@@ -181,6 +240,8 @@ int main(int argc, char ** argv) {
         else if (!std::strncmp(a, "--blocks=", 9)) blocks = std::atoi(a + 9);
         else if (!std::strncmp(a, "--seed=", 7)) seed = (unsigned) std::strtoul(a + 7, nullptr, 10);
         else if (!std::strncmp(a, "--modes=", 8)) modes_arg = a + 8;
+        else if (!std::strcmp(a, "--stop-on-fail")) stop_on_fail = true;
+        else if (!std::strcmp(a, "--hw-selftest")) hw_selftest = true;
         else {
             std::printf("BENCH_VERDICT FAIL usage: unknown argument %s\n", a);
             return 2;
@@ -226,11 +287,17 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<int64_t>> walls(modes.size());
     // Warm-up reps (rep < 0) run every mode once per rep, are golden-checked like the
     // others, and are excluded from BENCH_SUMMARY (first-use allocation, trace rings).
-    for (int64_t rep = -warmup; rep < repeat; ++rep) {
-        for (size_t mi = 0; mi < modes.size(); ++mi) {
+    epoch_marker("begin");
+    bool stopped = false;
+    for (int64_t rep = -warmup; rep < repeat && !stopped; ++rep) {
+        for (size_t mi = 0; mi < modes.size() && !stopped; ++mi) {
             const mode & md = modes[mi];
+            apply_variant(md.variant);
             setenv("GGML_POTAL_HART_ROLES", md.roles ? "ON" : "OFF", 1);
             setenv("GGML_POTAL_INDEX_QUEUE", md.queue ? "ON" : "OFF", 1);
+            setenv("GGML_POTAL_STRICT_ISSUER", md.strict ? "ON" : "OFF", 1);
+            setenv("GGML_POTAL_FAST_DECODE", md.opt ? "ON" : "OFF", 1);
+            setenv("GGML_POTAL_PLAN_VALIDATED_REUSE", md.opt ? "ON" : "OFF", 1);
             std::memset(y->data, 0xff, ggml_nbytes(y));
             const uint32_t                 q0     = potal_index_queue_remaining();
             const ggml_backend_potal_stats b      = stats_of(potal.get());
@@ -241,7 +308,9 @@ int main(int argc, char ** argv) {
             const uint32_t                 q1     = potal_index_queue_remaining();
             const uint64_t                 h      = fnv64(y);
             const uint64_t stripes = a.stripes_semantic_completed - b.stripes_semantic_completed;
-            const bool ok = status == GGML_STATUS_SUCCESS && h == gold_hash &&
+            const uint64_t on_issuer = (a.prepares_on_issuer_thread - b.prepares_on_issuer_thread) +
+                                       (a.prepares_on_issuer_cpu - b.prepares_on_issuer_cpu);
+            const bool ok = status == GGML_STATUS_SUCCESS && h == gold_hash && (!md.strict || on_issuer == 0) &&
                             std::memcmp(y->data, expected->data, ggml_nbytes(y)) == 0 && stripes == gold_stripes &&
                             a.stripe_pipeline_failed == b.stripe_pipeline_failed &&
                             (!md.queue || q1 < q0);
@@ -255,10 +324,37 @@ int main(int argc, char ** argv) {
                         a.main_logical_gemms - b.main_logical_gemms, a.main_loop_ws - b.main_loop_ws,
                         a.residual_logical_gemms - b.residual_logical_gemms, a.residual_loop_ws - b.residual_loop_ws,
                         a.merges_completed - b.merges_completed, q0 - q1, q1, h);
+            std::printf("BENCH_SCHED mode=%s rep=%" PRId64 " variant=%s prefetch_loads=%" PRIu64 " prefetch_ldb_only=%" PRIu64
+                        " stream_loops=%" PRIu64 " stream_pair_waits=%" PRIu64 " stream_batches=%" PRIu64 "\n",
+                        md.name.c_str(), rep, md.variant.empty() ? "default" : md.variant.c_str(),
+                        a.paired_prefetch_loads - b.paired_prefetch_loads,
+                        a.paired_prefetch_ldb_only - b.paired_prefetch_ldb_only,
+                        a.paired_stream_loops - b.paired_stream_loops,
+                        a.paired_stream_pair_waits - b.paired_stream_pair_waits,
+                        a.paired_stream_batches - b.paired_stream_batches);
+            std::printf("BENCH_ROLE mode=%s rep=%" PRId64 " strict=%d prepares_on_issuer_thread=%" PRIu64
+                        " prepares_on_issuer_cpu=%" PRIu64 " prepares_on_producer=%" PRIu64 " paired_stripes=%" PRIu64
+                        " paired_main_loop_ws=%" PRIu64 " paired_residual_loop_ws=%" PRIu64 " index_configs=%" PRIu64
+                        " index_writes=%" PRIu64 " scale_writes=%" PRIu64 " scale_releases=%" PRIu64 " readbacks=%" PRIu64
+                        " fences=%" PRIu64 " drains=%" PRIu64 "\n",
+                        md.name.c_str(), rep, md.strict ? 1 : 0, a.prepares_on_issuer_thread - b.prepares_on_issuer_thread,
+                        a.prepares_on_issuer_cpu - b.prepares_on_issuer_cpu,
+                        a.prepares_on_producer - b.prepares_on_producer, a.paired_stripes - b.paired_stripes,
+                        a.paired_main_loop_ws - b.paired_main_loop_ws, a.paired_residual_loop_ws - b.paired_residual_loop_ws,
+                        a.paired_index_configs - b.paired_index_configs, a.paired_index_writes - b.paired_index_writes,
+                        a.scale_writes - b.scale_writes, a.scale_releases - b.scale_releases,
+                        a.paired_readbacks - b.paired_readbacks, a.paired_fences - b.paired_fences,
+                        a.paired_drains - b.paired_drains);
+            if (!ok && stop_on_fail) {
+                std::printf("BENCH_STOP mode=%s rep=%" PRId64 " reason=run_failed\n", md.name.c_str(), rep);
+                stopped = true;
+            }
         }
     }
+    epoch_marker("end");
     for (size_t mi = 0; mi < modes.size(); ++mi) {
         std::vector<int64_t> v = walls[mi];
+        if (v.empty()) continue;  // stopped before this mode was measured
         std::sort(v.begin(), v.end());
         const size_t n   = v.size();
         const double med = n % 2 ? (double) v[n / 2] : 0.5 * ((double) v[n / 2 - 1] + (double) v[n / 2]);
@@ -287,6 +383,22 @@ int main(int argc, char ** argv) {
                     " unregistered=%" PRIu64 " overflowed_threads=%u\n",
                     std::getenv("POTAL_TIMELINE_PROFILE") ? std::getenv("POTAL_TIMELINE_PROFILE") : "window",
                     ts.threads, ts.events, ts.dropped, ts.unregistered, ts.overflowed_threads);
+    }
+    if (hw_selftest) {
+        // H3-8I-25AC fixture gate: all nine checks must pass before a model run starts.
+        const auto t = ::potal::hw_window::selftest_evaluate();
+        const bool golden = failures == 0;
+        const bool pass = t.reset_accepted && t.read_response && t.monotonic && t.load_and_mac && t.ownership &&
+                          t.alignment && t.no_overflow && golden;
+        std::printf("HW_SELFTEST trace_reset=%d trace_read=%d monotonic=%d load_mac=%d ownership=%d alignment=%d "
+                    "no_overflow=%d numeric_golden=%d rocc_completion=%d windows=%" PRIu64 " mac_cycles=%" PRIu64
+                    " bdma_windows=%" PRIu64 " bracket_max=%" PRIu64 " bracket_disagree=%" PRIu64 " first_failure=%s\n",
+                    t.reset_accepted, t.read_response, t.monotonic, t.load_and_mac, t.ownership, t.alignment,
+                    t.no_overflow, golden, golden && t.read_response, t.windows, t.mac_cycles, t.bdma_windows,
+                    t.alignment_width_max, t.alignment_inconsistent, t.first_failure ? t.first_failure : "none");
+        ::potal::hw_window::flush();
+        std::printf("HW_SELFTEST_VERDICT %s\n", pass ? "PASS" : "FAIL");
+        if (!pass) failures += 1;
     }
     std::printf("BENCH_VERDICT %s failures=%d runs=%zu\n", failures == 0 ? "PASS" : "FAIL", failures,
                 (size_t) ((repeat + warmup) * (int64_t) modes.size()));

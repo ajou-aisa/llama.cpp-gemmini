@@ -27,6 +27,8 @@ namespace potal::timeline {
 namespace detail {
 bool                        g_on   = false;
 bool                        g_detail = false;
+bool                        g_coarse = false;
+std::atomic<bool>           g_rec{ true };
 thread_local thread_ring *  t_ring = nullptr;
 void                        init() noexcept;
 }  // namespace detail
@@ -93,6 +95,8 @@ struct state {
     std::atomic<uint32_t> next_edge{ 1 };
     std::atomic<uint64_t> unregistered{ 0 };
     std::atomic<uint32_t> rejected_threads{ 0 };
+    bool                  reuse = false;  // POTAL_TIMELINE_REUSE=1
+    std::atomic<uint32_t> reused{ 0 };
     std::mutex            flush_mu;
     uint64_t              flushed_signature = 0;
 };
@@ -270,7 +274,7 @@ std::string build_meta(const state & s) {
     m += ",clock_local=steady_ns";
 #endif
     m += ",clock_common=CLOCK_MONOTONIC_ns";
-    m += std::string(",profile=") + (detail::g_detail ? "detail" : "window");
+    m += std::string(",profile=") + (detail::g_detail ? "detail" : detail::g_coarse ? "coarse" : "window");
     m += ",ring_events=" + std::to_string(s.events_cap);
     m += ",anchor_capacity=" + std::to_string(s.anchors_cap);
     m += ",env=" + joined;
@@ -311,6 +315,9 @@ void init_once() {
     s.anchors_cap = parse_count("POTAL_TIMELINE_ANCHORS", kDefaultAnchors);
     const char * profile = std::getenv("POTAL_TIMELINE_PROFILE");
     detail::g_detail = profile != nullptr && std::strcmp(profile, "detail") == 0;
+    detail::g_coarse = profile != nullptr && std::strcmp(profile, "coarse") == 0;
+    const char * reuse = std::getenv("POTAL_TIMELINE_REUSE");
+    s.reuse            = reuse != nullptr && std::strcmp(reuse, "1") == 0;
     s.cpu_to_hart = read_cpu_to_hart();
     s.meta        = build_meta(s);
     if (std::atexit(flush_at_exit) != 0) {
@@ -363,6 +370,35 @@ const char * stage_name(uint16_t id) {
         case stage::exsia_thread_spawn: return "exsia.thread_spawn";
         case stage::role_start: return "role.start";
         case stage::node_report: return "node.report";
+        case stage::gc_total: return "gc.total";
+        case stage::gc_setup: return "gc.setup";
+        case stage::gc_node_setup: return "gc.node_setup";
+        case stage::mm_prep: return "mm.prep";
+        case stage::pipe_options: return "pipe.options";
+        case stage::pipe_prenode: return "pipe.prenode";
+        case stage::role_cpu_map: return "role.cpu_map";
+        case stage::mm_post: return "mm.post";
+        case stage::issuer_wait_job: return "issuer.wait_job";
+        case stage::issuer_wait_hw: return "issuer.wait_hw";
+        case stage::prep_job: return "prep.job";
+        case stage::prep_validate: return "prep.validate";
+        case stage::decode_validate: return "decode.validate";
+        case stage::decode_rows: return "decode.rows";
+        case stage::plan_tile: return "plan.tile";
+        case stage::plan_exec: return "plan.exec";
+        case stage::mm_options: return "mm.options";
+        case stage::mm_init_args: return "mm.init_args";
+        case stage::mm_weights: return "mm.weights";
+        case stage::attn_local: return "attn.local";
+        case stage::attn_stationary: return "attn.stationary";
+        case stage::attn_fold: return "attn.fold";
+        case stage::attn_issue: return "attn.issue";
+        case stage::attn_recon: return "attn.recon";
+        case stage::attn_node: return "attn.node";
+        case stage::model_inference: return "model.inference";
+        case stage::model_prefill: return "model.prefill";
+        case stage::model_decode: return "model.decode";
+        case stage::model_token: return "model.token";
         case stage::acc_scale_write: return "acc.scale_write";
         case stage::acc_index_scalar: return "acc.index_scalar";
         case stage::acc_queue_install: return "acc.queue_install";
@@ -416,7 +452,46 @@ uint16_t register_thread(role r, int hart_id, int cpu_id) noexcept {
     if (t_info != nullptr) {
         return t_info->ring.slot;
     }
-    state &       s  = st();
+    state & s = st();
+    if (s.reuse) {
+        // An exited thread of the same role and placement hands its slot over: the ring,
+        // anchors and runs continue (its records happen-before its release of `exited`).
+        thread_info * ti = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(s.reg_mu);
+            const uint32_t              n = s.nthreads.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < n && ti == nullptr; ++i) {
+                thread_info * c = s.threads[i];
+                if (c->r == r && c->req_hart == hart_id && c->req_cpu == cpu_id &&
+                    c->exited.load(std::memory_order_acquire)) {
+                    c->exited.store(false, std::memory_order_relaxed);
+                    ti = c;
+                }
+            }
+        }
+        if (ti != nullptr) {
+            ti->tid        = static_cast<long>(syscall(SYS_gettid));
+            ti->cpu_start  = sched_getcpu();
+            ti->hart_start = hart_of(ti->cpu_start);
+            ti->cpu_exit.store(-1, std::memory_order_relaxed);
+            ti->affinity_ok = false;
+            if (cpu_id >= 0) {
+                cpu_set_t got;
+                CPU_ZERO(&got);
+                ti->affinity_ok = pthread_getaffinity_np(pthread_self(), sizeof(got), &got) == 0 &&
+                                  CPU_COUNT(&got) == 1 && CPU_ISSET(cpu_id, &got) && ti->cpu_start == cpu_id &&
+                                  (hart_id < 0 || ti->hart_start == hart_id);
+            }
+            ti->ring.cur_op    = 0;
+            ti->ring.cur_phase = 0;
+            s.reused.fetch_add(1, std::memory_order_relaxed);
+            t_info         = ti;
+            t_guard.ti     = ti;
+            detail::t_ring = &ti->ring;
+            take_anchor(ti, a_register, 0);
+            return ti->ring.slot;
+        }
+    }
     thread_info * ti = new (std::nothrow) thread_info();
     const uint32_t cap = r == role::issuer ? parse_count("POTAL_TIMELINE_ISSUER_EVENTS", s.events_cap) : s.events_cap;
     if (ti != nullptr) {
@@ -530,6 +605,14 @@ uint32_t next_edge_id() noexcept {
     return st().next_edge.fetch_add(1, std::memory_order_relaxed);
 }
 
+void set_recording(bool on) noexcept {
+    detail::g_rec.store(on, std::memory_order_relaxed);
+}
+
+uint32_t reuse_count() noexcept {
+    return st().reused.load(std::memory_order_relaxed);
+}
+
 void anchor() noexcept {
     if (!detail::g_on) {
         return;
@@ -585,10 +668,14 @@ bool flush() noexcept {
         std::fprintf(stderr, "potal timeline: cannot write %s: %s\n", tmp.c_str(), std::strerror(errno));
         return false;
     }
-    std::fprintf(f, "# potal_timeline v1\n%s,unregistered_records=%" PRIu64 ",rejected_threads=%u\n", s.meta.c_str(),
+    std::fprintf(f, "# potal_timeline v1\n%s,unregistered_records=%" PRIu64 ",rejected_threads=%u", s.meta.c_str(),
                  s.unregistered.load(std::memory_order_relaxed), s.rejected_threads.load(std::memory_order_relaxed));
+    if (s.reuse) {
+        std::fprintf(f, ",reuse_count=%u", s.reused.load(std::memory_order_relaxed));
+    }
+    std::fprintf(f, "\n");
     std::fprintf(f, "#STAGE,id,name\n");
-    for (uint16_t id = 0; id < 64; ++id) {
+    for (uint16_t id = 0; id < 128; ++id) {
         if (const char * name = stage_name(id)) {
             std::fprintf(f, "S,%u,%s\n", id, name);
         }
@@ -676,3 +763,41 @@ bool flush() noexcept {
 }
 
 }  // namespace potal::timeline
+
+// Public C API (declared in ggml/include/ggml-potal.h). Defined here, with the timeline
+// it wraps, so the hardware-free potal-timeline-test links it without the backend.
+namespace tl = potal::timeline;
+
+extern "C" __attribute__((visibility("default"))) void ggml_backend_potal_timeline_mark(int stage_id, int event,
+                                                                                      uint32_t index, uint64_t work) {
+    if (stage_id < static_cast<int>(tl::stage::model_inference) || stage_id > static_cast<int>(tl::stage::model_token) ||
+        (event != static_cast<int>(tl::event::begin) && event != static_cast<int>(tl::event::end) &&
+         event != static_cast<int>(tl::event::instant)) ||
+        !tl::enabled()) {
+        return;
+    }
+    tl::register_thread(tl::role::caller, -1, -1);
+    tl::record(static_cast<tl::stage>(stage_id), static_cast<tl::event>(event), 0, 0, 0, index, tl::no_id, tl::no_id,
+               0, work);
+}
+
+extern "C" __attribute__((visibility("default"))) void ggml_backend_potal_timeline_set_recording(bool on) {
+    tl::set_recording(on);
+}
+
+extern "C" __attribute__((visibility("default"))) bool ggml_backend_potal_timeline_flush(void) {
+    return tl::enabled() && tl::flush();
+}
+
+extern "C" __attribute__((visibility("default"))) bool ggml_backend_potal_timeline_stats(
+    uint64_t * events, uint64_t * dropped, uint32_t * overflowed_threads, uint32_t * threads) {
+    if (!tl::enabled()) {
+        return false;
+    }
+    const tl::stats_t s = tl::stats();
+    if (events != nullptr) *events = s.events;
+    if (dropped != nullptr) *dropped = s.dropped;
+    if (overflowed_threads != nullptr) *overflowed_threads = s.overflowed_threads;
+    if (threads != nullptr) *threads = s.threads;
+    return true;
+}

@@ -37,6 +37,9 @@
 //   X15 determinism, X16 mutated plans refused, X17 every logical contribution once
 //   XR  real RMD packets: entries follow the paired descriptor's fragments and
 //       original K, rows keep their (lane, source row) provenance
+//   XL  GGML_POTAL_PLAN_LIVE_SCAN: the live-window Scale-overlap scan gives the same
+//       status and diagnostic as the full scan for every plan built here and for
+//       mutated plans (scale fields, programs, releases, live overlaps, indices)
 
 #include "support/paired-support.hpp"
 
@@ -659,6 +662,19 @@ struct exec_case {
     std::string                 why;
 };
 
+// Every execution plan build_case accepted, for the XL live-scan equivalence test.
+struct recorded_plan {
+    potal_paired_execution_plan exec;
+    residual::decoded_packet    residual;
+    bool                        has_residual = false;
+    potal_paired_geometry       hw;
+};
+
+std::vector<recorded_plan> & recorded_plans() {
+    static std::vector<recorded_plan> plans;
+    return plans;
+}
+
 bool build_case(exec_case & c, size_t m, size_t n, size_t k, size_t rows,
                 const potal_paired_geometry & hw = potal_paired_hw_geometry()) {
     if (!main_select(m, n, k, c.main)) {
@@ -674,6 +690,7 @@ bool build_case(exec_case & c, size_t m, size_t n, size_t k, size_t rows,
         std::printf("  execution plan refused: %s %s\n", potal_paired_status_name(c.status), c.why.c_str());
         return false;
     }
+    recorded_plans().push_back({ c.exec, c.residual, c.has_residual, hw });
     return true;
 }
 
@@ -1495,6 +1512,201 @@ void test_generic_jk_selector() {
     }
 }
 
+// XL: potal_validate_execution_plan_mode(..., live_scan) against the full scan.
+struct live_scan_tally {
+    size_t plans = 0, accepted = 0, refused = 0, overlap = 0, differ = 0;
+};
+
+void compare_live_scan(const potal_paired_execution_plan & e, const recorded_plan & r, live_scan_tally & t,
+                       const char * name) {
+    const residual::decoded_packet * res = r.has_residual ? &r.residual : nullptr;
+    std::string                      why_full = "stale", why_live = "stale";
+    const potal_paired_status        full = potal_validate_execution_plan_mode(e, res, &why_full, r.hw, false);
+    const potal_paired_status        live = potal_validate_execution_plan_mode(e, res, &why_live, r.hw, true);
+    t.plans++;
+    if (full != live || why_full != why_live) {
+        t.differ++;
+        std::printf("  XL %s differs: full %s '%s' live %s '%s'\n", name, potal_paired_status_name(full), why_full.c_str(),
+                    potal_paired_status_name(live), why_live.c_str());
+    }
+    (full == potal_paired_status::ok ? t.accepted : t.refused)++;
+    t.overlap += why_full.find("scale slots overwritten while window") != std::string::npos;
+}
+
+// Renumber ops after `order` (new position -> old id): ids, dependencies and every op reference.
+void reorder_ops(potal_paired_execution_plan & m, const std::vector<size_t> & order) {
+    std::vector<size_t> to(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        to[order[i]] = i;
+    }
+    const auto map = [&](size_t & id) {
+        if (id < to.size()) {
+            id = to[id];
+        }
+    };
+    std::vector<potal_paired_op> ops;
+    for (size_t i = 0; i < order.size(); ++i) {
+        ops.push_back(m.ops[order[i]]);
+        potal_paired_op & op = ops.back();
+        op.id                = i;
+        map(op.same_buffer_predecessor);
+        for (potal_paired_dep & d : op.deps) {
+            map(d.op);
+        }
+        // A dependency that now points at a later op would be refused first; drop it so the
+        // mutant reaches the Scale rules.
+        op.deps.erase(std::remove_if(op.deps.begin(), op.deps.end(), [&](const potal_paired_dep & d) { return d.op >= i; }),
+                      op.deps.end());
+    }
+    m.ops = std::move(ops);
+    for (potal_paired_scale_window & w : m.scale_windows) {
+        map(w.program_op);
+        map(w.consumer_op);
+        map(w.release_op);
+    }
+    for (potal_paired_residency & r : m.residencies) {
+        map(r.load_weight_op);
+        map(r.main_gemm_op);
+        map(r.retire_op);
+        map(r.first_residual_op);
+        map(r.last_residual_op);
+    }
+    for (potal_paired_pair_transition & tr : m.transitions) {
+        map(tr.op);
+    }
+}
+
+// Move op `from` to position `to_pos` (shifting the ops in between).
+void move_op(potal_paired_execution_plan & m, size_t from, size_t to_pos) {
+    std::vector<size_t> order;
+    for (size_t i = 0; i < m.ops.size(); ++i) {
+        if (i != from) {
+            order.push_back(i);
+        }
+    }
+    order.insert(order.begin() + (std::ptrdiff_t) to_pos, from);
+    reorder_ops(m, order);
+}
+
+void test_exec_live_scan() {
+    // Plans of the earlier tests plus the long-K multi-window fixture.
+    exec_case big;
+    big.has_residual = true;
+    big.residual     = synth(32, MULTI_ROWS, dense_runs(64, 3));
+    build_case(big, MULTI_ROWS, 160, 2048, MULTI_ROWS);
+    const std::vector<recorded_plan> plans = recorded_plans();
+
+    live_scan_tally base;
+    for (const recorded_plan & r : plans) {
+        compare_live_scan(r.exec, r, base, "built plan");
+    }
+    std::printf("  XL built plans: %zu compared, %zu accepted, %zu refused, %zu differ\n", base.plans, base.accepted,
+                base.refused, base.differ);
+    check("XL every built execution plan: live scan and full scan give the same status and diagnostic",
+          !plans.empty() && base.differ == 0 && base.accepted == base.plans);
+
+    uint64_t   seed = 0x9e3779b97f4a7c15ull;
+    const auto rnd  = [&](size_t n) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return n == 0 ? 0 : (size_t) (seed % n);
+    };
+    const auto ops_of = [](const potal_paired_execution_plan & e, op_kind kind) {
+        std::vector<size_t> ids;
+        for (const potal_paired_op & op : e.ops) {
+            if (op.kind == kind) {
+                ids.push_back(op.id);
+            }
+        }
+        return ids;
+    };
+    live_scan_tally mut;
+    size_t          overlap_targeted = 0;
+    for (const recorded_plan & r : plans) {
+        const potal_paired_execution_plan & e = r.exec;
+        if (e.scale_windows.empty()) {
+            continue;
+        }
+        const size_t              S        = e.scale_windows.size();
+        const std::vector<size_t> programs = ops_of(e, op_kind::scale_program);
+        const std::vector<size_t> releases = ops_of(e, op_kind::scale_release);
+        const auto mutate = [&](const char * name, const std::function<void(potal_paired_execution_plan &)> & f) {
+            potal_paired_execution_plan m = e;
+            f(m);
+            compare_live_scan(m, r, mut, name);
+        };
+        for (int round = 0; round < 2; ++round) {
+            mutate("slot_base corrupted", [&](potal_paired_execution_plan & m) {
+                m.scale_windows[rnd(S)].slot_base = rnd(r.hw.scale_entries + 2);
+            });
+            mutate("slots corrupted", [&](potal_paired_execution_plan & m) {
+                potal_paired_scale_window & w = m.scale_windows[rnd(S)];
+                w.slots                       = rnd(2) ? w.slots + 1 + rnd(4) : w.slots - std::min(w.slots, 1 + rnd(4));
+            });
+            mutate("generation corrupted", [&](potal_paired_execution_plan & m) {
+                potal_paired_scale_window & w = m.scale_windows[rnd(S)];
+                w.generation                  = rnd(2) ? w.generation + 1 : w.generation - 1;
+            });
+            mutate("duplicate program", [&](potal_paired_execution_plan & m) {
+                if (programs.size() > 1) {
+                    const size_t p = 1 + rnd(programs.size() - 1);
+                    m.ops[programs[p]].scale_window = m.ops[programs[rnd(p)]].scale_window;
+                }
+            });
+            mutate("missing release", [&](potal_paired_execution_plan & m) {
+                const size_t rel = releases[rnd(releases.size())];
+                m.ops[rel].kind  = op_kind::acc_complete;
+            });
+            mutate("swapped release order", [&](potal_paired_execution_plan & m) {
+                if (releases.size() > 1) {
+                    const size_t a = rnd(releases.size() - 1);
+                    std::swap(m.ops[releases[a]].scale_window, m.ops[releases[a + 1]].scale_window);
+                }
+            });
+            mutate("out-of-range window index", [&](potal_paired_execution_plan & m) {
+                const std::vector<size_t> & from = rnd(2) ? programs : releases;
+                m.ops[from[rnd(from.size())]].scale_window = S + rnd(3);
+            });
+            mutate("live window moved over another", [&](potal_paired_execution_plan & m) {
+                // Every window takes the slots of a random other window (other checks may fire first).
+                potal_paired_scale_window & w = m.scale_windows[rnd(S)];
+                const potal_paired_scale_window & x = e.scale_windows[rnd(S)];
+                w.slot_base = x.slot_base;
+            });
+        }
+        // Overlapping windows while live: delay a release past the next program whose slots
+        // overlap the released window (and past a random later program).
+        for (const size_t rel : releases) {
+            const potal_paired_scale_window & a = e.scale_windows[e.ops[rel].scale_window];
+            for (const size_t p : programs) {
+                const potal_paired_scale_window & b = e.scale_windows[e.ops[p].scale_window];
+                if (p > rel && b.slot_base < a.slot_base + a.slots && a.slot_base < b.slot_base + b.slots) {
+                    overlap_targeted++;
+                    mutate("release delayed past an overlapping program", [&](potal_paired_execution_plan & m) {
+                        move_op(m, rel, p);
+                    });
+                    break;
+                }
+            }
+        }
+        if (!releases.empty() && !programs.empty()) {
+            mutate("release delayed past a random program", [&](potal_paired_execution_plan & m) {
+                const size_t rel = releases[rnd(releases.size())];
+                const size_t p   = programs[rnd(programs.size())];
+                if (p > rel) {
+                    move_op(m, rel, p);
+                }
+            });
+        }
+    }
+    std::printf("  XL mutants: %zu compared, %zu accepted, %zu refused, %zu overlap failures (%zu targeted), %zu differ\n",
+                mut.plans, mut.accepted, mut.refused, mut.overlap, overlap_targeted, mut.differ);
+    check("XL >= 200 mutated plans: live scan and full scan give the same status and diagnostic",
+          mut.plans >= 200 && mut.differ == 0);
+    check("XL >= 20 mutated plans refused by the Scale-overlap rule in both modes", mut.overlap >= 20);
+}
+
 } // namespace
 
 int main() {
@@ -1515,6 +1727,7 @@ int main() {
     test_exec_tails();
     test_exec_determinism_and_mutations();
     test_exec_real_packets();
+    test_exec_live_scan();
     std::printf("%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

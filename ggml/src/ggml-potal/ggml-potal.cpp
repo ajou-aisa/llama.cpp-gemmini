@@ -8,19 +8,29 @@
 #include "ggml-impl.h"
 #include "ggml-potal-buffer.hpp"
 #include "log.hpp"
+#include "matmul/attention.hpp"
 #include "matmul/execution.hpp"
 #include "matmul/options.hpp"
 #include "matmul/pack.hpp"
 #include "ops.hpp"
 #include "potal.h"
+#include "trace/timeline.hpp"
 
 #include <gemmini/log.hpp>
 #include <gemmini/semantic.h>
 #include <gemmini/trace-context.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -32,6 +42,168 @@ std::atomic<uint64_t> g_supports_rejected[GGML_POTAL_REJECT_COUNT];
 
 const char * type_name_of(const ggml_tensor * t) {
     return t != nullptr ? ggml_type_name(t->type) : "-";
+}
+
+// potal_graph_compute calls in the process (graph index of the node dump).
+std::atomic<uint64_t> g_graph_count{ 0 };
+
+// Live backends in creation order (ggml_backend_potal_get_last_stats).
+std::mutex                  g_live_mu;
+std::vector<ggml_backend_t> g_live;
+
+// ---- node dump (GGML_POTAL_DUMP_DIR / _GRAPHS / _NODES, read once) ---------
+
+struct dump_config {
+    bool                     on = false;  // directory set and at least one node pattern
+    std::string              dir;
+    std::vector<uint64_t>    graphs;  // empty: every graph
+    std::vector<std::string> nodes;
+};
+
+std::vector<std::string> split_list(const char * v) {
+    std::vector<std::string> out;
+    if (v == nullptr) {
+        return out;
+    }
+    std::string cur;
+    for (const char * p = v;; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (!cur.empty()) {
+                out.push_back(cur);
+            }
+            cur.clear();
+            if (*p == '\0') {
+                break;
+            }
+        } else {
+            cur += *p;
+        }
+    }
+    return out;
+}
+
+const dump_config & dump_cfg() {
+    static const dump_config c = [] {
+        dump_config  d;
+        const char * dir = std::getenv("GGML_POTAL_DUMP_DIR");
+        if (dir == nullptr || *dir == '\0') {
+            return d;
+        }
+        d.dir   = dir;
+        d.nodes = split_list(std::getenv("GGML_POTAL_DUMP_NODES"));
+        for (const std::string & g : split_list(std::getenv("GGML_POTAL_DUMP_GRAPHS"))) {
+            d.graphs.push_back(std::strtoull(g.c_str(), nullptr, 10));
+        }
+        d.on = !d.nodes.empty();
+        return d;
+    }();
+    return c;
+}
+
+const char * dump_kind(const ggml_tensor * node) {
+    switch (ggml::potal::attention::get_role(node)) {
+        case ggml::potal::attention::role::qk: return "qk";
+        case ggml::potal::attention::role::pv: return "pv";
+        case ggml::potal::attention::role::none: break;
+    }
+    return "linear";
+}
+
+std::string sanitize(const char * s) {
+    std::string out;
+    for (const char * p = s; *p != '\0'; ++p) {
+        const char c = *p;
+        out += (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_') ? c : '_';
+    }
+    return out.empty() ? std::string("_") : out;
+}
+
+// Element bytes of a tensor whose type has one element per block (F32, F16, I8 ...).
+bool dumpable(const ggml_tensor * t) {
+    return t != nullptr && t->data != nullptr && ggml_blck_size(t->type) == 1;
+}
+
+size_t dump_bytes(const ggml_tensor * t) {
+    return dumpable(t) ? static_cast<size_t>(ggml_nelements(t)) * ggml_type_size(t->type) : 0;
+}
+
+// Row-major (ne order) element bytes, following nb (views, permuted K/V).
+void write_elements(FILE * f, const ggml_tensor * t) {
+    if (!dumpable(t)) {
+        return;
+    }
+    const size_t es   = ggml_type_size(t->type);
+    const char * base = static_cast<const char *>(t->data);
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                const char * row = base + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+                if (t->nb[0] == es) {
+                    std::fwrite(row, es, static_cast<size_t>(t->ne[0]), f);
+                } else {
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        std::fwrite(row + i0 * t->nb[0], es, 1, f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+std::string shape_of(const char * tag, const ggml_tensor * t) {
+    char b[256];
+    if (t == nullptr) {
+        std::snprintf(b, sizeof(b), " %s_ne=- %s_nb=-", tag, tag);
+    } else {
+        std::snprintf(b, sizeof(b), " %s_ne=%lld,%lld,%lld,%lld %s_nb=%zu,%zu,%zu,%zu", tag, (long long) t->ne[0],
+                      (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], tag, t->nb[0], t->nb[1],
+                      t->nb[2], t->nb[3]);
+    }
+    return b;
+}
+
+// One completed node: header line, then src1, dst and (F16/F32 only) src0 elements.
+void dump_node(const dump_config & c, uint64_t graph, int index, const ggml_tensor * node) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const char *        kind = dump_kind(node);
+    bool                hit  = false;
+    for (const std::string & p : c.nodes) {
+        hit = hit || std::strstr(node->name, p.c_str()) != nullptr ||
+              (src0 != nullptr && std::strstr(src0->name, p.c_str()) != nullptr) ||
+              std::strstr(kind, p.c_str()) != nullptr;
+    }
+    if (!hit) {
+        return;
+    }
+    const bool        with_src0 = src0 != nullptr && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32);
+    const std::string path      = c.dir + "/g" + std::to_string(graph) + "_n" + std::to_string(index) + "_" +
+                             sanitize(node->name) + ".bin";
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "[POTAL_DUMP] cannot write %s: %s\n", path.c_str(), std::strerror(errno));
+        return;
+    }
+    std::string h = "POTAL_DUMP v1 kind=" + std::string(kind) + " graph=" + std::to_string(graph) +
+                    " node_index=" + std::to_string(index) + " node=" + sanitize(node->name) +
+                    " src0=" + (src0 ? sanitize(src0->name) : "-") + " types=" + type_name_of(src0) + "," +
+                    type_name_of(src1) + "," + ggml_type_name(node->type) + shape_of("src0", src0) +
+                    shape_of("src1", src1) + shape_of("dst", node) + " sections=src1:" +
+                    std::to_string(dump_bytes(src1)) + ",dst:" + std::to_string(dump_bytes(node));
+    if (with_src0) {
+        h += ",src0:" + std::to_string(dump_bytes(src0));
+    }
+    h += "\n";
+    std::fputs(h.c_str(), f);
+    write_elements(f, src1);
+    write_elements(f, node);
+    if (with_src0) {
+        write_elements(f, src0);
+    }
+    const bool err = std::ferror(f) != 0;
+    if (std::fclose(f) != 0 || err) {
+        std::fprintf(stderr, "[POTAL_DUMP] writing %s failed\n", path.c_str());
+    }
 }
 
 ggml_guid_t potal_guid() {
@@ -123,12 +295,39 @@ void potal_free(ggml_backend_t backend) {
             (unsigned long long)st.attention_bias_mvins);
     }
     (void) ggml::gemmini::log::cycle.flush();
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        g_live.erase(std::remove(g_live.begin(), g_live.end(), backend), g_live.end());
+    }
     delete static_cast<potal_context *>(backend->context);
     delete backend;
 }
 
 ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     potal_context & ctx = *static_cast<potal_context *>(backend->context);
+    const uint64_t      graph_index = g_graph_count.fetch_add(1, std::memory_order_relaxed);
+    const dump_config & dump        = dump_cfg();
+    // Strict issuer (H3-8I-25S): hart 0's CPU runs only the issuer, so the calling thread
+    // (graph walk, node preparation, output commit) leaves it for this call.
+    ggml::potal::issuer_cpu_exclusion caller_off_issuer;
+    {
+        bool roles_invalid = false, strict_invalid = false;
+        const bool roles = ggml::potal::hart_roles_requested(roles_invalid);
+        if (ggml::potal::strict_issuer_requested(strict_invalid) && roles) {
+            std::string why;
+            if (!caller_off_issuer.begin(why)) {
+                ggml::potal::log::failure("potal.backend", "[POTAL_BACKEND] strict issuer: %s; nothing issued",
+                                          why.c_str());
+                return GGML_STATUS_FAILED;
+            }
+        }
+    }
+    // Graph-level timeline spans on the calling thread (inert unless POTAL_TIMELINE is set).
+    if (::potal::timeline::enabled()) ::potal::timeline::register_thread(::potal::timeline::role::caller, -1, -1);
+    ::potal::timeline::scoped_span gc_total(::potal::timeline::active(), ::potal::timeline::stage::gc_total, 0, 0,
+                                            ::potal::timeline::no_id, ::potal::timeline::no_id);
+    ::potal::timeline::scoped_span gc_setup(::potal::timeline::active(), ::potal::timeline::stage::gc_setup, 0, 0,
+                                            ::potal::timeline::no_id, ::potal::timeline::no_id);
 
     // Refuse the whole graph before any hardware work if one node is outside
     // the contract (only a direct caller can get here; the scheduler asks supports_op).
@@ -149,11 +348,14 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // it while it runs this node's jobs.
     const gemmini_trace_context graph_trace = gemmini_trace_capture();
     const uint64_t graph_id = gemmini_trace_reserve_ids(static_cast<uint64_t>(cgraph->n_nodes) + 1);
+    gc_setup.close();
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
             continue; // view ops: metadata only, the data is already in place
         }
+        ::potal::timeline::scoped_span node_setup(::potal::timeline::active(), ::potal::timeline::stage::gc_node_setup,
+                                                  0, 0, ::potal::timeline::no_id, uint32_t(i));
 #if LOG_CYCLE || CYCLE_SIM
         // The node's semantic identity (phase, graph occurrence, ordinal) for the
         // records below, bound as the Gemmini and CPU backends do; one issuing
@@ -171,9 +373,14 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
         ggml::gemmini::trace::ScopedContext operator_context(
             gemmini_trace_operator(graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
                                    static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
+        node_setup.close();
         const ggml_status status = ggml::potal::compute_mul_mat(ctx, node, i); // passed the loop above
         if (status != GGML_STATUS_SUCCESS) {
             return status;
+        }
+        if (dump.on && (dump.graphs.empty() ||
+                        std::find(dump.graphs.begin(), dump.graphs.end(), graph_index) != dump.graphs.end())) {
+            dump_node(dump, graph_index, i, node);
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -353,12 +560,17 @@ ggml_backend_t ggml_backend_potal_init(void) {
     GGML_UNUSED(registered);
     ggml::potal::log::debug("potal.backend", "[POTAL_BACKEND] device_init dim=%u precision=A8W8 params_sha256=%s",
                             (unsigned) potal_hw_dim(), potal_hw_params_sha256());
-    return new ggml_backend{
+    ggml_backend_t backend = new ggml_backend{
         /* .guid      = */ potal_guid(),
         /* .interface = */ potal_backend_i,
         /* .device    = */ ggml_backend_reg_dev_get(ggml_backend_potal_reg(), 0),
         /* .context   = */ new potal_context,
     };
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        g_live.push_back(backend);
+    }
+    return backend;
 }
 
 bool ggml_backend_is_potal(ggml_backend_t backend) {
@@ -407,6 +619,15 @@ bool ggml_backend_potal_get_stats(ggml_backend_t backend, ggml_backend_potal_sta
     stats->weight_cache_bytes             = cache.bytes;
     stats->weight_cache_budget            = cache.budget;
     return true;
+}
+
+bool ggml_backend_potal_get_last_stats(ggml_backend_potal_stats * out) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    return !g_live.empty() && ggml_backend_potal_get_stats(g_live.back(), out);
+}
+
+uint64_t ggml_backend_potal_graph_count(void) {
+    return g_graph_count.load(std::memory_order_relaxed);
 }
 
 void ggml_backend_potal_clear_weight_cache(ggml_backend_t backend) {

@@ -11,6 +11,7 @@
 
 #include "potal.h"
 #include "potal_hw_params.h"
+#include "support/hw-trace-model.hpp"
 #include "support/potal-emulator.hpp"
 
 #include <algorithm>
@@ -92,6 +93,15 @@ struct h2_emulator {
     uint64_t queue_allocations = 0, queue_applied = 0;
     uint32_t queue_corrupt_funct = UINT32_MAX; // full64 fault injection after the genuine side effect
     uint64_t queue_corrupt_mask = 0;
+    // H3-8I-25AC strict hardware timeline: funct 126 goes to hw_trace, never to records.
+    struct trace_record {
+        potal_paired_cmd_record cmd;
+        size_t position;  // records.size() at this command
+        bool   in_flight; // the model had work in flight
+    };
+    bool                      hw_trace_mode = false;
+    hw_trace_model            hw_trace;
+    std::vector<trace_record> trace_records;
 
     void err(const std::string & e) {
         errors += e;
@@ -224,6 +234,10 @@ struct h2_emulator {
 
     static potal_status on_counter(void * ctx, const potal_paired_cmd_record * rec, uint64_t * value) {
         auto & e = *static_cast<h2_emulator *>(ctx);
+        if (e.hw_trace_mode && rec->funct == POTAL_FUNCT_COUNTER) {
+            e.trace_records.push_back({*rec, e.records.size(), e.hw_trace.work_in_flight()});
+            return e.hw_trace.counter_command(*rec, value);
+        }
         e.records.push_back(*rec);
         if (rec->funct != POTAL_FUNCT_COUNTER || rec->xd != 1 || rec->rs2 ||
             (rec->rs1 != UINT64_C(0xA) && rec->rs1 != POTAL_LDB_ONLY_TAG &&
@@ -238,6 +252,45 @@ struct h2_emulator {
     }
 
     potal_status command(const potal_paired_cmd_record & r) {
+        const potal_status status = command_core(r);
+        if (hw_trace_mode) hw_trace_drive(r, status);
+        return status;
+    }
+
+    // One fixed stamp sequence per command. Stricter than the RTL about what is in flight, never looser:
+    // RTL drained excludes the Scale and Index ingress state, so those commands leave it alone.
+    void hw_trace_drive(const potal_paired_cmd_record & r, potal_status status) {
+        using model = hw_trace_model;
+        switch (r.funct) {
+            case POTAL_FUNCT_FENCE:
+                if (status == POTAL_OK) hw_trace.fence(r.xd, r.rs1, r.rs2);
+                return;
+            case POTAL_FUNCT_SCALE_WRITE: case POTAL_FUNCT_SCALE_RELEASE:
+            case POTAL_FUNCT_INDEX_CONFIG: case POTAL_FUNCT_INDEX_WRITE:
+                hw_trace.step();
+                return;
+            case POTAL_FUNCT_LOOP_WS: {
+                hw_trace.work_begin();
+                if (status != POTAL_OK) return;
+                const bool     residual = ((r.rs1 >> 62) & 1) != 0, indexed = ((r.rs1 >> 63) & 1) != 0;
+                const uint32_t pair = uint32_t((r.rs1 >> 18) & 3) - 1;
+                if (!residual && !indexed && b_dram != 0) {
+                    hw_trace.dma_request(pair);
+                    hw_trace.b_write(pair);
+                }
+                hw_trace.mac(pair);
+                return;
+            }
+            case POTAL_FUNCT_MVOUT:
+                hw_trace.work_begin(uint64_t(1) << model::ev_store_active);
+                return;
+            default:
+                hw_trace.work_begin();
+                return;
+        }
+    }
+
+    potal_status command_core(const potal_paired_cmd_record & r) {
         records.push_back(r);
         if (r.funct == fail_funct) {
             fail_funct = 0xFFFFFFFFu;

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <time.h>
 
 #if defined(__riscv)
 #include "potal_rocc.h"
@@ -1054,6 +1055,8 @@ typedef struct stream_state {
     stream_panel_state panel[POTAL_PAIRS];
 } stream_state;
 
+enum { hw_trace_off = 0, hw_trace_idle, hw_trace_armed, hw_trace_frozen, hw_trace_read };
+
 struct potal_paired_session {
     potal_paired_sink sink;
     resident_ws_state *resident;            /* NULL for every legacy session */
@@ -1062,6 +1065,7 @@ struct potal_paired_session {
     potal_observation_counter_fn observation_counter;
     int observation_active, observation_in_call;
     uint64_t observation_b0_base;          /* retained across the early capability counter0 probe */
+    int               hw_trace_state;      /* H3-8I-25AC: 0 off, else hw_trace_* below */
     int               failed;
     int               queue_fatal;          /* unknown Queue obligation; never cleaned or reset */
     int               trace_enabled;        /* POTAL_RAW_TRACE snapshot at successful open */
@@ -1554,6 +1558,171 @@ potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, 
     return paired_scale_release_core(s, slot, generation, column);
 }
 
+/*
+ * The conditions every per-column call of a window would evaluate to the same
+ * result, since only a failed command changes them and a failed command ends
+ * the window. Managed modes and the raw and CPU diagnostics keep their per-column
+ * behavior: a session with any of them runs through the per-column calls.
+ */
+static int scale_window_direct(const potal_paired_session *s, const potal_paired_scale_columns *w) {
+    if (s == NULL || s->resident || s->h2 || s->stream || s->trace_enabled || s->scale_cpu_profile ||
+        paired_ready(s) != POTAL_OK || !paired_can_issue(s) || w->generation > POTAL_GENERATION_MAX ||
+        w->blocks == 0 || w->j_tiles == 0 || w->last_columns == 0 || w->last_columns > POTAL_HW_DIM ||
+        w->slot_base >= POTAL_SCALE_ENTRIES) {
+        return 0;
+    }
+    return (uint64_t)w->blocks * w->j_tiles <= POTAL_SCALE_ENTRIES - w->slot_base;
+}
+
+static uint64_t scale_column_mask(uint32_t columns) {
+    return columns >= 64 ? ~(uint64_t)0 : ((uint64_t)1 << columns) - 1;
+}
+
+static inline potal_status scale_column_issue(potal_paired_session *s, uint32_t funct, uint64_t rs1, uint64_t rs2) {
+    s->commands++;
+    if (s->sink.cmd != NULL) {
+        const potal_paired_cmd_record rec = { funct, 1u, rs1, rs2 };
+        return s->sink.cmd(s->sink.ctx, &rec);
+    }
+#if defined(__riscv)
+    return hw_status(funct == POTAL_FUNCT_SCALE_WRITE ? potal_rocc_scale_write(rs1, rs2)
+                                                      : potal_rocc_scale_release(rs1, rs2));
+#else
+    return POTAL_ERR_NO_HARDWARE;
+#endif
+}
+
+potal_status potal_paired_scale_write_columns(potal_paired_session *s, const potal_paired_scale_columns *w,
+                                              const uint32_t *const *block_carriers, uint64_t *columns_done) {
+    if (w == NULL || block_carriers == NULL || columns_done == NULL) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    *columns_done = 0;
+    int direct = scale_window_direct(s, w);
+    if (direct) {
+        const uint32_t slots = w->blocks * w->j_tiles;
+        for (uint32_t i = 0; i < slots; ++i) {
+            direct &= s->slot_columns[w->slot_base + i] == 0;
+        }
+    }
+    uint64_t done = 0;
+    if (!direct) {
+        for (uint32_t b = 0; b < w->blocks; ++b) {
+            for (uint32_t j = 0; j < w->j_tiles; ++j) {
+                const uint32_t columns = j + 1 == w->j_tiles ? w->last_columns : POTAL_HW_DIM;
+                for (uint32_t c = 0; c < columns; ++c) {
+                    const potal_status status = potal_paired_scale_write(s, w->slot_base + b * w->j_tiles + j,
+                        w->generation, c, block_carriers[b][j * POTAL_HW_DIM + c]);
+                    if (status != POTAL_OK) {
+                        *columns_done = done;
+                        return status;
+                    }
+                    ++done;
+                }
+            }
+        }
+        *columns_done = done;
+        return POTAL_OK;
+    }
+    /* Every slot is free: no column can conflict, and each slot takes this window's generation. */
+    const uint64_t generation_bits = (uint64_t)w->generation << SCALE_GENERATION_SHIFT;
+    potal_status status = POTAL_OK;
+    for (uint32_t b = 0; b < w->blocks && status == POTAL_OK; ++b) {
+        for (uint32_t j = 0; j < w->j_tiles && status == POTAL_OK; ++j) {
+            const uint32_t slot = w->slot_base + b * w->j_tiles + j;
+            const uint32_t columns = j + 1 == w->j_tiles ? w->last_columns : POTAL_HW_DIM;
+            const uint32_t *carriers = block_carriers[b] + j * POTAL_HW_DIM;
+            uint32_t c = 0;
+            for (; c < columns; ++c) {
+                if (!potal_carrier_is_valid(carriers[c])) {
+                    status = POTAL_ERR_INVALID_ARGUMENT;
+                    break;
+                }
+                status = scale_column_issue(s, POTAL_FUNCT_SCALE_WRITE,
+                    (uint64_t)slot | generation_bits | ((uint64_t)c << SCALE_COLUMN_SHIFT), carriers[c]);
+                if (status != POTAL_OK) {
+                    status = paired_fail(s, status, "scale_write");
+                    break;
+                }
+            }
+            if (c != 0) {
+                s->slot_columns[slot] = scale_column_mask(c);
+                s->slot_generation[slot] = (uint8_t)w->generation;
+            }
+            done += c;
+        }
+    }
+    *columns_done = done;
+    return status;
+}
+
+potal_status potal_paired_scale_release_columns(potal_paired_session *s, const potal_paired_scale_columns *w,
+                                                uint32_t first_column, uint64_t *columns_done) {
+    if (w == NULL || columns_done == NULL) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    *columns_done = 0;
+    int direct = scale_window_direct(s, w) && first_column < (w->j_tiles == 1 ? w->last_columns : POTAL_HW_DIM);
+    if (direct) {
+        for (uint32_t b = 0; b < w->blocks; ++b) {
+            for (uint32_t j = 0; j < w->j_tiles; ++j) {
+                const uint32_t slot = w->slot_base + b * w->j_tiles + j;
+                uint64_t mask = scale_column_mask(j + 1 == w->j_tiles ? w->last_columns : POTAL_HW_DIM);
+                if (b == 0 && j == 0) {
+                    mask &= ~scale_column_mask(first_column);
+                }
+                direct &= (s->slot_columns[slot] & mask) == mask && s->slot_generation[slot] == w->generation;
+            }
+        }
+    }
+    uint64_t done = 0;
+    if (!direct) {
+        for (uint32_t b = 0; b < w->blocks; ++b) {
+            for (uint32_t j = 0; j < w->j_tiles; ++j) {
+                const uint32_t columns = j + 1 == w->j_tiles ? w->last_columns : POTAL_HW_DIM;
+                for (uint32_t c = b == 0 && j == 0 ? first_column : 0; c < columns; ++c) {
+                    const potal_status status = potal_paired_scale_release(s, w->slot_base + b * w->j_tiles + j,
+                                                                           w->generation, c);
+                    if (status != POTAL_OK) {
+                        *columns_done = done;
+                        return status;
+                    }
+                    ++done;
+                }
+            }
+        }
+        *columns_done = done;
+        return POTAL_OK;
+    }
+    /* Every column is live with this generation. An accepted release is a drain point, as in the per-column call. */
+    const uint64_t generation_bits = (uint64_t)w->generation << SCALE_GENERATION_SHIFT;
+    potal_status status = POTAL_OK;
+    for (uint32_t b = 0; b < w->blocks && status == POTAL_OK; ++b) {
+        for (uint32_t j = 0; j < w->j_tiles && status == POTAL_OK; ++j) {
+            const uint32_t slot = w->slot_base + b * w->j_tiles + j;
+            const uint32_t columns = j + 1 == w->j_tiles ? w->last_columns : POTAL_HW_DIM;
+            const uint32_t begin = b == 0 && j == 0 ? first_column : 0;
+            uint32_t c = begin;
+            for (; c < columns; ++c) {
+                status = scale_column_issue(s, POTAL_FUNCT_SCALE_RELEASE,
+                    (uint64_t)slot | generation_bits | ((uint64_t)c << SCALE_COLUMN_SHIFT), 0);
+                if (status != POTAL_OK) {
+                    status = paired_fail(s, status, "scale_release");
+                    break;
+                }
+            }
+            if (c != begin) {
+                s->slot_columns[slot] &= ~(scale_column_mask(c) & ~scale_column_mask(begin));
+                paired_drained(s);
+                s->drains += c - begin - 1;
+            }
+            done += c - begin;
+        }
+    }
+    *columns_done = done;
+    return status;
+}
+
 static potal_status paired_index_admit(potal_paired_session *s, const potal_index_config *cfg) {
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) return ready;
@@ -1973,6 +2142,7 @@ potal_status potal_paired_fence(potal_paired_session *s) {
     }
     paired_drained(s);
     if (s->stream) s->stream->final_fenced = 1;
+    if (s->hw_trace_state == hw_trace_armed) s->hw_trace_state = hw_trace_frozen;
     return POTAL_OK;
 }
 
@@ -2964,6 +3134,119 @@ potal_status potal_paired_observation_end(potal_paired_session *s, uint64_t cycl
     memcpy(cycles, values, sizeof(values));
     s->observation_active = 0;
     return POTAL_OK;
+}
+
+/* ---- Strict hardware timeline (H3-8I-25AC): checked access to the early-event window ---- */
+
+uint64_t potal_paired_hw_cycle(void) {
+#if defined(__riscv)
+    uint64_t value;
+    __asm__ volatile("rdcycle %0" : "=r"(value) :: "memory");
+    return value;
+#else
+    /* The native timeline's t_local clock, so a native trace joins it the way a target trace does. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+/* Rocket lets later instructions pass an xd RoCC command until they read rd, and rdcycle does not
+ * read it. Reading the reply register first holds this rdcycle until the reply has arrived. */
+static uint64_t hw_cycle_after_reply(uint64_t reply) {
+#if defined(__riscv)
+    uint64_t value;
+    __asm__ volatile("mv %1, %1\n\trdcycle %0" : "=&r"(value), "+r"(reply) :: "memory");
+    return value;
+#else
+    (void)reply;
+    return potal_paired_hw_cycle();
+#endif
+}
+
+static potal_status hw_trace_counter(potal_paired_session *s, uint64_t rs1, uint64_t *value) {
+    if (s->sink.cmd) {
+        const potal_paired_cmd_record record = {POTAL_FUNCT_COUNTER, 1, rs1, 0};
+        s->observation_in_call = 1;
+        const potal_status status = s->observation_counter(s->sink.ctx, &record, value);
+        s->observation_in_call = 0;
+        return status;
+    }
+#if defined(__riscv)
+    *value = potal_rocc_counter(rs1, 0);
+    return POTAL_OK;
+#else
+    (void)value;
+    return POTAL_ERR_NO_HARDWARE;
+#endif
+}
+
+static int hw_trace_outstanding(const potal_paired_session *s) {
+    return s->outstanding_loops || s->outstanding_readbacks || s->outstanding_acc_updates || s->index_open;
+}
+
+potal_status potal_paired_hw_trace_enable(potal_paired_session *s,
+    potal_observation_counter_fn counter, int probe_capability) {
+    potal_status status = paired_ready(s);
+    if (status != POTAL_OK) return status;
+    if (s->resident || s->h2 || s->stream || s->observation_active || hw_trace_outstanding(s) ||
+        s->hw_trace_state == hw_trace_armed)
+        return POTAL_ERR_BUSY;
+    if (POTAL_HW_DIM != 32) return POTAL_ERR_UNSUPPORTED;
+    if (!!s->sink.cmd != !!counter) return POTAL_ERR_INVALID_ARGUMENT;
+    if (!paired_can_issue(s)) return POTAL_ERR_NO_HARDWARE;
+    s->observation_counter = counter;
+    if (probe_capability) {
+        uint64_t value = 0;
+        status = hw_trace_counter(s, UINT64_C(0xA), &value);
+        if (status == POTAL_OK) status = hw_trace_counter(s, POTAL_LDB_ONLY_TAG, &value);
+        if (status != POTAL_OK) return status;
+        if (value != POTAL_LDB_ONLY_CAPABILITY) return POTAL_ERR_UNSUPPORTED;
+    }
+    s->hw_trace_state = hw_trace_idle;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_hw_trace_arm(potal_paired_session *s, uint64_t *cycle_before, uint64_t *cycle_after) {
+    if (!s || !cycle_before || !cycle_after || s->hw_trace_state == hw_trace_off)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_status ready = paired_ready(s);
+    if (ready != POTAL_OK) return ready;
+    if (s->hw_trace_state == hw_trace_armed || s->hw_trace_state == hw_trace_frozen) return POTAL_ERR_BUSY;
+    if (hw_trace_outstanding(s)) return POTAL_ERR_BUSY;
+    uint64_t accepted = 0;
+    const uint64_t before = potal_paired_hw_cycle();
+    const potal_status status = hw_trace_counter(s, POTAL_LDB_ONLY_TRACE_RESET, &accepted);
+    const uint64_t after = hw_cycle_after_reply(accepted);
+    if (status != POTAL_OK) return status;
+    if (accepted == 0) return POTAL_ERR_BUSY;
+    if (accepted != 1) return POTAL_ERR_BAD_RESPONSE;
+    *cycle_before = before;
+    *cycle_after = after;
+    s->hw_trace_state = hw_trace_armed;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_hw_trace_read(potal_paired_session *s, uint32_t field, uint64_t *value) {
+    if (!s || !value || field >= POTAL_LDB_ONLY_TRACE_FIELDS) return POTAL_ERR_INVALID_ARGUMENT;
+    if (s->hw_trace_state != hw_trace_frozen && s->hw_trace_state != hw_trace_read)
+        return s->hw_trace_state == hw_trace_off ? POTAL_ERR_INVALID_ARGUMENT : POTAL_ERR_BUSY;
+    const potal_status status = hw_trace_counter(s, POTAL_LDB_ONLY_TRACE_READ + field, value);
+    if (status != POTAL_OK) return status;
+    s->hw_trace_state = hw_trace_read;
+    return POTAL_OK;
+}
+
+potal_status potal_paired_hw_counter(potal_paired_session *s, uint64_t rs1, uint64_t *value) {
+    if (!s || !value || s->hw_trace_state == hw_trace_off) return POTAL_ERR_INVALID_ARGUMENT;
+    const uint64_t configure = rs1 & ~(UINT64_C(0x3F) << 12) & ~(UINT64_C(7) << 4);
+    const int legal = rs1 == 1 || rs1 == 2 || rs1 == 4 || (rs1 >> 7 == 0 && (rs1 & 0xF) == 0) ||
+        (configure == 8 && (rs1 >> 12) < 52);
+    if (!legal) return POTAL_ERR_INVALID_ARGUMENT;
+    const potal_status ready = paired_ready(s);
+    if (ready != POTAL_OK) return ready;
+    if (hw_trace_outstanding(s) || s->hw_trace_state == hw_trace_armed) return POTAL_ERR_BUSY;
+    return hw_trace_counter(s, rs1, value);
 }
 
 /* ---- Owning resident mode ------------------------------------------------ */

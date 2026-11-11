@@ -655,6 +655,35 @@ potal_status potal_paired_scale_write(potal_paired_session *session, uint32_t sl
                                       uint32_t column, uint32_t carrier);
 potal_status potal_paired_scale_release(potal_paired_session *session, uint32_t slot, uint32_t generation,
                                         uint32_t column);
+
+/*
+ * One Scale window: slots slot_base + b * j_tiles + j for b < blocks and
+ * j < j_tiles, each with POTAL_HW_DIM columns except that the last J tile of
+ * every block has last_columns.
+ */
+typedef struct potal_paired_scale_columns {
+    uint32_t slot_base;
+    uint32_t blocks;
+    uint32_t j_tiles;
+    uint32_t last_columns;
+    uint32_t generation;
+} potal_paired_scale_columns;
+
+/*
+ * The per-column calls above, for a whole window in (block, J tile, column)
+ * order: the same commands, the same return status and the same session state.
+ * Conditions that hold for the whole window are checked once; every carrier and
+ * every hardware response is still checked per column. A window that does not
+ * pass those conditions runs through the per-column calls, so an error stops at
+ * the same column with the same commands already issued. *columns_done counts
+ * the columns that succeeded. block_carriers[b] points at the first column of
+ * block b, and a J tile's carriers are consecutive at j * POTAL_HW_DIM.
+ */
+potal_status potal_paired_scale_write_columns(potal_paired_session *session, const potal_paired_scale_columns *window,
+                                              const uint32_t *const *block_carriers, uint64_t *columns_done);
+/* Starts at first_column of the window's first slot. Every other slot starts at column 0. */
+potal_status potal_paired_scale_release_columns(potal_paired_session *session, const potal_paired_scale_columns *window,
+                                                uint32_t first_column, uint64_t *columns_done);
 potal_status potal_paired_index_config(potal_paired_session *session, const potal_index_config *cfg);
 potal_status potal_paired_index_write(potal_paired_session *session, const potal_index_write *w);
 potal_status potal_paired_loop_ws_issue(potal_paired_session *session, const potal_paired_loop_ws *loop);
@@ -885,6 +914,25 @@ potal_status potal_paired_h2_early_enable(potal_paired_session *session,
 potal_status potal_paired_h2_early_trace_begin(potal_paired_session *session);
 potal_status potal_paired_h2_early_trace_end(potal_paired_session *session,
     uint64_t values[POTAL_LDB_ONLY_TRACE_FIELDS]);
+/* H3-8I-25AC diagnostic: the same early-event window on a plain non-stream session, re-armed per
+ * checked Fence. Only COUNTER_OP is added. These calls never mark the session failed, so a refused
+ * or failed call leaves its numeric work and later commands untouched.
+ * enable: probe_capability sends rs1=0xA (counter0 config, value, snapshot selection) and the tag
+ * read once per process. counter is required with a software sink and must be NULL without one.
+ * arm: refused BUSY with software-visible work outstanding, with an open Index, with a window armed
+ * or frozen and unread. A hardware reply of 0 (not drained) is BUSY and arms nothing. cycle_before
+ * and cycle_after bracket the arm cycle (field 22) on this hart's rdcycle.
+ * read: only after a successful Fence froze the window. A read while armed would itself move the
+ * not-drained stamps, so it is refused. enable and counter refuse an armed window for the same reason.
+ * counter: drained only; rs1 is 1 (reset), 2 (snapshot clear), 4 (snapshot), i<<4 (read counter i)
+ * or (event<<12)|(i<<4)|8 (configure). Its value is the counter file reply, a cycle count. */
+potal_status potal_paired_hw_trace_enable(potal_paired_session *session,
+    potal_observation_counter_fn counter, int probe_capability);
+potal_status potal_paired_hw_trace_arm(potal_paired_session *session,
+    uint64_t *cycle_before, uint64_t *cycle_after);
+potal_status potal_paired_hw_trace_read(potal_paired_session *session, uint32_t field, uint64_t *value);
+potal_status potal_paired_hw_counter(potal_paired_session *session, uint64_t rs1, uint64_t *value);
+uint64_t potal_paired_hw_cycle(void); /* rdcycle on RISC-V, nanoseconds elsewhere */
 potal_status potal_paired_observation_begin(potal_paired_session *session,
     potal_observation_counter_fn counter);
 potal_status potal_paired_observation_end(potal_paired_session *session, uint64_t cycles[7]);

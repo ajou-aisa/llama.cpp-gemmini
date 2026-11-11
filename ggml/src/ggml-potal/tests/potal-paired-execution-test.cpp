@@ -29,6 +29,8 @@
 #include "matmul/stripe.hpp"
 #include "quants/act/quantize.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -79,6 +81,8 @@ struct run_result {
     uint64_t                         hot_clock_reads = 0;
 };
 
+bool window_scale_request = false; // potal_paired_request::window_scale_issue of the next run_paired
+
 // One stripe (stripe 0, rows = min(stripe_rows, M)) of a fixture through the new executor.
 run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, const paired_inputs & in, h2_emulator & emu,
                       bool with_sink = true, uint32_t generation = 0, bool conservative = false,
@@ -118,6 +122,7 @@ run_result run_paired(const paired_fixture & f, const potal_tile_plan & main, co
     q.generation   = &r.generation;
     q.conservative_fences = conservative;
     if (scale_reuse >= 0) q.ktile_scale_reuse = scale_reuse != 0;
+    q.window_scale_issue = window_scale_request;
     q.plan = plan;
     q.hw = hw;
     q.next_k_prefetch = prefetch;
@@ -1815,6 +1820,176 @@ void test_pairs_and_generations() {
     check("G a second call after the first (counter continues, pairs reused after drains): executor == reference",
           r2.status == potal_paired_status::ok && emu.errors.empty() && compare_stripe(f, in, ref, r2, rows).empty() &&
               r2.generation != gen_after);
+}
+
+// The window calls against the per-column calls through the executor: one forked
+// child per side, so both start from the same allocator state and raw words compare
+// with their addresses. A failed Release keeps the owner, so faults need the isolation too.
+struct window_scale_fault {
+    uint32_t     funct = 0xFFFFFFFFu;
+    size_t       nth = 0;
+    potal_status status = POTAL_OK;
+    bool         bad_carrier = false;
+};
+
+struct window_scale_sink {
+    h2_emulator        emulator;
+    window_scale_fault fault;
+    size_t             seen = 0;
+    static potal_status command(void * ctx, const potal_paired_cmd_record * r) {
+        auto & self = *static_cast<window_scale_sink *>(ctx);
+        if (r->funct == self.fault.funct && self.seen++ == self.fault.nth) {
+            self.emulator.records.push_back(*r);
+            return self.fault.status;
+        }
+        return self.emulator.command(*r);
+    }
+};
+
+struct window_scale_outcome {
+    int      finished, status, hw_status, fatal, cleaned, issued;
+    char     stage[48];
+    uint32_t last_generation, live_scale_slots, session_failed;
+    int      session_error;
+    uint64_t scale_writes, scale_releases, drains, fences, reused_windows, reused_columns;
+    uint64_t session_commands, session_drains, records, words_hash, result_hash, emulator_errors;
+};
+
+uint64_t fnv_words(uint64_t h, const void * data, size_t bytes) {
+    const auto * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < bytes; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+void window_scale_side(const case_spec & c, int reuse, bool window, const window_scale_fault & fault,
+                       window_scale_outcome * out) {
+    paired_fixture f(c.M, c.N, c.K, c.seed, [](size_t blk, size_t n) { return (int16_t) ((blk * 7 + n) % 4); });
+    potal_tile_plan main;
+    paired_inputs   in;
+    if (!f.ok || !main_select_ok(f, main) ||
+        !make_inputs(f, main.tile_I * PD, c.entries ? within_k(c.entries, f.K) : entries_fn{}, in)) {
+        return;
+    }
+    if (fault.bad_carrier) f.weight.carriers[f.N / 2] = 0x7FFFFFFFu;
+    window_scale_sink failure;
+    failure.fault = fault;
+    const potal_paired_sink sink{window_scale_sink::command, &failure};
+    window_scale_request = window;
+    const run_result r = run_paired(f, main, in, failure.emulator, true, 0, false, &sink, reuse);
+    window_scale_request = false;
+    out->status = int(r.status);
+    out->hw_status = r.report.hw_status;
+    out->fatal = r.report.fatal;
+    out->cleaned = r.report.cleaned;
+    out->issued = r.report.issued;
+    if (r.report.stage != nullptr) std::strncpy(out->stage, r.report.stage, sizeof(out->stage) - 1);
+    out->last_generation = r.report.last_generation;
+    out->live_scale_slots = r.session.live_scale_slots;
+    out->session_failed = r.session.failed;
+    out->session_error = r.session.error;
+    out->scale_writes = r.report.counts.scale_writes;
+    out->scale_releases = r.report.counts.scale_releases;
+    out->drains = r.report.counts.drains;
+    out->fences = r.report.counts.fences;
+    out->reused_windows = r.report.counts.scale_reused_windows;
+    out->reused_columns = r.report.counts.scale_reused_columns;
+    out->session_commands = r.session.commands;
+    out->session_drains = r.session.drains;
+    out->records = failure.emulator.records.size();
+    out->emulator_errors = failure.emulator.errors.size();
+    uint64_t words = 1469598103934665603ull;
+    for (const auto & w : failure.emulator.records) {
+        words = fnv_words(words, &w.funct, sizeof(w.funct));
+        words = fnv_words(words, &w.xd, sizeof(w.xd));
+        words = fnv_words(words, &w.rs1, sizeof(w.rs1));
+        words = fnv_words(words, &w.rs2, sizeof(w.rs2));
+    }
+    out->words_hash = words;
+    uint64_t results = 1469598103934665603ull;
+    results = fnv_words(results, r.main_c.data(), r.main_c.size() * sizeof(r.main_c[0]));
+    results = fnv_words(results, r.residual_c.data(), r.residual_c.size() * sizeof(r.residual_c[0]));
+    out->result_hash = results;
+    out->finished = 1;
+}
+
+bool window_scale_fork(const case_spec & c, int reuse, bool window, const window_scale_fault & fault,
+                       window_scale_outcome * out) {
+    std::memset(out, 0, sizeof(*out));
+    std::fflush(nullptr);
+    const pid_t child = fork();
+    if (child == 0) {
+        window_scale_side(c, reuse, window, fault, out);
+        std::fflush(nullptr);
+        _exit(0);
+    }
+    int status = 0;
+    return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 && out->finished;
+}
+
+void test_window_scale_issue() {
+    auto * shared = static_cast<window_scale_outcome *>(mmap(nullptr, 2 * sizeof(window_scale_outcome), PROT_READ | PROT_WRITE,
+                                                             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    check("W shared result page", shared != MAP_FAILED);
+    if (shared == MAP_FAILED) return;
+    window_scale_outcome & a = shared[0];
+    window_scale_outcome & b = shared[1];
+    const auto same = [&] {
+        return a.status == b.status && a.hw_status == b.hw_status && a.fatal == b.fatal && a.cleaned == b.cleaned &&
+               a.issued == b.issued && std::strcmp(a.stage, b.stage) == 0 && a.last_generation == b.last_generation &&
+               a.live_scale_slots == b.live_scale_slots && a.session_failed == b.session_failed &&
+               a.session_error == b.session_error && a.scale_writes == b.scale_writes &&
+               a.scale_releases == b.scale_releases && a.drains == b.drains && a.fences == b.fences &&
+               a.reused_windows == b.reused_windows && a.reused_columns == b.reused_columns &&
+               a.session_commands == b.session_commands && a.session_drains == b.session_drains &&
+               a.records == b.records && a.words_hash == b.words_hash && a.result_hash == b.result_hash &&
+               a.emulator_errors == b.emulator_errors;
+    };
+    const std::vector<case_spec> cases = {
+        { "single panel", 48, 48, 160, 2, dense_entries(7, 4096, 100) },
+        { "many windows", 16, 96, 768, 4, dense_entries(1, 3, 200) },
+        { "I/J/K tails", PD == 32 ? 54u : 70u, 140, 2048, 6, dense_entries(5, 9, 100) },
+        { "decode shape M = 1", 1, 768, 768, 8, dense_entries(1, 5, 90) },
+        { "saturating Residual", 128, 32, 64, 239, dense_entries(1, 1, 30000) },
+        { "no Residual", 32, 64, 256, 7, nullptr },
+    };
+    for (const case_spec & c : cases) {
+        for (const int reuse : {0, 1}) {
+            if (reuse != 0 && PD != 32) continue;
+            const std::string name = std::string("W ") + c.name + (reuse != 0 ? ", K-tile reuse" : "");
+            const bool clean = window_scale_fork(c, reuse, false, {}, &a) && window_scale_fork(c, reuse, true, {}, &b);
+            check(name + ": identical words, results, counts and session", clean && same() && a.scale_writes != 0 &&
+                  a.status == int(potal_paired_status::ok) && a.emulator_errors == 0);
+            if (!clean || a.scale_writes == 0) continue;
+            const uint64_t writes = a.scale_writes, releases = a.scale_releases;
+            std::vector<std::pair<std::string, window_scale_fault>> faults;
+            for (const potal_status status : {potal_status(POTAL_HW_INVALID_ADDRESS), POTAL_ERR_BAD_RESPONSE}) {
+                for (const uint64_t nth : {uint64_t(0), writes / 2, writes - 1}) {
+                    window_scale_fault fault;
+                    fault.funct = POTAL_FUNCT_SCALE_WRITE;
+                    fault.nth = size_t(nth);
+                    fault.status = status;
+                    faults.push_back({"Scale WRITE " + std::to_string(nth) + " status " + std::to_string(int(status)), fault});
+                }
+                for (const uint64_t nth : {uint64_t(0), uint64_t(1), releases / 2, releases - 1}) {
+                    window_scale_fault fault;
+                    fault.funct = POTAL_FUNCT_SCALE_RELEASE;
+                    fault.nth = size_t(nth);
+                    fault.status = status;
+                    faults.push_back({"Scale RELEASE " + std::to_string(nth) + " status " + std::to_string(int(status)), fault});
+                }
+            }
+            window_scale_fault bad;
+            bad.bad_carrier = true;
+            faults.push_back({"invalid carrier", bad});
+            for (const auto & fault : faults) {
+                const bool ran = window_scale_fork(c, reuse, false, fault.second, &a) &&
+                                 window_scale_fork(c, reuse, true, fault.second, &b);
+                check(name + ": " + fault.first + ": same failure and same words", ran && same() &&
+                      a.status != int(potal_paired_status::ok));
+            }
+        }
+    }
+    munmap(shared, 2 * sizeof(window_scale_outcome));
 }
 
 void test_failures() {
@@ -4409,6 +4584,7 @@ int main() {
     test_stream_execution_failures();
     test_pairs_and_generations();
     test_ktile_scale_reuse();
+    test_window_scale_issue();
     test_failures();
     test_review_followups();
     test_conservative();

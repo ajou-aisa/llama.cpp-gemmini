@@ -212,6 +212,15 @@ struct ggml_backend_potal_stats {
     uint64_t attention_pv_corrections;     // low-limb jobs with one final ACC bias phase
     uint64_t attention_bias_mvins;        // one full-width INT32 bias MVIN per output tile
     double   attention_wall_s;           // preparation, issuer, reconstruction; not FPGA-only time
+    uint64_t attention_strict_nodes;      // H3-8I-25V: nodes run by the strict five-hart pipeline
+    uint64_t attention_strict_tasks;      // their stripes
+    uint64_t attention_issuer_cpu_work;   // CPU numeric steps seen on the issuer thread/CPU (must be 0)
+
+    // H3-8I-25S strict issuer evidence: paired stripe preparations (decode, plan, Residual C,
+    // executor job) by the thread/CPU that ran them; strict mode requires zero on hart 0.
+    uint64_t prepares_on_issuer_thread;
+    uint64_t prepares_on_issuer_cpu;
+    uint64_t prepares_on_producer;
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);
@@ -220,6 +229,41 @@ GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struc
 // is mutated or freed (and another one possibly allocated at its address)
 // while the backend lives; must not overlap ggml_backend_graph_compute on it.
 GGML_BACKEND_API void ggml_backend_potal_clear_weight_cache(ggml_backend_t backend);
+
+// ---- Application runner hooks (opt-in; inert unless the named variables are set) ----
+
+// Stats of the most recently created PoTal backend that is still alive (for an application
+// that only holds a llama_context). False when no PoTal backend lives or out is NULL.
+GGML_BACKEND_API bool ggml_backend_potal_get_last_stats(struct ggml_backend_potal_stats * out);
+
+// Number of PoTal graph_compute calls in this process (= the next graph index of
+// GGML_POTAL_DUMP_GRAPHS).
+GGML_BACKEND_API uint64_t ggml_backend_potal_graph_count(void);
+
+// Timeline (POTAL_TIMELINE=<csv path>; every call is a no-op / false without it).
+// mark: one application record on the calling thread (registered as role caller, cpu -1, on
+// first use). stage_id 81 model.inference, 82 model.prefill, 83 model.decode, 84 model.token;
+// event 1 begin, 2 end, 7 instant; index -> stripe_id column, work -> work column. Any other
+// stage or event is ignored.
+GGML_BACKEND_API void ggml_backend_potal_timeline_mark(int stage_id, int event, uint32_t index, uint64_t work);
+// Recording gate (default on): off drops records; registration, runs and anchors continue.
+GGML_BACKEND_API void ggml_backend_potal_timeline_set_recording(bool on);
+// Writes the CSV now (recording threads must be quiescent). False if disabled or on error.
+GGML_BACKEND_API bool ggml_backend_potal_timeline_flush(void);
+// H3-8I-25AC: strict hardware timeline state. Returns true when GGML_POTAL_STRICT_HW_TIMELINE requests it.
+GGML_BACKEND_API bool ggml_backend_potal_hw_timeline_stats(uint64_t * windows, uint64_t * stripes, uint64_t * dropped,
+                                                           uint64_t * commands, bool * disabled, const char ** reason);
+GGML_BACKEND_API bool ggml_backend_potal_hw_timeline_flush(void);
+// Totals over all registered threads; NULL outputs are skipped. False if disabled.
+GGML_BACKEND_API bool ggml_backend_potal_timeline_stats(uint64_t * events, uint64_t * dropped,
+                                                        uint32_t * overflowed_threads, uint32_t * threads);
+
+// Node dump (graph_compute, after a node completed): GGML_POTAL_DUMP_DIR=<existing dir>
+// enables it; GGML_POTAL_DUMP_GRAPHS=<comma list of graph indices> (unset/empty: every graph);
+// GGML_POTAL_DUMP_NODES=<comma list of substrings> matched against the node name, the src0
+// name and the kind (qk, pv, linear) (unset/empty: no node). Each match writes
+// <dir>/g<graph>_n<node>_<name>.bin: one text header line, then the raw elements (row-major,
+// ne order) of src1, dst and, only when F16/F32 (attention K/V), src0.
 
 #ifdef __cplusplus
 }

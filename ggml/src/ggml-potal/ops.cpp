@@ -11,6 +11,7 @@
 #include "matmul/stripe.hpp"
 #include "potal.h"
 #include "potal_hw_params.h"
+#include "trace/timeline.hpp"
 
 #include "ggml-gemmini/matmul/options.hpp" // resolve_matmul_options (shared Gemmini source)
 
@@ -142,8 +143,21 @@ ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
     auto & stats = state.stats;
     (attention::get_role(node) == attention::role::qk ? stats.attention_qk_nodes : stats.attention_pv_nodes)++;
     const auto start = clock_type::now();
-    const attention::result result = attention::execute_hardware(node);
+    // GGML_POTAL_HART_ROLES + GGML_POTAL_STRICT_ISSUER: QK/PV on the strict five-hart pipeline
+    // (H3-8I-25V); otherwise the existing single-task route on the issuer.
+    bool roles_invalid = false, strict_invalid = false;
+    const bool strict = hart_roles_requested(roles_invalid) && strict_issuer_requested(strict_invalid);
+    attention::result result;
+    if (roles_invalid || strict_invalid) {
+        result.status = POTAL_ERR_INVALID_ARGUMENT;
+        result.stage = "attention_options";
+    } else {
+        result = strict ? attention::execute_strict_hardware(node) : attention::execute_hardware(node);
+    }
     stats.attention_wall_s += seconds_since(start);
+    stats.attention_strict_nodes += strict;
+    stats.attention_strict_tasks += result.strict_tasks;
+    stats.attention_issuer_cpu_work += result.cpu_work_on_issuer_thread + result.cpu_work_on_issuer_cpu;
     stats.attention_limb_jobs += result.jobs;
     stats.attention_residual_jobs += result.residual_jobs;
     stats.attention_loop_ws += result.loops;
@@ -301,6 +315,8 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
                                  size_t job_capacity) {
     ggml_backend_potal_stats & st     = state.stats;
     const hp1_weight &         weight = *wl.weight;
+    ::potal::timeline::scoped_span pipe_options(::potal::timeline::active(), ::potal::timeline::stage::pipe_options,
+                                                0, 0, ::potal::timeline::no_id, ::potal::timeline::no_id);
 
     // Paired route: requested (build default / GGML_POTAL_PAIRED_AUTO) and eligible
     // (compensation ON: the ws_packet residual exists). Compensation OFF keeps the
@@ -357,10 +373,25 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     cfg.paired_stream = stream;
     cfg.measure_timing = log::timing_enabled();
     cfg.layer        = layer;
+    // Timeline layer id (records only, POTAL_TIMELINE): N of the weight name "blk.N.", 1000 for
+    // the LM head ("output.weight", or the tied "token_embd.weight"), else 0.
+    {
+        const char * w = node->src[0]->name;
+        unsigned     n = 0;
+        int          used = 0;
+        if (std::sscanf(w, "blk.%u.%n", &n, &used) == 1 && used > 0) {
+            cfg.timeline_layer = n;
+        } else if (std::strcmp(w, "output.weight") == 0 || std::strcmp(w, "token_embd.weight") == 0) {
+            cfg.timeline_layer = 1000;
+        }
+    }
     issuer_owner owner;
     const uint64_t c0 = cfg.measure_timing ? gcycle::read() : 0;
     const auto     t  = cfg.measure_timing ? clock_type::now() : clock_type::time_point{};
+    pipe_options.close();
     const pipeline_report r = run_stripe_pipeline(node->src[1], args, weight, plan, cfg, owner);
+    ::potal::timeline::scoped_span mm_post(::potal::timeline::active(), ::potal::timeline::stage::mm_post, 0, 0,
+                                           ::potal::timeline::no_id, ::potal::timeline::no_id);
     // Caller-side interval: quantization, the overlapped issuer work and the
     // final drain; not SCU or array time.
     st.pipeline_wall_s += seconds_since(t);
@@ -389,6 +420,9 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     st.paired_prefetch_loads += c.paired_prefetch_loads;
     st.paired_prefetch_mvins += c.paired_prefetch_mvins;
     st.paired_prefetch_ldb_only += c.paired_prefetch_ldb_only;
+    st.prepares_on_issuer_thread += c.prepares_on_issuer_thread;
+    st.prepares_on_issuer_cpu += c.prepares_on_issuer_cpu;
+    st.prepares_on_producer += c.prepares_on_producer;
     st.paired_prefetch_bytes_declared += c.paired_prefetch_bytes_declared;
     st.paired_resident_main_loop_ws += c.paired_resident_main_loop_ws;
     st.paired_residual_prefetch_issue_s += c.paired_residual_prefetch_issue_s;
@@ -491,6 +525,10 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     ggml_backend_potal_stats & st = state.stats;
     const ggml_tensor *        w  = node->src[0];
     const ggml_tensor *        x  = node->src[1];
+    ::potal::timeline::scoped_span mm_prep(::potal::timeline::active(), ::potal::timeline::stage::mm_prep, 0, 0,
+                                           ::potal::timeline::no_id, ::potal::timeline::no_id);
+    ::potal::timeline::scoped_span mm_options(::potal::timeline::active(), ::potal::timeline::stage::mm_options, 0,
+                                              0, ::potal::timeline::no_id, ::potal::timeline::no_id);
     st.hp1_nodes++;
     (s.m == 1 ? st.decode_shaped_nodes : st.prefill_shaped_nodes)++;
     const std::string layer = ggml::gemmini::types::resolve_matmul_layer(state.model_arch, w->name, x->name,
@@ -555,17 +593,25 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     const auto          residual_route = rmd_backend == ggml::gemmini::RmdBackend::cpu_direct
                                              ? ggml::gemmini::residual::ResidualRoute::cpu_direct
                                              : ggml::gemmini::residual::ResidualRoute::ws_packet;
+    mm_options.close();
+    ::potal::timeline::scoped_span mm_init(::potal::timeline::active(), ::potal::timeline::stage::mm_init_args, 0, 0,
+                                           ::potal::timeline::no_id, ::potal::timeline::no_id);
     if (!init_args(w, node, s, state.model_arch.c_str(), layer.c_str(), residual_route, plan, args)) {
         return hp1_fail(st, node, layer, "alloc", "out of memory for the activation codes");
     }
+    mm_init.close();
 
     // 1. Weight: the prepared B / carriers / channel scales of w (weight_cache.hpp).
     //    A hit reuses them; otherwise the HP1 blocks are validated and unpacked.
     const bool         measure = log::timing_enabled();
     uint64_t           c0     = measure ? gcycle::read() : 0;
     auto               t      = measure ? clock_type::now() : clock_type::time_point{};
+    ::potal::timeline::scoped_span mm_weights(::potal::timeline::active(), ::potal::timeline::stage::mm_weights, 0,
+                                              0, ::potal::timeline::no_id, ::potal::timeline::no_id);
     weight_lookup      wl     = state.weights.get(w, args);
+    mm_weights.close();
     const double       wl_s   = seconds_since(t);
+    mm_prep.close();
     uint64_t           c1     = measure ? gcycle::read() : 0;
     const bool         reused = wl.outcome == weight_cache_outcome::hit;
     if (reused) {

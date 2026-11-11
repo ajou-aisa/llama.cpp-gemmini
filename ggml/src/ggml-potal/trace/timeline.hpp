@@ -70,6 +70,37 @@ enum class stage : uint16_t {
     exsia_thread_spawn       = 53,  // caller: role thread creation
     role_start               = 54,  // each role thread: pin + register; both ends direct-stamped
     node_report              = 55,  // caller: report and completion poll after join
+    gc_total                 = 56,  // caller: potal_graph_compute (inclusive; contains node.total)
+    gc_setup                 = 57,  // caller: node validation and trace-id capture
+    gc_node_setup            = 58,  // caller: per-node semantic/trace context
+    mm_prep                  = 59,  // caller: mul_mat_hp1 prologue through weight-cache lookup
+    pipe_options             = 60,  // caller: paired option parsing and pipeline config
+    pipe_prenode             = 61,  // caller: run_stripe_pipeline checks before node.total
+    role_cpu_map             = 62,  // caller: find_role_cpus (/proc/cpuinfo), inside 61
+    mm_post                  = 63,  // caller: stats merge and records after node.total
+    issuer_wait_job          = 64,  // strict issuer: waiting for a prepared job (wait events)
+    issuer_wait_hw           = 65,  // strict issuer: blocked in a drain (fence, first release of a window)
+    prep_job                 = 66,  // strict issuer, hart 3: prepare one stripe's job (inclusive)
+    prep_validate            = 67,  // hart 3: potal_validate_execution_plan, inside 66
+    // H3-8I-25T sub-stages (inclusive parents: 23 prep.decode, 24 prep.plan, 59 mm.prep)
+    decode_validate          = 68,  // rmd::validate_packet inside residual::decode_packet
+    decode_rows              = 69,  // run list + digit rows inside residual::decode_packet
+    plan_tile                = 70,  // potal_make_tile_plan inside potal_paired_plan_stripe
+    plan_exec                = 71,  // potal_make_execution_plan inside potal_paired_plan_stripe
+    mm_options               = 72,  // caller: matmul options, layer name, checks, tile select (in 59)
+    mm_init_args             = 73,  // caller: init_args (activation buffers) (in 59)
+    mm_weights               = 74,  // caller: weight cache lookup (in 59)
+    // H3-8I-25V strict attention pipeline (matmul/attention.cpp execute_strict) and model markers
+    attn_local               = 75,  // hart 1/2: Q/P stripe rows: finite reads, ExSIA local stage (QK)
+    attn_stationary          = 76,  // hart 3: K/V stationary quantization and limbs (prepare_weight)
+    attn_fold                = 77,  // hart 3: anchor/shift or P scale+quantization, limbs, staging, plans
+    attn_issue               = 78,  // hart 0: the planned GEMM jobs of one attention stripe
+    attn_recon               = 79,  // hart 4: checked INT64 reconstruction and F32 output of one stripe
+    attn_node                = 80,  // caller: one strict attention node, setup to publication
+    model_inference          = 81,  // application: prompt evaluation plus generation
+    model_prefill            = 82,  // application: prompt evaluation up to the first token
+    model_decode             = 83,  // application: one decode step (stripe field = step index)
+    model_token              = 84,  // application: instant, one sampled token (work = token id)
 };
 
 enum class event : uint8_t {
@@ -138,6 +169,10 @@ struct thread_ring {
 extern bool g_on;
 // POTAL_TIMELINE_PROFILE=detail: per Scale/Index entry spans (high overhead). Default: window.
 extern bool g_detail;
+// POTAL_TIMELINE_PROFILE=coarse: no per-command accelerator (acc.*) spans; see op_profile().
+extern bool g_coarse;
+// set_recording() gate (default on): off drops every record before any ring write.
+extern std::atomic<bool> g_rec;
 extern thread_local thread_ring * t_ring;
 
 void note_unregistered() noexcept;
@@ -175,6 +210,19 @@ inline bool detail_profile() noexcept {
     return detail::g_detail && active();
 }
 
+// Per-op / per-window / per-command accelerator spans (acc.*): off in the coarse profile.
+inline bool op_profile() noexcept {
+    return active() && !detail::g_coarse;
+}
+
+// Recording gate (default on). Off: record()/record_mono() write nothing and count no
+// unregistered record; register_thread, begin_run, end_run and anchors are unaffected.
+void set_recording(bool on) noexcept;
+
+// POTAL_TIMELINE_REUSE=1: register_thread reuses the slot (ring, anchors, runs) of an exited
+// thread with the same role, hart and cpu; seq continues. Number of such reuses (0 without it).
+uint32_t reuse_count() noexcept;
+
 // Registers the calling thread (idempotent per thread). hart_id / cpu_id are the
 // expected placement (-1 = not pinned / unknown); the module records the actual
 // sched_getcpu() CPU, its /proc/cpuinfo hart and whether the affinity equals
@@ -209,6 +257,9 @@ stats_t stats() noexcept;
 inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uint32_t layer_id,
                         uint32_t stripe_id, uint32_t tile_id, uint32_t buffer_id, uint32_t edge_id,
                         uint64_t work, uint64_t mono) noexcept {
+    if (__builtin_expect(!detail::g_rec.load(std::memory_order_relaxed), 0)) {
+        return;
+    }
     if (__builtin_expect(!detail::g_on, 1)) {
         return;
     }
@@ -224,8 +275,10 @@ inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uin
         return;
     }
     record_t & e   = r->events[h];
-    e.t_local      = detail::now_local();
+    // The ring is demand-paged: store first, so a page fault precedes both clock reads below and
+    // t_local stays adjacent to the CLOCK_MONOTONIC stamp (I25Y).
     e.seq          = h;
+    e.t_local      = detail::now_local();
     e.thread_slot  = r->slot;
     e.stage        = static_cast<uint16_t>(st);
     e.event_type   = static_cast<uint8_t>(ev);

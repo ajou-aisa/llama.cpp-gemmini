@@ -73,6 +73,8 @@ struct result {
     uint64_t pv_bitplane_stripes = 0, pv_bitplane_jobs = 0;
     uint64_t loops = 0, fences = 0, scale_writes = 0, scale_releases = 0, tlb_flushes = 0;
     double scale_s = 0, issue_s = 0, fence_s = 0, reconstruct_s = 0;
+    // execute_strict (H3-8I-25V): stripes, and CPU numeric steps seen on the issuer (must stay 0).
+    uint64_t strict_tasks = 0, cpu_work_on_issuer_thread = 0, cpu_work_on_issuer_cpu = 0;
 };
 
 // The runner is the existing planned WS execution seam. Tests bind the
@@ -88,5 +90,14 @@ result execute(ggml_tensor * op, const planned_runner & run, const corrected_run
 planned_result run_corrected(const potal_stripe_gemm_desc & desc, const int32_t * bias, size_t columns,
                              const potal_paired_sink * sink = nullptr);
 result execute_hardware(ggml_tensor * op);
+
+// H3-8I-25V strict five-hart attention: the same stripes, operands, GEMMs and reconstruction as
+// execute(), bitwise identical, with every CPU numeric step on the hart-role threads (local 1/2,
+// fold 3, final 4, pinned to role_cpus when pin) and only the owner's planned runner on its thread
+// (hart 0 in the backend). Balanced PV and QK only; legacy PV is refused. execute_strict_hardware
+// binds the hart-0 issuer and the /proc/cpuinfo role CPUs.
+result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<int, 5> & role_cpus, bool pin,
+                      pv_algorithm algorithm = default_pv_algorithm);
+result execute_strict_hardware(ggml_tensor * op);
 
 } // namespace ggml::potal::attention

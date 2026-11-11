@@ -56,6 +56,13 @@ set_target_properties(potal-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRE
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-api-test COMMAND potal-api-test)
 endif()
+# The window calls of potal.h against the per-column calls, success and error paths.
+add_executable(potal-scale-window-test tests/potal-scale-window-test.cpp)
+target_link_libraries(potal-scale-window-test PRIVATE potal-api)
+target_compile_features(potal-scale-window-test PRIVATE cxx_std_17)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-scale-window-test COMMAND potal-scale-window-test)
+endif()
 add_executable(potal-attention-api-test tests/potal-attention-api-test.c)
 target_link_libraries(potal-attention-api-test PRIVATE potal-api)
 set_target_properties(potal-attention-api-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
@@ -305,6 +312,8 @@ set(POTAL_BACKEND_SOURCES
     quants/weight/hp1/hp1.hpp
     residual/stripe-residual.cpp
     residual/stripe-residual.hpp
+    trace/hw-window.cpp
+    trace/hw-window.hpp
     trace/timeline.cpp
     trace/timeline.hpp
     ${POTAL_GEMMINI_SHARED_SOURCES})
@@ -333,6 +342,7 @@ set(POTAL_LOG_DEFINITIONS
     ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS}
     GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_EXSIA_STRIPE_ANCHOR=${GGML_GEMMINI_EXSIA_STRIPE_ANCHOR}
     GGML_GEMMINI_CONFIGURED_DIM=${POTAL_HW_DIM}
     GGML_POTAL_PAIRED_AUTO=${_POTAL_PAIRED_AUTO_VALUE}
     GGML_GEMMINI_EXECUTION_BACKEND_HARDWARE=1
@@ -483,6 +493,23 @@ target_include_directories(potal-full-inference PRIVATE
 target_compile_features(potal-full-inference PRIVATE cxx_std_17)
 target_link_libraries(potal-full-inference PRIVATE llama ggml)
 
+# H3-8I-25V model-scale E2E runner (N-token prompt + M greedy tokens, per-step records).
+add_executable(potal-e2e-runner tests/potal-e2e-runner.cpp)
+target_compile_features(potal-e2e-runner PRIVATE cxx_std_17)
+target_link_libraries(potal-e2e-runner PRIVATE llama ggml)
+
+option(POTAL_ATTN_SWEEP "Build the I25X attention-only sweep tool" OFF)
+if (POTAL_ATTN_SWEEP)
+    add_executable(potal-attention-sweep tests/potal-attention-sweep.cpp)
+    potal_add_backend_settings(potal-attention-sweep)
+    target_include_directories(potal-attention-sweep PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(potal-attention-sweep PRIVATE -fno-fast-math)
+    target_link_libraries(potal-attention-sweep PRIVATE llama ggml)
+    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+        target_sources(potal-attention-sweep PRIVATE ${POTAL_BACKEND_SOURCES})
+    endif()
+endif()
+
 # Hardware-free checks (host and target): registration, supports_op contract,
 # packing against a CPU-backend golden, scheduler placement, no fake success.
 # The backend sources are compiled in because their functions are internal.
@@ -556,6 +583,18 @@ target_compile_definitions(potal-stripe-pipeline-test PRIVATE GGML_GEMMINI_TESTI
 target_link_libraries(potal-stripe-pipeline-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-stripe-pipeline-test COMMAND potal-stripe-pipeline-test)
+endif()
+
+# Hardware-free checks of the strict hardware timeline (trace/hw-window.hpp): the RTL-faithful model of the
+# early-event window and counter file, the checked C11 calls, the full strict route on the emulator, OFF
+# against ON command identity and failure injection. Emulator values are never hardware times.
+add_executable(potal-hw-timeline-test tests/potal-hw-timeline-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-hw-timeline-test)
+target_include_directories(potal-hw-timeline-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_definitions(potal-hw-timeline-test PRIVATE GGML_GEMMINI_TESTING)
+target_link_libraries(potal-hw-timeline-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-hw-timeline-test COMMAND potal-hw-timeline-test)
 endif()
 
 # Hardware-free checks (host and target) of the paired Main/Residual GEMM

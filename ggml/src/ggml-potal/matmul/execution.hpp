@@ -28,6 +28,25 @@ bool find_hart_cpu(unsigned hart, int & cpu, std::string & why);
 bool find_role_cpus(std::array<int, 5> & cpus, std::string & why);
 bool pin_role_cpu(int cpu, std::string & why);
 bool hart_roles_requested(bool & invalid);
+// H3-8I-25S GGML_POTAL_STRICT_ISSUER=ON|OFF|1|0 (opt-in, needs ROLES and the paired route):
+// hart 0 only issues jobs hart 3 prepared.
+bool strict_issuer_requested(bool & invalid);
+// find_role_cpus once per process (the hart/CPU map does not change at run time).
+bool cached_role_cpus(std::array<int, 5> & cpus, std::string & why);
+// Strict issuer: while alive, the calling thread keeps every CPU of its affinity but hart 0's;
+// the destructor restores the saved affinity (other modes of the same process are unaffected).
+class issuer_cpu_exclusion {
+  public:
+    issuer_cpu_exclusion() = default;
+    issuer_cpu_exclusion(const issuer_cpu_exclusion &) = delete;
+    issuer_cpu_exclusion & operator=(const issuer_cpu_exclusion &) = delete;
+    ~issuer_cpu_exclusion();
+    bool begin(std::string & why);
+
+  private:
+    bool          active_ = false;
+    unsigned char saved_[128]{};
+};
 
 // matmul/paired-auto.hpp (not included here: it includes this header through dense.hpp).
 struct potal_paired_request;

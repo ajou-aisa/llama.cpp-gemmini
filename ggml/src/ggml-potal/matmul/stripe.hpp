@@ -81,6 +81,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ggml::potal {
@@ -211,6 +212,15 @@ struct pipeline_config {
     bool            paired_next_k_prefetch = false;
     bool            paired_early_k_prefetch = false;
     potal_paired_stream_mode paired_stream = potal_paired_stream_mode::off;
+    // H3-8I-25S GGML_POTAL_STRICT_ISSUER=ON (needs hart_roles + paired, no stream): the
+    // producer (hart 3, inside submit) decodes the packet, plans, allocates the Residual C
+    // and prepares the executor's job (potal_paired_prepare) before READY; the issuer
+    // (hart 0) only issues it. A stripe the paired planner refuses fails the run.
+    bool            strict_issuer = false;
+    // H3-8I-25AC GGML_POTAL_STRICT_HW_TIMELINE=ON (strict Linear only, trace/hw-window.hpp).
+    bool            hw_timeline = false;
+    uint32_t        hw_node = 0;
+    uint8_t         hw_phase = 0;
     bool            measure_timing = true; // false: event timestamps and quant time are unmeasured
     // Optional; called on the thread of each step after its record, holding no
     // lock of the run (it may query or abort the run). Order across threads:
@@ -282,6 +292,9 @@ struct pipeline_counts {
     uint64_t paired_stream_batches = 0, paired_stream_capacity_boundaries = 0;
     uint64_t paired_residual_staging_bytes = 0, paired_residual_pitch_padding_bytes = 0;
     uint64_t paired_residual_valid_bytes = 0, paired_residual_load_bytes_declared = 0;
+    // Paired preparations (decode + plan + Residual C, plus the executor job in strict mode) by
+    // the thread and the CPU that ran them: the strict issuer's role-separation evidence.
+    uint64_t prepares_on_issuer_thread = 0, prepares_on_issuer_cpu = 0, prepares_on_producer = 0;
     double   act_quant_s                = 0; // ExSIA quantize_activation call, including producer capacity waits
     double   scale_s                    = 0; // guest seconds inside the GEMMs (owner thread)
     double   issue_s                    = 0;
@@ -347,7 +360,11 @@ class stripe_run {
     struct slot;
     struct stripe_result;
     struct stripe_work;
+    struct prep_outcome;
 
+    prep_outcome         prepare_paired(slot & s, stripe_work & work, bool has_paired_runner);
+    bool                 prepare_job(slot & s, prep_outcome & out); // strict issuer: on the producer
+    potal_paired_request paired_request(const slot & s, stripe_work & work) const;
     stripe_result execute(slot & s, const stripe_event & main_begin, const owner_runners & runners);
     stripe_result finalize(slot & s, stripe_work & work);
     void          finalizer_loop();
@@ -384,6 +401,7 @@ class stripe_run {
     std::vector<std::unique_ptr<slot>> slots_;
     std::deque<slot *>                 ready_;
     std::deque<std::pair<slot *, std::shared_ptr<stripe_work>>> final_ready_;
+    std::atomic<std::thread::id>       issuer_thread_{};
     bool                               device_done_ = false;
     bool                               closing_     = false;
     bool                               failed_      = false;
