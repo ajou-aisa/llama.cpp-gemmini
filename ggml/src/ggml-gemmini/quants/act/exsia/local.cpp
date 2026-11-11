@@ -1,5 +1,6 @@
 #include "local.hpp"
 #include "exsia_shift.hpp"
+#include "../../common/rounding.hpp"
 #include "ggml.h"
 
 #include <algorithm>
@@ -46,9 +47,7 @@ static inline int32_t quantize_to_i32(float x, int16_t theta) {
     if (scaled >= max_i32)
         return std::numeric_limits<int32_t>::max();
 
-    const int32_t truncated = static_cast<int32_t>(scaled);
-    const double fraction = scaled - static_cast<double>(truncated);
-    return truncated + int(fraction >= 0.5) - int(fraction <= -0.5);
+    return round_nearest_even_i32(scaled);
 }
 
 static inline int64_t magnitude_i32(int32_t value) noexcept {

@@ -97,6 +97,16 @@ static inline int q4_hp1_block_exponent(float amax) {
     return ilogbf(amax) - 2;
 }
 
+// MXINT4/8 normalized magnitudes fit in int. Truncation and the exact fractional
+// remainder avoid both fenv dependence and false ties from adding 0.5f.
+static inline int mxint_round_to_even(float x) {
+    const float magnitude = fabsf(x);
+    const int integral = (int) magnitude;
+    const float fraction = magnitude - (float) integral;
+    const int rounded = integral + (fraction > 0.5f || (fraction == 0.5f && (integral & 1)));
+    return x < 0.0f ? -rounded : rounded;
+}
+
 static bool quantize_q4_hp1_input_valid(const float * x, int64_t k) {
     for (int64_t i = 0; i < k; ++i) {
         if (!isfinite(x[i])) {
@@ -154,8 +164,8 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) (block_exponent - channel_exponent);
         for (int j = 0; j < QK4_HP/2; ++j) {
-            const int q0 = MIN(7, MAX(-7, (int) roundf(x[i*QK4_HP + j] / block_scale)));
-            const int q1 = MIN(7, MAX(-7, (int) roundf(x[i*QK4_HP + QK4_HP/2 + j] / block_scale)));
+            const int q0 = MIN(7, MAX(-7, mxint_round_to_even(x[i*QK4_HP + j] / block_scale)));
+            const int q1 = MIN(7, MAX(-7, mxint_round_to_even(x[i*QK4_HP + QK4_HP/2 + j] / block_scale)));
             y[i].qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
         }
     }
@@ -521,7 +531,7 @@ bool quantize_row_q8_hp1_ref(const float * GGML_RESTRICT x, block_q8_hp1 * GGML_
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) (block_exponent - channel_exponent);
         for (int j = 0; j < QK8_HP; ++j) {
-            const int q = (int) roundf(x[i*QK8_HP + j] / block_scale);
+            const int q = mxint_round_to_even(x[i*QK8_HP + j] / block_scale);
             y[i].qs[j] = (int8_t) MIN(127, MAX(-127, q));
         }
     }
