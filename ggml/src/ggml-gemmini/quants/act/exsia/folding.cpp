@@ -3,24 +3,35 @@
 #include "ggml-gemmini-args.h"
 #include "../../../ggml-gemmini-evaluation-observer.hpp"
 
+#include <algorithm>
+#include <cassert>
 #include <limits>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace ggml::gemmini::quants::act::exsia {
 using namespace detail;
 
-void OutlierMarker::mark_outlier(StripeState &   stripe,
-                                 size_t          row,
-                                 size_t          blk_idx,
-                                 size_t          blk_size,
-                                 const BitMask & d_mask) const {
-    size_t       n         = blk_size;
-    const size_t local_row = stripe.local_row(row);
-    for (size_t i = 0; i < n; ++i) {
-        size_t col = blk_idx * n + i;
-        if (d_mask.is_set(0, i))
-            stripe.outlier_mask.set(local_row, col);
+void OutlierMarker::mark_valid_range(StripeState & stripe,
+                                     size_t        row,
+                                     size_t        col_begin,
+                                     size_t        col_end) const {
+    BitMask &    mask = stripe.outlier_mask;
+    const size_t base = stripe.local_row(row) * mask.cols;
+    assert(col_begin <= col_end && col_end <= mask.cols);
+    // Whole-word ORs over the row's bit range: the same final words as one BitMask::set per column.
+    for (size_t idx = base + col_begin, end = base + col_end; idx < end;) {
+        const size_t   lo   = idx % 64;
+        const size_t   n    = std::min<size_t>(64 - lo, end - idx);
+        const uint64_t bits = (n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1) << lo;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp atomic update
+        mask.words[idx / 64] |= bits;
+#else
+        mask.words[idx / 64] |= bits;
+#endif
+        idx += n;
     }
 }
 
@@ -28,7 +39,7 @@ std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q, bool 
     constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
     constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
     const int32_t     sat  = q > qmax ? qmax : (q < qmin ? qmin : q);
-    if (!decompose)
+    if (!decompose || q == sat)
         return {sat, 0};
     // u = sum_l L_l 2^(n l) with signed n-bit limbs. L0 is the balanced low digit, so it fits the
     // dense operand, and u - L0 is a multiple of 2^n: the RMD builders see lane 0 == 0 and stack
@@ -124,53 +135,62 @@ bool StripeFolding::run(Meta &                           meta,
             const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
                                               ? 0
                                               : static_cast<int16_t>(block_exp - stripe.e_s);
-            if (stripe.promote_top_block && block_exp > stripe.e_s) {
-                BitMask & block_inlier_mask = stripe.scratch.folding_inlier_mask;
-                block_inlier_mask.clear_active_bits();
-
+            // Select masked correction or whole-block correction once per block.
+            const detail::PreparedShift shift(delta_theta_b);
+            const auto fold_block = [&](auto selection) -> bool {
                 for (size_t i = 0; i < state.B_size; ++i) {
-                    const size_t col = block_offset + i;
-                    if (col < args.K && !stripe.outlier_mask.is_set(local_row, col))
-                        block_inlier_mask.set(0, i);
-                }
-                unit_outlier_.mark_outlier(stripe, r, b, state.B_size, block_inlier_mask);
-            }
+                    const size_t  col        = block_offset + i;
+                    const size_t  padded_idx = local_row * state.K_padded + col;
+                    const int32_t q_shifted =
+                        shift(stripe_q_wide[padded_idx]);
+                    bool outlier;
+                    if constexpr (decltype(selection)::value == 2)
+                        outlier = col < args.K;
+                    else
+                        outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
+                    // Outliers and promoted top blocks keep their low limb in the dense operand and
+                    // carry the higher limbs as residual; every other position saturates.
+                    const auto [q8, residual_i32] = unit_clip_.clip_with_residual(
+                        q_shifted, outlier && GGML_GEMMINI_ENABLE_RMD);
 
-            for (size_t i = 0; i < state.B_size; ++i) {
-                const size_t  col        = block_offset + i;
-                const size_t  padded_idx = local_row * state.K_padded + col;
-                const int32_t q_shifted =
-                    detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
-                const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                // Keep a low limb only when the higher limbs have a compensation consumer.
-                // With RMD disabled, outliers follow the same saturation rule as other values.
-                const bool decompose = outlier && GGML_GEMMINI_ENABLE_RMD;
-                const auto [q8, residual_i32] = unit_clip_.clip_with_residual(q_shifted, decompose);
-
-                if (col < args.K)
-                    if (!args.A.set(r, col, q8))
-                        return false;
+                    if (col < args.K)
+                        if (!args.A.set(r, col, q8))
+                            return false;
 
 #if GGML_GEMMINI_ACT_QUANT_METRICS
-                if (col < args.K && args.evaluation_context)
-                    args.evaluation_context->position(r, col, outlier, residual_i32 != 0);
+                    if (col < args.K && args.evaluation_context)
+                        args.evaluation_context->position(r, col, outlier, residual_i32 != 0);
 #endif
 #if EXSIA_STAGE_PROFILE_ENABLED
-                stripe.selected_positions += outlier;
-                stripe.residual_nnz += residual_i32 != 0;
+                    stripe.selected_positions += outlier;
+                    stripe.residual_nnz += residual_i32 != 0;
 #endif
 #if EXSIA_VALIDATION
-                const size_t global_idx = r * state.K_padded + col;
-                GGML_ASSERT(global_idx < residual.size());
-                residual[global_idx] = residual_i32;
+                    const size_t global_idx = r * state.K_padded + col;
+                    GGML_ASSERT(global_idx < residual.size());
+                    residual[global_idx] = residual_i32;
 #endif
 
 #if GGML_GEMMINI_ENABLE_RMD
-                if (outlier && residual_i32 != 0 &&
-                    !rmd_builder.add_residual(local_row, col, residual_i32)) {
-                    return false;
-                }
+                    if (outlier && residual_i32 != 0 &&
+                        !rmd_builder.add_residual(local_row, col, residual_i32)) {
+                        return false;
+                    }
 #endif
+                }
+                return true;
+            };
+
+            if (stripe.promote_top_block && block_exp > stripe.e_s) {
+                // The valid columns are still marked, in one range write: the RMD bitmap builder
+                // reads outlier_mask as its selection.
+                if (block_offset < args.K)
+                    unit_outlier_.mark_valid_range(
+                        stripe, r, block_offset, std::min(block_offset + state.B_size, args.K));
+                if (!fold_block(std::integral_constant<int, 2>{}))
+                    return false;
+            } else if (!fold_block(std::integral_constant<int, 1>{})) {
+                return false;
             }
         }
     }

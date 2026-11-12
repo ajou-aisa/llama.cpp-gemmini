@@ -482,10 +482,18 @@ void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool
         if (mask.live.empty()) upper({0, residual.m, 0, w.n});
         else for (const auto & region : residual_regions) upper(region);
     }
+    // Finite F32 operand scales keep these factors and INT64 products normal in double.
+    const bool share_scales = st.rows > 1;
+    std::vector<double> scales(share_scales ? w.n : 0);
+    if (share_scales)
+        for (size_t j = 0; j < w.n; ++j)
+            scales[j] = std::ldexp(1.0, st.scale+w.base[j]);
     for (size_t i = 0; i < st.rows; ++i)
         for (size_t j = 0; j < w.n; ++j) {
             if (!qk) scaled_add(acc[i*w.n+j], w.colsum[j], pe_bits-1);
-            const float value = static_cast<float>(std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base[j]));
+            const double scaled = share_scales ? static_cast<double>(acc[i*w.n+j])*scales[j] :
+                std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base[j]);
+            const float value = static_cast<float>(scaled);
             require(std::isfinite(value), RmdStatus::overflow);
             output[i*w.n+j] = value;
         }
