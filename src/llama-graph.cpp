@@ -1193,7 +1193,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_mask,
          ggml_tensor * v_mla,
              bool      v_trans,
-             float     kq_scale) const {
+             float     kq_scale,
+         const ggml_gemmini_kv_cache_info * kv_info) const {
+#if !GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    GGML_UNUSED(kv_info);
+#endif
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
     const std::string attention_layer = q->name;
 #endif
@@ -1265,6 +1269,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * const potal_kq = kq;
         if (potal_attention && quant_qk) {
             ggml_gemmini_set_attention_role(kq, GGML_GEMMINI_ATTENTION_QK);
+            if (kv_info && !v_mla) ggml_gemmini_set_attention_kv_cache(kq, kv_info);
             ggml_format_name(kq,"qk-%s",attention_layer.c_str());
             kq->src[2] = kq_mask;
         }
@@ -1307,6 +1312,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (potal_attention && (quant_qk || quant_pv)) {
             if (quant_pv) {
                 ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
+                if (kv_info && !v_mla && v_trans) ggml_gemmini_set_attention_kv_cache(kqv, kv_info);
                 ggml_format_name(kqv,"pv-%s",attention_layer.c_str());
             }
             ggml_backend_t selected = nullptr;
@@ -1532,7 +1538,9 @@ ggml_tensor * llm_graph_context::build_attn(
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
     ggml_format_name(q,"layer-%d",il);
 #endif
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
+    const auto kv_info = kv_self->kv_attention_info(il);
+    const auto * kv_info_ptr = kv_info.revision && kv_info.begin < kv_info.end ? &kv_info : nullptr;
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale, kv_info_ptr);
     cb(cur, "kqv_out", il);
 
     if (wo) {

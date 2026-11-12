@@ -7,6 +7,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -30,6 +31,9 @@ llama_kv_cache_unified::llama_kv_cache_unified(
                      bool   offload,
                  uint32_t   kv_size,
                  uint32_t   padding) : model(model), hparams(model.hparams), v_trans(v_trans), padding(padding) {
+    static std::atomic<uint64_t> next_instance{1};
+    attention_instance = next_instance.fetch_add(1, std::memory_order_relaxed);
+    GGML_ASSERT(attention_instance != 0);
     const int32_t n_layer = hparams.n_layer;
 
     has_shift = false;
@@ -134,6 +138,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 }
 
 void llama_kv_cache_unified::clear() {
+    invalidate_attention_cache();
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -147,6 +152,7 @@ void llama_kv_cache_unified::clear() {
 }
 
 bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    invalidate_attention_cache();
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -190,6 +196,7 @@ bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 }
 
 void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    invalidate_attention_cache();
     if (seq_id_src == seq_id_dst) {
         return;
     }
@@ -213,6 +220,7 @@ void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
+    invalidate_attention_cache();
     uint32_t new_head = size;
 
     for (uint32_t i = 0; i < size; ++i) {
@@ -240,6 +248,7 @@ void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    invalidate_attention_cache();
     if (delta == 0) {
         return;
     }
@@ -284,6 +293,7 @@ void llama_kv_cache_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_kv_cache_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    invalidate_attention_cache();
     if (d == 1) {
         return;
     }
@@ -331,6 +341,8 @@ void llama_kv_cache_unified::restore() {
         return;
     }
 
+    invalidate_attention_cache();
+
     uint32_t new_head = size;
 
     for (auto & range : pending.ranges) {
@@ -364,6 +376,9 @@ void llama_kv_cache_unified::commit() {
 }
 
 bool llama_kv_cache_unified::update(llama_context & lctx) {
+    if (has_shift || do_defrag) {
+        invalidate_attention_cache();
+    }
     bool need_reserve = false;
 
     auto * sched = lctx.get_sched();
@@ -527,6 +542,15 @@ bool llama_kv_cache_unified::find_slot(
 
     pending.ranges.push_back({head, head + n_tokens});
 
+    if (head != attention_frontier) {
+        invalidate_attention_cache();
+    }
+    ++attention_revision;
+    GGML_ASSERT(attention_revision != 0);
+    attention_begin = head;
+    attention_end = head + n_tokens;
+    attention_frontier = attention_end;
+
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // after enough generations, the benefit from this heuristic disappears
     // if we start defragmenting the cache, the benefit from this will be more important
@@ -535,6 +559,17 @@ bool llama_kv_cache_unified::find_slot(
     //printf("n = %5d, used = %5d, head = %5d\n", n, used, head);
 
     return true;
+}
+
+void llama_kv_cache_unified::invalidate_attention_cache() {
+    ++attention_epoch;
+    GGML_ASSERT(attention_epoch != 0);
+    attention_frontier = 0;
+    attention_begin = attention_end = 0;
+}
+
+ggml_gemmini_kv_cache_info llama_kv_cache_unified::kv_attention_info(uint32_t layer) const {
+    return {attention_instance, attention_epoch, attention_revision, layer, attention_begin, attention_end};
 }
 
 int32_t llama_kv_cache_unified::get_n_tokens() const {
@@ -1044,6 +1079,7 @@ void llama_kv_cache_unified::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_kv_cache_unified::state_read(llama_io_read_i & io, llama_seq_id seq_id) {
+    invalidate_attention_cache();
     uint32_t cell_count;
     io.read_to(&cell_count, sizeof(cell_count));
 

@@ -13,6 +13,7 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_gemmini_kv_cache_info;
 
 struct llama_ubatch;
 struct llama_cparams;
@@ -514,7 +515,8 @@ struct llm_graph_context {
              ggml_tensor * kq_mask,
              ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                     bool   v_trans,
-                   float   kq_scale) const;
+                   float   kq_scale,
+             const ggml_gemmini_kv_cache_info * kv_info = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

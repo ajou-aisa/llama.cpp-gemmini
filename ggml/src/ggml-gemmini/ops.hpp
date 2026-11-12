@@ -8,6 +8,7 @@
 struct ggml_backend_gemmini_context {
     std::string model_arch;
     ggml::gemmini::AttentionMetrics attention;
+    ggml::gemmini::AttentionCache attention_cache;
 };
 
 void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst);

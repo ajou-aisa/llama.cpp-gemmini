@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include "ggml-cpp.h"
+#include "ggml-gemmini.h"
 
 #include <set>
 #include <vector>
@@ -158,6 +159,8 @@ public:
     // to the first cell of the slot.
     bool find_slot(const llama_ubatch & batch) override;
 
+    ggml_gemmini_kv_cache_info kv_attention_info(uint32_t layer) const;
+
     int32_t get_n_tokens()   const override;
     int32_t get_used_cells() const override;
 
@@ -184,6 +187,15 @@ public:
     std::vector<ggml_tensor *> v_l;
 
 private:
+    uint64_t attention_instance;
+    uint64_t attention_epoch = 1;
+    uint64_t attention_revision = 0;
+    uint32_t attention_begin = 0;
+    uint32_t attention_end = 0;
+    uint32_t attention_frontier = 0;
+
+    void invalidate_attention_cache();
+
     const llama_model & model;
     const llama_hparams & hparams;
 
