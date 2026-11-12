@@ -69,7 +69,8 @@ int read_run_weight_i8(void * opaque, size_t row, size_t column, size_t count, i
     const auto & weights = work.original_weights ? *work.original_weights : request.weights;
     const int32_t   minimum = request.operand_bits == 4 ? -8 : -128;
     const int32_t   maximum = request.operand_bits == 4 ? 7 : 127;
-    const int32_t * source  = weights.data() + row * request.n + work.column_begin + column;
+    const size_t stride = work.original_weights && work.original_stride ? work.original_stride : request.n;
+    const int32_t * source  = weights.data() + row * stride + work.column_begin + column;
     for (size_t index = 0; index < count; ++index) {
         if (source[index] < minimum || source[index] > maximum)
             return IM2P_INVALID_LAYOUT;
@@ -87,7 +88,8 @@ int read_run_scale(void * opaque, size_t run, size_t column, size_t count, uint3
     const auto & request = *work.request;
     const auto & carriers = work.original_carriers ? *work.original_carriers : request.carriers;
     if (work.original_carriers) run = request.runs[run].original_block_id;
-    const uint32_t * source = carriers.data() + run * request.n + work.column_begin + column;
+    const size_t stride = work.original_carriers && work.original_stride ? work.original_stride : request.n;
+    const uint32_t * source = carriers.data() + run * stride + work.column_begin + column;
     for (size_t index = 0; index < count; ++index) {
         if (!quants::hp1::valid_carrier(source[index]))
             return IM2P_INVALID_LAYOUT;
@@ -135,11 +137,12 @@ RmdStatus prepare_run_view(const Im2pRunAwareWork &           work,
         (carriers = request.runs.size() * request.n, request.activations.size() != activations))
         return RmdStatus::invalid_arguments;
     if (work.original_weights || work.original_carriers) {
+        const size_t stride = work.original_stride ? work.original_stride : request.n;
         if (!work.original_weights || !work.original_carriers ||
             !request.weights.empty() || !request.carriers.empty() ||
-            request.original_k > SIZE_MAX / request.n ||
-            work.original_weights->size() < request.original_k * request.n ||
-            work.original_carriers->size() != ((request.original_k - 1) / 32 + 1) * request.n)
+            stride < request.n || request.original_k > SIZE_MAX / stride ||
+            work.original_weights->size() < request.original_k * stride ||
+            work.original_carriers->size() != ((request.original_k - 1) / 32 + 1) * stride)
             return RmdStatus::invalid_arguments;
     } else if (request.weights.size() != weights || request.carriers.size() != carriers) {
         return RmdStatus::invalid_arguments;

@@ -175,6 +175,7 @@ struct Im2pRunAwareWork {
     // Borrow original K-major operands for synchronous reads through request->runs.
     const std::vector<int32_t> *                           original_weights = nullptr;
     const std::vector<uint32_t> *                          original_carriers = nullptr;
+    size_t original_stride = 0; // zero uses request->n
     size_t row_begin = 0, row_count = 0;       // 0 count uses the remaining rows
     size_t column_begin = 0, column_count = 0; // views retain the request's K runs and strides
     gemmini_cycle_record_v2                                timing_identity{};

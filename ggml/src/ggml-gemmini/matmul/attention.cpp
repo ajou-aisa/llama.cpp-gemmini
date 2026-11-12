@@ -141,13 +141,8 @@ struct StreamStripe {
     rmd::StripePacketHandle upper;
 };
 
-struct StreamWorkspace {
-    std::vector<uint64_t> selected;
-    rmd::RmdBitmapBuilder builder;
-};
-
 StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t begin,
-                    size_t rows, size_t n, bool qk, int selected_anchor, StreamWorkspace & workspace) {
+                    size_t rows, size_t n, bool qk, int selected_anchor) {
     const size_t k = t.ne[0], kp = rmd::align_up(k, bk), blocks = kp/bk;
     StreamStripe st{rows, kp, 0, std::vector<int8_t>(rows*kp), {}};
     std::vector<float> values(rows*kp);
@@ -157,8 +152,6 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
             require(qk || (values[i*kp+c] >= 0 && values[i*kp+c] <= 1));
         }
     std::vector<int32_t> codes(rows*kp);
-    std::vector<int16_t> exponents(qk ? rows*blocks : 0);
-    int16_t anchor = 0;
     exsia::ExpScanner scanner;
     if (qk) {
         exsia::Meta meta;
@@ -172,6 +165,7 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
         require(scratch.prepare(bk), RmdStatus::allocation_failure);
         exsia::LocalStage local;
         exsia::StripeState stripe;
+        std::vector<int16_t> exponents(rows*blocks);
         for (size_t i = 0; i < rows; ++i) {
             for (size_t b = 0; b < blocks; ++b) {
                 uint64_t mask_word = 0;
@@ -188,33 +182,35 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
                 scanner.update_stripe_top3_exp(stripe, exponents[i*blocks+b]);
             }
         }
-        anchor = selected_anchor == 3 && stripe.e3 != neg
+        const int16_t anchor = selected_anchor == 3 && stripe.e3 != neg
             ? stripe.e3 : stripe.e2 != neg ? stripe.e2 : stripe.e1 != neg ? stripe.e1 : 0;
         st.scale = anchor-meta.rho;
+        for (size_t i = 0; i < rows; ++i)
+            for (size_t c = 0; c < k; ++c) {
+                const int16_t e = exponents[i*blocks+c/bk];
+                const int16_t delta = e == neg ? 0 : e-anchor;
+                codes[i*kp+c] = exsia::detail::shift_q_i32(codes[i*kp+c], delta);
+            }
     } else {
         const float maximum = *std::max_element(values.begin(), values.end());
         st.scale = (maximum > 0 ? scanner.unbiased_exp(maximum) : 0)-(code_bits-1);
         exsia::WideQuantizer quantizer;
         quantizer.quantize_block(values.data(), values.size(), static_cast<int16_t>(st.scale), codes);
     }
-    workspace.selected.resize((rows*kp+63)/64, UINT64_MAX);
-    auto & builder = workspace.builder;
-    builder.reset(begin, begin, rows, k, n, pe_bits, workspace.selected, kp);
+    std::vector<uint64_t> selected((rows*kp+63)/64, UINT64_MAX);
+    rmd::RmdBitmapBuilder builder;
+    builder.reset(begin, begin, rows, k, n, pe_bits, selected, kp);
     require(builder.status() == RmdStatus::success, builder.status());
     for (size_t i = 0; i < rows; ++i) {
-        for (size_t b = 0; b < blocks; ++b) {
-            const int16_t e = qk ? exponents[i*blocks+b] : neg;
-            const exsia::detail::PreparedShift shift(e == neg ? 0 : e-anchor);
-            for (size_t c = b*bk; c < std::min(k, (b+1)*bk); ++c) {
-                const size_t index = i*kp+c;
-                const int32_t code = qk ? shift(codes[index]) : std::clamp(codes[index], 0, (1 << code_bits)-1);
-                const int32_t main = lowdigit(code - (qk ? 0 : zero_point), pe_bits);
-                st.main[index] = static_cast<int8_t>(main);
-                // Packet lane 0 represents original lane 1. Dividing by the radix avoids
-                // overflowing INT32 when a positive saturated code has low digit -1.
-                const int32_t upper = static_cast<int32_t>((int64_t(code)-main-(qk ? 0 : zero_point))/radix);
-                if (upper && !builder.emit(i, c, upper)) throw builder.status();
-            }
+        for (size_t c = 0; c < k; ++c) {
+            const size_t index = i*kp+c;
+            const int32_t code = qk ? codes[index] : std::clamp(codes[index], 0, (1 << code_bits)-1);
+            const int32_t main = lowdigit(code - (qk ? 0 : zero_point), pe_bits);
+            st.main[index] = static_cast<int8_t>(main);
+            // Packet lane 0 represents original lane 1. Dividing by the radix avoids
+            // overflowing INT32 when a positive saturated code has low digit -1.
+            const int32_t upper = static_cast<int32_t>((int64_t(code)-main-(qk ? 0 : zero_point))/radix);
+            if (upper && !builder.emit(i, c, upper)) throw builder.status();
         }
     }
     if (!builder.empty()) {
@@ -344,7 +340,7 @@ struct ScuGemm {
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (!w.gpu) {
             w.gpu.reset(ggml_cuda_potal_attention_create(w.codes[0].data(),
-                w.codes[1].empty() ? nullptr : w.codes[1].data(), w.carriers.data(), w.n, w.kp, pe_bits));
+                w.codes[1].empty() ? nullptr : w.codes[1].data(), w.carriers.data(), w.packed_columns(), w.kp, pe_bits));
         }
         std::vector<ggml_cuda_potal_attention_fragment> fragments;
         if (runs) for (const auto & run : *runs) {
@@ -381,10 +377,10 @@ struct ScuGemm {
         dot.activation_row_stride_bytes = st.kp;
         dot.weights = w.codes[pass].data()+region.column;
         dot.columns = region.columns;
-        dot.weight_row_stride = w.n;
+        dot.weight_row_stride = w.packed_columns();
         dot.k = w.k;
         dot.scu_carriers = w.carriers.data()+region.column;
-        dot.scu_row_stride = w.n;
+        dot.scu_row_stride = w.packed_columns();
         dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
         dot.trace_role = GEMMINI_TRACE_ROLE_DENSE;
         dot.timing_identity.interval.layer = layer;
@@ -405,7 +401,7 @@ struct ScuGemm {
         }
 #endif
         software(st.main.data()+region.row*st.kp, region.rows, st.kp, w.codes[pass].data()+region.column,
-                 region.columns, w.k, w.n, w.carriers.data()+region.column, out);
+                 region.columns, w.k, w.packed_columns(), w.carriers.data()+region.column, out);
 #endif
     }
     void run(const rmd::RunAwareRequest & request, const Stationary & w, size_t pass,
@@ -415,6 +411,7 @@ struct ScuGemm {
         work.request = &request;
         work.original_weights = &w.codes[pass];
         work.original_carriers = &w.carriers;
+        work.original_stride = w.packed_columns();
         work.row_begin = region.row;
         work.row_count = region.rows;
         work.column_begin = region.column;
@@ -433,7 +430,7 @@ struct ScuGemm {
         }
 #endif
         software(request.activations.data()+region.row*request.k, region.rows, request.k,
-                 w.codes[pass].data()+region.column, region.columns, request.k, request.n,
+                 w.codes[pass].data()+region.column, region.columns, request.k, w.packed_columns(),
                  w.carriers.data()+region.column, out, &request.runs);
 #endif
     }
@@ -548,7 +545,6 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, A
         const QkMask mask(qk ? op->src[2] : nullptr, rows, n, schedule);
         const size_t head_repeat = b.ne[2]/a.ne[2], batch_repeat = b.ne[3]/a.ne[3];
         std::vector<float> staged(size_t(ggml_nelements(op)));
-        StreamWorkspace workspace;
         AttentionMetrics pending = metrics;
         ggml_gemmini_kv_cache_info info{};
         const bool annotated = cache && ggml_gemmini_get_attention_kv_cache(op, &info);
@@ -592,7 +588,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, A
                 for (size_t batch = ab*batch_repeat; batch < (ab+1)*batch_repeat; ++batch)
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
-                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk, selected_anchor, workspace);
+                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk, selected_anchor);
                             multiply(scu, st, w, qk, begin, mask,
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }

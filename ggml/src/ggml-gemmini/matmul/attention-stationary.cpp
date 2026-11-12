@@ -63,6 +63,18 @@ AttentionPreparation prepare_attention_stationary(
     const size_t k = input.tensor.ne[0], n = input.tensor.ne[1];
     const size_t blocks = (k + block_size - 1)/block_size, kp = blocks*block_size;
     const bool reshape = !w.packed_valid || w.k != k || w.n != n;
+    size_t stride = input.qk && input.reuse ? w.packed_columns() : n;
+    if (input.qk && stride < n) {
+        require(stride <= SIZE_MAX / 2, rmd::RmdStatus::overflow);
+        stride = std::max(n, stride * 2);
+    }
+    if (input.qk) {
+        require(stride <= SIZE_MAX - 31, rmd::RmdStatus::overflow);
+        stride = (stride + 31) / 32 * 32;
+    }
+    require(stride >= n && kp <= SIZE_MAX / stride, rmd::RmdStatus::overflow);
+    const bool repack = !w.packed_valid || !input.reuse || stride != w.packed_columns() ||
+        (input.qk ? w.k != k || n < w.n : w.n != n || k < w.k);
     w.packed_valid = false;
     w.columns.resize(n);
     for (auto & column : w.columns) column.resize(blocks);
@@ -137,18 +149,19 @@ AttentionPreparation prepare_attention_stationary(
     w.k = k;
     w.n = n;
     w.kp = kp;
+    w.column_stride = stride;
     w.base.resize(n);
-    w.carriers.resize(blocks*n);
-    w.codes[0].resize(kp*n);
-    w.codes[1].resize(input.qk ? kp*n : 0);
+    w.carriers.resize(blocks*stride);
+    w.codes[0].resize(kp*stride);
+    w.codes[1].resize(input.qk ? kp*stride : 0);
     w.colsum.assign(input.qk ? 0 : n, 0);
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
     w.gpu.reset();
 #endif
-    // K's n-stride changes on append. Repack cached digits without repeating
-    // quantization; V's changing minimum base requires re-encoding carriers.
+    // Grow K's physical pitch geometrically. Logical append no longer rewrites
+    // old limbs; V keeps its pitch and only overwrites changed token blocks.
     for (size_t j = 0; j < n; ++j) {
-        if (!reshape && input.reuse && input.qk && (j < input.begin || j >= input.end)) continue;
+        if (!repack && input.reuse && input.qk && (j < input.begin || j >= input.end)) continue;
         int16_t base = std::numeric_limits<int16_t>::max();
         for (const auto & block : w.columns[j])
             if (block.theta != zero_exp) base = std::min(base, block.theta);
@@ -156,16 +169,16 @@ AttentionPreparation prepare_attention_stationary(
         for (size_t b = 0; b < blocks; ++b) {
             const auto & block = w.columns[j][b];
             require(quants::hp1::encode_carrier(
-                block.theta == zero_exp ? zero_exp : block.theta-w.base[j], w.carriers[b*n+j]));
-            if (reshape || !input.reuse || input.qk ||
+                block.theta == zero_exp ? zero_exp : block.theta-w.base[j], w.carriers[b*stride+j]));
+            if (repack || input.qk ||
                 (b*block_size < input.end && (b+1)*block_size > input.begin))
                 for (size_t c = 0; c < block_size; ++c) {
-                    const size_t index = (b*block_size+c)*n+j;
+                    const size_t index = (b*block_size+c)*stride+j;
                     w.codes[0][index] = block.low[c];
                     if (input.qk) w.codes[1][index] = block.high[c];
                 }
-            if (!input.qk && w.carriers[b*n+j] != quants::hp1::zero_carrier)
-                add_scaled(w.colsum[j], block.sum, w.carriers[b*n+j]);
+            if (!input.qk && w.carriers[b*stride+j] != quants::hp1::zero_carrier)
+                add_scaled(w.colsum[j], block.sum, w.carriers[b*stride+j]);
         }
     }
     w.packed_valid = true;

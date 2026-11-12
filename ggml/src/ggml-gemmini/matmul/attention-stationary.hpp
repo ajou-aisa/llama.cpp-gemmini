@@ -22,6 +22,8 @@ struct AttentionBlock {
 
 struct AttentionStationary {
     size_t k = 0, n = 0, kp = 0;
+    size_t column_stride = 0;
+    size_t packed_columns() const { return column_stride ? column_stride : n; }
     std::vector<int16_t> base;
     std::vector<uint32_t> carriers;
     std::array<std::vector<int32_t>, 2> codes;
