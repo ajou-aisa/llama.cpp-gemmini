@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace ggml::gemmini {
@@ -141,8 +142,14 @@ struct StreamStripe {
     rmd::StripePacketHandle upper;
 };
 
+struct StreamWorkspace {
+    std::vector<uint64_t> selected;
+    rmd::RmdBitmapBuilder builder;
+};
+
 StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t begin,
-                    size_t rows, size_t n, bool qk, int selected_anchor) {
+                    size_t rows, size_t n, bool qk, int selected_anchor,
+                    StreamWorkspace * workspace = nullptr) {
     const size_t k = t.ne[0], kp = rmd::align_up(k, bk), blocks = kp/bk;
     StreamStripe st{rows, kp, 0, std::vector<int8_t>(rows*kp), {}};
     std::vector<float> values(rows*kp);
@@ -197,9 +204,12 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
         exsia::WideQuantizer quantizer;
         quantizer.quantize_block(values.data(), values.size(), static_cast<int16_t>(st.scale), codes);
     }
-    std::vector<uint64_t> selected((rows*kp+63)/64, UINT64_MAX);
-    rmd::RmdBitmapBuilder builder;
-    builder.reset(begin, begin, rows, k, n, pe_bits, selected, kp);
+    std::optional<StreamWorkspace> local_workspace;
+    if (!workspace) local_workspace.emplace();
+    auto & scratch = workspace ? *workspace : *local_workspace;
+    scratch.selected.assign((rows*kp+63)/64, UINT64_MAX);
+    auto & builder = scratch.builder;
+    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp);
     require(builder.status() == RmdStatus::success, builder.status());
     for (size_t i = 0; i < rows; ++i) {
         for (size_t c = 0; c < k; ++c) {
@@ -541,6 +551,10 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, A
         const int selected_anchor = sensitivity::anchor(op);
         const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
         const size_t rows = b.ne[1], n = a.ne[1], rs = stripe_rows(rows, n, b.ne[0]);
+        // Single-query decode reuses scratch across heads/batches in this call.
+        // Multi-row prefill keeps the original stripe-local lifetime.
+        std::optional<StreamWorkspace> decode_workspace;
+        if (rows == 1) decode_workspace.emplace();
         const auto schedule = qk ? qk_schedule() : QkSchedule::full;
         const QkMask mask(qk ? op->src[2] : nullptr, rows, n, schedule);
         const size_t head_repeat = b.ne[2]/a.ne[2], batch_repeat = b.ne[3]/a.ne[3];
@@ -588,7 +602,8 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, A
                 for (size_t batch = ab*batch_repeat; batch < (ab+1)*batch_repeat; ++batch)
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
-                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk, selected_anchor);
+                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk,
+                                                   selected_anchor, decode_workspace ? &*decode_workspace : nullptr);
                             multiply(scu, st, w, qk, begin, mask,
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }

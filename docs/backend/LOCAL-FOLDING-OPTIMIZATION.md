@@ -1,6 +1,7 @@
 # Applied Local/Folding and KV preparation optimizations
 
-Runtime snapshot: `fc30c0a` on `hotfix/optimize-local-folding`.
+Runtime baseline: `fc30c0a` on `hotfix/optimize-local-folding`, with the
+subsequent single-query decode workspace change described below.
 This branch starts at develop `1cf4697`. It changes `ggml-gemmini`, not
 `ggml-potal`, and keeps the existing hardware operand widths and execution
 order. It does not redistribute work across Core1/2/3.
@@ -25,15 +26,49 @@ Source paths below are relative to `ggml/src/ggml-gemmini/`.
 | Promoted-block mask updates | Updates selected valid columns by word-range OR | `quants/act/exsia/folding.cpp` |
 | Residual early exit | Returns zero residual for in-range values; skips a zero low lane only when radix divisibility holds | `quants/act/exsia/folding.cpp`, `residual/rmd/rmd-bitmap-builder.cpp` |
 | General builder/scratch reuse | Retains builder capacity and visits/clears touched bitmap words; completed packets keep ownership | `residual/residual-capture.hpp`, `residual/rmd/rmd-bitmap-builder.*` |
+| Decode attention workspace reuse | Reuses bitmap capacity and builder scratch across heads/batches within one call when the query tensor has one row | `matmul/attention.cpp` |
 
-General builder reuse in this table does not include the deferred
-attention-call bitmap/builder workspace reuse.
+The attention workspace is distinct from the general residual builder reuse
+and from token-to-token KV caching. Eligibility is the query shape
+`b.ne[1] == 1`, normally single-token decode. Multi-row calls, including a
+one-row tail stripe within prefill, keep stripe-local storage.
+
+Only working memory is reused. Each head's input is quantized again, the
+selection bitmap is filled with its original valid pattern, and builder
+reset clears previous metadata, digits and touched masks. Completed packets
+retain independent ownership. The workspace ends with the attention call,
+so nothing is shared between invocations or backend contexts. QK shift and
+digit emission remain separate, with unchanged anchor/rounding/order.
+
+### Decode workspace validation
+
+At A4 and A8, 48 public attention-execution cases per width produced identical
+raw output bytes and logical work counts before/after this change. Cases cover
+QK/PV, query rows 1/3/65, K=33/65, N=5/67, four query heads, two KV heads, two
+batches, alternating zero/residual-heavy inputs and repeated calls. Invalid
+input leaves the previously published output unchanged. Retained packets also
+remain unchanged after a shared workspace resets for a zero-input stripe.
+
+Instrumented ordinary C++ allocation calls decreased in all 16 one-row cases
+per width: 77-126 fewer at A4 and 77-128 fewer at A8. All 32 multi-row cases
+per width had unchanged counts. These are allocation counts, not wall-time
+or allocator-time measurements. Both widths also passed the four selected
+integration tests and cached-pitch/masked-residual checks again.
+
+An isolated A4 mutant that skipped reset after a nonempty builder failed with
+invalid arguments during the public execution test. The normal source was not
+modified for this mutation. Local evidence in the existing A4/A8 build roots:
+`decode-workspace-tests.log`, `decode-workspace-pitched-mask.log`,
+`decode-before.log`, `decode-after.log`, `decode-before.bin`, `decode-after.bin`,
+and `decode-mutant.log` (A4). Test code and snapshots remain unpublished.
 
 ## Historical stream candidates
 
 QK shift/digit fusion and attention-call bitmap/builder reuse were published
-in `8166496`, then explicitly deferred by the user's latest scope decision.
+in `8166496`, then explicitly deferred by an earlier scope decision.
 They were removed by published follow-up `fc30c0a`; published history is retained.
+The current follow-up restores workspace reuse only for one-query-row calls;
+QK fusion and multi-row workspace reuse remain excluded.
 Their historical checks at each of A4/A8 covered 144 stream preparation cases
 and 96 reconstructed outputs whose digests matched the frozen pre-change implementation.
 The cases cover Top2/Top3, tail K, shrinking/growing stripe sizes, zero inputs,
@@ -227,7 +262,7 @@ as `sigma64-audit.md` and `sigma64-verified.md`.
 | Block shift/mask, residual early exit, general builder/scratch reuse | Keep |
 | KV limb repacking reduction | Added; native A4/A8 integration checks passed |
 | QK shift/digit fusion | Deferred; removed from default path in `fc30c0a` |
-| Attention stripe bitmap/builder reuse | Removed in `fc30c0a`; later evidence recommends decode-only reintroduction, which is not implemented here |
+| Attention stripe bitmap/builder reuse | Reintroduced only for one-query-row decode; multi-row prefill reuse remains excluded |
 | PV temporary arrays/intermediate passes | Reference worktree only; not imported |
 | Sigma64 | Experimental; bounded guard and production wide fallback required |
 | Folding row writes | Not included; input-dependent regressions |
@@ -291,7 +326,7 @@ produced by running preceding layers in PoTal or a full-model accuracy test.
 
 | Candidate | Observed preparation result | Current action |
 | --- | --- | --- |
-| Attention bitmap/builder workspace reuse | Decode QK 5.9-15.8% and PV 8.5-13.6% lower; prefill benefit unproven | Decode-only candidate; not yet restored to this hotfix |
+| Attention bitmap/builder workspace reuse | Decode QK 5.9-15.8% and PV 8.5-13.6% lower; prefill benefit unproven | Supports the single-query decode change; these are earlier replay measurements, not new target measurements of this commit |
 | QK folding/digit fusion | No consistent gain; Qwen W4 decode 5.1% slower | Keep deferred |
 | Sigma64 | Qwen prefill Local+Folding W4 3.1% and W8 6.7% slower | Do not enable by default |
 | Residual Scale reuse | Older NPU source contains conditional `ktile_scale_reuse`; past `PAIRED_KTILE` setting was ON | Preserve existing behavior; do not count twice |
