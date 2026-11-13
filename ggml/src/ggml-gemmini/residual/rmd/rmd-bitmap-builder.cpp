@@ -33,6 +33,10 @@ uint8_t decompose(int32_t                                      residual,
     constexpr int64_t radix    = int64_t{1} << Bits;
     int64_t           quotient = residual;
     uint8_t           lane     = 0;
+    if ((static_cast<uint32_t>(residual) & (radix - 1)) == 0) {
+        quotient /= radix;
+        lane = 1;
+    }
     while (quotient != 0) {
         int64_t digit = static_cast<uint64_t>(quotient) & (radix - 1);
         if (digit >= radix / 2)
@@ -107,6 +111,8 @@ void RmdBitmapBuilder::reset(size_t                        stripe_id,
     cursor_    = 0;
     limb_masks_.clear();
     digits_.clear();
+    for (size_t word : nonzero_words_) nonzero_mask_[word] = 0;
+    nonzero_words_.clear();
     metadata_               = StripePacket{};
     metadata_.stripe_id     = stripe_id;
     metadata_.row_begin     = row_begin;
@@ -147,7 +153,7 @@ void RmdBitmapBuilder::reset(size_t                        stripe_id,
 #if LOG_CYCLE
         row_seen_.assign(rows, 0);
 #endif
-        nonzero_mask_.assign(cells / 64 + (cells % 64 != 0), 0);
+        nonzero_mask_.resize(cells / 64 + (cells % 64 != 0), 0);
     } catch (const std::bad_alloc &) {
         status_ = RmdStatus::allocation_failure;
     } catch (const std::length_error &) {
@@ -197,6 +203,7 @@ bool RmdBitmapBuilder::emit(size_t row, size_t k, int32_t residual) {
                                                                          row_words_,
                                                                          row_bit);
     try {
+        if (!nonzero_mask_[cell / 64]) nonzero_words_.push_back(cell / 64);
         limb_masks_.push_back(mask);
         digits_.insert(digits_.end(), packed.begin(), packed.begin() + count);
     } catch (const std::bad_alloc &) {
@@ -229,9 +236,12 @@ StripePacketHandle RmdBitmapBuilder::finish() {
     }
     try {
         const size_t          block_count = block_lane_masks_.size();
-        std::vector<uint32_t> block_indices(block_count, 0);
-        std::vector<uint32_t> row_ranks(lane_rows_.size(), 0);
-        std::vector<std::array<uint8_t, kMaxNativeRadixLanes>> lane_groups(block_count);
+        block_indices_.assign(block_count, 0);
+        row_ranks_.assign(lane_rows_.size(), 0);
+        lane_groups_.assign(block_count, {});
+        auto & block_indices = block_indices_;
+        auto & row_ranks = row_ranks_;
+        auto & lane_groups = lane_groups_;
         auto packet = std::make_shared<StripePacket>(metadata_);
         packet->blocks.reserve(block_count);
         packet->k_indices.reserve(std::min(digits_.size(), block_count * kBlockSize));
@@ -271,9 +281,8 @@ StripePacketHandle RmdBitmapBuilder::finish() {
             }
             block.k_index_offset = static_cast<uint32_t>(packet->k_indices.size());
             for (size_t k = 0; k < kBlockSize; ++k) {
-                if (block_mask & (uint32_t{1} << k)) {
+                if (block_mask & (uint32_t{1} << k))
                     packet->k_indices.push_back(static_cast<uint16_t>(k));
-                }
             }
             block.activation_offset      = static_cast<uint32_t>(activation_values);
             block.activation_byte_offset = block.activation_offset;
@@ -346,7 +355,7 @@ StripePacketHandle RmdBitmapBuilder::finish() {
         }
         packet->stacked_activation.signed_int8.resize(activation_values, 0);
         size_t residual_index = 0, digit_index = 0;
-        for (size_t word = 0; word < nonzero_mask_.size(); ++word) {
+        for (size_t word : nonzero_words_) {
             uint64_t nonzero = nonzero_mask_[word];
             while (nonzero) {
                 const size_t cell = word * 64 + static_cast<size_t>(__builtin_ctzll(nonzero));

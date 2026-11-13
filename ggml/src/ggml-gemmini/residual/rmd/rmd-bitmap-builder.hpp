@@ -29,11 +29,14 @@ class RmdBitmapBuilder {
     const std::vector<uint64_t> * selection_ = nullptr;
     size_t                        stride_ = 0, cursor_ = 0, row_words_ = 0;
     std::vector<uint64_t>         nonzero_mask_;
+    std::vector<size_t>           nonzero_words_;
     std::vector<uint16_t>         limb_masks_;
     std::vector<int8_t>           digits_;
     std::vector<std::array<uint32_t, kMaxNativeRadixLanes>> block_lane_masks_;
     std::vector<uint64_t>                                   lane_rows_;
     std::vector<uint8_t>                                    row_seen_;
+    std::vector<uint32_t>                                   block_indices_, row_ranks_;
+    std::vector<std::array<uint8_t, kMaxNativeRadixLanes>>    lane_groups_;
     StripePacket                                            metadata_;
     RmdStatus                                               status_ = RmdStatus::invalid_arguments;
 };

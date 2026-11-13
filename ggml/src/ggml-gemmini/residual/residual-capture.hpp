@@ -47,9 +47,9 @@ class TimedResidualCapture {
 
     void select(ResidualRoute route) {
         if (route == ResidualRoute::cpu_direct) {
-            sink_.emplace<DirectStripeBuilder>();
+            if (!holds_cpu_sink()) sink_.emplace<DirectStripeBuilder>();
         } else {
-            sink_.emplace<rmd::RmdStripeBuilder>();
+            if (holds_cpu_sink()) sink_.emplace<rmd::RmdStripeBuilder>();
         }
     }
 

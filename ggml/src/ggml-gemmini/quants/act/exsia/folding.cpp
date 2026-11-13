@@ -39,7 +39,7 @@ std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q, bool 
     constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
     constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
     const int32_t     sat  = q > qmax ? qmax : (q < qmin ? qmin : q);
-    if (!decompose)
+    if (!decompose || q == sat)
         return {sat, 0};
     // u = sum_l L_l 2^(n l) with signed n-bit limbs. L0 is the balanced low digit, so it fits the
     // dense operand, and u - L0 is a multiple of 2^n: the RMD builders see lane 0 == 0 and stack
@@ -135,24 +135,23 @@ bool StripeFolding::run(Meta &                           meta,
             const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
                                               ? 0
                                               : static_cast<int16_t>(block_exp - stripe.e_s);
-            // One element loop per block kind, chosen once here. full_valid: the block is above the
-            // anchor exponent, so every valid (col < K) position compensates and the per-element
-            // local-outlier test is skipped; otherwise the local outlier mask decides as before.
-            const auto fold_block = [&](auto full_valid) -> bool {
+            // Select masked correction or whole-block correction once per block.
+            const detail::PreparedShift shift(delta_theta_b);
+            const auto fold_block = [&](auto selection) -> bool {
                 for (size_t i = 0; i < state.B_size; ++i) {
                     const size_t  col        = block_offset + i;
                     const size_t  padded_idx = local_row * state.K_padded + col;
                     const int32_t q_shifted =
-                        detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
+                        shift(stripe_q_wide[padded_idx]);
                     bool outlier;
-                    if constexpr (decltype(full_valid)::value)
+                    if constexpr (decltype(selection)::value == 2)
                         outlier = col < args.K;
                     else
                         outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                    // Keep a low limb only when the higher limbs have a compensation consumer.
-                    // With RMD disabled, outliers follow the same saturation rule as other values.
-                    const bool decompose = outlier && GGML_GEMMINI_ENABLE_RMD;
-                    const auto [q8, residual_i32] = unit_clip_.clip_with_residual(q_shifted, decompose);
+                    // Outliers and promoted top blocks keep their low limb in the dense operand and
+                    // carry the higher limbs as residual; every other position saturates.
+                    const auto [q8, residual_i32] = unit_clip_.clip_with_residual(
+                        q_shifted, outlier && GGML_GEMMINI_ENABLE_RMD);
 
                     if (col < args.K)
                         if (!args.A.set(r, col, q8))
@@ -188,9 +187,9 @@ bool StripeFolding::run(Meta &                           meta,
                 if (block_offset < args.K)
                     unit_outlier_.mark_valid_range(
                         stripe, r, block_offset, std::min(block_offset + state.B_size, args.K));
-                if (!fold_block(std::true_type{}))
+                if (!fold_block(std::integral_constant<int, 2>{}))
                     return false;
-            } else if (!fold_block(std::false_type{})) {
+            } else if (!fold_block(std::integral_constant<int, 1>{})) {
                 return false;
             }
         }

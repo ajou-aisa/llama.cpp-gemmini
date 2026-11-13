@@ -217,7 +217,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             ggml::gemmini::cycle_sim::ScopedContext cycle_sim_scope(cycle_sim_context);
 #endif
             if (ggml_gemmini_get_attention_role(node) != GGML_GEMMINI_ATTENTION_NONE) {
-                const auto status = ggml::gemmini::attention_execute(node, ctx->attention);
+                const auto status = ggml::gemmini::attention_execute(node, ctx->attention, &ctx->attention_cache);
                 if (status != ggml::gemmini::rmd::RmdStatus::success) {
                     GGML_LOG_ERROR("Gemmini attention %s failed: %s\n", node->name,
                                    ggml::gemmini::rmd::rmd_status_message(status));

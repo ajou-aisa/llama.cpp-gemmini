@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace ggml::gemmini {
@@ -104,20 +105,13 @@ size_t stripe_rows(size_t rows, size_t columns, size_t k) {
     return geometry.geometry.stripe_rows;
 }
 
-struct Stationary {
-    size_t k, n, kp;
-    std::vector<int16_t> base;
-    std::vector<uint32_t> carriers;
-    std::array<std::vector<int32_t>, 2> codes;
-    std::vector<int64_t> colsum;
-#if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-    mutable std::unique_ptr<ggml_cuda_potal_attention_weights,
-        decltype(&ggml_cuda_potal_attention_destroy)> gpu{nullptr, ggml_cuda_potal_attention_destroy};
-#endif
-};
+using Stationary = AttentionStationary;
 
 Stationary stationary(const ggml_tensor & t, size_t head, size_t batch, bool qk) {
-    Stationary w{size_t(t.ne[0]), size_t(t.ne[1]), rmd::align_up(size_t(t.ne[0]), bk), {}, {}, {}, {}};
+    Stationary w;
+    w.k = size_t(t.ne[0]);
+    w.n = size_t(t.ne[1]);
+    w.kp = rmd::align_up(w.k, bk);
     w.base.resize(w.n);
     w.carriers.resize(w.kp/bk*w.n);
     w.codes[0].resize(w.kp*w.n);
@@ -174,8 +168,14 @@ struct StreamStripe {
     rmd::StripePacketHandle upper;
 };
 
+struct StreamWorkspace {
+    std::vector<uint64_t> selected;
+    rmd::RmdBitmapBuilder builder;
+};
+
 StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t begin,
-                    size_t rows, size_t n, bool qk, int selected_anchor) {
+                    size_t rows, size_t n, bool qk, int selected_anchor,
+                    StreamWorkspace * workspace = nullptr) {
     const size_t k = t.ne[0], kp = rmd::align_up(k, bk), blocks = kp/bk;
     StreamStripe st{rows, kp, 0, std::vector<int8_t>(rows*kp), {}};
     std::vector<float> values(rows*kp);
@@ -230,9 +230,12 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
         exsia::WideQuantizer quantizer;
         quantizer.quantize_block(values.data(), values.size(), static_cast<int16_t>(st.scale), codes);
     }
-    std::vector<uint64_t> selected((rows*kp+63)/64, UINT64_MAX);
-    rmd::RmdBitmapBuilder builder;
-    builder.reset(begin, begin, rows, k, n, pe_bits, selected, kp);
+    std::optional<StreamWorkspace> local_workspace;
+    if (!workspace) local_workspace.emplace();
+    auto & scratch = workspace ? *workspace : *local_workspace;
+    scratch.selected.assign((rows*kp+63)/64, UINT64_MAX);
+    auto & builder = scratch.builder;
+    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp);
     require(builder.status() == RmdStatus::success, builder.status());
     for (size_t i = 0; i < rows; ++i) {
         for (size_t c = 0; c < k; ++c) {
@@ -373,7 +376,7 @@ struct ScuGemm {
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (!w.gpu) {
             w.gpu.reset(ggml_cuda_potal_attention_create(w.codes[0].data(),
-                w.codes[1].empty() ? nullptr : w.codes[1].data(), w.carriers.data(), w.n, w.kp, pe_bits));
+                w.codes[1].empty() ? nullptr : w.codes[1].data(), w.carriers.data(), w.packed_columns(), w.kp, pe_bits));
         }
         std::vector<ggml_cuda_potal_attention_fragment> fragments;
         if (runs) for (const auto & run : *runs) {
@@ -410,10 +413,10 @@ struct ScuGemm {
         dot.activation_row_stride_bytes = st.kp;
         dot.weights = w.codes[pass].data()+region.column;
         dot.columns = region.columns;
-        dot.weight_row_stride = w.n;
+        dot.weight_row_stride = w.packed_columns();
         dot.k = w.k;
         dot.scu_carriers = w.carriers.data()+region.column;
-        dot.scu_row_stride = w.n;
+        dot.scu_row_stride = w.packed_columns();
         dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
         dot.trace_role = GEMMINI_TRACE_ROLE_DENSE;
         dot.timing_identity.interval.layer = layer;
@@ -434,7 +437,7 @@ struct ScuGemm {
         }
 #endif
         software(st.main.data()+region.row*st.kp, region.rows, st.kp, w.codes[pass].data()+region.column,
-                 region.columns, w.k, w.n, w.carriers.data()+region.column, out);
+                 region.columns, w.k, w.packed_columns(), w.carriers.data()+region.column, out);
 #endif
     }
     void run(const rmd::RunAwareRequest & request, const Stationary & w, size_t pass,
@@ -444,6 +447,7 @@ struct ScuGemm {
         work.request = &request;
         work.original_weights = &w.codes[pass];
         work.original_carriers = &w.carriers;
+        work.original_stride = w.packed_columns();
         work.row_begin = region.row;
         work.row_count = region.rows;
         work.column_begin = region.column;
@@ -462,7 +466,7 @@ struct ScuGemm {
         }
 #endif
         software(request.activations.data()+region.row*request.k, region.rows, request.k,
-                 w.codes[pass].data()+region.column, region.columns, request.k, request.n,
+                 w.codes[pass].data()+region.column, region.columns, request.k, w.packed_columns(),
                  w.carriers.data()+region.column, out, &request.runs);
 #endif
     }
@@ -515,10 +519,18 @@ void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool
         if (mask.live.empty()) upper({0, residual.m, 0, w.n});
         else for (const auto & region : residual_regions) upper(region);
     }
+    // Finite F32 operand scales keep these factors and INT64 products normal in double.
+    const bool share_scales = st.rows > 1;
+    std::vector<double> scales(share_scales ? w.n : 0);
+    if (share_scales)
+        for (size_t j = 0; j < w.n; ++j)
+            scales[j] = std::ldexp(1.0, st.scale+w.base[j]);
     for (size_t i = 0; i < st.rows; ++i)
         for (size_t j = 0; j < w.n; ++j) {
             if (!qk) scaled_add(acc[i*w.n+j], w.colsum[j], pe_bits-1);
-            const float value = static_cast<float>(std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base[j]));
+            const double scaled = share_scales ? static_cast<double>(acc[i*w.n+j])*scales[j] :
+                std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base[j]);
+            const float value = static_cast<float>(scaled);
             require(std::isfinite(value), RmdStatus::overflow);
             output[i*w.n+j] = value;
         }
@@ -554,7 +566,7 @@ const char * attention_execution_backend() {
     return "cpu_quantized_scu";
 }
 
-rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
+rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, AttentionCache * cache) {
     if (!attention_supported(op)) return RmdStatus::unsupported_route;
     if (!op->data || !op->src[0]->data || !op->src[1]->data) return RmdStatus::invalid_arguments;
     try {
@@ -565,19 +577,59 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
         const int selected_anchor = sensitivity::anchor(op);
         const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
         const size_t rows = b.ne[1], n = a.ne[1], rs = stripe_rows(rows, n, b.ne[0]);
+        // Single-query decode reuses scratch across heads/batches in this call.
+        // Multi-row prefill keeps the original stripe-local lifetime.
+        std::optional<StreamWorkspace> decode_workspace;
+        if (rows == 1) decode_workspace.emplace();
         const auto schedule = qk ? qk_schedule() : QkSchedule::full;
         const QkMask mask(qk ? op->src[2] : nullptr, rows, n, schedule);
         const size_t head_repeat = b.ne[2]/a.ne[2], batch_repeat = b.ne[3]/a.ne[3];
         std::vector<float> staged(size_t(ggml_nelements(op)));
         AttentionMetrics pending = metrics;
+        ggml_gemmini_kv_cache_info info{};
+        const bool annotated = cache && ggml_gemmini_get_attention_kv_cache(op, &info);
+        const size_t extent = qk ? size_t(a.ne[1]) : size_t(a.ne[0]);
+        require(!annotated || info.end <= extent);
+        if (annotated && cache->instance != info.instance) {
+            cache->entries.clear();
+            cache->instance = info.instance;
+        }
         for (size_t ab = 0; ab < size_t(a.ne[3]); ++ab)
             for (size_t ah = 0; ah < size_t(a.ne[2]); ++ah) {
-                const auto w = stationary(a, ah, ab, qk);
+                Stationary fresh;
+                Stationary * prepared = &fresh;
+                if (annotated) {
+                    prepared = &cache->entries[{info.layer, ah, ab, qk}];
+                    const std::array<size_t, 4> strides{a.nb[0], a.nb[1], a.nb[2], a.nb[3]};
+                    const bool reuse = prepared->packed_valid && prepared->epoch == info.epoch &&
+                        prepared->revision != UINT64_MAX && prepared->revision+1 == info.revision &&
+                        prepared->frontier == info.begin && prepared->source == a.data &&
+                        prepared->type == a.type && prepared->strides == strides &&
+                        (qk ? prepared->k == size_t(a.ne[0]) && prepared->n <= size_t(a.ne[1])
+                            : prepared->n == size_t(a.ne[1]) && prepared->k <= size_t(a.ne[0]));
+                    const size_t old_extent = qk ? prepared->n : prepared->k;
+                    if (!reuse) *prepared = Stationary{};
+                    const size_t begin = reuse ? info.begin : 0;
+                    const size_t end = reuse && old_extent == extent ? info.end : extent;
+                    const auto count = prepare_attention_stationary({a, ah, ab, qk, reuse, begin, end}, *prepared, 1);
+                    prepared->epoch = info.epoch;
+                    prepared->revision = info.revision;
+                    prepared->frontier = info.end;
+                    prepared->source = a.data;
+                    prepared->type = a.type;
+                    prepared->strides = strides;
+                    pending.stationary_quantized_blocks += count.quantized_blocks;
+                    pending.stationary_reused_blocks += count.reused_blocks;
+                } else {
+                    fresh = stationary(a, ah, ab, qk);
+                }
+                const auto & w = *prepared;
                 if (!qk) pending.add_ops += w.k*w.n;
                 for (size_t batch = ab*batch_repeat; batch < (ab+1)*batch_repeat; ++batch)
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
-                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk, selected_anchor);
+                            const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk,
+                                                   selected_anchor, decode_workspace ? &*decode_workspace : nullptr);
                             multiply(scu, st, w, qk, begin, mask,
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }
@@ -590,10 +642,13 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
         ++(qk ? completed_qk : completed_pv);
         return RmdStatus::success;
     } catch (RmdStatus status) {
+        if (cache) cache->entries.clear();
         return status;
     } catch (const std::bad_alloc &) {
+        if (cache) cache->entries.clear();
         return RmdStatus::allocation_failure;
     } catch (const std::length_error &) {
+        if (cache) cache->entries.clear();
         return RmdStatus::overflow;
     }
 }
@@ -614,7 +669,7 @@ bool attention_supported(const ggml_tensor *) {
     return false;
 }
 
-rmd::RmdStatus attention_execute(ggml_tensor *, AttentionMetrics &) {
+rmd::RmdStatus attention_execute(ggml_tensor *, AttentionMetrics &, AttentionCache *) {
     return rmd::RmdStatus::unsupported_route;
 }
 #endif

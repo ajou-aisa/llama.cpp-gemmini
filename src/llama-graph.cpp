@@ -1195,7 +1195,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_mask,
          ggml_tensor * v_mla,
              bool      v_trans,
-             float     kq_scale) const {
+             float     kq_scale,
+         const ggml_gemmini_kv_cache_info * kv_info) const {
+#if !GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+    GGML_UNUSED(kv_info);
+#endif
   //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
   //const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -1265,6 +1269,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * const potal_kq = kq;
         if (potal_attention) {
             ggml_gemmini_set_attention_role(kq, GGML_GEMMINI_ATTENTION_QK);
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+            if (kv_info && !v_mla) ggml_gemmini_set_attention_kv_cache(kq, kv_info);
+#endif
             kq->src[2] = kq_mask;
         }
 #endif
@@ -1322,6 +1329,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION || GGML_POTAL_ATTENTION
         if (potal_attention) {
             ggml_gemmini_set_attention_role(kqv, GGML_GEMMINI_ATTENTION_PV);
+#if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
+            if (kv_info && !v_mla && v_trans) ggml_gemmini_set_attention_kv_cache(kqv, kv_info);
+#endif
             ggml_backend_t selected = nullptr;
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                 auto * backend = ggml_backend_sched_get_backend(sched, i);
@@ -1545,7 +1555,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
+    const auto kv_info = kv_self->kv_attention_info(il);
+    const auto * kv_info_ptr = kv_info.revision && kv_info.begin < kv_info.end ? &kv_info : nullptr;
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale, kv_info_ptr);
     cb(cur, "kqv_out", il);
 
     if (wo) {
