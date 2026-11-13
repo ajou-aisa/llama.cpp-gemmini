@@ -1464,13 +1464,14 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
     };
     const auto quantize_activation = [&]() {
         const auto quantize_start = gemmini_cpu_timing_read();
-        const bool result         = ggml::gemmini::quants::quantize_activation(src1, args);
+        const auto preparation    = ctx->preparation_cache.prepare(dst, args);
+        const bool result         = preparation.ok;
         const auto quantize_end   = gemmini_cpu_timing_read();
         // This caller envelope can contain queue waits and nested worker work.
         // Its wall span is not CPU work time; actual overlap uses the endpoints.
         log_outer_cpu_interval(args,
                                matmul_invocation_id,
-                               "gemmini.quantize_activation",
+                               preparation.reused ? "gemmini.reuse_activation" : "gemmini.quantize_activation",
                                quantize_start,
                                quantize_end,
                                false,

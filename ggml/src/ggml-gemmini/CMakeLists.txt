@@ -87,6 +87,7 @@ set(GGML_GEMMINI_SOURCES
     ggml-gemmini-telemetry.cpp
     quants/act/dispatch.cpp
     quants/act/quantize.cpp
+    quants/act/preparation-cache.cpp
     quants/act/block/block.cpp
     quants/act/exsia/exsia.cpp
     quants/act/exsia/exsia-profile.cpp

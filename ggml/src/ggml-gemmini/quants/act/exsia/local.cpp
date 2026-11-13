@@ -1,6 +1,6 @@
 #include "local.hpp"
 #include "exsia_shift.hpp"
-#include "../../common/rounding.hpp"
+#include "exsia_float.hpp"
 #include "ggml.h"
 
 #include <algorithm>
@@ -28,26 +28,7 @@ static_assert(GGML_GEMMINI_EXSIA_SIGMA > 0, "GGML_GEMMINI_EXSIA_SIGMA must be po
 
 namespace {
 static inline int32_t quantize_to_i32(float x, int16_t theta) {
-    const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-
-    if (theta == neg_inf || !std::isfinite(x))
-        return 0;
-
-    const double scaled = std::ldexp(static_cast<double>(x), -static_cast<int>(theta));
-
-    if (!std::isfinite(scaled))
-        return scaled < 0.0 ? std::numeric_limits<int32_t>::min()
-                            : std::numeric_limits<int32_t>::max();
-
-    const double min_i32 = static_cast<double>(std::numeric_limits<int32_t>::min());
-    const double max_i32 = static_cast<double>(std::numeric_limits<int32_t>::max());
-
-    if (scaled <= min_i32)
-        return std::numeric_limits<int32_t>::min();
-    if (scaled >= max_i32)
-        return std::numeric_limits<int32_t>::max();
-
-    return round_nearest_even_i32(scaled);
+    return detail::quantize_f32_pot(x, theta);
 }
 
 static inline int64_t magnitude_i32(int32_t value) noexcept {
@@ -62,10 +43,7 @@ std::atomic<size_t> validation_block_top2_exp_rescan_counter{0};
 } // namespace
 
 int16_t ExpScanner::unbiased_exp(const float & x) {
-    if (x == 0.f || !std::isfinite(x))
-        return std::numeric_limits<int16_t>::min();
-
-    return static_cast<int16_t>(std::ilogb(std::abs(x)));
+    return detail::unbiased_exp_f32(x);
 }
 
 void ExpScanner::scan_top2_exp(const std::vector<float> & x, BlockState & blk) {
