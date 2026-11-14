@@ -1675,6 +1675,8 @@ list(APPEND _GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-bitmap-log1
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
+    test-gemmini-exsia-production
+    test-gemmini-exsia-rmd-off
     test-gemmini-exsia-writer
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
