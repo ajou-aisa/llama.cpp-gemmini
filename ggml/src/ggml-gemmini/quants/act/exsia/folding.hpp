@@ -39,7 +39,8 @@ class StripeFolding {
         const std::vector<int32_t> & stripe_q_wide,
         const std::vector<int16_t> & stripe_block_exp,
         std::vector<int32_t> &       residual, // dense global output, I * K_padded
-        ggml::gemmini::residual::TimedResidualCapture & rmd_builder); // route-specific stripe sink
+        ggml::gemmini::residual::TimedResidualCapture & rmd_builder,
+        const float * original = nullptr); // logical args.K stride, alive through folding
 
   private:
     OutlierMarker   unit_outlier_;

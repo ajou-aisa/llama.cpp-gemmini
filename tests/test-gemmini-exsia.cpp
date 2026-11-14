@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cfenv>
 #include <chrono>
 #include <charconv>
 #include <cstring>
@@ -219,6 +220,10 @@ bool test_meta_rho_invariant() {
                  "ExSIA metadata reset restores width-native rho") &&
            check(meta.theta.empty(), "ExSIA metadata reset clears theta");
 }
+
+#include "gemmini-exsia-stripe-oracle.hpp"
+#include "gemmini-exsia-stripe-policy.hpp"
+#include "gemmini-exsia-direct-stripe-cases.hpp"
 
 bool test_non_exsia_capture_context() {
 #if GGML_GEMMINI_ENABLE_RMD
@@ -742,10 +747,16 @@ bool test_exsia_packet_capture() {
     if (!check(packet_count > 1 && meta.direct_residuals.empty(),
                "real ExSIA uses packets across reused stripe slots"))
         return false;
+#if EXSIA_VALIDATION
     if (!check(std::equal(
                    restored.begin(), restored.end(), state.residual.begin(), state.residual.end()),
                "packet reconstruction equals ExSIA selected residual plane"))
         return false;
+#else
+    if (!check(state.residual.empty() && state.residual.capacity() == 0,
+               "production packet capture retains no validation residual plane"))
+        return false;
+#endif
     args.residual_route = residual::ResidualRoute::cpu_direct;
     if (!check(exsia.run(meta, &tensor, args) && meta.rmd_packets.empty() &&
                    !meta.direct_residuals.empty(),
@@ -3572,7 +3583,8 @@ int main(int argc, char ** argv) {
                        case_name == "direct-executor" || case_name == "rmd-gather" ||
                        case_name == "stripe-geometry" || case_name == "meta-rho" ||
                        case_name == "non-outlier-clipping" || case_name == "outlier-limb" ||
-                       case_name == "non-exsia-capture-context" || case_name == "packet-capture";
+                       case_name == "non-exsia-capture-context" || case_name == "packet-capture" ||
+                       case_name == "direct-stripe-rn";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -3580,13 +3592,15 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
+        (case_name == "all" && test_meta_rho_invariant() && test_direct_stripe_rn() &&
+         test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_outlier_limb_policy() &&
          test_exsia_packet_capture() && test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
+        (case_name == "direct-stripe-rn" && test_direct_stripe_rn()) ||
         (case_name == "packet-capture" && test_exsia_packet_capture()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -58,6 +59,26 @@ inline int32_t quantize_f32_pot(float value, int16_t theta) noexcept {
     if (magnitude >= limit)
         return negative ? std::numeric_limits<int32_t>::min() : std::numeric_limits<int32_t>::max();
     return negative ? -int32_t(magnitude) : int32_t(magnitude);
+}
+
+// Convert original F32 once at the final stripe scale. The reachable exponent
+// range is exact in double; explicit ties-even rounding preserves caller fenv.
+inline int32_t quantize_f32_stripe_rn(float value, int16_t theta) noexcept {
+    if (theta == std::numeric_limits<int16_t>::min() ||
+        (f32_bits(value) & 0x7f800000u) == 0x7f800000u)
+        return 0;
+    const double scaled = std::ldexp(static_cast<double>(value), -int(theta));
+    if (scaled >= double(std::numeric_limits<int32_t>::max()))
+        return std::numeric_limits<int32_t>::max();
+    if (scaled <= double(std::numeric_limits<int32_t>::min()))
+        return std::numeric_limits<int32_t>::min();
+    const double magnitude = std::fabs(scaled);
+    const double base = std::floor(magnitude);
+    const double fraction = magnitude - base;
+    const int64_t integer = static_cast<int64_t>(base);
+    const int64_t rounded = integer +
+        (fraction > 0.5 || (fraction == 0.5 && (integer & 1)));
+    return static_cast<int32_t>(scaled < 0 ? -rounded : rounded);
 }
 
 } // namespace ggml::gemmini::quants::act::exsia::detail

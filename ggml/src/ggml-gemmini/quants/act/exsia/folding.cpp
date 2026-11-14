@@ -1,5 +1,6 @@
 #include "folding.hpp"
 #include "exsia_shift.hpp"
+#include "exsia_float.hpp"
 #include "ggml-gemmini-args.h"
 #include "../../../ggml-gemmini-evaluation-observer.hpp"
 
@@ -64,7 +65,9 @@ bool StripeFolding::run(Meta &                           meta,
                         const std::vector<int32_t> &     stripe_q_wide,
                         const std::vector<int16_t> &     stripe_block_exp,
                         std::vector<int32_t> &           residual,
-                        residual::TimedResidualCapture & rmd_builder) {
+                        residual::TimedResidualCapture & rmd_builder,
+                        const float * original) {
+    const bool direct = original != nullptr;
     const int16_t neg_inf = std::numeric_limits<int16_t>::min();
 #if !EXSIA_VALIDATION
     (void)residual;
@@ -114,7 +117,7 @@ bool StripeFolding::run(Meta &                           meta,
     GGML_ASSERT(state.K_padded >= args.K);
     GGML_ASSERT(state.blocks_per_row == state.K_padded / state.B_size);
     GGML_ASSERT(stripe.row_start <= stripe.row_end && stripe.row_end <= args.I);
-    GGML_ASSERT(stripe_q_wide.size() >= stripe.row_count() * state.K_padded);
+    GGML_ASSERT(direct || stripe_q_wide.size() >= stripe.row_count() * state.K_padded);
     GGML_ASSERT(stripe_block_exp.size() >= stripe.row_count() * state.blocks_per_row);
     GGML_ASSERT(stripe.outlier_mask.rows == stripe.row_count());
     GGML_ASSERT(stripe.outlier_mask.cols >= state.K_padded);
@@ -132,7 +135,7 @@ bool StripeFolding::run(Meta &                           meta,
             GGML_ASSERT(block_exp_idx < stripe_block_exp.size());
 
             const int16_t block_exp     = stripe_block_exp[block_exp_idx];
-            const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
+            const int16_t delta_theta_b = direct || block_exp == neg_inf || stripe.e_s == neg_inf
                                               ? 0
                                               : static_cast<int16_t>(block_exp - stripe.e_s);
             // Select masked correction or whole-block correction once per block.
@@ -142,7 +145,9 @@ bool StripeFolding::run(Meta &                           meta,
                     const size_t  col        = block_offset + i;
                     const size_t  padded_idx = local_row * state.K_padded + col;
                     const int32_t q_shifted =
-                        shift(stripe_q_wide[padded_idx]);
+                        direct ? (col < args.K
+                                      ? quantize_f32_stripe_rn(original[r * args.K + col], theta_s) : 0)
+                               : shift(stripe_q_wide[padded_idx]);
                     bool outlier;
                     if constexpr (decltype(selection)::value == 2)
                         outlier = col < args.K;

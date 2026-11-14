@@ -705,6 +705,53 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
+
+# Exercise production storage with the same behavioral owner and source set.
+add_executable(test-gemmini-exsia-production
+    test-gemmini-exsia.cpp
+    ${_GEMMINI_TEST_EXSIA_SOURCES})
+get_target_property(_exsia_production_definitions test-gemmini-exsia COMPILE_DEFINITIONS)
+list(FILTER _exsia_production_definitions EXCLUDE REGEX "^EXSIA_VALIDATION=")
+target_compile_definitions(test-gemmini-exsia-production PRIVATE
+    ${_exsia_production_definitions} EXSIA_VALIDATION=0)
+unset(_exsia_production_definitions)
+target_compile_features(test-gemmini-exsia-production PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-exsia-production PRIVATE
+    $<TARGET_PROPERTY:test-gemmini-exsia,INCLUDE_DIRECTORIES>)
+target_link_libraries(test-gemmini-exsia-production PRIVATE ggml-base ggml-gemmini-utils)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    target_link_libraries(test-gemmini-exsia-production PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+    target_link_libraries(test-gemmini-exsia-production PRIVATE atomic)
+endif()
+foreach(_case IN ITEMS stripe-geometry packet-capture direct-stripe-rn)
+    add_test(NAME gemmini_exsia_production_${_case}
+        COMMAND $<TARGET_FILE:test-gemmini-exsia-production> --case=${_case})
+endforeach()
+
+# The direct path must saturate selected positions when no residual consumer exists.
+add_executable(test-gemmini-exsia-rmd-off
+    test-gemmini-exsia.cpp
+    ${_GEMMINI_TEST_EXSIA_SOURCES})
+get_target_property(_exsia_rmd_off_definitions test-gemmini-exsia-production COMPILE_DEFINITIONS)
+list(FILTER _exsia_rmd_off_definitions EXCLUDE REGEX "^GGML_GEMMINI_ENABLE_RMD=")
+target_compile_definitions(test-gemmini-exsia-rmd-off PRIVATE
+    ${_exsia_rmd_off_definitions} GGML_GEMMINI_ENABLE_RMD=0)
+unset(_exsia_rmd_off_definitions)
+target_compile_features(test-gemmini-exsia-rmd-off PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-exsia-rmd-off PRIVATE
+    $<TARGET_PROPERTY:test-gemmini-exsia,INCLUDE_DIRECTORIES>)
+target_link_libraries(test-gemmini-exsia-rmd-off PRIVATE ggml-base ggml-gemmini-utils)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    target_link_libraries(test-gemmini-exsia-rmd-off PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+    target_link_libraries(test-gemmini-exsia-rmd-off PRIVATE atomic)
+endif()
+add_test(NAME gemmini_exsia_rmd_off_direct_stripe_rn
+    COMMAND $<TARGET_FILE:test-gemmini-exsia-rmd-off> --case=direct-stripe-rn)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_library(test-gemmini-direct-linux-aarch64-strict OBJECT
@@ -839,7 +886,7 @@ add_test(NAME test-gemmini-exsia-profile-contract
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-profile-contract.cmake)
 
 set(_GGML_GEMMINI_EXSIA_CASES
-    all baseline dispatch direct-executor stripe-geometry non-exsia-capture-context)
+    all baseline dispatch direct-executor stripe-geometry non-exsia-capture-context direct-stripe-rn)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
     _GGML_GEMMINI_WEIGHT_BITS_VALUE EQUAL 8)
     list(APPEND _GGML_GEMMINI_EXSIA_CASES
@@ -857,6 +904,11 @@ endforeach()
 set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
     ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
     TIMEOUT 30)
+# The standalone ExSIA owner uses four local workers plus a folding coordinator.
+set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_stripe_rn
+    gemmini_exsia_production_stripe-geometry gemmini_exsia_production_packet-capture
+    gemmini_exsia_production_direct-stripe-rn gemmini_exsia_rmd_off_direct_stripe_rn
+    PROPERTIES ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=4;OMP_THREAD_LIMIT=5")
 unset(_GGML_GEMMINI_EXSIA_CASES)
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)

@@ -192,6 +192,7 @@ struct BlockState {
 struct StripeScratch {
     BlockState block;
     BitMask    folding_inlier_mask;
+    std::vector<int32_t> sigma_q; // preliminary worker integers, not stripe output
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     bool actual_requantized = false;
 #endif
@@ -219,6 +220,8 @@ struct StripeScratch {
 #endif
 
     bool prepare(size_t block_size) {
+        if (sigma_q.size() < block_size)
+            sigma_q.resize(block_size);
         if (!block.prepare(block_size) || !folding_inlier_mask.prepare(1, block_size)) {
             return false;
         }
@@ -310,13 +313,16 @@ struct StripePipelineSlot {
                  size_t max_block_count,
                  size_t max_rows,
                  size_t K_padded,
-                 size_t block_size) {
+                 size_t block_size,
+                 bool materialize_wide = true) {
         const size_t words_per_block          = BlockMask::word_count(block_size);
         size_t       block_mask_word_capacity = 0;
         if (!BitMask::checked_mul(max_block_count, words_per_block, block_mask_word_capacity))
             return false;
 
-        if (q_wide.size() < elem_capacity)
+        if (!materialize_wide)
+            std::vector<int32_t>().swap(q_wide);
+        else if (q_wide.size() < elem_capacity)
             q_wide.resize(elem_capacity);
         if (block_exp.size() < max_block_count)
             block_exp.resize(max_block_count);
@@ -392,7 +398,8 @@ struct StripePipelineSlot {
         stripe.outlier_mask.cols = K_padded;
         stripe.scratch.reset();
 
-        std::fill(q_wide.begin(), q_wide.begin() + elem, 0);
+        if (!q_wide.empty())
+            std::fill(q_wide.begin(), q_wide.begin() + elem, 0);
         std::fill(block_exp.begin(), block_exp.begin() + blocks, neg_inf);
         assert(block_mask_word_count <= block_mask_words.size());
         std::fill_n(block_mask_words.begin(), block_mask_word_count, uint64_t{0});
