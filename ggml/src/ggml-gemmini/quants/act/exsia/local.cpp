@@ -285,7 +285,11 @@ bool LocalStage::run_optimized(Meta &          meta,
 #endif
 {
     GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(q_out != nullptr);
+    const bool analysis_only = q_out == nullptr;
+    if (analysis_only) {
+        GGML_ASSERT(scratch.sigma_q.size() >= block_size);
+        q_out = scratch.sigma_q.data();
+    }
     GGML_ASSERT(block_size == state.B_size);
     GGML_ASSERT(valid_count <= block_size);
     (void)local_row;
@@ -300,6 +304,7 @@ bool LocalStage::run_optimized(Meta &          meta,
                                   block_size,
                                   scratch,
                                   block_mask,
+                                  analysis_only,
                                   q_out,
                                   block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -314,6 +319,7 @@ bool LocalStage::run_optimized(Meta &          meta,
                                  block_size,
                                  scratch,
                                  block_mask,
+                                 analysis_only,
                                  q_out,
                                  block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -328,6 +334,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
                                     size_t          block_size,
                                     StripeScratch & scratch,
                                     BlockMask &     block_mask,
+                                    bool            analysis_only,
                                     int32_t *       q_out,
                                     int16_t &       block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -392,7 +399,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
     const bool null_theta = theta_pre == neg_inf;
     for (size_t i = 0; i < block_size; ++i) {
         // Source zero is excluded; a nonzero source rounded to zero remains in U.
-        if (blk.e[i] == neg_inf) {
+        if (blk.e[i] == neg_inf || (analysis_only && block_mask.is_set(i))) {
             q_out[i] = 0;
             continue;
         }
@@ -469,7 +476,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_sample.p3_path = P3Path::BypassSameScale;
 #endif
-        } else {
+        } else if (!analysis_only) {
             const bool final_null_theta = blk.theta_b == neg_inf;
             for (size_t i = 0; i < block_size; ++i)
                 q_out[i] = final_null_theta ? 0 : quantize_to_i32(x[i], blk.theta_b);
@@ -483,7 +490,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
         }
     }
 
-    if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre)) {
+    if (!analysis_only && force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre)) {
         for (size_t i = 0; i < block_size; ++i)
             q_out[i] = quantize_to_i32(x[i], blk.theta_b);
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -520,6 +527,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
                                        size_t          block_size,
                                        StripeScratch & scratch,
                                        BlockMask &     block_mask,
+                                       bool            analysis_only,
                                        int32_t *       q_out,
                                        int16_t &       block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -583,7 +591,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
     theta_pre             = exp_to_theta(e_pre, meta.rho);
     const bool null_theta = theta_pre == neg_inf;
     for (size_t i = 0; i < block_size; ++i) {
-        if (i >= valid_count || blk.e[i] == neg_inf) {
+        if (i >= valid_count || blk.e[i] == neg_inf || (analysis_only && block_mask.is_set(i))) {
             q_out[i] = 0;
             continue;
         }
@@ -656,7 +664,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_sample.p3_path = P3Path::BypassSameScale;
 #endif
-        } else {
+        } else if (!analysis_only) {
             const bool final_null_theta = blk.theta_b == neg_inf;
             for (size_t i = 0; i < block_size; ++i)
                 q_out[i] = final_null_theta ? 0 : quantize_to_i32(blk.x[i], blk.theta_b);
@@ -670,7 +678,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
         }
     }
 
-    if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre)) {
+    if (!analysis_only && force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre)) {
         for (size_t i = 0; i < block_size; ++i)
             q_out[i] = quantize_to_i32(blk.x[i], blk.theta_b);
 #if EXSIA_STAGE_PROFILE_ENABLED

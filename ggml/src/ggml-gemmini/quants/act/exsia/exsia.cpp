@@ -388,6 +388,17 @@ bool ExSIA::run(Meta &                  meta,
     EXSIA_PROFILE_LOG(
         if (!profile_config.setup_ok) return fail(ExSIAState::FailureCode::ProfileFlushFailure);)
 
+    const char * direct_policy = std::getenv("GGML_GEMMINI_EXSIA_DIRECT_STRIPE");
+    if (direct_policy != nullptr && std::strcmp(direct_policy, "0") != 0 &&
+        std::strcmp(direct_policy, "1") != 0) {
+        std::fprintf(stderr, "gemmini: GGML_GEMMINI_EXSIA_DIRECT_STRIPE must be 0 or 1 (got '%s')\n",
+                     direct_policy);
+        return fail(ExSIAState::FailureCode::InvalidInput);
+    }
+    const bool direct_stripe = direct_policy == nullptr || std::strcmp(direct_policy, "1") == 0;
+    if (args.folding_anchor != 2 && args.folding_anchor != 3)
+        return fail(ExSIAState::FailureCode::InvalidInput);
+
     meta.rho   = config::GGML_GEMMINI_ACTIVATION_RHO;
     meta.sigma = GGML_GEMMINI_EXSIA_SIGMA;
     for (StripePipelineSlot & slot : pipeline_slots_)
@@ -465,7 +476,8 @@ bool ExSIA::run(Meta &                  meta,
                           max_stripe_block_count,
                           max_stripe_rows,
                           state_.K_padded,
-                          state_.B_size))
+                          state_.B_size,
+                          !direct_stripe))
             return fail(ExSIAState::FailureCode::InvalidInput);
     }
     if (!local_workspace_.prepare(max_stripe_block_count, state_.B_size))
@@ -647,7 +659,7 @@ bool ExSIA::run(Meta &                  meta,
     };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #if EXSIA_BRANCH_COUNTS_ENABLED
-    const auto record_sample = [](StripeCycleStats & stats, const LocalBlockCycleSample & sample) {
+    const auto record_sample = [direct_stripe](StripeCycleStats & stats, const LocalBlockCycleSample & sample) {
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
         stats.p0.add(sample.stage_intervals[0]);
@@ -662,6 +674,9 @@ bool ExSIA::run(Meta &                  meta,
 #endif
         stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
+        // Analysis publishes no materialized P3 output or replay/bypass event.
+        if (direct_stripe)
+            return;
         switch (sample.p3_path) {
         case P3Path::BypassNoIntegerOutlier:
             ++stats.p3_bypass_no_int_count;
@@ -688,7 +703,7 @@ bool ExSIA::run(Meta &                  meta,
         const size_t local_row     = slot.stripe.local_row(row);
         const size_t block_base    = local_row * state_.K_padded + col_offset;
         const size_t block_exp_idx = local_row * state_.blocks_per_row + block;
-        GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
+        GGML_ASSERT(direct_stripe || slot.q_wide.size() >= block_base + state_.B_size);
         GGML_ASSERT(block_exp_idx < slot.block_exp.size());
         BlockMask block_mask =
             slot.block_mask(local_row * state_.blocks_per_row + block, state_.B_size);
@@ -701,7 +716,7 @@ bool ExSIA::run(Meta &                  meta,
                                   block,
                                   scratch,
                                   block_mask,
-                                  slot.q_wide.data() + block_base,
+                                  direct_stripe ? nullptr : slot.q_wide.data() + block_base,
                                   slot.block_exp[block_exp_idx]
 #if EXSIA_BRANCH_COUNTS_ENABLED
                                   ,
@@ -1220,7 +1235,8 @@ bool ExSIA::run(Meta &                  meta,
                                                               slot.q_wide,
                                                               slot.block_exp,
                                                               state_.residual,
-                                                              slot.rmd_builder)) {
+                                                              slot.rmd_builder,
+                                                              direct_stripe ? src_data : nullptr)) {
                                                 record_failure(
                                                     ExSIAState::FailureCode::FoldingFailure, s);
                                                 pipeline_ok.store(false, std::memory_order_relaxed);
@@ -1367,7 +1383,7 @@ bool ExSIA::run(Meta &                  meta,
                     "exsia.local",
                     s);)
 #if EXSIA_BRANCH_COUNTS_ENABLED
-            const auto record_sample = [](StripeCycleStats &            stats,
+            const auto record_sample = [direct_stripe](StripeCycleStats &            stats,
                                           const LocalBlockCycleSample & sample) {
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
@@ -1383,6 +1399,8 @@ bool ExSIA::run(Meta &                  meta,
 #endif
                 stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
+                if (direct_stripe)
+                    return;
                 switch (sample.p3_path) {
                 case P3Path::BypassNoIntegerOutlier:
                     ++stats.p3_bypass_no_int_count;
@@ -1407,7 +1425,7 @@ bool ExSIA::run(Meta &                  meta,
                     const size_t local_row     = stripe.local_row(r);
                     const size_t block_base    = local_row * state_.K_padded + col_offset;
                     const size_t block_exp_idx = local_row * state_.blocks_per_row + b;
-                    GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
+                    GGML_ASSERT(direct_stripe || slot.q_wide.size() >= block_base + state_.B_size);
                     GGML_ASSERT(block_exp_idx < slot.block_exp.size());
                     BlockMask block_mask =
                         slot.block_mask(local_row * state_.blocks_per_row + b, state_.B_size);
@@ -1420,7 +1438,7 @@ bool ExSIA::run(Meta &                  meta,
                                               b,
                                               scratch,
                                               block_mask,
-                                              slot.q_wide.data() + block_base,
+                                              direct_stripe ? nullptr : slot.q_wide.data() + block_base,
                                               slot.block_exp[block_exp_idx]
 #if EXSIA_BRANCH_COUNTS_ENABLED
                                               ,
@@ -1665,7 +1683,8 @@ bool ExSIA::run(Meta &                  meta,
                               slot.q_wide,
                               slot.block_exp,
                               state_.residual,
-                              slot.rmd_builder))
+                              slot.rmd_builder,
+                              direct_stripe ? src_data : nullptr))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
 
             // Seal the stripe packet and hand the shared handle to the metadata. Stripes

@@ -88,7 +88,8 @@ class LocalStage {
     void set_force_recompute(bool enabled) {
         force_recompute_ = enabled;
     }
-    // q_out addresses one caller-owned, block-disjoint slot q_wide range and never aliases x.
+    // Null q_out requests analysis only, retaining preliminary integers in worker scratch.
+    // Otherwise publish final block codes, as required by materialized attention consumers.
     bool run_optimized(Meta &          meta,
                        ExSIAState &    state,
                        const float *   x,
@@ -127,6 +128,7 @@ class LocalStage {
                             size_t          block_size,
                             StripeScratch & scratch,
                             BlockMask &     block_mask,
+                            bool            analysis_only,
                             int32_t *       q_out,
                             int16_t &       block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -141,6 +143,7 @@ class LocalStage {
                                size_t          block_size,
                                StripeScratch & scratch,
                                BlockMask &     block_mask,
+                               bool            analysis_only,
                                int32_t *       q_out,
                                int16_t &       block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
