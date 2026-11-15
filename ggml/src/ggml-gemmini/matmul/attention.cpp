@@ -235,7 +235,7 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
     auto & scratch = workspace ? *workspace : *local_workspace;
     scratch.selected.assign((rows*kp+63)/64, UINT64_MAX);
     auto & builder = scratch.builder;
-    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp);
+    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp, workspace != nullptr);
     require(builder.status() == RmdStatus::success, builder.status());
     for (size_t i = 0; i < rows; ++i) {
         for (size_t c = 0; c < k; ++c) {

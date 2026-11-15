@@ -65,7 +65,8 @@ class TimedResidualCapture {
                size_t                        logical_k,
                size_t                        logical_j,
                const std::vector<uint64_t> * selection = nullptr,
-               size_t                        stride    = 0) {
+               size_t                        stride    = 0,
+               bool                          reuse_completed_packet = false) {
         stripe_id_ = stripe_id;
         if (!holds_cpu_sink() && selection && GGML_GEMMINI_ACTIVATION_BITS != 16) {
             if (!uses_bitmap())
@@ -77,7 +78,8 @@ class TimedResidualCapture {
                                                          logical_j,
                                                          GGML_GEMMINI_ACTIVATION_BITS,
                                                          *selection,
-                                                         stride);
+                                                         stride,
+                                                         reuse_completed_packet);
             return;
         }
         if (auto * cpu = std::get_if<DirectStripeBuilder>(&sink_)) {

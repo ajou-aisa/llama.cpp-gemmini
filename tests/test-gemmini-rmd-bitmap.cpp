@@ -71,7 +71,7 @@ void check_source(const rmd::StripePacket &packet, const Input &input) {
 
 
 rmd::StripePacketHandle verify(rmd::RmdBitmapBuilder &bitmap, const Input &input,
-                               uint8_t bits, size_t stride) {
+                               uint8_t bits, size_t stride, bool reuse = false) {
     std::vector<uint64_t> mask((input.rows * stride + 63) / 64, 0);
     for (const auto &event : input.events) {
         const size_t cell = event.row * stride + event.k;
@@ -79,7 +79,7 @@ rmd::StripePacketHandle verify(rmd::RmdBitmapBuilder &bitmap, const Input &input
     }
     rmd::RmdStripeBuilder legacy;
     legacy.reset(3, 7, input.rows, input.k, 65, bits);
-    bitmap.reset(3, 7, input.rows, input.k, 65, bits, mask, stride);
+    bitmap.reset(3, 7, input.rows, input.k, 65, bits, mask, stride, reuse);
     for (const auto &event : input.events) {
         require(legacy.add_residual(event.row, event.k, event.value), "legacy add");
         if (event.value) require(bitmap.emit(event.row, event.k, event.value), "bitmap emit");
@@ -92,7 +92,7 @@ rmd::StripePacketHandle verify(rmd::RmdBitmapBuilder &bitmap, const Input &input
     if (actual) {
         require(canonical(*expected) == canonical(*actual), "packet mismatch");
         check_source(*actual, input);
-        require(canonical(*bitmap.finish()) == canonical(*actual), "repeat finish mismatch");
+        if (!reuse) require(canonical(*bitmap.finish()) == canonical(*actual), "repeat finish mismatch");
     }
     return actual;
 }
@@ -132,6 +132,25 @@ int main() {
             verify(reused, Input{"selected zero", 2, 32, {{0, 2, 0}, {1, 3, 0}}}, bits, 32);
         }
         require(retained && canonical(*retained) == retained_bytes, "retained packet mutated");
+        // Decode reuses completed storage, but an outstanding consumer keeps its
+        // packet immutable while subsequent packets change shape and digit width.
+        std::vector<rmd::StripePacketHandle> held;
+        std::vector<std::vector<uint64_t>> snapshots;
+        for (unsigned step = 0; step < 60; ++step) {
+            const size_t k = step % 3 == 0 ? 4093 : step % 3 == 1 ? 33 : 127;
+            Input input{"decode reuse", step % 11 == 0 ? size_t{3} : size_t{1}, k, {}};
+            for (size_t row = 0; row < input.rows; ++row)
+                for (size_t col = 0; col < k; ++col)
+                    if (step % 7 && col % (1 + step % 5) == 0)
+                        input.events.push_back({row, col, col % 2 ? INT32_MIN : int32_t(step + 1)});
+            auto packet = verify(reused, input, step % 2 ? 4 : 8, rmd::align_up(k, 32), true);
+            for (size_t i = 0; i < held.size(); ++i)
+                require(canonical(*held[i]) == snapshots[i], "in-flight packet changed during reuse");
+            if (packet && step % 9 == 0) {
+                snapshots.push_back(canonical(*packet));
+                held.push_back(std::move(packet));
+            }
+        }
         std::vector<uint64_t> mask(1, uint64_t{1} << 1);
         reused.reset(0, 0, 1, 64, 16, 4, mask, 64);
         require(reused.emit(0, 1, 257), "initial emission");
