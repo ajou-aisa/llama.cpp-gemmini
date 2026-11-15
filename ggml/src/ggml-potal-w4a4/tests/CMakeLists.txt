@@ -41,6 +41,14 @@ target_link_libraries(potal-w4a4-golden-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-w4a4-golden-test COMMAND potal-w4a4-golden-test)
     set_tests_properties(potal-w4a4-golden-test PROPERTIES PASS_REGULAR_EXPRESSION "W4A4_GOLDEN PASS cases=")
+    add_test(NAME potal-w4a4-qk-transfer-test COMMAND potal-w4a4-golden-test)
+    set_tests_properties(potal-w4a4-qk-transfer-test PROPERTIES
+        ENVIRONMENT "POTAL_QK_POLICY=residual-transfer"
+        PASS_REGULAR_EXPRESSION "W4A4_GOLDEN PASS cases=")
+    add_test(NAME potal-w4a4-qk-residual-test COMMAND potal-w4a4-golden-test)
+    set_tests_properties(potal-w4a4-qk-residual-test PROPERTIES
+        ENVIRONMENT "POTAL_QK_POLICY=residual"
+        PASS_REGULAR_EXPRESSION "W4A4_GOLDEN PASS cases=")
     add_test(NAME potal-w4a4-counters-test COMMAND potal-w4a4-golden-test dense-random)
     set_tests_properties(potal-w4a4-counters-test PROPERTIES PASS_REGULAR_EXPRESSION "W4A4_COUNTERS dense-random PASS")
 endif()
