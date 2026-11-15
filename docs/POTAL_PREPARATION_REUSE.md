@@ -14,6 +14,8 @@ The shared residual packet builder supports both 4-bit and 8-bit digits.
 | Shared Attention packing | More than one activation limb | Repeated stationary B/carrier allocation and copying across limbs; duplicate Q A packing for K-low/K-high |
 | Output scale reuse | More than one row | Repeated `ldexp` for each output row; one exact power-of-two factor per column |
 | Completed packet reuse | Explicit decode opt-in, one row, previous packet exclusively owned by builder | Packet/payload/group allocation; all current contents are still regenerated |
+| Stationary packing across jobs | Multi-limb jobs in one strict Attention invocation, same KV head and batch | Repacking B/carriers for each stripe or grouped query head |
+| Main conversion during residual merge | Linear stripe with a residual packet | Separate Main output write/read traversal before the checked residual merge |
 
 Single-limb packing retains the original path. PV keeps limb-major
 reconstruction; it does not use QK's element-major fusion. One-row PV output
@@ -35,6 +37,18 @@ GEMM removal, or change to the FP baseline.
   pass 0's read-only activation allocation; every GEMM retains a separate C
   allocation. Shapes, padded layout, carrier stride, descriptors, planning,
   validation, command ordering, and fencing stay on the production path.
+- Stationary packing is shared across jobs only inside that invocation. A KV
+  head/batch change resets the producer's cache; pending jobs retain their own
+  shared owners. This is not a persistent KV cache or cross-token quantization
+  cache. Single-limb jobs retain their original path.
+- The Linear merge keeps Main as `float(double(C) * activation_scale *
+  double(weight_scale))` and the residual delta as `float(double(R) *
+  double(weight_scale) * double(float(2^theta)))`, then adds those two floats.
+  It does not combine integers before conversion or reassociate the factors.
+  Residual radix reconstruction and every overflow check remain. Output and
+  nonzero count commit only after every staged cell passes; slots are released
+  after the same semantic-completion boundary. Trace span 43 now includes Main
+  conversion in the merge traversal for residual stripes.
 - Unknown DMA completion still abandons all job allocations, including shared
   stationary allocations. No shared DMA input is overwritten or freed on that
   failure path. Public output is committed only after successful completion.
@@ -56,6 +70,11 @@ paired path enabled. Hardware header SHA-256:
   failure with unknown DMA state.
 - `potal-stripe-pipeline-test`: real host pipeline with the existing accelerator
   model, including packet ownership and backpressure behavior.
+- Follow-up integration reran both tests and `potal-residual-unit-test`. Added
+  distinct two-batch/two-head Attention fixtures exercise cache reset and pending
+  ownership. Fused merge tests compare with the previous separate production
+  conversion/merge for strided outputs, cancellation, INT32 extremes, subnormal
+  and large scales, invalid Main stride, and late overflow without partial commit.
 - `test-gemmini-rmd-bitmap.cpp`: LOG_CYCLE=0 and 1, 4/8-bit exact packets versus
   the existing builder and independent reconstruction. Includes 60 changing
   decode/prefill/empty shapes and retained packets. LOG_CYCLE=1 also passed
@@ -108,3 +127,33 @@ These are CPU-stage measurements, not CUDA timings and not Rocket/FPGA TTFT or
 TPOT speedups. Native model tests do not establish actual RTL execution. No new
 FireSim/FPGA run, RISC-V target build, or full-model PPL run was performed for this
 PR. Target execution remains necessary before reporting end-to-end improvement.
+
+## Additional integration measurement (2026-11-16)
+
+The two follow-up changes were replayed from their final product bodies on Nano3
+CPU5, with the same scalar compiler settings and seven alternating pairs. The
+baseline here is the already optimized PR implementation at `5f85a6f`, not the
+original `potal` implementation. Packing includes first allocation/packing and
+destruction, with up to four jobs alive. Jobs use three limbs; QK has K=127,
+N=4093 and PV has K=4093, N=65. Shared planning/validation remains excluded from
+both replay sides and remains enabled in production.
+
+| Stage / group | Before ms | After ms | Wall reduction | User-cycle reduction |
+| --- | ---: | ---: | ---: | ---: |
+| QK packing, 32 rows, 28 jobs | 32.900 | 22.263 | 32.3% | 49.2% |
+| QK packing, 1 row, 28 jobs | 24.070 | 20.764 | 13.7% | 52.6% |
+| PV packing, 32 rows, 28 jobs | 24.201 | 22.025 | 9.0% | 8.9% |
+| PV packing, 1 row, 28 jobs | 3.659 | 1.535 | 58.0% | 58.0% |
+| Linear Main conversion + merge, 32 x 4096 | 1.3104 | 1.1123 | 15.1% | 15.1% |
+| Linear Main conversion + merge, 1 x 4096 | 0.04387 | 0.03712 | 15.4% | 15.3% |
+
+Single-job packing controls were within 0.3% wall time. The Linear measurement
+excludes unchanged residual radix reconstruction. Both replay correctness checks
+passed on Nano and under local ASan/UBSan; native pipeline tests cover the full
+production path. Raw pairs and extracted sources are retained under
+`.omo/evidence/potal-followup-integration-20261116/` in the project workspace;
+paired medians are in [the follow-up CSV](potal-followup-nano.csv).
+These reductions cannot be added to the earlier stage percentages or reported
+as end-to-end speedups. The FPGA/Rocket and full-model validation limits above
+still apply. PV maximum fusion and general preparation-buffer pooling were not
+promoted by this change.
