@@ -81,4 +81,3 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
 }
 
 } // namespace ggml::potal::attention::detail
-
