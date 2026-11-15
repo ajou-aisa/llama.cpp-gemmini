@@ -87,14 +87,16 @@ bool finite_bits(double value) {
     return (observed & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
-// H3-8I-25T opt-in GGML_POTAL_FAST_DECODE=ON: the digit rows of decode_packet with the checks of
+// Prefill fast decode (GGML_POTAL_FAST_DECODE overrides the default): digit rows with the checks of
 // rmd::read_packet_digit / read_group_digit evaluated once per (run, lane) instead of once per digit.
 // Every check either holds for the whole (run, lane) or the function returns false, and the caller
 // then runs the per-digit reference loop, so a malformed packet reports exactly the reference status.
 // On true, out.rows / out.digits equal the reference loop's (same digits, same lane-major row order).
-bool fast_decode_requested() {
+bool fast_decode_requested(size_t rows) {
     const char * env = std::getenv("GGML_POTAL_FAST_DECODE");
-    return env != nullptr && (std::strcmp(env, "ON") == 0 || std::strcmp(env, "1") == 0);
+    if (env != nullptr) return std::strcmp(env, "ON") == 0 || std::strcmp(env, "1") == 0;
+    // Mapping setup amortizes over prefill rows; sparse one-row decode keeps the reference loop.
+    return rows >= 32;
 }
 
 // rmd-builder.cpp checked_activation_sizes (file-local there): one group's payload values and bytes.
@@ -319,7 +321,7 @@ rmd::RmdStatus decode_packet(const rmd::StripePacket & packet, decoded_packet & 
     }
 
     // Rows: lane-major, then source row; one compact digit row each.
-    if (fast_decode_requested()) {
+    if (fast_decode_requested(packet.row_count)) {
         if (fast_decode_rows(packet, offset, out.k_compact, radix, out)) {
             return out.rows.empty() ? rmd::RmdStatus::invalid_packet : rmd::RmdStatus::success;
         }
