@@ -1010,6 +1010,116 @@ void test_exec_pairs() {
               c.exec.pairs[0].residencies + c.exec.pairs[1].residencies == 3 * MULTI_J_GROUPS);
 }
 
+void test_exec_retirement_dependencies() {
+    const auto hw = potal_paired_hw_geometry();
+    size_t compared = 0, accepted = 0, rejected = 0;
+    for (size_t windows : {size_t(0), size_t(1), size_t(2), size_t(14)}) {
+        exec_case c;
+        c.has_residual = windows != 0;
+        // Two block fragments per physical Index Window on both supported geometries.
+        c.residual = synth(1, 1, dense_runs(2 * windows, 1));
+        const bool built = build_case(c, 1, PD, 896, 1);
+        check("X8 dependency fixture W=" + std::to_string(windows),
+              built && c.exec.residencies[0].windows == windows);
+        if (!built || c.exec.residencies[0].windows != windows) {
+            continue;
+        }
+        const auto & residency = c.exec.residencies[0];
+        const size_t retire = residency.retire_op;
+        std::vector<size_t> gemms;
+        for (const auto & op : c.exec.ops) {
+            if (op.residency == 0 && op.kind == op_kind::residual_gemm) {
+                gemms.push_back(op.id);
+            }
+        }
+        const auto original = c.exec.ops[retire].deps;
+        const auto compare = [&](std::vector<potal_paired_dep> deps, const char * name) {
+            std::stable_sort(deps.begin(), deps.end(),
+                             [](const potal_paired_dep & a, const potal_paired_dep & b) { return a.op < b.op; });
+            for (size_t order = 0; order < 3; ++order) {
+                auto plan = c.exec;
+                auto & op = plan.ops[retire];
+                op.deps = deps;
+                if (order == 1) {
+                    std::reverse(op.deps.begin(), op.deps.end());
+                } else if (order == 2 && op.deps.size() > 1) {
+                    std::rotate(op.deps.begin(), op.deps.begin() + 1, op.deps.end());
+                }
+                // Previous semantics: independent linear existential searches, Main first,
+                // then Residual consumers in operation order. Only this retire is mutated.
+                std::string expected;
+                if (std::any_of(op.deps.begin(), op.deps.end(),
+                                [&](const potal_paired_dep & d) { return d.op >= retire; })) {
+                    expected = "dependency on a later or own op";
+                } else if (!depends(op, residency.main_gemm_op, true)) {
+                    expected = "retire of a residency that is not resident or already retired";
+                } else {
+                    for (size_t gemm : gemms) {
+                        if (!depends(op, gemm, true)) {
+                            expected = "retire without completion of residual gemm " + std::to_string(gemm);
+                            break;
+                        }
+                    }
+                }
+                const auto status = expected.empty() ? potal_paired_status::ok :
+                                                       potal_paired_status::invalid_execution_plan;
+                if (!expected.empty()) {
+                    expected = "op " + std::to_string(retire) + " " + potal_paired_op_name(op.kind) + ": " + expected;
+                }
+                for (bool live : {false, true}) {
+                    std::string why = "stale";
+                    const auto actual = potal_validate_execution_plan_mode(
+                        plan, c.has_residual ? &c.residual : nullptr, &why, hw, live);
+                    check("X8 old-search equivalence W=" + std::to_string(windows) + " " + name +
+                              " order=" + std::to_string(order) + " live=" + std::to_string(live),
+                          actual == status && why == expected);
+                    ++compared;
+                    (status == potal_paired_status::ok ? accepted : rejected)++;
+                }
+            }
+        };
+        compare(original, "unchanged");
+        auto unrelated = original;
+        for (size_t id = 0; id < retire; ++id) {
+            unrelated.push_back({id, false});
+        }
+        compare(unrelated, "unrelated-and-false-duplicates");
+        auto missing_main = original;
+        missing_main.erase(std::remove_if(missing_main.begin(), missing_main.end(),
+            [&](const potal_paired_dep & d) { return d.op == residency.main_gemm_op; }), missing_main.end());
+        compare(missing_main, "missing-Main");
+        if (gemms.empty()) {
+            continue;
+        }
+        for (size_t at : {size_t(0), gemms.size() / 2, gemms.size() - 1}) {
+            auto missing = original;
+            missing.erase(std::remove_if(missing.begin(), missing.end(),
+                [&](const potal_paired_dep & d) { return d.op == gemms[at]; }), missing.end());
+            compare(missing, "missing-consumer");
+        }
+        const size_t target = gemms[gemms.size() / 2];
+        auto without = original;
+        without.erase(std::remove_if(without.begin(), without.end(),
+            [&](const potal_paired_dep & d) { return d.op == target; }), without.end());
+        for (const std::vector<bool> & bits : {std::vector<bool>{false}, {false, true}, {true, false}, {false, false}}) {
+            auto duplicates = without;
+            for (bool bit : bits) {
+                duplicates.push_back({target, bit});
+            }
+            compare(duplicates, "duplicate-completion-bits");
+        }
+        // Multiple missing consumers must still name the earliest one, not the last.
+        auto all_false = original;
+        for (auto & dep : all_false) {
+            dep.complete = dep.op == residency.main_gemm_op;
+        }
+        compare(all_false, "all-residual-false");
+        compare({{retire, true}}, "missing-Main-with-own-dependency");
+    }
+    std::printf("X8 retirement equivalence: %zu comparisons, %zu accepted, %zu rejected\n",
+                compared, accepted, rejected);
+}
+
 void test_exec_zero_fragments() {
     // Digits known: run 0 (2 fragments) has zeros in every row for its second fragment; run 1 is nonzero.
     // DIM32 uses a whole zero run between the two live fragments; K32 never
@@ -1722,6 +1832,7 @@ int main() {
     test_exec_multi_panel();
     test_exec_windows();
     test_exec_pairs();
+    test_exec_retirement_dependencies();
     test_exec_zero_fragments();
     test_exec_scale();
     test_exec_tails();
