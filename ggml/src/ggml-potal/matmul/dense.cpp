@@ -152,9 +152,20 @@ bool hp1_weight::allocate(int64_t n_, int64_t k_) {
     cstride = n_pad;
     const size_t k_blocks = k / quants::weight::hp1::block_k;
 
-    b        = static_cast<int8_t *>(blocks[0] = dma_alloc(k * ldb));
-    carriers = static_cast<uint32_t *>(blocks[1] = dma_alloc(k_blocks * cstride * sizeof(uint32_t)));
-    scale    = static_cast<float *>(blocks[2] = dma_alloc(n_pad * sizeof(float)));
+    // Let calloc retain demand-zero pages for these large, static operands.
+    // Keep the allocation base for free/abandon and align the exposed DMA view.
+    const auto allocate_zeroed = [&](size_t index, size_t bytes) -> void * {
+        if (bytes > SIZE_MAX - 2 * (ALIGN - 1)) {
+            return nullptr;
+        }
+        blocks[index] = std::calloc(1, align_up(bytes, ALIGN) + ALIGN - 1);
+        return blocks[index] == nullptr
+                   ? nullptr
+                   : reinterpret_cast<void *>(align_up(reinterpret_cast<uintptr_t>(blocks[index]), ALIGN));
+    };
+    b        = static_cast<int8_t *>(allocate_zeroed(0, k * ldb));
+    carriers = static_cast<uint32_t *>(allocate_zeroed(1, k_blocks * cstride * sizeof(uint32_t)));
+    scale    = static_cast<float *>(allocate_zeroed(2, n_pad * sizeof(float)));
     return b && carriers && scale;
 }
 

@@ -353,6 +353,90 @@ ggml_gemmini_args_t hp1_args(const std::vector<block_q8_hp1> & blocks, size_t N,
     return args;
 }
 
+bool same_hp1_stats(const hp1::stats & a, const hp1::stats & b) {
+    return a.blocks == b.blocks && a.zero_blocks == b.zero_blocks && a.shift_blocks == b.shift_blocks &&
+           a.zero_rows == b.zero_rows && a.min_m == b.min_m && a.max_m == b.max_m &&
+           std::memcmp(&a.sum_m, &b.sum_m, sizeof(double)) == 0 &&
+           std::memcmp(&a.min_channel_scale, &b.min_channel_scale, sizeof(float)) == 0 &&
+           std::memcmp(&a.max_channel_scale, &b.max_channel_scale, sizeof(float)) == 0;
+}
+
+void test_hp1_error_precedence() {
+    using RS = gq::wreader::WeightReaderStatus;
+    constexpr size_t N = 3, K = 128, nb = K / QK8_HP, ldb = 7, cs = 5;
+    std::vector<block_q8_hp1> blocks(N * nb);
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t b = 0; b < nb; ++b) {
+            blocks[n * nb + b].channel_scale = float(n + 1);
+            blocks[n * nb + b].m = int16_t(b);
+        }
+    }
+    const hp1::stats sentinel = { 91, 92, 93, 94, -95, 96, 97.0, 98.0f, 99.0f };
+    const auto expect = [&](const std::string & name, auto mutate, hp1::status want, RS want_reader,
+                            size_t written_blocks) {
+        auto bad = blocks;
+        mutate(bad);
+        std::vector<int8_t> B(K * ldb, 90);
+        std::vector<uint32_t> carriers(nb * cs, 0xdeadbeefu);
+        std::vector<float> scales(cs, -9.0f);
+        hp1::stats st = sentinel;
+        RS reader = RS::UnsupportedFormat;
+        const auto got = hp1::unpack(hp1_args(bad, N, K), B.data(), ldb, carriers.data(), cs, scales.data(),
+                                     &st, &reader);
+        bool partial = std::all_of(B.begin(), B.end(), [](int8_t v) { return v == 90; });
+        for (size_t n = 0; n < cs; ++n) {
+            const float scale = n < written_blocks / nb ? bad[n * nb].channel_scale : -9.0f;
+            partial = partial && std::memcmp(&scales[n], &scale, sizeof(float)) == 0;
+            for (size_t b = 0; b < nb; ++b) {
+                const uint32_t carrier = n < N && n * nb + b < written_blocks ?
+                    (bad[n * nb + b].m == INT16_MIN ? POTAL_CARRIER_ZERO : uint32_t(bad[n * nb + b].m)) :
+                    0xdeadbeefu;
+                partial = partial && carriers[b * cs + n] == carrier;
+            }
+        }
+        check("C HP1 precedence / sentinels / partial outputs: " + name,
+              got == want && reader == want_reader && same_hp1_stats(st, sentinel) && partial);
+    };
+    for (bool mismatch : { false, true }) {
+        for (int fault = 0; fault < 3; ++fault) {
+            expect(std::string(mismatch ? "early mismatch" : "early negative scale") +
+                       " + late " + (fault == 0 ? "padding" : fault == 1 ? "NaN" : "invalid m"),
+                   [=](auto & b) {
+                       if (mismatch) {
+                           b[1].channel_scale *= 2.0f;
+                       } else {
+                           for (size_t i = 0; i < nb; ++i) b[i].channel_scale = -1.0f;
+                       }
+                       if (fault == 0) b[9].padding[1] = 1;
+                       if (fault == 1) b[9].channel_scale = std::nanf("");
+                       if (fault == 2) b[9].m = -1;
+                   }, hp1::status::metadata, RS::InvalidMetadata, 0);
+        }
+    }
+    expect("early mismatch + later negative row", [](auto & b) {
+        b[1].channel_scale *= 2.0f;
+        for (size_t i = nb; i < 2 * nb; ++i) b[i].channel_scale = -2.0f;
+    }, hp1::status::scale_mismatch, RS::Success, 1);
+    expect("later negative row", [](auto & b) {
+        for (size_t i = nb; i < 2 * nb; ++i) b[i].channel_scale = -2.0f;
+    }, hp1::status::channel_scale, RS::Success, nb);
+    expect("later mismatch after completed row", [](auto & b) { b[nb + 1].channel_scale *= 2.0f; },
+           hp1::status::scale_mismatch, RS::Success, nb + 1);
+    expect("signed scale bit mismatch", [](auto & b) { b[1].channel_scale = -1.0f; },
+           hp1::status::scale_mismatch, RS::Success, 1);
+    expect("+0 / -0 bit mismatch", [](auto & b) {
+        for (size_t i = 0; i < nb; ++i) { b[i].channel_scale = 0.0f; b[i].m = INT16_MIN; }
+        b[1].channel_scale = -0.0f;
+    }, hp1::status::scale_mismatch, RS::Success, 1);
+    expect("-0 with zero carriers", [](auto & b) {
+        for (size_t i = 0; i < nb; ++i) { b[i].channel_scale = -0.0f; b[i].m = INT16_MIN; }
+    }, hp1::status::channel_scale, RS::Success, 0);
+    expect("+0 with m=0", [](auto & b) {
+        for (size_t i = 0; i < nb; ++i) { b[i].channel_scale = 0.0f; b[i].m = INT16_MIN; }
+        b[0].m = 0;
+    }, hp1::status::channel_scale, RS::Success, 0);
+}
+
 void test_hp1() {
     const size_t       N = 24, K = 128;
     std::vector<float> w(N * K);
@@ -1076,6 +1160,99 @@ bool same_as_reader(const ggml_gemmini_args_t & args, const hp1_weight & w) {
     return true;
 }
 
+void test_hp1_allocation_contract() {
+    constexpr size_t alignment = std::max(size_t(POTAL_HW_MAX_BYTES), size_t(DIM) * sizeof(int32_t));
+    const auto rounded = [](size_t bytes) { return (bytes + alignment - 1) / alignment * alignment; };
+    const size_t shapes[][2] = {
+        { 1, 32 }, { 1, 96 }, { 31, 32 }, { 31, 96 }, { 32, 32 }, { 32, 96 },
+        { 33, 32 }, { 33, 96 }, { 64, 32 }, { 64, 96 }, { 65, 32 }, { 65, 96 },
+        { 4097, 1024 }, // A separate multi-megabyte allocation, beyond the small heap cases.
+    };
+    for (const auto & shape : shapes) {
+        const size_t N = shape[0], K = shape[1];
+        const size_t n_pad = (N + DIM - 1) / DIM * DIM;
+        const size_t ldb = rounded(n_pad);
+        const size_t bytes[] = {
+            rounded(K * ldb), rounded(K / QK8_HP * n_pad * sizeof(uint32_t)), rounded(n_pad * sizeof(float)),
+        };
+        bool ok = true;
+        for (size_t repeat = 0; repeat < 3; ++repeat) {
+            hp1_weight w;
+            if (!w.allocate(N, K)) {
+                ok = false;
+                break;
+            }
+            ok = ok && w.n == N && w.k == K && w.n_pad == n_pad && w.ldb == ldb && w.cstride == n_pad &&
+                 w.bytes() == bytes[0] + bytes[1] + bytes[2];
+            void * views[] = { w.b, w.carriers, w.scale };
+            for (size_t i = 0; i < 3; ++i) {
+                const auto * data = static_cast<const unsigned char *>(views[i]);
+                const bool aligned = reinterpret_cast<uintptr_t>(data) % alignment == 0;
+                const bool zero = std::all_of(data, data + bytes[i], [](unsigned char v) { return v == 0; });
+                ok = ok && aligned && zero;
+                // Poison every exposed rounded byte before destruction, including padding.
+                // Repeated allocations must zero any dirty storage the allocator reuses.
+                std::memset(views[i], int(0xa5 + repeat), bytes[i]);
+            }
+            // Normal destruction must free the retained base, not an interior view.
+        }
+        char name[160];
+        std::snprintf(name, sizeof(name),
+                      "C HP1 allocation aligned/full-rounded-zero before prepare, poison/free x3 N=%zu K=%zu", N, K);
+        check(name, ok);
+    }
+}
+
+void test_hp1_padded_tails() {
+    for (size_t N : { 1u, 15u, 16u, 17u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 129u }) {
+        for (size_t K : { 32u, 64u, 96u, 128u }) {
+            const size_t nb = K / QK8_HP;
+            std::vector<block_q8_hp1> blocks(N * nb);
+            hp1::stats want;
+            bool have_m = false, have_scale = false;
+            for (size_t n = 0; n < N; ++n) {
+                const float scale = n % 5 == 0 ? 0.0f : float(n % 7 + 1) * 0.125f;
+                for (size_t b = 0; b < nb; ++b) {
+                    auto & blk = blocks[n * nb + b];
+                    blk.channel_scale = scale;
+                    blk.m = scale == 0.0f || (n + b) % 3 == 0 ? INT16_MIN :
+                            (n + b) % 3 == 1 ? 0 : 32767;
+                    // Zero-carrier blocks retain their nonzero payload bytes.
+                    for (size_t i = 0; i < QK8_HP; ++i) {
+                        blk.qs[i] = int8_t(int((n * 17 + b * 31 + i) % 255) - 127);
+                    }
+                    want.blocks++;
+                    if (blk.m == INT16_MIN) {
+                        want.zero_blocks++;
+                    } else {
+                        want.min_m = have_m ? std::min(want.min_m, int32_t(blk.m)) : blk.m;
+                        want.max_m = have_m ? std::max(want.max_m, int32_t(blk.m)) : blk.m;
+                        want.sum_m += blk.m;
+                        want.shift_blocks += blk.m > 0;
+                        have_m = true;
+                    }
+                }
+                if (scale == 0.0f) {
+                    want.zero_rows++;
+                } else {
+                    want.min_channel_scale = have_scale ? std::min(want.min_channel_scale, scale) : scale;
+                    want.max_channel_scale = have_scale ? std::max(want.max_channel_scale, scale) : scale;
+                    have_scale = true;
+                }
+            }
+            const auto args = hp1_args(blocks, N, K);
+            hp1_weight w;
+            auto reader = gq::wreader::WeightReaderStatus::UnsupportedFormat;
+            const bool ok = w.allocate(N, K) && prepare_weight(args, w, &reader) == hp1::status::ok &&
+                            reader == gq::wreader::WeightReaderStatus::Success &&
+                            same_as_reader(args, w) && same_hp1_stats(w.stats, want);
+            char name[160];
+            std::snprintf(name, sizeof(name), "C HP1 padded reader-exact B/carriers/scale/all stats N=%zu K=%zu", N, K);
+            check(name, ok);
+        }
+    }
+}
+
 bool same_weight(const hp1_weight & a, const hp1_weight & b) {
     return a.n == b.n && a.k == b.k && a.ldb == b.ldb && a.cstride == b.cstride && a.n_pad == b.n_pad &&
            std::memcmp(a.b, b.b, a.k * a.ldb) == 0 &&
@@ -1370,6 +1547,9 @@ int main() {
     test_tile_select();
     test_tiled_execution();
     test_hp1();
+    test_hp1_error_precedence();
+    test_hp1_allocation_contract();
+    test_hp1_padded_tails();
     test_configured_dispatcher();
     test_end_to_end();
     test_routes();

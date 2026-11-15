@@ -72,21 +72,21 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
     bool         have_m     = false;
     bool         have_scale = false;
     for (size_t n = 0; n < args.J; ++n) {
-        const wreader::ColumnScaleResult cs = wreader::read_column_scale_validated(args, plan, n, 0);
-        if (!cs.ok()) {
+        const wreader::Hp1CarrierResult first = wreader::read_hp1_carrier_validated(args, plan, n, 0);
+        if (!first.ok()) {
             if (reader != nullptr) {
-                *reader = cs.status;
+                *reader = first.status;
             }
             return status::metadata;
         }
-        const float    row_scale  = cs.column_scale;
+        const float    row_scale  = first.column_scale;
         const uint32_t scale_bits = float_bits(row_scale);
         if ((scale_bits & 0x80000000u) != 0) {
             return status::channel_scale;
         }
         const bool zero_scale = scale_bits == 0;
         for (size_t b = 0; b < nb; ++b) {
-            const wreader::Hp1CarrierResult c = wreader::read_hp1_carrier_validated(args, plan, n, b);
+            const wreader::Hp1CarrierResult c = b == 0 ? first : wreader::read_hp1_carrier_validated(args, plan, n, b);
             if (!c.ok()) {
                 if (reader != nullptr) {
                     *reader = c.status;
@@ -126,7 +126,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
     // are read per block (as wreader::read_code_tile_validated does), not per
     // element through read_code_validated. Column tiles keep the transpose in
     // cache: each B row segment is written contiguously.
-    constexpr size_t tile_n = 64;
+    constexpr size_t tile_n = 16;
     for (size_t n0 = 0; n0 < args.J; n0 += tile_n) {
         const size_t n1 = std::min(args.J, n0 + tile_n);
         for (size_t b = 0; b < nb; ++b) {
