@@ -369,25 +369,33 @@ bool LocalStage::run_optimized_full(Meta &          meta,
 #endif
 #endif
 
-    blk.reset();
-    blk.blk_size = block_size;
-    block_mask.clear();
-    for (size_t i = 0; i < block_size; ++i) {
-        const int16_t exp = unit_exp_.unbiased_exp(x[i]);
-        blk.e[i]          = exp;
-        if (exp > blk.e1) {
-            blk.e2 = blk.e1;
-            blk.e1 = exp;
-            block_mask.clear();
-            block_mask.set(i);
-        } else if (exp == blk.e1 && exp != neg_inf)
-            block_mask.set(i);
-        else if (exp < blk.e1 && exp > blk.e2)
-            blk.e2 = exp;
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+        // Keep A16's measured path; deferred mask writes did not improve the complete stage.
+        blk.reset();
+        blk.blk_size = block_size;
+        block_mask.clear();
+        for (size_t i = 0; i < block_size; ++i) {
+            const int16_t exp = unit_exp_.unbiased_exp(x[i]);
+            blk.e[i] = exp;
+            if (exp > blk.e1) {
+                blk.e2 = blk.e1;
+                blk.e1 = exp;
+                block_mask.clear();
+                block_mask.set(i);
+            } else if (exp == blk.e1 && exp != neg_inf)
+                block_mask.set(i);
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = exp;
+        }
+    } else {
+        block_mask.clear();
+        unit_exp_.scan_top2_exp(x, block_size, blk);
     }
     const bool has_second_bucket = blk.e2 != neg_inf;
-    if (!has_second_bucket)
-        block_mask.clear();
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+        if (!has_second_bucket)
+            block_mask.clear();
+    }
     e_pre = has_second_bucket ? blk.e2 : blk.e1;
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
@@ -407,8 +415,14 @@ bool LocalStage::run_optimized_full(Meta &          meta,
         }
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_pre);
         q_out[i]          = tmp;
-        if (block_mask.is_set(i))
+        if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+            if (block_mask.is_set(i))
+                continue;
+        } else if (has_second_bucket && blk.e[i] == blk.e1) {
+            // Build the top-bucket mask once, after its exponent is known.
+            block_mask.set(i);
             continue;
+        }
 
         const int64_t magnitude = magnitude_i32(tmp);
         S += magnitude;
@@ -560,26 +574,34 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
 #endif
 #endif
 
-    blk.reset();
-    blk.blk_size = block_size;
-    block_mask.clear();
-    for (size_t i = 0; i < valid_count; ++i) {
-        const int16_t exp = unit_exp_.unbiased_exp(blk.x[i]);
-        blk.e[i]          = exp;
-        if (exp > blk.e1) {
-            blk.e2 = blk.e1;
-            blk.e1 = exp;
-            block_mask.clear();
-            block_mask.set(i);
-        } else if (exp == blk.e1 && exp != neg_inf)
-            block_mask.set(i);
-        else if (exp < blk.e1 && exp > blk.e2)
-            blk.e2 = exp;
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+        blk.reset();
+        blk.blk_size = block_size;
+        block_mask.clear();
+        for (size_t i = 0; i < valid_count; ++i) {
+            const int16_t exp = unit_exp_.unbiased_exp(blk.x[i]);
+            blk.e[i] = exp;
+            if (exp > blk.e1) {
+                blk.e2 = blk.e1;
+                blk.e1 = exp;
+                block_mask.clear();
+                block_mask.set(i);
+            } else if (exp == blk.e1 && exp != neg_inf)
+                block_mask.set(i);
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = exp;
+        }
+    } else {
+        block_mask.clear();
+        unit_exp_.scan_top2_exp(blk.x.data(), valid_count, blk);
+        blk.blk_size = block_size;
     }
     std::fill(blk.e.begin() + valid_count, blk.e.begin() + block_size, neg_inf);
     const bool has_second_bucket = blk.e2 != neg_inf;
-    if (!has_second_bucket)
-        block_mask.clear();
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+        if (!has_second_bucket)
+            block_mask.clear();
+    }
     e_pre = has_second_bucket ? blk.e2 : blk.e1;
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
@@ -598,8 +620,13 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
         }
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(blk.x[i], theta_pre);
         q_out[i]          = tmp;
-        if (block_mask.is_set(i))
+        if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 16) {
+            if (block_mask.is_set(i))
+                continue;
+        } else if (has_second_bucket && blk.e[i] == blk.e1) {
+            block_mask.set(i);
             continue;
+        }
 
         const int64_t magnitude = magnitude_i32(tmp);
         S += magnitude;

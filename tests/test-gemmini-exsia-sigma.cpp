@@ -40,8 +40,10 @@ static bool check_sigma(const std::vector<int32_t> & values) {
     return !values.empty() || !detector.detect(0, context);
 }
 
-static bool check_local(const std::vector<float> & values, size_t block_size) {
+static bool check_local(const std::vector<float> & values, size_t block_size,
+                        int16_t rho = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_RHO) {
     ex::Meta meta;
+    meta.rho = rho;
     ex::ExSIAState state;
     state.B_size = state.K_padded = block_size;
     state.K_logical = values.size();
@@ -67,11 +69,18 @@ static bool check_local(const std::vector<float> & values, size_t block_size) {
         !stage.run_reference(meta, state, padded, 0, 0, reference_scratch, reference_mask,
                              reference, reference_exp, reference_sample))
         return false;
+    int16_t remaining_exp = std::numeric_limits<int16_t>::min();
+    for (size_t i = 0; i < values.size(); ++i)
+        if (!reference_mask.is_set(i))
+            remaining_exp = std::max(remaining_exp, reference_scratch.block.e[i]);
     if (optimized_words != reference_words || optimized != reference ||
-        optimized_exp != reference_exp[0]) {
-        std::fprintf(stderr, "Local/reference mismatch: B=%zu valid=%zu A%d sigma=%d\n",
+        optimized_exp != reference_exp[0] ||
+        optimized_scratch.block.theta_b != reference_scratch.block.theta_b ||
+        optimized_sample.p3_path != reference_sample.p3_path ||
+        optimized_sample.final_remaining_exp != remaining_exp) {
+        std::fprintf(stderr, "Local/reference mismatch: B=%zu valid=%zu A%d rho=%d sigma=%d\n",
                      block_size, values.size(), GGML_GEMMINI_ACTIVATION_BITS,
-                     GGML_GEMMINI_EXSIA_SIGMA);
+                     rho, GGML_GEMMINI_EXSIA_SIGMA);
         return false;
     }
     return true;
@@ -105,6 +114,35 @@ int main() {
         }
     }
     for (size_t block_size : {32, 64, 128}) {
+        const float tiny = std::numeric_limits<float>::denorm_min();
+        const float inf = std::numeric_limits<float>::infinity();
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const std::vector<std::vector<float>> cases = {
+            {0.0f, -0.0f, inf, -inf, nan},
+            {256, -2, 2, -3, 3},                 // Nonzero variance without a 2-sigma outlier.
+            {256, -8, tiny, tiny, tiny, tiny},   // N=5: exact strict 2-sigma boundary.
+            {256, -8, tiny, tiny, tiny, tiny, tiny}, // N=6: rounded zeros still count.
+            {256, -8, 1.375f, 1.375f, 1.375f, 1.375f, 1.375f}, // Scale replay.
+            {256, 2, -2, 2, -2, 2, -3.75f},    // Selection can retain the same exponent.
+            {1, 2, 4, 8, -8, 4, 0, 8},        // A later maximum replaces earlier buckets.
+            {8, -8, 4, 8, 2, 4, 1},           // Repeated maxima keep every top-bucket bit.
+            {std::nextafter(2.0f, 0.0f), -std::nextafter(2.0f, 0.0f)},
+        };
+        for (int16_t rho : {ex::Meta{}.rho, int16_t{14}}) {
+            for (const auto & input : cases) {
+                for (size_t valid : {input.size(), block_size - 1, block_size}) {
+                    std::vector<float> values = input;
+                    values.resize(valid, 0.0f);
+                    if (!check_local(values, block_size, rho))
+                        return 1;
+                }
+            }
+        }
+        std::vector<float> cross_word(block_size, 1.0f);
+        cross_word.front() = 4.0f;
+        cross_word.back() = -8.0f;
+        if (!check_local(cross_word, block_size))
+            return 1;
         for (size_t valid : {size_t{1}, block_size - 1, block_size}) {
             std::vector<float> values(valid, 0);
             if (!check_local(values, block_size))

@@ -155,8 +155,9 @@ enum class P3Path {
 
 struct LocalBlockCycleSample {
 #if EXSIA_STAGE_PROFILE_ENABLED
-    // P0 scans exponents and marks top buckets. P1 writes provisional q_out and
-    // accumulates S/SS. P2 marks integer outliers and tracks the final exponent.
+    // A4/A8 P0 selects the top exponents; P1 materializes their mask while writing
+    // provisional q_out and S/SS. A16 retains P0 mask writes.
+    // P2 marks integer outliers and tracks the final exponent.
     // P3 commits it, retaining q_out or overwriting it only for changed-scale replay.
     uint64_t p0                     = 0;
     uint64_t p1                     = 0;
@@ -186,7 +187,7 @@ struct LocalBlockCycleSample {
 #if EXSIA_BRANCH_COUNTS_ENABLED
 struct StripeCycleStats {
 #if EXSIA_STAGE_PROFILE_ENABLED
-    // P0: exponent/top-bucket selection; P1: direct q_out/statistics;
+    // P0: exponent/top-bucket selection (and A16 mask); P1: A4/A8 mask and q_out/statistics;
     // P2: integer-outlier/final-exponent selection; P3: q_out replay decision.
     StageCycleStats p0;
     StageCycleStats p1;
