@@ -21,6 +21,7 @@
 #include "ggml-gemmini.h"
 #include "ggml.h"
 #include "matmul/attention.hpp"
+#include "matmul/attention-residual.hpp"
 #include "matmul/dense.hpp"
 #include "matmul/options.hpp"
 #include "matmul/paired-auto.hpp"
@@ -32,6 +33,7 @@
 #include "quants/act/exsia/types.hpp"
 #include "quants/act/quantize.hpp"
 #include "residual/rmd/rmd-types.hpp"
+#include "residual/rmd/rmd-bitmap-builder.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -599,6 +601,52 @@ void test_main_merge() {
           bad_stride == grmd::RmdStatus::invalid_arguments && out == untouched && count == SIZE_MAX);
 }
 
+void test_upper_decode() {
+    namespace rmd = ggml::gemmini::rmd;
+    bool equal = true;
+    const int32_t edges[] = {INT32_MIN, INT32_MAX, -129, -128, -9, -8, -1, 0, 1, 7, 8, 127, 128};
+    for (auto role : {att::role::qk, att::role::pv})
+    for (bool zero : {false, true})
+    for (size_t rows : {1u, 3u, 33u})
+    for (size_t k : {1u, 31u, 32u, 33u, 257u}) {
+        att::stream a;
+        a.rows = rows + 1; a.k = k; a.kp = (k + 31) / 32 * 32; a.limb_count = 1;
+        a.codes.assign(a.rows * a.kp, 0);
+        a.limbs[0].assign(a.codes.size(), 0);
+        for (size_t row = 0; row < a.rows; ++row) for (size_t col = 0; col < k; ++col) {
+            const size_t index = row * a.kp + col;
+            const int32_t value = zero ? 0 : role == att::role::qk ? edges[(row * k + col) % 13] : (row * k + col) % 256;
+            a.codes[index] = value;
+            a.limbs[0][index] = int8_t(ggml::gemmini::lowdigit(uint64_t(int64_t(value) - (role == att::role::pv ? 8 : 0)), 4));
+        }
+        std::vector<uint64_t> selected((rows * a.kp + 63) / 64, UINT64_MAX);
+        rmd::RmdBitmapBuilder builder;
+        builder.reset(0, 0, rows, k, 37, 4, selected, a.kp);
+        for (size_t row = 0; row < rows; ++row) for (size_t col = 0; col < k; ++col) {
+            const size_t index = (row + 1) * a.kp + col;
+            const int32_t upper = int32_t((int64_t(a.codes[index]) - a.limbs[0][index] -
+                                          (role == att::role::pv ? 8 : 0)) / 16);
+            equal = builder.emit(row, col, upper) && equal;
+        }
+        residual::decoded_packet reference;
+        if (!builder.empty()) {
+            auto packet = builder.finish();
+            equal = packet && residual::decode_packet(*packet, reference) == rmd::RmdStatus::success && equal;
+        }
+        const auto got = att::detail::decode_upper(a, 1, rows, role);
+        equal = equal && got->k_compact == reference.k_compact && got->digits == reference.digits &&
+                got->rows.size() == reference.rows.size() && got->runs.size() == reference.runs.size();
+        if (!equal) break;
+        for (size_t i = 0; i < got->rows.size(); ++i)
+            equal = equal && got->rows[i].lane == reference.rows[i].lane &&
+                    got->rows[i].source_row == reference.rows[i].source_row;
+        for (size_t i = 0; i < got->runs.size(); ++i)
+            equal = equal && got->runs[i].block_id == reference.runs[i].block_id &&
+                    got->runs[i].local_k == reference.runs[i].local_k;
+    }
+    verdict("UPPER", "direct residual rows match packet decode including INT32 boundaries", equal, "");
+}
+
 // One case in a child process: a crash in the lowering under test is a FAIL of that case only.
 const char * only_case = nullptr; // argv[1]: run just this case, in-process (for a debugger)
 
@@ -662,6 +710,7 @@ int main(int argc, char ** argv) {
     };
     for (const auto & c : dense_cases) isolated("D", c.name, [&] { dense_case(c); });
     isolated("MERGE", "main-residual", [] { test_main_merge(); });
+    isolated("UPPER", "direct-upper", [] { test_upper_decode(); });
     const att_spec att_cases[] = {
         { "qk-random", att::role::qk, 64, 5, 3, 2, 4, 21, false },
         { "qk-boundary-tails", att::role::qk, 64, 37, 33, 2, 14, 22, true },
