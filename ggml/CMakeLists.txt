@@ -218,6 +218,7 @@ set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_POTAL                           "ggml: use the PoTal RoCC accelerator (DIM16 MUL_MAT)" OFF)
+option(GGML_POTAL_W4A4                      "ggml: build the PoTal W4A4 fork (ggml-potal-w4a4) instead of ggml-potal" OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
