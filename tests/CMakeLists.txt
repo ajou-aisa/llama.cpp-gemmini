@@ -663,6 +663,24 @@ if (NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini.h"
     message(FATAL_ERROR "test-gemmini-exsia requires a supported Gemmini header layout under ${TEST_GEMMINI_EXSIA_SW_PATH}")
 endif()
 
+add_executable(test-gemmini-exsia-sigma
+    test-gemmini-exsia-sigma.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/local.cpp)
+target_link_libraries(test-gemmini-exsia-sigma PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-exsia-sigma PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-exsia-sigma PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=0
+    LOG_CYCLE=0 CYCLE_DETAIL=0 EXSIA_VALIDATION=1)
+target_include_directories(test-gemmini-exsia-sigma PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini-utils/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH} ${TEST_GEMMINI_EXSIA_SW_PATH}/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
+add_test(NAME test-gemmini-exsia-sigma COMMAND test-gemmini-exsia-sigma)
+
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ${_GEMMINI_TEST_EXSIA_SOURCES})

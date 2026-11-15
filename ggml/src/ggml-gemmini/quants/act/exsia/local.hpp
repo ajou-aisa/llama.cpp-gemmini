@@ -68,18 +68,20 @@ class WideQuantizer {
 
 class SigmaDetector {
   public:
+    // Local statistics contain at most 128 members with |q| <= 2^(activation_bits - 1).
+    // detect() tests a member of that same population.
     struct SigmaContext {
-        __int128_t n         = 0;
-        __int128_t S         = 0;
-        __int128_t threshold = 0;
-        bool       valid     = false;
+        int64_t n         = 0;
+        int64_t S         = 0;
+        int64_t threshold = 0;
+        bool    valid     = false;
     };
 
-    SigmaContext prepare(__int128_t S, __int128_t SS, size_t N) const;
+    SigmaContext prepare(int64_t S, int64_t SS, size_t N) const;
     bool         detect(int32_t q, const SigmaContext & context) const;
 
     // Detect a one-sided upper-tail outlier from magnitude statistics.
-    bool detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
+    bool detect_sigma(int32_t q, int64_t S, int64_t SS, size_t N);
 };
 
 class LocalStage {

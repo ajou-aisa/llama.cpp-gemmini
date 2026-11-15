@@ -237,19 +237,28 @@ void WideQuantizer::quantize_block(const float *          x,
         q[i] = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
 }
 
-SigmaDetector::SigmaContext SigmaDetector::prepare(__int128_t S, __int128_t SS, size_t N) const {
+SigmaDetector::SigmaContext SigmaDetector::prepare(int64_t S, int64_t SS, size_t N) const {
     SigmaContext context;
-    context.n = static_cast<__int128_t>(N);
+    context.n = static_cast<int64_t>(N);
     context.S = S;
     if (N == 0)
         return context;
 
-    const __int128_t variance_numer = context.n * SS - S * S;
+    // A population member satisfies centered^2 <= (N - 1) * variance_numer.
+    // Large configured sigma values therefore need no potentially overflowing product.
+    constexpr int64_t tau = GGML_GEMMINI_EXSIA_SIGMA;
+    constexpr int64_t tau_squared = tau * tau;
+    if (tau_squared >= context.n)
+        return context;
+
+    // P0 bounds unmasked exponents by e_pre; rho = activation_bits - 2 bounds
+    // unmasked |q| by 32768 even for A16. With N <= 128, S^2 and N*SS are
+    // at most 2^44; tau_squared < N also keeps the threshold within int64.
+    const int64_t variance_numer = context.n * SS - S * S;
     if (variance_numer <= 0)
         return context;
 
-    const __int128_t tau = GGML_GEMMINI_EXSIA_SIGMA;
-    context.threshold    = tau * tau * variance_numer;
+    context.threshold    = tau_squared * variance_numer;
     context.valid        = true;
     return context;
 }
@@ -258,11 +267,11 @@ bool SigmaDetector::detect(int32_t q, const SigmaContext & context) const {
     if (!context.valid)
         return false;
 
-    const __int128_t centered = context.n * static_cast<__int128_t>(magnitude_i32(q)) - context.S;
+    const int64_t centered = context.n * magnitude_i32(q) - context.S;
     return centered > 0 && centered * centered > context.threshold;
 }
 
-bool SigmaDetector::detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N) {
+bool SigmaDetector::detect_sigma(int32_t q, int64_t S, int64_t SS, size_t N) {
     return detect(q, prepare(S, SS, N));
 }
 
@@ -345,8 +354,8 @@ bool LocalStage::run_optimized_full(Meta &          meta,
     GGML_ASSERT(q_out != nullptr);
     BlockState &  blk             = scratch.block;
     const int16_t neg_inf         = std::numeric_limits<int16_t>::min();
-    __int128_t    S               = 0;
-    __int128_t    SS              = 0;
+    int64_t       S               = 0;
+    int64_t       SS              = 0;
     size_t        unmasked_count  = 0;
     bool          has_int_outlier = false;
     int16_t       final_exp       = neg_inf;
@@ -401,7 +410,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
         if (block_mask.is_set(i))
             continue;
 
-        const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
+        const int64_t magnitude = magnitude_i32(tmp);
         S += magnitude;
         SS += magnitude * magnitude;
         ++unmasked_count;
@@ -536,8 +545,8 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
     const int16_t neg_inf = std::numeric_limits<int16_t>::min();
     std::copy_n(x, valid_count, blk.x.begin());
     std::fill(blk.x.begin() + valid_count, blk.x.begin() + block_size, 0.0f);
-    __int128_t S               = 0;
-    __int128_t SS              = 0;
+    int64_t    S               = 0;
+    int64_t    SS              = 0;
     size_t     unmasked_count  = 0;
     bool       has_int_outlier = false;
     int16_t    final_exp       = neg_inf;
@@ -592,7 +601,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
         if (block_mask.is_set(i))
             continue;
 
-        const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
+        const int64_t magnitude = magnitude_i32(tmp);
         S += magnitude;
         SS += magnitude * magnitude;
         ++unmasked_count;
@@ -772,12 +781,18 @@ bool LocalStage::run_reference(Meta &                     meta,
 #endif
 #endif
 
+    // Preserve the original 128-bit predicate as an independent validation oracle.
+    const __int128_t n = static_cast<__int128_t>(unmasked_count);
+    const __int128_t variance_numer = n * SS - S * S;
+    const __int128_t tau = GGML_GEMMINI_EXSIA_SIGMA;
+    const __int128_t threshold = tau * tau * variance_numer;
     for (size_t i = 0; i < blk_size; ++i) {
         const size_t col = blk_idx * blk_size + i;
         if (col >= state.K_logical || blk.e[i] == neg_inf || block_mask.is_set(i))
             continue;
 
-        if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count)) {
+        const __int128_t centered = n * static_cast<__int128_t>(magnitude_i32(q_tmp[i])) - S;
+        if (variance_numer > 0 && centered > 0 && centered * centered > threshold) {
             block_mask.set(i);
             has_int_outlier = true;
         }
