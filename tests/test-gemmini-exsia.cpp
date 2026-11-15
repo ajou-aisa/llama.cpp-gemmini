@@ -441,11 +441,12 @@ bool test_folding_integer_boundaries() {
     constexpr int32_t imax = std::numeric_limits<int32_t>::max();
     constexpr int32_t imin = std::numeric_limits<int32_t>::min();
     const std::pair<int32_t, int32_t> cases[] = {
-        {0, 0}, {qmin, qmin}, {qmax, qmax}, {qmin - 1, qmax}, {qmax + 1, qmin},
+        {0, 0}, {1, 1}, {-1, -1}, {qmin, qmin}, {qmax, qmax},
+        {qmin - 1, qmax}, {qmax + 1, qmin},
         {imin, 0}, {imin + 1, 1}, {imax - qmax - 1, qmax},
         {imax - qmax, qmax}, {imax, qmax},
     };
-    constexpr size_t columns = 32;
+    constexpr size_t columns = 64;
     std::vector<int32_t> wide(columns, 0), validation_residual(columns, 0);
     for (size_t i = 0; i < std::size(cases); ++i)
         wide[i] = cases[i].first;
@@ -457,8 +458,9 @@ bool test_folding_integer_boundaries() {
     if (!args.A.allocate(1, columns, GGML_GEMMINI_ACTIVATION_BITS))
         return false;
     ExSIAState state;
-    state.B_size = state.K_padded = columns;
-    state.blocks_per_row = 1;
+    state.B_size = 32;
+    state.K_padded = columns;
+    state.blocks_per_row = 2;
     StripeState stripe;
     stripe.row_end = 1;
     stripe.e1 = 0;
@@ -470,7 +472,7 @@ bool test_folding_integer_boundaries() {
     meta.theta.resize(1);
     residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
     StripeFolding folding;
-    if (!check(folding.run(meta, state, stripe, args, 0, wide, {0},
+    if (!check(folding.run(meta, state, stripe, args, 0, wide, {0, 0},
                            validation_residual, capture),
                "folding accepts signed INT32 boundary values"))
         return false;
@@ -487,6 +489,27 @@ bool test_folding_integer_boundaries() {
             !check(restored[i] + args.A.get(0, i) == wide[i],
                    "dense plus emitted residual exactly reconstructs INT32 input"))
             return false;
+    }
+    for (int16_t delta : {1, 7, 15, 30, 31, 40}) {
+        stripe.e1 = delta;
+        stripe.e2 = 0;
+        if (!check(folding.run(meta, state, stripe, args, 0, wide, {delta, 0},
+                               validation_residual, capture),
+                   "folding accepts promoted blocks at left-shift boundaries"))
+            return false;
+        const auto shifted_payload = capture.finish();
+        std::fill(restored.begin(), restored.end(), 0);
+        if (shifted_payload.direct)
+            for (const auto & event : shifted_payload.direct->events)
+                restored.at(event.original_k) += event.residual;
+        for (size_t i = 0; i < columns; ++i) {
+            const int64_t scaled = i < state.B_size
+                ? int64_t(wide[i]) * (int64_t{1} << std::min<int>(delta, 31)) : wide[i];
+            const int64_t expected = std::clamp(scaled, int64_t(imin), int64_t(imax));
+            if (!check(restored[i] + args.A.get(0, i) == expected,
+                       "promoted dense plus residual matches saturated INT64 scaling"))
+                return false;
+        }
     }
 #endif
     return true;

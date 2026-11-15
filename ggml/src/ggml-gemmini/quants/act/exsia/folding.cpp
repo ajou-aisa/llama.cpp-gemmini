@@ -59,6 +59,17 @@ void fold_block_dense(T * codes, int32_t * shifted, const int32_t * q, size_t n,
             shifted[i] = round_shift_right_even(q[i], shift);
             codes[i]   = static_cast<T>(saturate_activation(shifted[i]));
         }
+    } else if (delta > 0 && sizeof(T) == 1 && GGML_GEMMINI_ACTIVATION_BITS != 16) {
+        const int shift = std::min<int>(delta, 31);
+        const int32_t lower = -static_cast<int32_t>(uint32_t{1} << (31 - shift));
+        const int32_t upper = INT32_MAX >> shift;
+        const int64_t factor = int64_t{1} << shift;
+        for (size_t i = 0; i < n; ++i) {
+            // Test the source range before scaling; the product is exact in INT64.
+            shifted[i] = q[i] < lower ? INT32_MIN : q[i] > upper ? INT32_MAX
+                : static_cast<int32_t>(static_cast<int64_t>(q[i]) * factor);
+            codes[i] = static_cast<T>(saturate_activation(shifted[i]));
+        }
     } else {
         const detail::PreparedShift prepared(delta);
         for (size_t i = 0; i < n; ++i) {
@@ -297,7 +308,8 @@ bool StripeFolding::run_blocks_typed(const ExSIAState &               state,
 #if !GGML_GEMMINI_ENABLE_RMD
     (void)rmd_builder;
 #endif
-    T       codes[64];
+    constexpr bool write_dense_direct = sizeof(T) == 1 && GGML_GEMMINI_ACTIVATION_BITS != 16;
+    T       code_storage[64];
     int32_t shifted[64];
 
     for (size_t r = stripe.row_start; r < stripe.row_end; ++r) {
@@ -311,6 +323,9 @@ bool StripeFolding::run_blocks_typed(const ExSIAState &               state,
             if (block_offset >= K)
                 break;
             const size_t  valid     = std::min(B, K - block_offset);
+            T * codes = code_storage;
+            if constexpr (write_dense_direct)
+                codes = reinterpret_cast<T *>(dense_row) + block_offset;
             const int16_t block_exp = exp_row[b];
             const int16_t delta     = block_exp == neg_inf || stripe.e_s == neg_inf
                                           ? 0
@@ -345,7 +360,8 @@ bool StripeFolding::run_blocks_typed(const ExSIAState &               state,
 #else
             (void)selected;
 #endif
-            std::memcpy(dense_row + block_offset * sizeof(T), codes, valid * sizeof(T));
+            if constexpr (!write_dense_direct)
+                std::memcpy(dense_row + block_offset * sizeof(T), codes, valid * sizeof(T));
         }
     }
     return true;
