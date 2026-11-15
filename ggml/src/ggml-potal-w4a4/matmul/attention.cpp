@@ -1,4 +1,5 @@
 #include "attention.hpp"
+#include "attention-residual.hpp"
 
 #include "dense.hpp"
 #include "paired-auto.hpp"
@@ -226,10 +227,11 @@ void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role 
 struct activation_parts {
     std::vector<float>   values;    // [rows][kp], zero padding
     std::vector<int16_t> exponents; // QK: [rows][kp / 32] local block exponents
+    bool main_only = false;
 };
 
 void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin, size_t rows,
-                     role operation, stream & out, activation_parts & parts) {
+                     role operation, stream & out, activation_parts & parts, bool main_only = false) {
     input_tensor(tensor, head, batch);
     require(operation == role::qk || operation == role::pv);
     require(rows != 0 && begin < size_t(tensor.ne[1]) && rows <= size_t(tensor.ne[1]) - begin);
@@ -239,8 +241,9 @@ void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size
     const size_t count = product(rows, out.kp);
     parts.values.assign(count, 0.0f);
     out.codes.assign(count, 0);
-    for (auto & limb : out.limbs) {
-        limb.assign(count, 0);
+    parts.main_only = main_only;
+    for (size_t limb = 0; limb < out.limbs.size(); ++limb) {
+        out.limbs[limb].assign(!main_only || limb == 0 ? count : 0, 0);
     }
     parts.exponents.assign(operation == role::qk ? product(rows, out.kp / block_k) : 0, 0);
 }
@@ -319,16 +322,22 @@ void fold_activation(role operation, stream & out, activation_parts & parts) {
             if (operation == role::pv) {
                 out.codes[index] = std::clamp(out.codes[index], 0, (1 << code_bits) - 1);
             }
-            split(out, index, int64_t(out.codes[index]) -
-                  (operation == role::pv ? bias : 0));
+            const int64_t code = int64_t(out.codes[index]) - (operation == role::pv ? bias : 0);
+            if (parts.main_only) {
+                // The paired runner decomposes the upper residual once in stage_job.
+                out.limbs[0][index] = int8_t(ggml::gemmini::lowdigit(uint64_t(code), bits));
+                out.limb_count = 1;
+            } else {
+                split(out, index, code);
+            }
         }
     }
 }
 
 void prepare_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin,
-                         size_t rows, role operation, stream & out) {
+                         size_t rows, role operation, stream & out, bool main_only = false) {
     activation_parts parts;
-    init_activation(tensor, head, batch, begin, rows, operation, out, parts);
+    init_activation(tensor, head, batch, begin, rows, operation, out, parts, main_only);
     local_activation(tensor, head, batch, begin, 0, rows, operation, out, parts);
     fold_activation(operation, out, parts);
 }
@@ -437,8 +446,6 @@ struct strict_job {
 
 struct preparation_workspace {
     std::array<std::shared_ptr<hp1_weight>, 2> weights;
-    std::vector<uint64_t> selected;
-    rmd::RmdBitmapBuilder builder;
 };
 
 std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
@@ -482,27 +489,7 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
                             product(operands.m_pad, operands.lda / 2), operands.lda / 2,
                             activation.limbs[0].data() + row_begin * activation.kp, activation.kp,
                             g.rows, activation.kp) == POTAL_OK);
-                auto upper = std::make_shared<residual::decoded_packet>();
-                prep.selected.assign((product(g.rows, activation.kp) + 63) / 64, UINT64_MAX);
-                auto & builder = prep.builder;
-                builder.reset(task, 0, g.rows, activation.k, weight->n, bits, prep.selected, activation.kp,
-                              workspace != nullptr && activation.rows == 1);
-                require(builder.status() == rmd::RmdStatus::success);
-                for (size_t i = 0; i < g.rows; ++i) {
-                    for (size_t k = 0; k < activation.k; ++k) {
-                        const size_t index = (row_begin + i) * activation.kp + k;
-                        const int64_t code = activation.codes[index];
-                        const int32_t value = int32_t((code - activation.limbs[0][index] -
-                                                      (operation == role::pv ? bias : 0)) / radix);
-                        require(!value || builder.emit(i, k, value));
-                    }
-                }
-                if (!builder.empty()) {
-                    auto packet = builder.finish();
-                    require(bool(packet));
-                    require(residual::decode_packet(*packet, *upper) == rmd::RmdStatus::success);
-                }
-                g.upper = std::move(upper);
+                g.upper = detail::decode_upper(activation, row_begin, g.rows, operation);
             } else {
                 require(job->gemms.size() >= slices, POTAL_ERR_BAD_RESPONSE);
                 const auto & first = *job->gemms[row_begin / POTAL_HW_DIM];
@@ -810,7 +797,7 @@ result execute(ggml_tensor * op, const paired_runner & paired, pv_algorithm algo
                             stream activation;
                             activation.algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
                             prepare_activation(b, head, batch, begin, std::min(stripe_rows, rows - begin),
-                                               operation, activation);
+                                               operation, activation, true);
                             std::vector<int64_t> integers;
                             execute_stripe(activation, weight, operation, paired, report, integers);
                             for (size_t i = 0; i < activation.rows; ++i) {
@@ -1033,7 +1020,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 note_cpu_work();
                 if (worker == 0) {
                     init_activation(b, task.head, task.batch, task.begin, task.rows, operation, st.streams[i],
-                                    st.parts[i]);
+                                    st.parts[i], true);
                     std::lock_guard<std::mutex> lock(st.m);
                     st.stage_done[i] = 1;
                     st.cv.notify_all();
