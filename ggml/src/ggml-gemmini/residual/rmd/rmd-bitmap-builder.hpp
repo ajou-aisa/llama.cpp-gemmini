@@ -15,7 +15,8 @@ class RmdBitmapBuilder {
                              size_t                        j,
                              uint8_t                       bits,
                              const std::vector<uint64_t> & selection,
-                             size_t                        stride);
+                             size_t                        stride,
+                             bool                          reuse_completed_packet = false);
     bool               emit(size_t row, size_t k, int32_t residual);
     StripePacketHandle finish();
     bool               empty() const noexcept {
@@ -39,6 +40,9 @@ class RmdBitmapBuilder {
     std::vector<uint32_t>                                   block_indices_, row_ranks_;
     std::vector<std::array<uint8_t, kMaxNativeRadixLanes>>    lane_groups_;
     StripePacket                                            metadata_;
+    bool                                                    reuse_completed_packet_ = false;
+    std::shared_ptr<StripePacket>                            cached_packet_;
+    std::vector<BlockDescriptor>                             recycled_blocks_;
     RmdStatus                                               status_ = RmdStatus::invalid_arguments;
 };
 

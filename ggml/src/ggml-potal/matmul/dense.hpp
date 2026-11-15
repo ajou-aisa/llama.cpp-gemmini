@@ -107,6 +107,8 @@ class hp1_operands {
 
     bool allocate(const hp1_shape & s);                        // false if out of memory
     bool allocate(const hp1_shape & s, const hp1_weight & w); // false if out of memory or w is not s.n x s.k
+    // Borrow a read-only activation allocation; both owners must survive the final fence.
+    bool allocate(const hp1_shape & s, const hp1_weight & w, const hp1_operands & activation);
     void abandon();                                            // leak the buffers on purpose
 
     int8_t *         a        = nullptr;

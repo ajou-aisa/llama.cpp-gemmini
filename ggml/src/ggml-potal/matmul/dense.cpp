@@ -205,6 +205,25 @@ bool hp1_operands::allocate(const hp1_shape & s, const hp1_weight & w) {
     return allocate_dynamic(s);
 }
 
+bool hp1_operands::allocate(const hp1_shape & s, const hp1_weight & w, const hp1_operands & activation) {
+    if (s.m <= 0 || s.n <= 0 || s.k <= 0 || w.n != size_t(s.n) || w.k != size_t(s.k) ||
+        !w.b || !activation.a || activation.m_pad < size_t(s.m) || activation.lda < size_t(s.k)) {
+        return false;
+    }
+    m_pad = align_up(size_t(s.m), HW_DIM);
+    n_pad = align_up(size_t(s.n), HW_DIM);
+    a = activation.a;
+    lda = activation.lda;
+    b = w.b;
+    ldb = w.ldb;
+    carriers = w.carriers;
+    cstride = w.cstride;
+    scale = w.scale;
+    ldc = n_pad;
+    c = static_cast<int32_t *>(blocks[1] = dma_alloc(m_pad * ldc * sizeof(int32_t)));
+    return c != nullptr;
+}
+
 bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
                const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
                const potal_tile_plan & plan, ggml_gemmini_args_t & args) {

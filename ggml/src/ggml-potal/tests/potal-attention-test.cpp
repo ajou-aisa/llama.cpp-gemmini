@@ -1827,20 +1827,22 @@ struct thread_owner final : ggml::potal::stripe_owner {
 };
 
 void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repeat, ggml_type wt, ggml_type at,
-                 uint32_t seed) {
+                 uint32_t seed, int weight_exponent = 0, int stream_exponent = 0) {
     graph g(r,k,n,m,false,heads,repeat,1,1,wt,at);
     uint32_t s = seed;
     const auto next = [&s] { s = s * 1664525u + 1013904223u; return s >> 8; };
     for (size_t h = 0; h < heads; ++h)
         for (size_t j = 0; j < n; ++j)
             for (size_t x = 0; x < k; ++x)
-                g.w.set(x,j,std::ldexp(float(int(next() % 255) - 127) / 64.0f,int(next() % 5) - 2),h,0);
+                g.w.set(x,j,std::ldexp(float(int(next() % 255) - 127) / 64.0f,
+                                     int(next() % 5) - 2 + weight_exponent),h,0);
     for (size_t h = 0; h < heads*repeat; ++h)
         for (size_t i = 0; i < m; ++i)
             for (size_t x = 0; x < k; ++x) {
                 const float u = float(next() % 65536) / 65535.0f;
                 // QK: per-block magnitudes over several exponents (anchor rank, outliers, upper limbs).
-                g.a.set(x,i,r == role::pv ? u : std::ldexp(u - 0.5f,int((x/32 + i + next() % 3) % 7) - 2),h,0);
+                const float input = r == role::pv ? u : std::ldexp(u - 0.5f,int((x/32 + i + next() % 3) % 7) - 2);
+                g.a.set(x,i,std::ldexp(input, stream_exponent),h,0);
             }
     const std::string name = std::string(r == role::qk ? "strict QK " : "strict PV ") + std::to_string(k) + "x" +
                              std::to_string(m) + "x" + std::to_string(n) + " heads " + std::to_string(heads) + "x" +
@@ -1877,6 +1879,16 @@ void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repe
         check(name + (fatal ? " fatal" : " nonfatal") + " injected failure propagates, nothing published",
               failed.status != POTAL_OK && failed.fatal == fatal && g.out.storage == untouched);
     }
+    g.out.fill(12345.0f);
+    const auto untouched = g.out.storage;
+    plain_runner unfenced;
+    unfenced.emu.fail_fence_at = 1;
+    thread_owner unfenced_owner;
+    unfenced_owner.runner = &unfenced;
+    const auto failed = attention::execute_strict(&g.out.t, unfenced_owner, cpus, false);
+    check(name + " failed hardware fence retains unknown DMA state, nothing published",
+          failed.status != POTAL_OK && failed.fatal && unfenced.emu.in_flight &&
+          !unfenced.emu.scales.empty() && g.out.storage == untouched);
 }
 
 void test_strict_pipeline() {
@@ -1886,6 +1898,11 @@ void test_strict_pipeline() {
     strict_case(role::pv, 70, 70, 64, 2, 2, GGML_TYPE_F16, GGML_TYPE_F32, 14);
     strict_case(role::qk, 129, 33, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F16, 15);   // odd K and rows
     strict_case(role::pv, 129, 130, 33, 1, 3, GGML_TYPE_F32, GGML_TYPE_F32, 16);
+    // Multi-row scaling must preserve subnormal/large F32 outputs, including signed zero.
+    strict_case(role::qk, 33, 32, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F32, 17, -100, -40);
+    strict_case(role::pv, 33, 32, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F32, 18, -100, -40);
+    strict_case(role::qk, 33, 32, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F32, 19, 60, 40);
+    strict_case(role::pv, 33, 32, 17, 1, 1, GGML_TYPE_F32, GGML_TYPE_F32, 20, 100, 0);
     graph legacy(role::pv,32,3,2);
     plain_runner unused;
     thread_owner owner;

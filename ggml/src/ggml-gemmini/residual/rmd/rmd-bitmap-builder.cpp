@@ -115,7 +115,13 @@ void RmdBitmapBuilder::reset(size_t                        stripe_id,
                              size_t                        j,
                              uint8_t                       bits,
                              const std::vector<uint64_t> & selection,
-                             size_t                        stride) {
+                             size_t                        stride,
+                             bool                          reuse_completed_packet) {
+    reuse_completed_packet_ = reuse_completed_packet && rows == 1;
+    if (!reuse_completed_packet_) {
+        cached_packet_.reset();
+        recycled_blocks_.clear();
+    }
     selection_ = &selection;
     stride_    = stride;
     cursor_    = 0;
@@ -265,7 +271,22 @@ StripePacketHandle RmdBitmapBuilder::finish() {
         auto & block_indices = block_indices_;
         auto & row_ranks = row_ranks_;
         auto & lane_groups = lane_groups_;
-        auto packet = std::make_shared<StripePacket>(metadata_);
+        std::shared_ptr<StripePacket> packet;
+        if (reuse_completed_packet_) {
+            recycled_blocks_.clear();
+            // A retained handle may still feed an asynchronous consumer. Reuse only
+            // after every consumer releases it, and rebuild all packet contents.
+            if (cached_packet_ && cached_packet_.unique()) {
+                cached_packet_->blocks.swap(recycled_blocks_);
+                *cached_packet_ = metadata_;
+            } else {
+                cached_packet_ = std::make_shared<StripePacket>(metadata_);
+            }
+            packet = cached_packet_;
+        } else {
+            packet = std::make_shared<StripePacket>(metadata_);
+        }
+        size_t recycled_cursor = 0;
         packet->blocks.reserve(block_count);
         packet->k_indices.reserve(std::min(digit_count_, block_count * kBlockSize));
         const size_t rows_padded = align_up(metadata_.row_count, kArrayDim);
@@ -288,6 +309,15 @@ StripePacketHandle RmdBitmapBuilder::finish() {
             }
             if (!block_mask)
                 continue;
+            if (recycled_cursor < recycled_blocks_.size()) {
+                block.groups.swap(recycled_blocks_[recycled_cursor++].groups);
+                for (auto & group : block.groups) {
+                    group.lane_positions.clear();
+                    group.row_ids.clear();
+                    group.row_offsets.fill(0);
+                    group.k_mask = 0;
+                }
+            }
             block_indices[block_id] = static_cast<uint32_t>(packet->blocks.size());
             for (size_t lane = 0; lane < packet->lane_capacity; ++lane) {
                 if (block.active_lane_mask & (uint16_t{1} << lane)) {

@@ -699,6 +699,7 @@ struct strict_job {
     size_t                            rows = 0;
     int                               scale = 0;
     std::shared_ptr<const stationary> weight;
+    std::array<std::unique_ptr<hp1_weight>, 2> packed_weights;
     std::vector<gemm_item>            gemms; // limb-major, pass-minor: execute_stripe's issue order
 
     void abandon() {
@@ -706,6 +707,9 @@ struct strict_job {
             if (g.ops) {
                 g.ops->abandon(); // unknown DMA completion: keep every operand alive
             }
+        }
+        for (auto & packed : packed_weights) {
+            if (packed) packed->abandon();
         }
     }
 };
@@ -721,27 +725,46 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
     job->rows = activation.rows;
     job->scale = activation.scale;
     job->weight = weight;
+    // Sharing pays for multiple limbs; a single limb retains its original allocations.
+    const bool share = activation.limb_count > 1;
+    if (share) {
+        for (size_t pass = 0; pass < passes; ++pass) {
+            auto & packed = job->packed_weights[pass];
+            packed = std::make_unique<hp1_weight>();
+            require(packed->allocate(int64_t(weight->n), int64_t(activation.kp)), POTAL_ERR_CAPACITY);
+            for (size_t block = 0; block < weight->kp / block_k; ++block)
+                std::copy_n(weight->carriers.data() + block * weight->n, weight->n,
+                            packed->carriers + block * packed->cstride);
+            for (size_t k = 0; k < weight->kp; ++k)
+                std::copy_n(weight->limbs[pass].data() + k * weight->n, weight->n,
+                            packed->b + k * packed->ldb);
+        }
+    }
     for (size_t limb = 0; limb < activation.limb_count; ++limb) {
         const potal_tile_plan plan = limb_plan(activation, *weight, operation, limb);
+        const hp1_operands * shared_activation = nullptr;
         for (size_t pass = 0; pass < passes; ++pass) {
             gemm_item item;
             item.limb = limb;
             item.pass = pass;
             item.ops = std::make_unique<hp1_operands>();
             hp1_operands & operands = *item.ops;
-            require(operands.allocate({ int64_t(activation.rows), int64_t(weight->n), int64_t(activation.kp) }),
-                    POTAL_ERR_CAPACITY);
-            for (size_t i = 0; i < activation.rows; ++i) {
+            const hp1_shape shape{int64_t(activation.rows), int64_t(weight->n), int64_t(activation.kp)};
+            const bool allocated = !share ? operands.allocate(shape) : shared_activation
+                ? operands.allocate(shape, *job->packed_weights[pass], *shared_activation)
+                : operands.allocate(shape, *job->packed_weights[pass]);
+            require(allocated, POTAL_ERR_CAPACITY);
+            if (!shared_activation) for (size_t i = 0; i < activation.rows; ++i) {
                 for (size_t k = 0; k < activation.k; ++k) {
                     operands.a[i * operands.lda + k] = activation.limbs[limb][i * activation.kp + k];
                 }
             }
-            for (size_t block = 0; block < weight->kp / block_k; ++block) {
+            if (!share) for (size_t block = 0; block < weight->kp / block_k; ++block) {
                 for (size_t j = 0; j < weight->n; ++j) {
                     operands.own.carriers[block * operands.cstride + j] = weight->carriers[block * weight->n + j];
                 }
             }
-            for (size_t k = 0; k < weight->kp; ++k) {
+            if (!share) for (size_t k = 0; k < weight->kp; ++k) {
                 for (size_t j = 0; j < weight->n; ++j) {
                     operands.own.b[k * operands.ldb + j] =
                         weight->limbs[operation == role::qk ? pass : 0][k * weight->n + j];
@@ -764,6 +787,7 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
             descriptor.tile_i = uint32_t(plan.tile_I);
             descriptor.tile_j = uint32_t(plan.tile_J);
             descriptor.tile_k = uint32_t(plan.tile_K);
+            if (share && pass == 0) shared_activation = &operands;
             job->gemms.push_back(std::move(item));
         }
     }
@@ -805,41 +829,72 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
     const stationary & weight = *job.weight;
     const size_t n = weight.n, passes = operation == role::qk ? 2 : 1;
     const auto start = std::chrono::steady_clock::now();
+    std::vector<double> scales;
+    if (job.rows > 1) {
+        scales.resize(n);
+        for (size_t j = 0; j < n; ++j) {
+            const int exponent = job.scale + int(weight.base[j]);
+            // Exact power-of-two multiplication, with room for any INT64 input.
+            scales[j] = exponent >= -1022 && exponent <= 960 ? std::ldexp(1.0, exponent) : 0;
+        }
+    }
+    const auto store = [&](size_t i, size_t j, int64_t code) {
+        const double decoded = !scales.empty() && scales[j] != 0
+            ? static_cast<double>(code) * scales[j]
+            : std::ldexp(static_cast<double>(code), job.scale + int(weight.base[j]));
+        const float value = static_cast<float>(decoded);
+        require(std::isfinite(value), POTAL_ERR_CAPACITY);
+        staged[((task.batch * heads + task.head) * rows_total + task.begin + i) * n + j] = value;
+    };
+    if (operation == role::qk) {
+        require(job.gemms.size() % passes == 0, POTAL_ERR_BAD_RESPONSE);
+        for (size_t index = 0; index < job.gemms.size(); index += passes) {
+            require(job.gemms[index].pass == 0 && job.gemms[index + 1].pass == 1 &&
+                    job.gemms[index].limb == job.gemms[index + 1].limb, POTAL_ERR_BAD_RESPONSE);
+        }
+        for (size_t i = 0; i < job.rows; ++i) {
+            for (size_t j = 0; j < n; ++j) {
+                int64_t out = 0;
+                for (size_t index = 0; index < job.gemms.size(); index += passes) {
+                    int64_t stationary_sum = 0;
+                    for (size_t pass = 0; pass < passes; ++pass) {
+                        const auto & g = job.gemms[index + pass];
+                        reconstruct(stationary_sum, g.ops->c[i * g.ops->ldc + j], pass);
+                    }
+                    reconstruct(out, stationary_sum, job.gemms[index].limb);
+                }
+                store(i, j, out);
+            }
+        }
+        reconstruct_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return;
+    }
     std::vector<int64_t> out(product(job.rows, n), 0);
-    std::vector<int64_t> stationary_sum;
     size_t index = 0;
     while (index < job.gemms.size()) {
         const size_t limb = job.gemms[index].limb;
-        if (operation == role::qk) {
-            stationary_sum.assign(out.size(), 0);
-        }
         for (size_t pass = 0; pass < passes; ++pass, ++index) {
             const gemm_item & g = job.gemms[index];
             require(g.limb == limb && g.pass == pass, POTAL_ERR_BAD_RESPONSE);
             for (size_t i = 0; i < job.rows; ++i) {
                 for (size_t j = 0; j < n; ++j) {
                     const int32_t value = g.ops->c[i * g.ops->ldc + j];
-                    if (operation == role::qk) {
-                        reconstruct(stationary_sum[i * n + j], value, pass);
-                    } else {
-                        reconstruct(out[i * n + j], value, limb, bits);
-                    }
+                    reconstruct(out[i * n + j], value, limb, bits);
                 }
             }
         }
-        if (operation == role::qk) {
-            for (size_t e = 0; e < out.size(); ++e) {
-                reconstruct(out[e], stationary_sum[e], limb);
-            }
-        }
     }
-    for (size_t i = 0; i < job.rows; ++i) {
+    if (job.rows == 1) {
         for (size_t j = 0; j < n; ++j) {
-            const float value = static_cast<float>(std::ldexp(static_cast<double>(out[i * n + j]),
+            const float value = static_cast<float>(std::ldexp(static_cast<double>(out[j]),
                                                               job.scale + int(weight.base[j])));
             require(std::isfinite(value), POTAL_ERR_CAPACITY);
-            staged[((task.batch * heads + task.head) * rows_total + task.begin + i) * n + j] = value;
+            staged[((task.batch * heads + task.head) * rows_total + task.begin) * n + j] = value;
         }
+    } else {
+        for (size_t i = 0; i < job.rows; ++i)
+            for (size_t j = 0; j < n; ++j)
+                store(i, j, out[i * n + j]);
     }
     reconstruct_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }

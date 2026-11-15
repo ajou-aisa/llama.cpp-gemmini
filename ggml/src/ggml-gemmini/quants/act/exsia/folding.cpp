@@ -156,7 +156,8 @@ bool StripeFolding::run(Meta &                           meta,
                       args.K,
                       args.J,
                       &stripe.outlier_mask.words,
-                      state.K_padded);
+                      state.K_padded,
+                      args.I == 1);
 #else
     (void)rmd_builder;
 #endif
