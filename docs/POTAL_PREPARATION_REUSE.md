@@ -2,8 +2,8 @@
 
 This change targets the host C++ path feeding the FPGA PoTal backend, based on
 `potal` commit `272802fa6439a939583b474ae7a91e5912adea4d`. It does not change CUDA
-kernels or require an RTL change. Attention changes here apply to the W8
-`ggml-potal` strict pipeline; they are not a port to `ggml-potal-w4a4`.
+kernels or require an RTL change. Attention changes now cover both W8
+`ggml-potal` and the separate packed INT4 `ggml-potal-w4a4` pipeline.
 The shared residual packet builder supports both 4-bit and 8-bit digits.
 
 ## Changes and conditions
@@ -14,8 +14,10 @@ The shared residual packet builder supports both 4-bit and 8-bit digits.
 | Shared Attention packing | More than one activation limb | Repeated stationary B/carrier allocation and copying across limbs; duplicate Q A packing for K-low/K-high |
 | Output scale reuse | More than one row | Repeated `ldexp` for each output row; one exact power-of-two factor per column |
 | Completed packet reuse | Explicit decode opt-in, one row, previous packet exclusively owned by builder | Packet/payload/group allocation; all current contents are still regenerated |
+| Stationary packing across jobs | Multi-limb jobs in one strict Attention invocation, same KV head and batch | Repacking B/carriers for each stripe or grouped query head |
+| Main conversion during residual merge | Linear stripe with a residual packet | Separate Main output write/read traversal before the checked residual merge |
 
-Single-limb packing retains the original path. PV keeps limb-major
+In W8, single-limb packing retains the original path. PV keeps limb-major
 reconstruction; it does not use QK's element-major fusion. One-row PV output
 conversion keeps its direct `ldexp` loop. Prefill packet pooling is disabled.
 There is no new quantization approximation, anchor change, residual suppression,
@@ -23,8 +25,9 @@ GEMM removal, or change to the FP baseline.
 
 ## Numerical and FPGA ownership contracts
 
-- QK retains low-pass then high-pass reconstruction for each limb, and increasing
-  limb order for each output. Every checked INT64 reconstruction is still checked.
+- W8 QK retains low-pass then high-pass reconstruction for each limb. W4 retains
+  its existing stationary-pass order, Main before the original upper lanes.
+  Every checked INT64 reconstruction is still checked.
   The hardware GEMM order and INT32/SCU saturation behavior are unchanged.
 - Scaling first converts INT64 to binary64 as before. Multiplication is used only
   for exponents in `[-1022, 960]`: the factor is an exactly representable normal
@@ -35,6 +38,18 @@ GEMM removal, or change to the FP baseline.
   pass 0's read-only activation allocation; every GEMM retains a separate C
   allocation. Shapes, padded layout, carrier stride, descriptors, planning,
   validation, command ordering, and fencing stay on the production path.
+- Stationary packing is shared across jobs only inside that invocation. A KV
+  head/batch change resets the producer's cache; pending jobs retain their own
+  shared owners. This is not a persistent KV cache or cross-token quantization
+  cache. W8 single-limb jobs retain their original path.
+- The Linear merge keeps Main as `float(double(C) * activation_scale *
+  double(weight_scale))` and the residual delta as `float(double(R) *
+  double(weight_scale) * double(float(2^theta)))`, then adds those two floats.
+  It does not combine integers before conversion or reassociate the factors.
+  Residual radix reconstruction and every overflow check remain. Output and
+  nonzero count commit only after every staged cell passes; slots are released
+  after the same semantic-completion boundary. Trace span 43 now includes Main
+  conversion in the merge traversal for residual stripes.
 - Unknown DMA completion still abandons all job allocations, including shared
   stationary allocations. No shared DMA input is overwritten or freed on that
   failure path. Public output is committed only after successful completion.
@@ -56,6 +71,11 @@ paired path enabled. Hardware header SHA-256:
   failure with unknown DMA state.
 - `potal-stripe-pipeline-test`: real host pipeline with the existing accelerator
   model, including packet ownership and backpressure behavior.
+- Follow-up integration reran both tests and `potal-residual-unit-test`. Added
+  distinct two-batch/two-head Attention fixtures exercise cache reset and pending
+  ownership. Fused merge tests compare with the previous separate production
+  conversion/merge for strided outputs, cancellation, INT32 extremes, subnormal
+  and large scales, invalid Main stride, and late overflow without partial commit.
 - `test-gemmini-rmd-bitmap.cpp`: LOG_CYCLE=0 and 1, 4/8-bit exact packets versus
   the existing builder and independent reconstruction. Includes 60 changing
   decode/prefill/empty shapes and retained packets. LOG_CYCLE=1 also passed
@@ -108,3 +128,104 @@ These are CPU-stage measurements, not CUDA timings and not Rocket/FPGA TTFT or
 TPOT speedups. Native model tests do not establish actual RTL execution. No new
 FireSim/FPGA run, RISC-V target build, or full-model PPL run was performed for this
 PR. Target execution remains necessary before reporting end-to-end improvement.
+
+## Additional integration measurement (2026-11-16)
+
+The two follow-up changes were replayed from their final product bodies on Nano3
+CPU5, with the same scalar compiler settings and seven alternating pairs. The
+baseline here is the already optimized PR implementation at `5f85a6f`, not the
+original `potal` implementation. Packing includes first allocation/packing and
+destruction, with up to four jobs alive. Jobs use three limbs; QK has K=127,
+N=4093 and PV has K=4093, N=65. Shared planning/validation remains excluded from
+both replay sides and remains enabled in production.
+
+| Stage / group | Before ms | After ms | Wall reduction | User-cycle reduction |
+| --- | ---: | ---: | ---: | ---: |
+| QK packing, 32 rows, 28 jobs | 32.900 | 22.263 | 32.3% | 49.2% |
+| QK packing, 1 row, 28 jobs | 24.070 | 20.764 | 13.7% | 52.6% |
+| PV packing, 32 rows, 28 jobs | 24.201 | 22.025 | 9.0% | 8.9% |
+| PV packing, 1 row, 28 jobs | 3.659 | 1.535 | 58.0% | 58.0% |
+| Linear Main conversion + merge, 32 x 4096 | 1.3104 | 1.1123 | 15.1% | 15.1% |
+| Linear Main conversion + merge, 1 x 4096 | 0.04387 | 0.03712 | 15.4% | 15.3% |
+
+Single-job packing controls were within 0.3% wall time. The Linear measurement
+excludes unchanged residual radix reconstruction. Both replay correctness checks
+passed on Nano and under local ASan/UBSan; native pipeline tests cover the full
+production path. Raw pairs and extracted sources are retained under
+`.omo/evidence/potal-followup-integration-20261116/` in the project workspace;
+paired medians are in [the follow-up CSV](potal-followup-nano.csv).
+These reductions cannot be added to the earlier stage percentages or reported
+as end-to-end speedups. The FPGA/Rocket and full-model validation limits above
+still apply. PV maximum fusion and general preparation-buffer pooling were not
+promoted by this change.
+
+## W4 completion (2026-11-16)
+
+The W8 changes were missing from the separate W4 module. The port now includes:
+
+| Optimization | W8 | W4 |
+| --- | --- | --- |
+| Stationary B/carrier packing shared within an invocation and KV head/batch | Applied | Applied, packed INT4 strides |
+| Q Main A shared by K-low/high | Applied | Applied, independently owned C buffers |
+| QK reconstruction without a dense INT64 stripe intermediate | Applied | Applied, original pass/Main/upper order |
+| Exact column scale reuse for multiple output rows | Applied | Applied; decode retains direct ldexp |
+| Decode bitmap/builder/completed-packet capacity reuse | Applied | Applied with exclusive packet ownership |
+| Linear Main conversion during checked residual merge | Applied | Applied |
+
+W4 also shares the decoded Q upper-residual packet between K-low/high. Its
+prepared paired plans and residual C buffers remain separate because the
+stationary operands differ. W4's PV unsigned-code bias correction remains in
+place. No Index/Scale/Fence command is omitted; no new ISA, RVV, or RTL is needed.
+
+W4 native Release validation uses a clearly labelled emulator geometry fixture,
+not an FPGA-generated header: DIM32, packed INT4, four scratchpad banks of 2048
+rows, and 512 accumulator rows. Fixture SHA256:
+`a8104a56eb0c0322f38498fa401fdbea7391ebfac84c28432cb4ee03f7748616`.
+The actual target must still supply its own matching generated hardware header.
+
+The expanded `potal-w4a4-golden-test` compares independent golden results with
+sequential and strict pipeline execution, including multiple batches/KV heads,
+GQA, 33-row tails, decode, boundary residuals and an injected failed Fence.
+Linear tests cover distinct float-rounding points, strided output, cancellation,
+large/subnormal scales and failure without partial publication. The test now
+initializes ggml before FP16 reads: without initialization, the portable FP16
+lookup table could return zero for every K/V value, weakening prior coverage.
+A mutation omitting the head/batch packing-cache reset fails the initialized
+decode golden test; restoring the reset passes.
+W8 Attention, stripe-pipeline and residual regression tests also pass.
+
+Local x86/WSL stage measurements use the full old/current W4 product Attention
+source, with unchanged production planner, preparation validator and paired
+staging enabled on both sides. They exclude quantization, DMA and GEMM execution.
+Inputs are deterministic synthetic F32 tensors converted by the product preparer;
+reconstruction uses seeded synthetic accumulator readbacks. GCC 13.3, O3,
+no fast-math, no loop/SLP vectorization for the Attention translation unit,
+single-CPU affinity, seven alternating old/new process pairs. Shared linked
+support objects use the normal Release build. Each preparation sample includes
+eight jobs (four live slots), three repetitions after a warm-up; reconstruction
+uses 100 repetitions. Baseline source is the W4 Attention file at `02e5e8e`.
+
+| W4 stage | Rows | Old median ms | New median ms | Change |
+| --- | ---: | ---: | ---: | ---: |
+| QK preparation, eight jobs | 1 | 12.933 | 6.509 | 49.7% lower |
+| QK preparation, eight jobs | 32 | 23.251 | 13.340 | 42.6% lower |
+| PV preparation, eight jobs | 1 | 4.457 | 2.756 | 38.2% lower |
+| PV preparation, eight jobs | 32 | 43.658 | 40.048 | 8.3% lower |
+| QK reconstruction | 1 | 0.03686 | 0.03594 | 2.5% lower; noisy |
+| QK reconstruction | 32 | 1.24593 | 1.04528 | 16.1% lower |
+| PV reconstruction | 1 | 0.04558 | 0.04808 | 5.5% higher; no speedup claimed |
+| PV reconstruction | 32 | 0.10220 | 0.09134 | 10.6% lower; noisy |
+
+QK K/N=128/1024; PV K/N=1024/64. Every old/new output/packing hash matched.
+Raw pairs, including timing variation, are in
+[the local W4 CSV](potal-w4-preparation-local.csv). PV decode retains the original
+merge and direct ldexp algorithm; the measured small reconstruction regression
+is reported rather than hidden by the larger preparation gain. These numbers
+are neither Nano measurements nor Rocket TTFT/TPOT results. No full-model PPL or
+new FPGA execution was run. Replay sources/build scripts and native logs are in
+`.omo/evidence/potal-w4-port-20261116/` in the project workspace.
+
+Previously rejected approximation, extra empty-mask/ctz variants, core
+redistribution, general prefill packet pooling, and unverified command omission
+remain excluded. This completion ports the accepted preparation/finalization
+optimizations; it does not revive those experiments.

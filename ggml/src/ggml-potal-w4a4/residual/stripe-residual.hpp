@@ -181,4 +181,16 @@ rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, s
                                   const rmd::BlockScaledInt64Correction & correction, float * out, size_t out_rows,
                                   size_t row_stride, size_t col_stride, size_t * nonzero);
 
+struct main_readback {
+    const int32_t * data;
+    size_t stride;
+    double activation_scale;
+};
+
+// Preserve separate Main/residual float rounding in one staged traversal.
+rmd::RmdStatus merge_main_residual_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+    const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & metadata,
+    const rmd::BlockScaledInt64Correction & correction, main_readback main,
+    float * out, size_t out_rows, size_t row_stride, size_t col_stride, size_t * nonzero);
+
 } // namespace ggml::potal::residual

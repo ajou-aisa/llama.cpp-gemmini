@@ -991,6 +991,67 @@ void test_merge() {
           all_ok && prepared_validations == 0 && prepared_reads == 0 && reference.same() && gemmini_validations >= 1);
 }
 
+void test_main_merge() {
+    constexpr size_t cols = 7, rows = 3, ldc = 11, stride = 19;
+    hp1_weight weight;
+    if (!weight.allocate(cols, 32)) {
+        check("fused merge weight allocation", false);
+        return;
+    }
+    const float scales[] = {0.0f, -0.0f, 0.003f, 1e-30f, 1e30f, -0.125f, 1.0f};
+    std::copy_n(scales, cols, weight.scale);
+    std::vector<int32_t> main(rows * ldc, 0);
+    const int32_t codes[] = {INT32_MIN, INT32_MAX, -16777217, 16777217, -1, 0, 1};
+    grmd::BlockScaledInt64Correction corr;
+    corr.values.resize(rows * cols);
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            main[r * ldc + c] = codes[(r + c) % cols];
+            corr.values[r * cols + c] = -int64_t(main[r * ldc + c]) + int64_t(c % 3);
+        }
+    }
+    bool equal = true;
+    for (int theta : {-140, -20, 0, 10, 100}) {
+        const std::vector<float> untouched(5 * stride, 123.25f);
+        auto reference = untouched;
+        auto fused = untouched;
+        exsia_ns::StripeMetadataSnapshot meta;
+        meta.theta = theta;
+        const double scale = std::ldexp(1.0f, theta);
+        for (size_t r = 0; r < rows; ++r) {
+            reconstruct_row(main.data() + r * ldc, cols, scale, weight.scale,
+                            reference.data() + (r + 1) * stride, 2);
+        }
+        size_t want_count = SIZE_MAX, got_count = SIZE_MAX;
+        const auto want = residual::merge_prepared_hp1(weight, 1, rows + 1, meta, corr,
+            reference.data(), 5, stride, 2, &want_count);
+        const auto got = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+            {main.data(), ldc, scale}, fused.data(), 5, stride, 2, &got_count);
+        equal = equal && want == got && want_count == got_count &&
+            std::memcmp(fused.data(), got == grmd::RmdStatus::success ? reference.data() : untouched.data(),
+                        fused.size() * sizeof(float)) == 0;
+    }
+    check("fused Main/residual merge matches separate float rounding, strides and overflow", equal);
+
+    exsia_ns::StripeMetadataSnapshot meta;
+    meta.theta = 100;
+    std::fill_n(weight.scale, cols, 1.0f);
+    std::fill(main.begin(), main.end(), 0);
+    std::fill(corr.values.begin(), corr.values.end(), 1);
+    corr.values.back() = INT64_MAX;
+    const std::vector<float> untouched(5 * stride, 123.25f);
+    auto out = untouched;
+    size_t count = SIZE_MAX;
+    const auto late = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+        {main.data(), ldc, std::ldexp(1.0f, 100)}, out.data(), 5, stride, 2, &count);
+    check("fused merge late overflow leaves output and count untouched",
+          late == grmd::RmdStatus::overflow && out == untouched && count == SIZE_MAX);
+    const auto bad_stride = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+        {main.data(), cols - 1, 1.0}, out.data(), 5, stride, 2, &count);
+    check("fused merge rejects short Main stride before reading",
+          bad_stride == grmd::RmdStatus::invalid_arguments && out == untouched && count == SIZE_MAX);
+}
+
 } // namespace
 
 int main() {
@@ -1001,6 +1062,7 @@ int main() {
     test_cancellation();
     test_failures();
     test_merge();
+    test_main_merge();
     if (failures != 0) {
         std::printf("POTAL_RESIDUAL_UNIT_TEST FAIL (%d)\n", failures);
         return 1;

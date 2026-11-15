@@ -482,10 +482,12 @@ rmd::RmdStatus reconstruct_rows(const rmd::StripePacket & packet, const std::vec
     return rmd::RmdStatus::overflow;
 }
 
-rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+template<bool FromMain>
+static rmd::RmdStatus merge_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
                                   const exsia::StripeMetadataSnapshot & metadata,
                                   const rmd::BlockScaledInt64Correction & correction, float * out, size_t out_rows,
-                                  size_t row_stride, size_t col_stride, size_t * nonzero) try {
+                                  size_t row_stride, size_t col_stride, size_t * nonzero,
+                                  main_readback main) try {
     // Layout: rmd-compose.cpp prepare_merge_layout.
     const size_t n = weight.n;
     if (out == nullptr || weight.scale == nullptr || n == 0 || row_begin > row_end || row_end > out_rows ||
@@ -493,6 +495,14 @@ rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, s
         return rmd::RmdStatus::invalid_arguments;
     }
     const size_t rows   = row_end - row_begin;
+    if constexpr (FromMain) {
+        size_t last_row = 0, last_cell = 0;
+        if (main.data == nullptr || main.stride < n ||
+            (rows != 0 && (__builtin_mul_overflow(rows - 1, main.stride, &last_row) ||
+                           __builtin_add_overflow(last_row, n - 1, &last_cell)))) {
+            return rmd::RmdStatus::invalid_arguments;
+        }
+    }
     size_t       values = 0, row_offset = 0, col_offset = 0, last = 0;
     if (__builtin_mul_overflow(rows, n, &values) || correction.values.size() != values) {
         return rmd::RmdStatus::invalid_arguments;
@@ -536,7 +546,14 @@ rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, s
             const double domain_value = static_cast<double>(value) * static_cast<double>(weight.scale[col]);
             const double scaled       = domain_value * static_cast<double>(activation_scale);
             const float  delta        = static_cast<float>(scaled);
-            const float  merged       = dst[col * col_stride] + delta;
+            float main_value;
+            if constexpr (FromMain) {
+                main_value = static_cast<float>(static_cast<double>(main.data[row * main.stride + col]) *
+                                                main.activation_scale * static_cast<double>(weight.scale[col]));
+            } else {
+                main_value = dst[col * col_stride];
+            }
+            const float  merged       = main_value + delta;
             if (!finite_bits(domain_value) || !finite_bits(scaled) || !finite_bits(delta) || !finite_bits(merged)) {
                 return rmd::RmdStatus::overflow;
             }
@@ -556,6 +573,20 @@ rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, s
     return rmd::RmdStatus::success;
 } catch (const std::bad_alloc &) {
     return rmd::RmdStatus::allocation_failure;
+}
+
+rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+    const exsia::StripeMetadataSnapshot & metadata, const rmd::BlockScaledInt64Correction & correction,
+    float * out, size_t out_rows, size_t row_stride, size_t col_stride, size_t * nonzero) {
+    return merge_hp1<false>(weight, row_begin, row_end, metadata, correction, out, out_rows,
+                            row_stride, col_stride, nonzero, {});
+}
+
+rmd::RmdStatus merge_main_residual_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
+    const exsia::StripeMetadataSnapshot & metadata, const rmd::BlockScaledInt64Correction & correction,
+    main_readback main, float * out, size_t out_rows, size_t row_stride, size_t col_stride, size_t * nonzero) {
+    return merge_hp1<true>(weight, row_begin, row_end, metadata, correction, out, out_rows,
+                           row_stride, col_stride, nonzero, main);
 }
 
 } // namespace ggml::potal::residual
