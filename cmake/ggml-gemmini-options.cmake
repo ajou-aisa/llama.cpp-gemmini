@@ -1,4 +1,17 @@
 # Gemmini compile-time switches (source of truth: root cache + build scripts).
+option(GGML_GEMMINI_FP32 "Run FP32 matmuls on the DIM8 Gemmini WS accelerator" OFF)
+if(GGML_GEMMINI_FP32)
+    if(NOT GGML_GEMMINI OR GGML_GEMMINI_PB OR GGML_POTAL OR GGML_POTAL_W4A4 OR
+       GGML_POTAL_ATTENTION OR GGML_GEMMINI_ENABLE_A4NKS_ATTENTION OR
+       GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION)
+        message(FATAL_ERROR "GGML_GEMMINI_FP32 requires GEMMINI=ON, PB and all PoTAL/A4NKS paths OFF")
+    endif()
+    if(GGML_OPENMP OR GGML_GEMMINI_ENABLE_OPENMP OR CYCLE_SIM OR
+       GGML_GEMMINI_CUDA_CPU_EXACT OR GGML_GEMMINI_CUDA_RTN OR GGML_GEMMINI_CUDA_RTN_ATTENTION)
+        message(FATAL_ERROR "GGML_GEMMINI_FP32 requires OpenMP, cycle simulation and CUDA Gemmini paths OFF")
+    endif()
+    cmake_language(DEFER CALL target_compile_definitions llama PRIVATE GGML_GEMMINI_FP32=1)
+endif()
 foreach(_metric IN ITEMS ACT ACT_QUANT RESIDUAL SCALE)
     set(GGML_GEMMINI_${_metric}_METRICS "0" CACHE STRING "Enable independent ${_metric} evaluation metrics (0|1)")
     set_property(CACHE GGML_GEMMINI_${_metric}_METRICS PROPERTY STRINGS 0 1)
@@ -182,7 +195,11 @@ endif()
 set(GGML_GEMMINI_DIM "16" CACHE STRING
     "Gemmini array dimension: 16, 32, or 64")
 set_property(CACHE GGML_GEMMINI_DIM PROPERTY STRINGS 16 32 64)
-if(NOT GGML_GEMMINI_DIM MATCHES "^(16|32|64)$")
+if(GGML_GEMMINI_FP32)
+    if(NOT GGML_GEMMINI_DIM STREQUAL "8")
+        message(FATAL_ERROR "GGML_GEMMINI_FP32 requires GGML_GEMMINI_DIM=8")
+    endif()
+elseif(NOT GGML_GEMMINI_DIM MATCHES "^(16|32|64)$")
     message(FATAL_ERROR
         "GGML_GEMMINI_DIM must be 16, 32, or 64, got '${GGML_GEMMINI_DIM}'")
 endif()

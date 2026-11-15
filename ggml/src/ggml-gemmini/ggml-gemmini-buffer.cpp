@@ -12,6 +12,9 @@
 #if defined(GGML_GEMMINI_PB)
 #include "pb/pb-exec.hpp"
 #endif
+#if defined(GGML_GEMMINI_FP32)
+#include "fp32/exec.hpp"
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -75,6 +78,9 @@ void gemmini_buffer_free(ggml_backend_buffer_t buffer) {
 #if defined(GGML_GEMMINI_PB)
         ggml::gemmini::pb::reset_validated_weights();
 #endif
+#if defined(GGML_GEMMINI_FP32)
+        ggml::gemmini::fp32::reset_weights();
+#endif
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         ggml_cuda_hp1_scu_clear_weights();
 #endif
@@ -89,6 +95,10 @@ void gemmini_buffer_free(ggml_backend_buffer_t buffer) {
 void gemmini_buffer_memset_tensor(
     ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     std::memset(static_cast<char *>(tensor->data) + offset, value, size);
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
+#endif
     GGML_UNUSED(buffer);
 }
 
@@ -101,6 +111,10 @@ void gemmini_buffer_set_tensor(ggml_backend_buffer_t buffer,
 #if defined(GGML_GEMMINI_PB)
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
         ggml::gemmini::pb::reset_validated_weights();
+#endif
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
 #endif
     GGML_UNUSED(buffer);
 }
@@ -119,6 +133,10 @@ bool gemmini_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                ggml_tensor *         destination) {
     if (ggml_backend_buffer_is_host(source->buffer)) {
         std::memcpy(destination->data, source->data, ggml_nbytes(source));
+#if defined(GGML_GEMMINI_FP32)
+        if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+            ggml::gemmini::fp32::reset_weights();
+#endif
         return true;
     }
     GGML_UNUSED(buffer);
@@ -132,6 +150,10 @@ void gemmini_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 #if defined(GGML_GEMMINI_PB)
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
         ggml::gemmini::pb::reset_validated_weights();
+#endif
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
 #endif
 }
 

@@ -73,6 +73,11 @@ function(ggml_gemmini_assert_profile_compile_definitions target)
     endforeach()
 endfunction()
 
+if(GGML_GEMMINI_FP32)
+    include(fp32/backend.cmake)
+    return()
+endif()
+
 set(GGML_GEMMINI_SOURCES
     ggml-gemmini.cpp
     potal-sensitivity.cpp
