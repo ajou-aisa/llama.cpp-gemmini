@@ -1922,7 +1922,60 @@ void test_strict_pipeline() {
           unused.calls == 0);
 }
 
-int main() {
+void test_q8_residual_policy() {
+    tensor q(GGML_TYPE_F32, 96, 1);
+    for (size_t k = 0; k < 96; ++k)
+        q.set(k, 0, k < 32 ? 1.999f : k == 32 ? 128.0f : k < 64 ? 1.0f : 4.0f);
+    q.set(0, 0, -1.999f);
+    const std::vector<int> identity(96, 0);
+    stream prepared;
+    const auto status = attention::prepare_stream(q.t, 0, 0, 0, 1, role::qk, prepared,
+                                                  attention::default_pv_algorithm, &identity);
+    if (check("Q8 selective preparation succeeds", status == POTAL_OK)) {
+        std::vector<int32_t> expected(96, 127);
+        expected[0] = -128;
+        expected[32] = 8192;
+        std::fill(expected.begin() + 33, expected.begin() + 64, 64);
+        std::fill(expected.begin() + 64, expected.end(), 256);
+        check("Q8 unselected clipping, selected outlier, above-anchor compensation",
+              prepared.scale == -6 && prepared.codes == expected && limbs_match(prepared, role::qk));
+    }
+
+    graph selected(role::qk, 96, 1, 1);
+    selected.w.fill(1);
+    for (size_t k = 0; k < 96; ++k) selected.a.set(k, 0, q.get(k, 0));
+    plain_runner selected_runner;
+    const auto executed = attention::execute(&selected.out.t,
+        [&](const potal_stripe_gemm_desc & d) { return selected_runner.run(d); });
+    check("Q8 selected runtime policy reaches NPU descriptors",
+          executed.status == POTAL_OK && selected.out.get(0, 0) == 22177.0f / 64);
+
+    tensor keys(GGML_TYPE_F32, 1, 1), queries(GGML_TYPE_F32, 1, 129, 2, 2);
+    keys.fill(1);
+    queries.fill(2);
+    queries.set(0, 0, 8, 1, 1);
+    queries.set(0, 128, 65536, 1, 1);
+    std::vector<int> shifts;
+    check("QK transfer shares grouped heads and broadcast batches, excludes tail",
+          attention::prepare_qk_transfer(keys.t, queries.t, 0, 0, shifts) == POTAL_OK &&
+          shifts == std::vector<int>{-3});
+    stationary w;
+    w.n = 777;
+    keys.set(0, 0, std::numeric_limits<float>::denorm_min());
+    shifts = {16};
+    check("QK transfer rejects underflow without publishing weights",
+          attention::prepare_stationary(keys.t, 0, 0, role::qk, w, &shifts) == POTAL_ERR_CAPACITY && w.n == 777);
+    shifts = {std::numeric_limits<int>::min()};
+    check("QK transfer rejects invalid shift before negation",
+          attention::prepare_stationary(keys.t, 0, 0, role::qk, w, &shifts) == POTAL_ERR_INVALID_ARGUMENT);
+
+    execute_case(role::qk, 33, 3, true, 2);
+    strict_case(role::qk, 64, 1, 40, 2, 7, GGML_TYPE_F16, GGML_TYPE_F32, 11);
+    strict_case(role::qk, 33, 129, 17, 2, 2, GGML_TYPE_F32, GGML_TYPE_F32, 21, 0, 0, 2);
+    strict_case(role::pv, 33, 3, 17, 1, 2, GGML_TYPE_F16, GGML_TYPE_F32, 14);
+}
+
+int main(int argc, char ** argv) {
     // Initialize GGML's F16 conversion tables without constructing a backend.
     const ggml_init_params params = {1u << 20,nullptr,true};
     ggml_context * context = ggml_init(params);
@@ -1930,6 +1983,12 @@ int main() {
     if (!check("DIM16/DIM32 attention contract",POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32)) {
         ggml_free(context);
         return 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "qk-policy") == 0) {
+        test_q8_residual_policy();
+        ggml_free(context);
+        std::printf("POTAL_QK_POLICY_TEST %s\n", failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
     }
     test_reference();
     test_prepare();

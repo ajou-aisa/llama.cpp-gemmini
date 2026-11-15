@@ -388,6 +388,10 @@ target_include_directories(potal-attention-test PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(potal-attention-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-attention-test COMMAND potal-attention-test)
+    add_test(NAME potal-qk-residual-test COMMAND potal-attention-test qk-policy)
+    set_tests_properties(potal-qk-residual-test PROPERTIES ENVIRONMENT "POTAL_QK_POLICY=residual")
+    add_test(NAME potal-qk-transfer-test COMMAND potal-attention-test qk-policy)
+    set_tests_properties(potal-qk-transfer-test PROPERTIES ENVIRONMENT "POTAL_QK_POLICY=residual-transfer")
 endif()
 
 if (POTAL_E4B2_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")

@@ -40,10 +40,17 @@ struct stream {
 // and folding. P has no local adaptation or outlier selection. Outputs publish
 // only on success; finite input and bounds are checked before quantization.
 potal_status prepare_stationary(const ggml_tensor & tensor, size_t head, size_t batch,
-                                 role operation, stationary & out);
+                                 role operation, stationary & out, const std::vector<int> * qk_shifts = nullptr);
 potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batch,
                             size_t begin, size_t rows, role operation, stream & out,
-                            pv_algorithm algorithm = default_pv_algorithm);
+                            pv_algorithm algorithm = default_pv_algorithm,
+                            const std::vector<int> * qk_shifts = nullptr);
+
+// Per-KV-head channel exponents from the first min(128, query rows) inputs,
+// shared by all broadcast query heads/batches. Q *= 2^d; K *= 2^-d.
+// Passing this plan to prepare_stream selects rho2 Q with selective residuals.
+potal_status prepare_qk_transfer(const ggml_tensor & keys, const ggml_tensor & queries,
+                                 size_t head, size_t batch, std::vector<int> & shifts);
 
 // Software reference only. Independent INT32 SCU/ACC epochs for each digit pair;
 // checked INT64 merges in stationary-pass order, main before original upper lanes.

@@ -408,7 +408,8 @@ struct att_stream {
 
 // get(i, kk): stream value at row i < rows, K index kk < k. anchor: 2 or 3 (Q only).
 template <class Get>
-bool att_prepare_stream(Get get, size_t rows, size_t k, bool qk, int anchor, att_stream & s, std::string & why) {
+bool att_prepare_stream(Get get, size_t rows, size_t k, bool qk, int anchor, att_stream & s, std::string & why,
+                        bool q4_residual = false) {
     s = att_stream{};
     s.qk = qk; s.rows = rows; s.k = k; s.kp = (k + BK - 1) / BK * BK;
     const size_t kp = s.kp, blocks = kp / BK;
@@ -422,19 +423,24 @@ bool att_prepare_stream(Get get, size_t rows, size_t k, bool qk, int anchor, att
     s.codes.assign(rows * kp, 0);
     if (qk) {
         std::vector<int16_t> eb(rows * blocks);
+        std::vector<uint8_t> selected(rows * kp, 0);
         top3 t;
         for (size_t i = 0; i < rows; ++i)
             for (size_t b = 0; b < blocks; ++b) {
                 bool mask[BK];
-                local_block(v.data() + i * kp + b * BK, QK_RHO, s.codes.data() + i * kp + b * BK, mask, eb[i * blocks + b]);
+                local_block(v.data() + i * kp + b * BK, q4_residual ? DENSE_RHO : QK_RHO,
+                            s.codes.data() + i * kp + b * BK, mask, eb[i * blocks + b]);
+                for (size_t c = 0; c < BK; ++c) selected[i * kp + b * BK + c] = mask[c];
                 t.add(eb[i * blocks + b]);
             }
         const int16_t a = anchor == 3 && t.e3 != NEG ? t.e3 : t.e2 != NEG ? t.e2 : t.e1 != NEG ? t.e1 : 0;
-        s.scale = a - QK_RHO;
+        s.scale = a - (q4_residual ? DENSE_RHO : QK_RHO);
         for (size_t i = 0; i < rows; ++i)
             for (size_t c = 0; c < k; ++c) {
                 const int16_t e = eb[i * blocks + c / BK];
                 s.codes[i * kp + c] = fold(s.codes[i * kp + c], e == NEG ? 0 : e - a);
+                if (q4_residual && e <= a && !selected[i * kp + c])
+                    s.codes[i * kp + c] = std::clamp(s.codes[i * kp + c], -8, 7);
             }
     } else {
         const float mx = *std::max_element(v.begin(), v.end());
