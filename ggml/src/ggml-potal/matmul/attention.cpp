@@ -694,12 +694,14 @@ struct gemm_item {
     size_t                         limb = 0, pass = 0;
 };
 
+using packed_stationary = std::array<std::shared_ptr<hp1_weight>, 2>;
+
 struct strict_job {
     size_t                            task = 0;
     size_t                            rows = 0;
     int                               scale = 0;
     std::shared_ptr<const stationary> weight;
-    std::array<std::unique_ptr<hp1_weight>, 2> packed_weights;
+    packed_stationary               packed_weights;
     std::vector<gemm_item>            gemms; // limb-major, pass-minor: execute_stripe's issue order
 
     void abandon() {
@@ -715,7 +717,8 @@ struct strict_job {
 };
 
 std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
-                                      const std::shared_ptr<const stationary> & weight, role operation) {
+                                      const std::shared_ptr<const stationary> & weight, role operation,
+                                      packed_stationary & cached) {
     validate_prepared(activation, *weight, operation);
     const size_t passes = operation == role::qk ? 2 : 1;
     require(activation.rows <= UINT32_MAX && weight->n <= UINT32_MAX &&
@@ -730,7 +733,11 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
     if (share) {
         for (size_t pass = 0; pass < passes; ++pass) {
             auto & packed = job->packed_weights[pass];
-            packed = std::make_unique<hp1_weight>();
+            if (cached[pass]) {
+                packed = cached[pass];
+                continue;
+            }
+            packed = std::make_shared<hp1_weight>();
             require(packed->allocate(int64_t(weight->n), int64_t(activation.kp)), POTAL_ERR_CAPACITY);
             for (size_t block = 0; block < weight->kp / block_k; ++block)
                 std::copy_n(weight->carriers.data() + block * weight->n, weight->n,
@@ -738,6 +745,7 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
             for (size_t k = 0; k < weight->kp; ++k)
                 std::copy_n(weight->limbs[pass].data() + k * weight->n, weight->n,
                             packed->b + k * packed->ldb);
+            cached[pass] = packed;
         }
     }
     for (size_t limb = 0; limb < activation.limb_count; ++limb) {
@@ -1294,6 +1302,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
     };
     const auto fold_body = [&] {
         std::shared_ptr<const stationary> weight;
+        packed_stationary packed;
         size_t current_ab = SIZE_MAX, current_ah = SIZE_MAX;
         for (size_t i = 0; i < T; ++i) {
             const strict_task & task = tasks[i];
@@ -1308,6 +1317,9 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 auto prepared = std::make_shared<stationary>();
                 prepare_weight(a, task.ah, task.ab, operation, *prepared);
                 weight = std::move(prepared);
+                // A new KV head/batch has different bytes. Pending jobs keep their
+                // own shared owners until completion, including fatal abandonment.
+                packed = {};
                 current_ab = task.ab;
                 current_ah = task.ah;
             }
@@ -1316,7 +1328,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 tl::scoped_span span(tl::active(), tl::stage::attn_fold, run_id, layer, uint32_t(i), tl::no_id);
                 fold_activation(operation, st.streams[i], st.parts[i]);
                 st.parts[i] = activation_parts{};
-                job = stage_job(i, st.streams[i], weight, operation);
+                job = stage_job(i, st.streams[i], weight, operation, packed);
                 st.streams[i] = stream{};
                 span.work = job->gemms.size();
             }
