@@ -1404,11 +1404,10 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
     try {
         if (cfg_.hart_roles && cfg_.role_checkpoint && !cfg_.role_checkpoint("finalizer", s.stripe_id))
             return failed("finalizer", POTAL_OK, false, "injected finalizer failure");
-        // 3. CPU: Main reconstruction into the private output, then the
-        //    residual radix reconstruction and checked merge.
+        // 3. CPU: reconstruct residuals, then convert Main during checked merge.
         set_state(s, slot_state::reconstruct_merge);
         float * out = out_.data() + s.row_begin * n_;
-        {
+        if (!s.packet) {
             role_span dequantizing(cfg_, 43, s.stripe_id, s.index);
             for (size_t r = 0; r < rows; ++r) {
                 reconstruct_row(s.c + r * ldc_, n_, s.activation_scale, w_.scale, out + r * n_, 1);
@@ -1439,7 +1438,8 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
             // The prepared weight (validated once, immutable) gives the channel
             // scales: no HP1 metadata pass per stripe.
             size_t               nonzero = 0;
-            const rmd::RmdStatus merged  = residual::merge_prepared_hp1(w_, s.row_begin, s.row_end, s.meta, correction,
+            const rmd::RmdStatus merged  = residual::merge_main_residual_hp1(w_, s.row_begin, s.row_end, s.meta, correction,
+                                                                       {s.c, ldc_, s.activation_scale},
                                                                        out_.data(), m_, n_, 1, &nonzero);
             if (merged != rmd::RmdStatus::success) {
                 return failed("merge", POTAL_OK, false, rmd::rmd_status_message(merged));

@@ -384,6 +384,7 @@ struct att_spec {
     int64_t      D, KV, T, HK, HQ;
     uint32_t     seed;
     bool         boundary;
+    int64_t      batches = 1;
 };
 
 void attention_case(const att_spec & c) {
@@ -392,21 +393,21 @@ void attention_case(const att_spec & c) {
     std::normal_distribution<float> nd(0.0f, 1.0f);
     host_tensor a, b, out;
     if (qk) {
-        a.shape(GGML_TYPE_F16, { c.D, c.KV, c.HK });
-        b.shape(GGML_TYPE_F32, { c.D, c.T, c.HQ });
+        a.shape(GGML_TYPE_F16, { c.D, c.KV, c.HK, c.batches });
+        b.shape(GGML_TYPE_F32, { c.D, c.T, c.HQ, c.batches });
         for (size_t i = 0; i < a.count(); ++i) a.set(i, nd(rng) * 2.0f);
         for (size_t i = 0; i < b.count(); ++i) b.set(i, nd(rng) * 1.5f);
         if (c.boundary) {
             for (size_t i = 0; i < a.count(); i += 9) a.set(i, (i % 2 ? -1.0f : 1.0f) * 1.99f); // K code 127 -> 119
-            for (size_t row = 0; row < (size_t) (c.T * c.HQ); row += 3)                     // Q outlier block
+            for (size_t row = 0; row < (size_t) (c.T * c.HQ * c.batches); row += 3)                     // Q outlier block
                 for (int64_t k = 32; k < 64 && k < c.D; ++k) b.set(row * c.D + k, nd(rng) * 6.0e4f);
         }
-        out.shape(GGML_TYPE_F32, { c.KV, c.T, c.HQ });
+        out.shape(GGML_TYPE_F32, { c.KV, c.T, c.HQ, c.batches });
     } else {
-        a.shape(GGML_TYPE_F16, { c.KV, c.D, c.HK });
-        b.shape(GGML_TYPE_F32, { c.KV, c.T, c.HQ });
+        a.shape(GGML_TYPE_F16, { c.KV, c.D, c.HK, c.batches });
+        b.shape(GGML_TYPE_F32, { c.KV, c.T, c.HQ, c.batches });
         for (size_t i = 0; i < a.count(); ++i) a.set(i, nd(rng) * 0.5f * ((i / 32) % 3 == 2 ? 300.0f : 1.0f));
-        for (size_t row = 0; row < (size_t) (c.T * c.HQ); ++row) {
+        for (size_t row = 0; row < (size_t) (c.T * c.HQ * c.batches); ++row) {
             std::vector<double> e(c.KV);
             double sum = 0;
             for (int64_t k = 0; k < c.KV; ++k) sum += e[k] = std::exp(2.0 * nd(rng));
@@ -414,7 +415,7 @@ void attention_case(const att_spec & c) {
             if (c.boundary && row % 4 == 1)
                 for (int64_t k = 0; k < c.KV; ++k) b.set(row * c.KV + k, k == (int64_t) (row % c.KV) ? 1.0f : 0.0f);
         }
-        out.shape(GGML_TYPE_F32, { c.D, c.T, c.HQ });
+        out.shape(GGML_TYPE_F32, { c.D, c.T, c.HQ, c.batches });
     }
     out.t.op     = GGML_OP_MUL_MAT;
     out.t.src[0] = &a.t;
@@ -434,14 +435,15 @@ void attention_case(const att_spec & c) {
     size_t base_mis = 0;
     int    fork_scale = 0, golden_scale = 0;
     std::string why;
+    for (size_t batch = 0; batch < size_t(c.batches); ++batch) {
     for (size_t ah = 0; ah < (size_t) c.HK; ++ah) {
         gold::att_stationary gs;
-        if (!gold::att_prepare_stationary([&](size_t kk, size_t j) { return a.get((ah * n + j) * K + kk); }, K, n, qk, gs, why)) {
+        if (!gold::att_prepare_stationary([&](size_t kk, size_t j) { return a.get(((batch * c.HK + ah) * n + j) * K + kk); }, K, n, qk, gs, why)) {
             verdict(qk ? "QK" : "PV", c.name, false, "reason=golden_" + why);
             return;
         }
         att::stationary fw;
-        const bool fw_ok = att::prepare_stationary(a.t, ah, 0, c.r, fw) == POTAL_OK;
+        const bool fw_ok = att::prepare_stationary(a.t, ah, batch, c.r, fw) == POTAL_OK;
         for (size_t head = ah * hr; head < (ah + 1) * hr; ++head)
             for (size_t begin = 0; begin < rows; begin += stripe_rows) {
                 ++stripes;
@@ -449,7 +451,7 @@ void attention_case(const att_spec & c) {
                 gold::att_stream     st;
                 std::vector<int64_t> gi;
                 std::vector<float>   gf;
-                if (!gold::att_prepare_stream([&](size_t i, size_t kk) { return b.get((head * rows + begin + i) * K + kk); },
+                if (!gold::att_prepare_stream([&](size_t i, size_t kk) { return b.get(((batch * c.HQ + head) * rows + begin + i) * K + kk); },
                                               r, K, qk, anchor, st, why) ||
                     !gold::att_multiply(st, gs, gi, gf, why)) {
                     verdict(qk ? "QK" : "PV", c.name, false, "reason=golden_" + why);
@@ -457,10 +459,10 @@ void attention_case(const att_spec & c) {
                 }
                 max_lanes = std::max(max_lanes, st.upper.size());
                 for (size_t i = 0; i < r; ++i)
-                    for (size_t j = 0; j < n; ++j) want[(head * rows + begin + i) * n + j] = gf[i * n + j];
+                    for (size_t j = 0; j < n; ++j) want[((batch * c.HQ + head) * rows + begin + i) * n + j] = gf[i * n + j];
                 att::stream          fs;
                 std::vector<int64_t> fi;
-                if (!fw_ok || att::prepare_stream(b.t, head, 0, begin, r, c.r, fs) != POTAL_OK ||
+                if (!fw_ok || att::prepare_stream(b.t, head, batch, begin, r, c.r, fs) != POTAL_OK ||
                     att::reference(fs, fw, c.r, fi) != POTAL_OK || fi.size() != gi.size()) {
                     ++prep_fail;
                     continue;
@@ -470,6 +472,7 @@ void attention_case(const att_spec & c) {
                 for (size_t j = 0; j < n; ++j) base_mis += fw.base[j] != gs.base[j];
                 for (size_t i = 0; i < gi.size(); ++i) int_mis += fi[i] != gi[i];
             }
+    }
     }
     // attention::execute takes the scalar-Index paired runner (contract section 5), on the H2 emulator.
     potal_test::h2_emulator h2;
@@ -504,6 +507,96 @@ void attention_case(const att_spec & c) {
                   res.stage ? res.stage : "-", res.jobs, prep_fail, int_mis, scale_mis, fork_scale, golden_scale, base_mis, diff,
                   want.size(), max_abs);
     verdict(qk ? "QK" : "PV", c.name, ok, b2);
+
+    std::fill(out.bytes.begin(), out.bytes.end(), 0x5a);
+    observer.expected = {};
+    potal_issue_counters_read(&issue_before);
+    potal_test::thread_owner owner({}, run);
+    const auto strict = att::execute_strict(&out.t, owner, {{-1,-1,-1,-1,-1}}, false);
+    if (qk) observer.expected.w4_attn_qk_digit_jobs = strict.jobs;
+    else observer.expected.w4_attn_pv_digit_jobs = strict.jobs;
+    bool strict_ok = strict.status == POTAL_OK && !strict.fatal &&
+        strict.loops == res.loops && strict.fences == res.fences &&
+        strict.scale_writes == res.scale_writes && strict.scale_releases == res.scale_releases &&
+        observer.check(c.name, issue_before);
+    for (size_t i = 0; i < want.size(); ++i) strict_ok = strict_ok && same_bits(out.get(i), want[i]);
+    verdict("STRICT", c.name, strict_ok, "independent golden, GQA/batch/stripe reuse and unchanged commands");
+
+    if (c.T == 1) {
+        std::fill(out.bytes.begin(), out.bytes.end(), 0x5a);
+        const auto untouched = out.bytes;
+        h2.fail_funct = POTAL_FUNCT_FENCE;
+        h2.fail_status = POTAL_ERR_BAD_RESPONSE;
+        potal_test::thread_owner failing({}, run);
+        const auto failure = att::execute_strict(&out.t, failing, {{-1,-1,-1,-1,-1}}, false);
+        verdict("FENCE", c.name, failure.status != POTAL_OK && failure.fatal && out.bytes == untouched,
+                "failed hardware fence preserves public output");
+    }
+}
+
+void test_main_merge() {
+    namespace grmd = ggml::gemmini::rmd;
+    namespace exsia_ns = ggml::gemmini::quants::act::exsia;
+    const auto check = [](const std::string & name, bool ok) { verdict("MERGE", name, ok, ""); };
+
+    constexpr size_t cols = 7, rows = 3, ldc = 11, stride = 19;
+    hp1_weight weight;
+    if (!weight.allocate(cols, 32)) {
+        check("fused merge weight allocation", false);
+        return;
+    }
+    const float scales[] = {0.0f, -0.0f, 0.003f, 1e-30f, 1e30f, -0.125f, 1.0f};
+    std::copy_n(scales, cols, weight.scale);
+    std::vector<int32_t> main(rows * ldc, 0);
+    const int32_t codes[] = {INT32_MIN, INT32_MAX, -16777217, 16777217, -1, 0, 1};
+    grmd::BlockScaledInt64Correction corr;
+    corr.values.resize(rows * cols);
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            main[r * ldc + c] = codes[(r + c) % cols];
+            corr.values[r * cols + c] = -int64_t(main[r * ldc + c]) + int64_t(c % 3);
+        }
+    }
+    bool equal = true;
+    for (int theta : {-140, -20, 0, 10, 100}) {
+        const std::vector<float> untouched(5 * stride, 123.25f);
+        auto reference = untouched;
+        auto fused = untouched;
+        exsia_ns::StripeMetadataSnapshot meta;
+        meta.theta = theta;
+        const double scale = std::ldexp(1.0f, theta);
+        for (size_t r = 0; r < rows; ++r) {
+            reconstruct_row(main.data() + r * ldc, cols, scale, weight.scale,
+                            reference.data() + (r + 1) * stride, 2);
+        }
+        size_t want_count = SIZE_MAX, got_count = SIZE_MAX;
+        const auto want = residual::merge_prepared_hp1(weight, 1, rows + 1, meta, corr,
+            reference.data(), 5, stride, 2, &want_count);
+        const auto got = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+            {main.data(), ldc, scale}, fused.data(), 5, stride, 2, &got_count);
+        equal = equal && want == got && want_count == got_count &&
+            std::memcmp(fused.data(), got == grmd::RmdStatus::success ? reference.data() : untouched.data(),
+                        fused.size() * sizeof(float)) == 0;
+    }
+    check("fused Main/residual merge matches separate float rounding, strides and overflow", equal);
+
+    exsia_ns::StripeMetadataSnapshot meta;
+    meta.theta = 100;
+    std::fill_n(weight.scale, cols, 1.0f);
+    std::fill(main.begin(), main.end(), 0);
+    std::fill(corr.values.begin(), corr.values.end(), 1);
+    corr.values.back() = INT64_MAX;
+    const std::vector<float> untouched(5 * stride, 123.25f);
+    auto out = untouched;
+    size_t count = SIZE_MAX;
+    const auto late = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+        {main.data(), ldc, std::ldexp(1.0f, 100)}, out.data(), 5, stride, 2, &count);
+    check("fused merge late overflow leaves output and count untouched",
+          late == grmd::RmdStatus::overflow && out == untouched && count == SIZE_MAX);
+    const auto bad_stride = residual::merge_main_residual_hp1(weight, 1, rows + 1, meta, corr,
+        {main.data(), cols - 1, 1.0}, out.data(), 5, stride, 2, &count);
+    check("fused merge rejects short Main stride before reading",
+          bad_stride == grmd::RmdStatus::invalid_arguments && out == untouched && count == SIZE_MAX);
 }
 
 // One case in a child process: a crash in the lowering under test is a FAIL of that case only.
@@ -538,6 +631,10 @@ template <class Fn> void isolated(const char * group, const char * name, Fn fn) 
 
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    // Initialize ggml's FP16 lookup table before constructing the host tensors.
+    ggml_context * context = ggml_init({4096, nullptr, true});
+    if (context == nullptr) return 1;
+    ggml_free(context);
     only_case = argc > 1 ? argv[1] : nullptr;
     std::printf("W4A4_CONFIG activation_bits=%d weight_bits=%d dim=%d anchor=%d sigma=%d rmd=%d exsia=%d "
 #if defined(POTAL_INPUT_BITS)
@@ -564,10 +661,13 @@ int main(int argc, char ** argv) {
         { "dense-qwen-k896", 32, 64, 896, 13, true },
     };
     for (const auto & c : dense_cases) isolated("D", c.name, [&] { dense_case(c); });
+    isolated("MERGE", "main-residual", [] { test_main_merge(); });
     const att_spec att_cases[] = {
         { "qk-random", att::role::qk, 64, 5, 3, 2, 4, 21, false },
         { "qk-boundary-tails", att::role::qk, 64, 37, 33, 2, 14, 22, true },
         { "pv-random", att::role::pv, 64, 5, 3, 2, 4, 23, false },
+        { "qk-decode-batches", att::role::qk, 64, 37, 1, 2, 4, 25, true, 2 },
+        { "pv-decode-batches", att::role::pv, 64, 37, 1, 2, 4, 26, true, 2 },
         { "pv-boundary-tails", att::role::pv, 64, 70, 33, 2, 14, 24, true },
     };
     for (const auto & c : att_cases) isolated(c.r == att::role::qk ? "QK" : "PV", c.name, [&] { attention_case(c); });

@@ -409,7 +409,7 @@ struct strict_task {
 struct gemm_item {
     hp1_operands ops;
     size_t row_begin = 0, rows = 0, pass = 0;
-    residual::decoded_packet upper;
+    std::shared_ptr<const residual::decoded_packet> upper;
     potal_tile_plan main;
     potal_paired_prepared prepared;
     potal_paired_request request;
@@ -426,22 +426,47 @@ struct strict_job {
     size_t task = 0, rows = 0;
     int scale = 0;
     std::shared_ptr<const stationary> weight;
+    std::array<std::shared_ptr<hp1_weight>, 2> packed_weights;
     std::vector<std::unique_ptr<gemm_item>> gemms; // stationary pass, then disjoint source-row slices
 
-    void abandon() { for (auto & g : gemms) g->abandon(); }
+    void abandon() {
+        for (auto & g : gemms) g->abandon();
+        for (auto & w : packed_weights) if (w) w->abandon();
+    }
+};
+
+struct preparation_workspace {
+    std::array<std::shared_ptr<hp1_weight>, 2> weights;
+    std::vector<uint64_t> selected;
+    rmd::RmdBitmapBuilder builder;
 };
 
 std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
-                                    const std::shared_ptr<const stationary> & weight, role operation) {
+                                    const std::shared_ptr<const stationary> & weight, role operation,
+                                    preparation_workspace * workspace = nullptr) {
     validate_prepared(activation, *weight, operation);
+    preparation_workspace local;
+    auto & prep = workspace ? *workspace : local;
     auto job = std::make_unique<strict_job>();
     job->task = task;
     job->rows = activation.rows;
     job->scale = activation.scale;
     job->weight = weight;
+    const size_t slices = (activation.rows + POTAL_HW_DIM - 1) / POTAL_HW_DIM;
     for (size_t pass = 0; pass < (operation == role::qk ? 2u : 1u); ++pass) {
-        // Eight upper lanes * 32 source rows * one J tile fit the 256-row ACC1.
-        // This slices execution only: local quantization and the stripe anchor remain unchanged.
+        if (!prep.weights[pass]) {
+            auto packed = std::make_shared<hp1_weight>();
+            require(packed->allocate(int64_t(weight->n), int64_t(activation.kp)), POTAL_ERR_CAPACITY);
+            require(potal_int4_pack_rows(reinterpret_cast<uint8_t *>(packed->b),
+                        product(weight->kp, packed->ldb / 2), packed->ldb / 2,
+                        weight->limbs[pass].data(), weight->n, weight->kp, weight->n) == POTAL_OK);
+            for (size_t block = 0; block < weight->kp / block_k; ++block)
+                std::copy_n(weight->carriers.data() + block * weight->n, weight->n,
+                            packed->carriers + block * packed->cstride);
+            prep.weights[pass] = std::move(packed);
+        }
+        job->packed_weights[pass] = prep.weights[pass];
+        // Only execution is sliced; quantization and the stripe anchor are unchanged.
         for (size_t row_begin = 0; row_begin < activation.rows; row_begin += POTAL_HW_DIM) {
             auto item = std::make_unique<gemm_item>();
             auto & g = *item;
@@ -449,37 +474,45 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
             g.rows = std::min(size_t(POTAL_HW_DIM), activation.rows - row_begin);
             g.pass = pass;
             auto & operands = g.ops;
-            require(operands.allocate({int64_t(g.rows), int64_t(weight->n), int64_t(activation.kp)}),
-                    POTAL_ERR_CAPACITY);
-            require(potal_int4_pack_rows(reinterpret_cast<uint8_t *>(operands.a),
-                        product(operands.m_pad, operands.lda / 2), operands.lda / 2,
-                        activation.limbs[0].data() + row_begin * activation.kp, activation.kp,
-                        g.rows, activation.kp) == POTAL_OK);
-            require(potal_int4_pack_rows(reinterpret_cast<uint8_t *>(operands.own.b),
-                        product(weight->kp, operands.ldb / 2), operands.ldb / 2,
-                        weight->limbs[pass].data(), weight->n, weight->kp, weight->n) == POTAL_OK);
-            for (size_t block = 0; block < weight->kp / block_k; ++block)
-                for (size_t j = 0; j < weight->n; ++j)
-                    operands.own.carriers[block * operands.cstride + j] = weight->carriers[block * weight->n + j];
-
-            std::vector<uint64_t> selected((product(g.rows, activation.kp) + 63) / 64, UINT64_MAX);
-            rmd::RmdBitmapBuilder builder;
-            builder.reset(task, 0, g.rows, activation.k, weight->n, bits, selected, activation.kp);
-            require(builder.status() == rmd::RmdStatus::success);
-            for (size_t i = 0; i < g.rows; ++i) {
-                for (size_t k = 0; k < activation.k; ++k) {
-                    const size_t index = (row_begin + i) * activation.kp + k;
-                    const int64_t code = activation.codes[index];
-                    const int32_t upper = int32_t((code - activation.limbs[0][index] -
-                                                  (operation == role::pv ? bias : 0)) / radix);
-                    require(!upper || builder.emit(i, k, upper));
+            const auto & packed = *job->packed_weights[pass];
+            const hp1_shape shape{int64_t(g.rows), int64_t(weight->n), int64_t(activation.kp)};
+            if (pass == 0) {
+                require(operands.allocate(shape, packed), POTAL_ERR_CAPACITY);
+                require(potal_int4_pack_rows(reinterpret_cast<uint8_t *>(operands.a),
+                            product(operands.m_pad, operands.lda / 2), operands.lda / 2,
+                            activation.limbs[0].data() + row_begin * activation.kp, activation.kp,
+                            g.rows, activation.kp) == POTAL_OK);
+                auto upper = std::make_shared<residual::decoded_packet>();
+                prep.selected.assign((product(g.rows, activation.kp) + 63) / 64, UINT64_MAX);
+                auto & builder = prep.builder;
+                builder.reset(task, 0, g.rows, activation.k, weight->n, bits, prep.selected, activation.kp,
+                              workspace != nullptr && activation.rows == 1);
+                require(builder.status() == rmd::RmdStatus::success);
+                for (size_t i = 0; i < g.rows; ++i) {
+                    for (size_t k = 0; k < activation.k; ++k) {
+                        const size_t index = (row_begin + i) * activation.kp + k;
+                        const int64_t code = activation.codes[index];
+                        const int32_t value = int32_t((code - activation.limbs[0][index] -
+                                                      (operation == role::pv ? bias : 0)) / radix);
+                        require(!value || builder.emit(i, k, value));
+                    }
                 }
+                if (!builder.empty()) {
+                    auto packet = builder.finish();
+                    require(bool(packet));
+                    require(residual::decode_packet(*packet, *upper) == rmd::RmdStatus::success);
+                }
+                g.upper = std::move(upper);
+            } else {
+                require(job->gemms.size() >= slices, POTAL_ERR_BAD_RESPONSE);
+                const auto & first = *job->gemms[row_begin / POTAL_HW_DIM];
+                require(first.row_begin == row_begin &&
+                        first.rows == g.rows, POTAL_ERR_BAD_RESPONSE);
+                require(operands.allocate(shape, packed, first.ops), POTAL_ERR_CAPACITY);
+                g.upper = first.upper;
             }
-            if (!builder.empty()) {
-                auto packet = builder.finish();
-                require(bool(packet));
-                require(residual::decode_packet(*packet, g.upper) == rmd::RmdStatus::success);
-                const size_t padded_rows = (g.upper.rows.size() + POTAL_HW_DIM - 1) / POTAL_HW_DIM * POTAL_HW_DIM;
+            if (!g.upper->rows.empty()) {
+                const size_t padded_rows = (g.upper->rows.size() + POTAL_HW_DIM - 1) / POTAL_HW_DIM * POTAL_HW_DIM;
                 g.upper_c.reset(dma_alloc(product(product(padded_rows, operands.ldc), sizeof(int32_t))));
                 require(bool(g.upper_c), POTAL_ERR_CAPACITY);
             }
@@ -493,9 +526,9 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
             req.rows = g.rows; req.n = weight->n; req.k = activation.kp;
             req.main_plan = &g.main;
             req.a = operands.a; req.lda = operands.lda;
-            req.weight = &operands.own;
+            req.weight = &packed;
             req.c_main = operands.c; req.ldc_main = operands.ldc;
-            req.residual = g.upper.rows.empty() ? nullptr : &g.upper;
+            req.residual = g.upper->rows.empty() ? nullptr : g.upper.get();
             req.c_residual = static_cast<int32_t *>(g.upper_c.get()); req.ldc_residual = operands.ldc;
             potal_paired_tile_plan tile;
             potal_paired_execution_plan plan;
@@ -559,8 +592,8 @@ void merge_job(const strict_job & job, role operation, std::vector<int64_t> & ou
             for (size_t j = 0; j < n; ++j)
                 reconstruct(out[(g.row_begin + i) * n + j], g.ops.c[i * g.ops.ldc + j], g.pass);
         const auto * c = static_cast<const int32_t *>(g.upper_c.get());
-        for (size_t i = 0; i < g.upper.rows.size(); ++i) {
-            const auto & row = g.upper.rows[i];
+        for (size_t i = 0; i < g.upper->rows.size(); ++i) {
+            const auto & row = g.upper->rows[i];
             for (size_t j = 0; j < n; ++j)
                 reconstruct(out[(g.row_begin + row.source_row) * n + j], c[i * g.ops.ldc + j],
                             size_t(row.lane) + 1 + g.pass);
@@ -583,14 +616,58 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
     const stationary & weight = *job.weight;
     const size_t n = weight.n;
     const auto start = std::chrono::steady_clock::now();
-    std::vector<int64_t> out;
-    merge_job(job, operation, out);
-    for (size_t i = 0; i < job.rows; ++i) {
+    std::vector<double> scales;
+    if (job.rows > 1) {
+        scales.resize(n);
         for (size_t j = 0; j < n; ++j) {
-            const float value = static_cast<float>(std::ldexp(static_cast<double>(out[i * n + j]),
-                                                              job.scale + int(weight.base[j])));
-            require(std::isfinite(value), POTAL_ERR_CAPACITY);
-            staged[((task.batch * heads + task.head) * rows_total + task.begin + i) * n + j] = value;
+            const int exponent = job.scale + int(weight.base[j]);
+            scales[j] = exponent >= -1022 && exponent <= 960 ? std::ldexp(1.0, exponent) : 0;
+        }
+    }
+    const auto store = [&](size_t i, size_t j, int64_t code) {
+        const double decoded = !scales.empty() && scales[j] != 0
+            ? static_cast<double>(code) * scales[j]
+            : std::ldexp(static_cast<double>(code), job.scale + int(weight.base[j]));
+        const float value = static_cast<float>(decoded);
+        require(std::isfinite(value), POTAL_ERR_CAPACITY);
+        staged[((task.batch * heads + task.head) * rows_total + task.begin + i) * n + j] = value;
+    };
+    if (operation == role::qk) {
+        // One row's ordered terms replace the full stripe INT64 intermediate.
+        struct term { const int32_t * values; size_t limb; };
+        std::vector<term> terms;
+        terms.reserve(2 * (size_t(rmd::balanced_radix_contract(bits).lane_capacity) + 1));
+        for (size_t i = 0; i < job.rows; ++i) {
+            terms.clear();
+            for (const auto & item : job.gemms) {
+                const auto & g = *item;
+                if (i < g.row_begin || i - g.row_begin >= g.rows) continue;
+                const size_t row = i - g.row_begin;
+                terms.push_back({g.ops.c + row * g.ops.ldc, g.pass});
+                const auto * c = static_cast<const int32_t *>(g.upper_c.get());
+                for (size_t r = 0; r < g.upper->rows.size(); ++r)
+                    if (g.upper->rows[r].source_row == row)
+                        terms.push_back({c + r * g.ops.ldc, size_t(g.upper->rows[r].lane) + 1 + g.pass});
+            }
+            for (size_t j = 0; j < n; ++j) {
+                int64_t code = 0;
+                for (const auto & t : terms) reconstruct(code, t.values[j], t.limb);
+                store(i, j, code);
+            }
+        }
+    } else {
+        std::vector<int64_t> out;
+        merge_job(job, operation, out);
+        if (job.rows == 1) {
+            for (size_t j = 0; j < n; ++j) {
+                const float value = static_cast<float>(std::ldexp(static_cast<double>(out[j]),
+                                                                  job.scale + int(weight.base[j])));
+                require(std::isfinite(value), POTAL_ERR_CAPACITY);
+                staged[((task.batch * heads + task.head) * rows_total + task.begin) * n + j] = value;
+            }
+        } else {
+            for (size_t i = 0; i < job.rows; ++i)
+                for (size_t j = 0; j < n; ++j) store(i, j, out[i * n + j]);
         }
     }
     reconstruct_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -972,6 +1049,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
     };
     const auto fold_body = [&] {
         std::shared_ptr<const stationary> weight;
+        preparation_workspace workspace;
         size_t current_ab = SIZE_MAX, current_ah = SIZE_MAX;
         for (size_t i = 0; i < T; ++i) {
             const strict_task & task = tasks[i];
@@ -986,6 +1064,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 auto prepared = std::make_shared<stationary>();
                 prepare_weight(a, task.ah, task.ab, operation, *prepared);
                 weight = std::move(prepared);
+                workspace.weights = {};
                 current_ab = task.ab;
                 current_ah = task.ah;
             }
@@ -994,7 +1073,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 tl::scoped_span span(tl::active(), tl::stage::attn_fold, run_id, layer, uint32_t(i), tl::no_id);
                 fold_activation(operation, st.streams[i], st.parts[i]);
                 st.parts[i] = activation_parts{};
-                job = stage_job(i, st.streams[i], weight, operation);
+                job = stage_job(i, st.streams[i], weight, operation, &workspace);
                 st.streams[i] = stream{};
                 span.work = job->gemms.size();
             }
