@@ -42,6 +42,22 @@ class StripeFolding {
         ggml::gemmini::residual::TimedResidualCapture & rmd_builder); // route-specific stripe sink
 
   private:
+    bool run_blocks(const ExSIAState &                              state,
+                    StripeState &                                   stripe,
+                    ggml_gemmini_args_t &                           args,
+                    const std::vector<int32_t> &                    stripe_q_wide,
+                    const std::vector<int16_t> &                    stripe_block_exp,
+                    std::vector<int32_t> &                          residual,
+                    ggml::gemmini::residual::TimedResidualCapture & rmd_builder);
+    template <typename T>
+    bool run_blocks_typed(const ExSIAState &                              state,
+                          StripeState &                                   stripe,
+                          ggml_gemmini_args_t &                           args,
+                          const std::vector<int32_t> &                    stripe_q_wide,
+                          const std::vector<int16_t> &                    stripe_block_exp,
+                          std::vector<int32_t> &                          residual,
+                          ggml::gemmini::residual::TimedResidualCapture & rmd_builder);
+
     OutlierMarker   unit_outlier_;
     ResidualClipper unit_clip_;
 };

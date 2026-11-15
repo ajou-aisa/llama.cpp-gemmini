@@ -164,13 +164,21 @@ bool assemble_stripe_mask(StripePipelineSlot & slot, const ExSIAState & state) {
         const size_t    local_row  = block / state.blocks_per_row;
         const size_t    blk_idx    = block % state.blocks_per_row;
         const BlockMask block_mask = slot.block_mask(block, state.B_size);
-        for (size_t i = 0; i < block_mask.bit_count; ++i) {
-            const size_t global_col = blk_idx * state.B_size + i;
-            if (global_col >= state.K_logical || !block_mask.is_set(i))
-                continue;
-
-            const size_t mask_idx = local_row * stripe.outlier_mask.cols + global_col;
-            stripe.outlier_mask.words[mask_idx / 64] |= uint64_t{1} << (mask_idx % 64);
+        const size_t col_begin = blk_idx * state.B_size;
+        if (col_begin >= state.K_logical)
+            continue;
+        const size_t valid = std::min(block_mask.bit_count, state.K_logical - col_begin);
+        const size_t base  = local_row * stripe.outlier_mask.cols + col_begin;
+        for (size_t i = 0; i < valid; i += 64) {
+            const size_t count  = std::min<size_t>(64, valid - i);
+            const size_t word   = (base + i) / 64;
+            const size_t offset = (base + i) % 64;
+            uint64_t     bits   = block_mask.words[i / 64];
+            if (count < 64)
+                bits &= (uint64_t{1} << count) - 1;
+            stripe.outlier_mask.words[word] |= bits << offset;
+            if (offset != 0 && count > 64 - offset)
+                stripe.outlier_mask.words[word + 1] |= bits >> (64 - offset);
         }
     }
 

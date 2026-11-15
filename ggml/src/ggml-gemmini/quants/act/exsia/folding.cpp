@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -12,6 +13,73 @@
 
 namespace ggml::gemmini::quants::act::exsia {
 using namespace detail;
+
+namespace {
+
+inline int32_t saturate_activation(int32_t q) {
+    constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
+    constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
+    return q > qmax ? qmax : (q < qmin ? qmin : q);
+}
+
+// PreparedShift for 1 <= shift <= 31 in 32-bit lanes so the block loop vectorizes:
+// |q| <= 2^31 fits uint32 and the round-to-nearest-even result is at most 2^30 + 1.
+inline int32_t round_shift_right_even(int32_t q, int shift) {
+    const bool     negative  = q < 0;
+    const uint32_t magnitude = negative ? 0u - static_cast<uint32_t>(q) : static_cast<uint32_t>(q);
+    const uint32_t half      = uint32_t{1} << (shift - 1);
+    const uint32_t quotient  = magnitude >> shift;
+    const uint32_t remainder = magnitude & ((half << 1) - 1);
+    const uint32_t rounded =
+        quotient + (remainder > half || (remainder == half && (quotient & 1) != 0));
+    return negative ? -static_cast<int32_t>(rounded) : static_cast<int32_t>(rounded);
+}
+
+// Bits [start, start + count) of a row-major bit matrix, count <= 64.
+inline uint64_t load_mask_bits(const std::vector<uint64_t> & words, size_t start, size_t count) {
+    const size_t word   = start / 64;
+    const size_t offset = start % 64;
+    uint64_t     bits   = words[word] >> offset;
+    if (offset != 0 && offset + count > 64)
+        bits |= words[word + 1] << (64 - offset);
+    return count == 64 ? bits : bits & ((uint64_t{1} << count) - 1);
+}
+
+// Shifted values and their saturated dense codes for one block, as if no column were selected.
+template <typename T>
+void fold_block_dense(T * codes, int32_t * shifted, const int32_t * q, size_t n, int16_t delta) {
+    if (delta == 0) {
+        for (size_t i = 0; i < n; ++i) {
+            shifted[i] = q[i];
+            codes[i]   = static_cast<T>(saturate_activation(q[i]));
+        }
+    } else if (delta < 0 && delta > -32) {
+        const int shift = -static_cast<int>(delta);
+        for (size_t i = 0; i < n; ++i) {
+            shifted[i] = round_shift_right_even(q[i], shift);
+            codes[i]   = static_cast<T>(saturate_activation(shifted[i]));
+        }
+    } else {
+        const detail::PreparedShift prepared(delta);
+        for (size_t i = 0; i < n; ++i) {
+            shifted[i] = prepared(q[i]);
+            codes[i]   = static_cast<T>(saturate_activation(shifted[i]));
+        }
+    }
+}
+
+// Direct block stores need every saturated activation code to be representable in A, which is
+// what A.set() would otherwise check per column.
+bool dense_rows_writable(const QuantizedActivationBuffer & a, size_t row_end, size_t cols) {
+    if (!a.valid() || row_end > a.rows || cols > a.cols || (a.bits != 4 && a.bits != 8 && a.bits != 16) ||
+        a.bits < GGML_GEMMINI_ACTIVATION_BITS)
+        return false;
+    const size_t element_bytes = a.bits == 16 ? sizeof(int16_t) : 1;
+    return a.row_stride_bytes >= cols * element_bytes &&
+           a.row_offset + row_end <= a.bytes->size() / a.row_stride_bytes;
+}
+
+} // namespace
 
 void OutlierMarker::mark_valid_range(StripeState & stripe,
                                      size_t        row,
@@ -121,6 +189,11 @@ bool StripeFolding::run(Meta &                           meta,
     if (stripe.outlier_mask.rows != stripe.row_count() || stripe.outlier_mask.cols < state.K_padded)
         return false;
 
+#if !(GGML_GEMMINI_ACT_QUANT_METRICS || EXSIA_STAGE_PROFILE_ENABLED)
+    if (state.B_size <= 64 && dense_rows_writable(args.A, stripe.row_end, args.K))
+        return run_blocks(state, stripe, args, stripe_q_wide, stripe_block_exp, residual, rmd_builder);
+#endif
+
     // The slot owns this disjoint row range for both dense int8 and residual writes.
     for (size_t r = stripe.row_start; r < stripe.row_end; ++r) {
         GGML_ASSERT(r < args.I);
@@ -196,6 +269,98 @@ bool StripeFolding::run(Meta &                           meta,
     }
 
     return true;
+}
+
+// Same results as the per-column loop in run(). Each block is first folded as if no column
+// were selected (shift + saturate, branch-free per element); only selected columns whose folded
+// value leaves the activation range, visited through their mask bits, are split into limbs and
+// emitted as residuals: a selected in-range column folds to the saturated code with no residual.
+template <typename T>
+bool StripeFolding::run_blocks_typed(const ExSIAState &               state,
+                                     StripeState &                    stripe,
+                                     ggml_gemmini_args_t &            args,
+                                     const std::vector<int32_t> &     stripe_q_wide,
+                                     const std::vector<int16_t> &     stripe_block_exp,
+                                     std::vector<int32_t> &           residual,
+                                     residual::TimedResidualCapture & rmd_builder) {
+    const int16_t                     neg_inf   = std::numeric_limits<int16_t>::min();
+    const size_t                      B         = state.B_size;
+    const size_t                      K         = args.K;
+    const size_t                      mask_cols = stripe.outlier_mask.cols;
+    const QuantizedActivationBuffer & dense     = args.A;
+#if !EXSIA_VALIDATION
+    (void)residual;
+#else
+    GGML_ASSERT(residual.size() >= stripe.row_end * state.K_padded);
+#endif
+#if !GGML_GEMMINI_ENABLE_RMD
+    (void)rmd_builder;
+#endif
+    T       codes[64];
+    int32_t shifted[64];
+
+    for (size_t r = stripe.row_start; r < stripe.row_end; ++r) {
+        const size_t    local_row = stripe.local_row(r);
+        const int32_t * q_row     = stripe_q_wide.data() + local_row * state.K_padded;
+        const int16_t * exp_row   = stripe_block_exp.data() + local_row * state.blocks_per_row;
+        uint8_t * dense_row = dense.bytes->data() + (dense.row_offset + r) * dense.row_stride_bytes;
+
+        for (size_t b = 0; b < state.blocks_per_row; ++b) {
+            const size_t block_offset = b * B;
+            if (block_offset >= K)
+                break;
+            const size_t  valid     = std::min(B, K - block_offset);
+            const int16_t block_exp = exp_row[b];
+            const int16_t delta     = block_exp == neg_inf || stripe.e_s == neg_inf
+                                          ? 0
+                                          : static_cast<int16_t>(block_exp - stripe.e_s);
+            fold_block_dense(codes, shifted, q_row + block_offset, valid, delta);
+
+            uint64_t selected = 0;
+            if (stripe.promote_top_block && block_exp > stripe.e_s) {
+                // The RMD bitmap builder reads outlier_mask as its selection.
+                unit_outlier_.mark_valid_range(stripe, r, block_offset, block_offset + valid);
+                selected = valid == 64 ? ~uint64_t{0} : (uint64_t{1} << valid) - 1;
+            } else {
+                selected = load_mask_bits(
+                    stripe.outlier_mask.words, local_row * mask_cols + block_offset, valid);
+            }
+#if GGML_GEMMINI_ENABLE_RMD
+            while (selected != 0) {
+                const size_t i = static_cast<size_t>(__builtin_ctzll(selected));
+                selected &= selected - 1;
+                if (shifted[i] == codes[i])
+                    continue;
+                const auto [low_limb, residual_i32] = unit_clip_.clip_with_residual(shifted[i], true);
+                codes[i] = static_cast<T>(low_limb);
+                if (residual_i32 == 0)
+                    continue;
+#if EXSIA_VALIDATION
+                residual[r * state.K_padded + block_offset + i] = residual_i32;
+#endif
+                if (!rmd_builder.add_residual(local_row, block_offset + i, residual_i32))
+                    return false;
+            }
+#else
+            (void)selected;
+#endif
+            std::memcpy(dense_row + block_offset * sizeof(T), codes, valid * sizeof(T));
+        }
+    }
+    return true;
+}
+
+bool StripeFolding::run_blocks(const ExSIAState &               state,
+                               StripeState &                    stripe,
+                               ggml_gemmini_args_t &            args,
+                               const std::vector<int32_t> &     stripe_q_wide,
+                               const std::vector<int16_t> &     stripe_block_exp,
+                               std::vector<int32_t> &           residual,
+                               residual::TimedResidualCapture & rmd_builder) {
+    return args.A.bits == 16 ? run_blocks_typed<int16_t>(state, stripe, args, stripe_q_wide,
+                                                         stripe_block_exp, residual, rmd_builder)
+                             : run_blocks_typed<int8_t>(state, stripe, args, stripe_q_wide,
+                                                        stripe_block_exp, residual, rmd_builder);
 }
 
 } // namespace ggml::gemmini::quants::act::exsia

@@ -5,6 +5,16 @@
 #include <new>
 #include <stdexcept>
 
+// finish() re-checks its own packet with validate_packet(): kept in debug, validation and test
+// builds, skipped in release builds where the builder is the only producer of the packet.
+#ifndef GGML_GEMMINI_RMD_VALIDATE_BUILT_PACKETS
+#if !defined(NDEBUG) || EXSIA_VALIDATION || GGML_GEMMINI_TESTING
+#define GGML_GEMMINI_RMD_VALIDATE_BUILT_PACKETS 1
+#else
+#define GGML_GEMMINI_RMD_VALIDATE_BUILT_PACKETS 0
+#endif
+#endif
+
 namespace ggml::gemmini::rmd {
 namespace {
 
@@ -22,7 +32,7 @@ bool fits_u32(size_t value) {
 
 template <unsigned Bits>
 uint8_t decompose(int32_t                                      residual,
-                  std::array<int8_t, kMaxNativeRadixLanes> &   packed,
+                  int8_t *                                     packed,
                   uint16_t &                                   mask,
                   size_t &                                     count,
                   std::array<uint32_t, kMaxNativeRadixLanes> & lane_masks,
@@ -110,7 +120,7 @@ void RmdBitmapBuilder::reset(size_t                        stripe_id,
     stride_    = stride;
     cursor_    = 0;
     limb_masks_.clear();
-    digits_.clear();
+    digit_count_ = 0;
     for (size_t word : nonzero_words_) nonzero_mask_[word] = 0;
     nonzero_words_.clear();
     metadata_               = StripePacket{};
@@ -176,7 +186,20 @@ bool RmdBitmapBuilder::emit(size_t row, size_t k, int32_t residual) {
     cursor_ = cell + 1;
     if (residual == 0)
         return true;
-    std::array<int8_t, kMaxNativeRadixLanes> packed{};
+    // Decompose straight into the digit storage; keep room for a whole residual so no
+    // per-event temporary or insert is needed.
+    if (digits_.size() - digit_count_ < kMaxNativeRadixLanes) {
+        try {
+            digits_.resize(std::max(digits_.size() * 2, digit_count_ + kMaxNativeRadixLanes * 64));
+        } catch (const std::bad_alloc &) {
+            status_ = RmdStatus::allocation_failure;
+            return false;
+        } catch (const std::length_error &) {
+            status_ = RmdStatus::overflow;
+            return false;
+        }
+    }
+    int8_t * const                           packed = digits_.data() + digit_count_;
     uint16_t                                 mask  = 0;
     size_t                                   count = 0;
     const size_t                             block = k / kBlockSize;
@@ -205,7 +228,7 @@ bool RmdBitmapBuilder::emit(size_t row, size_t k, int32_t residual) {
     try {
         if (!nonzero_mask_[cell / 64]) nonzero_words_.push_back(cell / 64);
         limb_masks_.push_back(mask);
-        digits_.insert(digits_.end(), packed.begin(), packed.begin() + count);
+        digit_count_ += count;
     } catch (const std::bad_alloc &) {
         status_ = RmdStatus::allocation_failure;
         return false;
@@ -231,7 +254,7 @@ bool RmdBitmapBuilder::emit(size_t row, size_t k, int32_t residual) {
 }
 
 StripePacketHandle RmdBitmapBuilder::finish() {
-    if (status_ != RmdStatus::success || digits_.empty()) {
+    if (status_ != RmdStatus::success || digit_count_ == 0) {
         return nullptr;
     }
     try {
@@ -244,7 +267,7 @@ StripePacketHandle RmdBitmapBuilder::finish() {
         auto & lane_groups = lane_groups_;
         auto packet = std::make_shared<StripePacket>(metadata_);
         packet->blocks.reserve(block_count);
-        packet->k_indices.reserve(std::min(digits_.size(), block_count * kBlockSize));
+        packet->k_indices.reserve(std::min(digit_count_, block_count * kBlockSize));
         const size_t rows_padded = align_up(metadata_.row_count, kArrayDim);
         if (packet->j_padded > std::numeric_limits<uint32_t>::max() / rows_padded) {
             status_ = RmdStatus::overflow;
@@ -354,13 +377,20 @@ StripePacketHandle RmdBitmapBuilder::finish() {
             packet->blocks.push_back(std::move(block));
         }
         packet->stacked_activation.signed_int8.resize(activation_values, 0);
-        size_t residual_index = 0, digit_index = 0;
+        size_t   residual_index = 0, digit_index = 0;
+        int8_t * stacked        = packet->stacked_activation.signed_int8.data();
+        // Cells ascend (emit enforces row/K order), so the row advances instead of dividing.
+        size_t row = 0, row_cell_end = stride_;
         for (size_t word : nonzero_words_) {
             uint64_t nonzero = nonzero_mask_[word];
             while (nonzero) {
                 const size_t cell = word * 64 + static_cast<size_t>(__builtin_ctzll(nonzero));
                 nonzero &= nonzero - 1;
-                const size_t row = cell / stride_, k = cell % stride_;
+                while (cell >= row_cell_end) {
+                    ++row;
+                    row_cell_end += stride_;
+                }
+                const size_t k = cell - (row_cell_end - stride_);
                 if (residual_index >= limb_masks_.size()) {
                     status_ = RmdStatus::invalid_arguments;
                     return nullptr;
@@ -372,30 +402,33 @@ StripePacketHandle RmdBitmapBuilder::finish() {
                     status_ = RmdStatus::invalid_arguments;
                     return nullptr;
                 }
-                const auto &   block   = packet->blocks[block_indices[block_id]];
-                const uint32_t lower_k = (uint32_t{1} << (k % kBlockSize)) - 1;
+                // Shared by every lane of this cell: block, K bit/rank mask, row word and bit.
+                const auto &     block      = packet->blocks[block_indices[block_id]];
+                const uint32_t   k_bit      = uint32_t{1} << (k % kBlockSize);
+                const uint32_t   lower_k    = k_bit - 1;
+                const uint64_t   row_bit    = uint64_t{1} << (row % 64);
+                const uint64_t   lower_rows = row_bit - 1;
+                const size_t     row_base   = block_id * packet->lane_capacity * row_words_ + row / 64;
+                const uint8_t *  groups_of  = lane_groups[block_id].data();
                 while (lanes) {
-                    const size_t lane = static_cast<size_t>(__builtin_ctz(lanes));
-                    const size_t index =
-                        (block_id * packet->lane_capacity + lane) * row_words_ + row / 64;
-                    if (!(block.lane_k_masks[lane] & (uint32_t{1} << (k % kBlockSize))) ||
-                        !(lane_rows_[index] & (uint64_t{1} << (row % 64)))) {
+                    const size_t   lane  = static_cast<size_t>(__builtin_ctz(lanes));
+                    const size_t   index = row_base + lane * row_words_;
+                    const uint64_t rows  = lane_rows_[index];
+                    if (!(block.lane_k_masks[lane] & k_bit) || !(rows & row_bit)) {
                         status_ = RmdStatus::invalid_arguments;
                         return nullptr;
                     }
-                    const auto & group = block.groups[lane_groups[block_id][lane]];
+                    const auto & group = block.groups[groups_of[lane]];
                     const size_t compact_row =
-                        row_ranks[index] +
-                        __builtin_popcountll(lane_rows_[index] & ((uint64_t{1} << (row % 64)) - 1));
+                        row_ranks[index] + static_cast<size_t>(__builtin_popcountll(rows & lower_rows));
                     const size_t compact_k = population(group.k_mask & lower_k);
-                    packet->stacked_activation
-                        .signed_int8[group.activation_offset + compact_row * group.padded_k_count +
-                                     compact_k] = digits_[digit_index++];
+                    stacked[group.activation_offset + compact_row * group.padded_k_count + compact_k] =
+                        digits_[digit_index++];
                     lanes &= lanes - 1;
                 }
             }
         }
-        if (residual_index != limb_masks_.size() || digit_index != digits_.size()) {
+        if (residual_index != limb_masks_.size() || digit_index != digit_count_) {
             status_ = RmdStatus::invalid_arguments;
             return nullptr;
         }
@@ -404,9 +437,11 @@ StripePacketHandle RmdBitmapBuilder::finish() {
         packet->active_original_rows =
             static_cast<size_t>(std::count(row_seen_.begin(), row_seen_.end(), uint8_t{1}));
 #endif
+#if GGML_GEMMINI_RMD_VALIDATE_BUILT_PACKETS
         status_ = validate_packet(*packet);
         if (status_ != RmdStatus::success)
             return nullptr;
+#endif
         return packet;
     } catch (const std::bad_alloc &) {
         status_ = RmdStatus::allocation_failure;

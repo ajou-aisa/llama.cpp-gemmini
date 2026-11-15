@@ -433,6 +433,65 @@ bool test_outlier_limb_policy() {
 #endif
 }
 
+bool test_folding_integer_boundaries() {
+#if GGML_GEMMINI_ENABLE_RMD
+    using namespace quants::act::exsia;
+    constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
+    constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
+    constexpr int32_t imax = std::numeric_limits<int32_t>::max();
+    constexpr int32_t imin = std::numeric_limits<int32_t>::min();
+    const std::pair<int32_t, int32_t> cases[] = {
+        {0, 0}, {qmin, qmin}, {qmax, qmax}, {qmin - 1, qmax}, {qmax + 1, qmin},
+        {imin, 0}, {imin + 1, 1}, {imax - qmax - 1, qmax},
+        {imax - qmax, qmax}, {imax, qmax},
+    };
+    constexpr size_t columns = 32;
+    std::vector<int32_t> wide(columns, 0), validation_residual(columns, 0);
+    for (size_t i = 0; i < std::size(cases); ++i)
+        wide[i] = cases[i].first;
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = columns;
+    if (!args.A.allocate(1, columns, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    ExSIAState state;
+    state.B_size = state.K_padded = columns;
+    state.blocks_per_row = 1;
+    StripeState stripe;
+    stripe.row_end = 1;
+    stripe.e1 = 0;
+    if (!stripe.outlier_mask.prepare(1, columns))
+        return false;
+    stripe.outlier_mask.words[0] = (uint64_t{1} << std::size(cases)) - 1;
+    Meta meta;
+    meta.rho = 0;
+    meta.theta.resize(1);
+    residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
+    StripeFolding folding;
+    if (!check(folding.run(meta, state, stripe, args, 0, wide, {0},
+                           validation_residual, capture),
+               "folding accepts signed INT32 boundary values"))
+        return false;
+    const auto payload = capture.finish();
+    if (!check(payload.direct != nullptr, "folding publishes boundary residuals"))
+        return false;
+    std::vector<int64_t> restored(columns, 0);
+    for (const auto & event : payload.direct->events)
+        restored.at(event.original_k) += event.residual;
+    for (size_t i = 0; i < columns; ++i) {
+        const int32_t expected_low = i < std::size(cases) ? cases[i].second : 0;
+        if (!check(args.A.get(0, i) == expected_low,
+                   "folding preserves balanced low limbs and INT32 saturation fallback") ||
+            !check(restored[i] + args.A.get(0, i) == wide[i],
+                   "dense plus emitted residual exactly reconstructs INT32 input"))
+            return false;
+    }
+#endif
+    return true;
+}
+
 bool test_activation_stripe_geometry_contract() {
     constexpr size_t   stripe_rows   = 2 * DIM;
     constexpr size_t   rows          = stripe_rows + 1;
@@ -3582,6 +3641,7 @@ int main(int argc, char ** argv) {
     const bool ok =
         (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_outlier_limb_policy() &&
+         test_folding_integer_boundaries() &&
          test_exsia_packet_capture() && test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
@@ -3601,7 +3661,8 @@ int main(int argc, char ** argv) {
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
         (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" && test_non_outlier_clipping_policy()) ||
-        (case_name == "outlier-limb" && test_outlier_limb_policy()) ||
+        (case_name == "outlier-limb" && test_outlier_limb_policy() &&
+         test_folding_integer_boundaries()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

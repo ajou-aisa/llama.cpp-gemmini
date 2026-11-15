@@ -19,7 +19,7 @@ class RmdBitmapBuilder {
     bool               emit(size_t row, size_t k, int32_t residual);
     StripePacketHandle finish();
     bool               empty() const noexcept {
-        return digits_.empty();
+        return digit_count_ == 0;
     }
     RmdStatus status() const noexcept {
         return status_;
@@ -31,7 +31,8 @@ class RmdBitmapBuilder {
     std::vector<uint64_t>         nonzero_mask_;
     std::vector<size_t>           nonzero_words_;
     std::vector<uint16_t>         limb_masks_;
-    std::vector<int8_t>           digits_;
+    std::vector<int8_t>           digits_; // storage; only [0, digit_count_) is live
+    size_t                        digit_count_ = 0;
     std::vector<std::array<uint32_t, kMaxNativeRadixLanes>> block_lane_masks_;
     std::vector<uint64_t>                                   lane_rows_;
     std::vector<uint8_t>                                    row_seen_;
