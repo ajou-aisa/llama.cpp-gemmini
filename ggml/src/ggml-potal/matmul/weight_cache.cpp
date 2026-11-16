@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <new>
+#include <stdexcept>
 
 namespace ggml::potal {
 
@@ -44,7 +45,9 @@ const char * weight_cache_outcome_name(weight_cache_outcome o) {
     return "unknown";
 }
 
-weight_cache::weight_cache() : weight_cache(budget_from_env()) {}
+weight_cache::weight_cache() : weight_cache(budget_from_env()) {
+    eager_grow_ = std::getenv("GGML_POTAL_WEIGHT_CACHE_MB") == nullptr;
+}
 
 weight_cache::weight_cache(size_t budget_bytes) {
     c_.budget = budget_bytes;
@@ -59,6 +62,52 @@ weight_cache::key weight_cache::key_of(const ggml_tensor * t) {
     const ggml_tensor * base = t->view_src ? t->view_src : t;
     return { static_cast<const void *>(base->buffer), potal_buffer_generation(base->buffer), t->data, (int) t->type,
              t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3] };
+}
+
+ggml_status weight_cache::prepare(const ggml_tensor * src0) {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (src0 == nullptr || !eligible(src0) || c_.budget == 0) return GGML_STATUS_SUCCESS;
+        const ggml_tensor * base = src0->view_src ? src0->view_src : src0;
+        if (!ggml_backend_buffer_is_host(base->buffer)) return GGML_STATUS_SUCCESS;
+        const key k = key_of(src0);
+        if (entries_.find(k) != entries_.end()) return GGML_STATUS_SUCCESS;
+
+        ggml_gemmini_args_t args;
+        if (!init_weight_args(src0, args)) {
+            log::failure("potal.init", "[POTAL_INIT] weight=%s invalid shape/layout or missing static data",
+                         src0->name);
+            return GGML_STATUS_FAILED;
+        }
+        size_t bytes;
+        if (!hp1_weight::required_bytes(src0->ne[1], src0->ne[0], bytes) || bytes > SIZE_MAX - c_.bytes) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        const size_t total = c_.bytes + bytes;
+        if (!eager_grow_ && total > c_.budget) return GGML_STATUS_ALLOC_FAILED;
+
+        std::unique_ptr<hp1_weight> w(new (std::nothrow) hp1_weight);
+        if (!w || !w->allocate(src0->ne[1], src0->ne[0])) return GGML_STATUS_ALLOC_FAILED;
+        auto reader = ggml::gemmini::quants::wreader::WeightReaderStatus::Success;
+        const auto status = prepare_weight(args, *w, &reader);
+        if (status != quants::weight::hp1::status::ok) {
+            log::failure("potal.init", "[POTAL_INIT] weight=%s prepare=%s reader=%s",
+                         src0->name, quants::weight::hp1::status_name(status),
+                         ggml::gemmini::quants::wreader::weight_reader_status_name(reader));
+            return GGML_STATUS_FAILED;
+        }
+        log::debug("potal.init", "[POTAL_INIT] prepared weight=%s bytes=%zu", src0->name, bytes);
+        const auto inserted = entries_.emplace(k, std::move(w));
+        if (!inserted.second) return GGML_STATUS_ALLOC_FAILED;
+        c_.entries++;
+        c_.bytes = total;
+        if (eager_grow_ && total > c_.budget) c_.budget = total;
+        return GGML_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) {
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (const std::length_error &) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 }
 
 weight_lookup weight_cache::get(const ggml_tensor * src0, const ggml_gemmini_args_t & args) {

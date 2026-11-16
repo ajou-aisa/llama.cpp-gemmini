@@ -430,6 +430,15 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-attention-test COMMAND potal-attention-test)
 endif()
 
+add_executable(potal-weight-preload-test ../ggml-potal/tests/potal-weight-preload-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-weight-preload-test)
+target_link_libraries(potal-weight-preload-test PRIVATE llama ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-weight-preload-test COMMAND potal-weight-preload-test)
+    set_tests_properties(potal-weight-preload-test PROPERTIES
+        ENVIRONMENT "GGML_POTAL_HART_ROLES=OFF;GGML_POTAL_STRICT_ISSUER=OFF")
+endif()
+
 if (POTAL_E4B2_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
     add_executable(potal-e4b2-hardware tests/potal-e4b2-hardware.cpp ${POTAL_BACKEND_SOURCES})
     potal_add_backend_settings(potal-e4b2-hardware)

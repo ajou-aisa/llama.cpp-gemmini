@@ -124,10 +124,15 @@ struct ggml_backend_potal_stats {
     // node, and where a rejected node runs is the scheduler's decision.
     uint64_t supports_mul_mat_rejected;
 
-    // Prepared Q8_HP1 weights of this backend (matmul/weight_cache.hpp). A
-    // weight in a GGML_BACKEND_BUFFER_USAGE_WEIGHTS buffer is validated and
-    // unpacked on its first MUL_MAT and reused afterwards; any other src0 is
-    // prepared per call. Budget: GGML_POTAL_WEIGHT_CACHE_MB (default 1024, 0 = off).
+    // Prepared HP1 weights of this backend (matmul/weight_cache.hpp). Scheduler
+    // reservations before the first graph_compute prepare assigned static
+    // WEIGHTS-buffer operands without executing the graph. Initialization
+    // preparation changes live entries/bytes/budget, not the inference counters
+    // below. Direct callers without reservation retain first-MUL_MAT preparation;
+    // non-WEIGHTS operands are prepared per call.
+    // Unset GGML_POTAL_WEIGHT_CACHE_MB permits initialization to grow the default
+    // 1024 MiB budget as needed. An explicit positive limit stays fixed and an
+    // insufficient limit fails preparation; 0 disables preparation and caching.
     uint64_t weight_cache_hits;      // nodes that reused a prepared weight (no validation, no unpacking)
     uint64_t weight_cache_misses;    // nodes that prepared a weight and cached it
     uint64_t weight_cache_bypasses;  // nodes that prepared a cacheable weight over the budget (not kept)

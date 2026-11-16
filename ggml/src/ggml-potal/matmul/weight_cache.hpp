@@ -6,7 +6,7 @@
 // it: llama.cpp creates the backends with a llama_context, and the model (its
 // GGML_BACKEND_BUFFER_USAGE_WEIGHTS buffers) must outlive every context. So
 // the validated, unpacked B / carriers / channel_scale of such a weight are
-// prepared on its first MUL_MAT and reused by every later one of this backend.
+// prepared during initialization or on its first MUL_MAT and reused thereafter.
 //
 //   eligible  src0 lives in a buffer with usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS.
 //             Anything else (compute buffers, tensors without a buffer) may be
@@ -21,6 +21,8 @@
 //             that does not fit is prepared per call (bypass); entries are
 //             never evicted while the backend lives, so no buffer the
 //             accelerator may still read is ever freed under it.
+//             Eager preparation must retain its entry or fail; only an unset
+//             environment budget permits it to grow the effective budget.
 //   release   all entries are freed with the backend, or by clear(). Both must
 //             not overlap a graph_compute of this backend (the GGML contract
 //             for one backend instance). Mutating or freeing a weight buffer
@@ -76,6 +78,12 @@ class weight_cache {
     // The prepared operands of src0 (args: init_args of this MUL_MAT).
     weight_lookup get(const ggml_tensor * src0, const ggml_gemmini_args_t & args);
 
+    // Initialization only, before this backend's first graph_compute. No inference
+    // counters or transient success. Only an unset environment budget may grow;
+    // explicit budgets stay bounded (0 skips preparation). Same lifetime and
+    // clear/abandon preconditions as get().
+    ggml_status prepare(const ggml_tensor * src0);
+
     void abandon(const hp1_weight * w); // drop the entry of w and leak its buffers
     void clear();                       // free every entry
 
@@ -95,6 +103,7 @@ class weight_cache {
     mutable std::mutex                             mutex_;
     std::map<key, std::unique_ptr<hp1_weight>>     entries_;
     counters                                       c_;
+    bool                                           eager_grow_ = false;
 };
 
 } // namespace ggml::potal

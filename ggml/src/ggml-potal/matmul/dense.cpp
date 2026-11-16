@@ -144,7 +144,31 @@ void hp1_weight::abandon() {
     }
 }
 
+bool hp1_weight::required_bytes(int64_t n, int64_t k, size_t & bytes) {
+    if (n <= 0 || k <= 0 || k % quants::weight::hp1::block_k != 0 ||
+        uint64_t(n) > SIZE_MAX - (HW_DIM - 1) || uint64_t(k) > SIZE_MAX) {
+        return false;
+    }
+    const size_t padded = align_up(size_t(n), HW_DIM);
+    if (padded > SIZE_MAX - (ALIGN - 1) || padded > SIZE_MAX / sizeof(uint32_t) ||
+        padded > SIZE_MAX / sizeof(float)) return false;
+    const size_t row = align_up(padded, ALIGN);
+    const size_t groups = size_t(k) / quants::weight::hp1::block_k;
+    if (size_t(k) > SIZE_MAX / row || groups > SIZE_MAX / (padded * sizeof(uint32_t))) return false;
+    bytes = 0;
+    for (size_t part : { size_t(k) * row, groups * padded * sizeof(uint32_t), padded * sizeof(float) }) {
+        // The Q8 calloc base also needs ALIGN - 1 bytes to align its exposed view.
+        if (part > SIZE_MAX - 2 * (ALIGN - 1)) return false;
+        const size_t rounded = align_up(part, ALIGN);
+        if (rounded > SIZE_MAX - bytes) return false;
+        bytes += rounded;
+    }
+    return true;
+}
+
 bool hp1_weight::allocate(int64_t n_, int64_t k_) {
+    size_t required;
+    if (!required_bytes(n_, k_, required)) return false;
     n       = (size_t) n_;
     k       = (size_t) k_;
     n_pad   = align_up(n, HW_DIM);
@@ -235,21 +259,34 @@ bool hp1_operands::allocate(const hp1_shape & s, const hp1_weight & w, const hp1
     return c != nullptr;
 }
 
-bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
-               const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
-               const potal_tile_plan & plan, ggml_gemmini_args_t & args) {
-    args.I                     = (size_t) s.m;
-    args.J                     = (size_t) s.n;
-    args.K                     = (size_t) s.k;
-    args.sA                    = args.K;
-    args.sC                    = args.J;
-    args.residual_route        = residual_route;
+bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args) {
+    if (src0 == nullptr || src0->type != GGML_TYPE_Q8_HP1 || !is_2d(src0) ||
+        src0->ne[0] <= 0 || src0->ne[1] <= 0 || src0->ne[0] % QK8_HP != 0 ||
+        uint64_t(src0->ne[0]) > SIZE_MAX / sizeof(block_q8_hp1) ||
+        uint64_t(src0->ne[1]) > SIZE_MAX / (size_t(src0->ne[0]) / QK8_HP) ||
+        src0->data == nullptr || (src0->view_src && src0->view_src->data == nullptr)) return false;
+    const size_t row = size_t(src0->ne[0]) / QK8_HP * sizeof(block_q8_hp1);
+    if (size_t(src0->ne[1]) > SIZE_MAX / row || src0->nb[0] != sizeof(block_q8_hp1) ||
+        (src0->ne[1] != 1 && src0->nb[1] != row)) return false;
+    args.J                     = size_t(src0->ne[1]);
+    args.K                     = size_t(src0->ne[0]);
     args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
     args.q8_hp1_blocks         = static_cast<const block_q8_hp1 *>(ggml::gemmini::tensor_data(src0));
     args.q8_hp1_blocks_per_row = args.K / QK8_HP;
     args.q8_hp1_block_count    = args.J * args.q8_hp1_blocks_per_row;
     args.native_weight_bytes   = ggml_nbytes(src0);
     args.block_size_k          = QK8_HP;
+    return true;
+}
+
+bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
+               const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
+               const potal_tile_plan & plan, ggml_gemmini_args_t & args) {
+    if (s.m <= 0 || !init_weight_args(src0, args) || args.J != size_t(s.n) || args.K != size_t(s.k)) return false;
+    args.I                     = (size_t) s.m;
+    args.sA                    = args.K;
+    args.sC                    = args.J;
+    args.residual_route        = residual_route;
     args.f_out                 = static_cast<float *>(dst->data);
     args.col_stride_f_out      = 1;
     args.stride_f_out          = dst->nb[1] / sizeof(float);

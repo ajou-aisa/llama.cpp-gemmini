@@ -1632,6 +1632,31 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         return false;
     }
 
+    ggml_backend_prepare_node_t prepare[GGML_SCHED_MAX_BACKENDS] = {};
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            prepare[i] = reinterpret_cast<ggml_backend_prepare_node_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_prepare_node"));
+        }
+    }
+    for (int i = 0; i < measure_graph->n_nodes; ++i) {
+        ggml_tensor * node = measure_graph->nodes[i];
+        const int backend_id = tensor_backend_id(node);
+        if (backend_id == -1 || !prepare[backend_id]) {
+            continue;
+        }
+        ggml_backend_t backend = sched->backends[backend_id];
+        const ggml_status status = prepare[backend_id](backend, node);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("%s: %s preparation failed for %s (status %d)\n",
+                           __func__, ggml_backend_name(backend), node->name, int(status));
+            ggml_backend_sched_reset(sched);
+            return false;
+        }
+    }
+
     ggml_backend_sched_reset(sched);
 
     return true;

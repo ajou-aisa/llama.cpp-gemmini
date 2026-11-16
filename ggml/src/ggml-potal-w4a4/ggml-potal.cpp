@@ -29,12 +29,17 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
-using potal_context = ggml::potal::backend_state;
+struct potal_context : ggml::potal::backend_state {
+    // Monotonic across failed compute, scheduler reset and weight-cache clear.
+    std::atomic<bool> compute_started{ false };
+};
 
 // supports_op is a device call without a backend instance: device-wide counters.
 std::atomic<uint64_t> g_supports_accepted{ 0 };
@@ -305,6 +310,7 @@ void potal_free(ggml_backend_t backend) {
 
 ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     potal_context & ctx = *static_cast<potal_context *>(backend->context);
+    ctx.compute_started.store(true, std::memory_order_relaxed);
     const uint64_t      graph_index = g_graph_count.fetch_add(1, std::memory_order_relaxed);
     const dump_config & dump        = dump_cfg();
     // Strict issuer (H3-8I-25S): hart 0's CPU runs only the issuer, so the calling thread
@@ -538,11 +544,50 @@ ggml_backend_dev_t potal_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     return &device;
 }
 
+ggml_status potal_prepare_node(ggml_backend_t backend, const ggml_tensor * node) {
+    if (!ggml_backend_is_potal(backend)) return GGML_STATUS_SUCCESS;
+    potal_context & ctx = *static_cast<potal_context *>(backend->context);
+    if (ctx.compute_started.load(std::memory_order_relaxed) || node == nullptr ||
+        node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
+        node->src[0]->type != GGML_TYPE_MXINT4 ||
+        ggml::potal::attention::get_role(node) != ggml::potal::attention::role::none) {
+        return GGML_STATUS_SUCCESS;
+    }
+    const ggml_tensor * weight = node->src[0];
+    const ggml_tensor * base = weight->view_src ? weight->view_src : weight;
+    if (!ggml::potal::weight_cache::eligible(weight) || !ggml_backend_buffer_is_host(base->buffer)) {
+        return GGML_STATUS_SUCCESS;
+    }
+    try {
+        if (ctx.weights.snapshot().budget == 0) return GGML_STATUS_SUCCESS;
+        // Scheduling has not allocated activation/output data yet.
+        const ggml_potal_reject reason = ggml::potal::check_mul_mat_hp1(node, false, nullptr);
+        if (reason != GGML_POTAL_REJECT_NONE) {
+            ggml::potal::log::failure("potal.init", "[POTAL_INIT] node=%s invalid static MUL_MAT (%s)",
+                                      node->name, ggml_potal_reject_name(reason));
+            return GGML_STATUS_FAILED;
+        }
+        return ctx.weights.prepare(weight);
+    } catch (const std::bad_alloc &) {
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (const std::length_error &) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+}
+
+void * potal_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (std::strcmp(name, "ggml_backend_prepare_node") == 0) {
+        return (void *) potal_prepare_node;
+    }
+    return nullptr;
+}
+
 const ggml_backend_reg_i potal_reg_i = {
     /* .get_name         = */ potal_reg_get_name,
     /* .get_device_count = */ potal_reg_get_device_count,
     /* .get_device       = */ potal_reg_get_device,
-    /* .get_proc_address = */ nullptr,
+    /* .get_proc_address = */ potal_reg_get_proc_address,
 };
 
 } // namespace

@@ -77,6 +77,8 @@ class hp1_weight {
     bool   allocate(int64_t n, int64_t k); // false if out of memory
     void   abandon();                      // leak the buffers on purpose
     size_t bytes() const;                  // allocated bytes
+    // Same padded byte count as bytes(); false on invalid dimensions or overflow.
+    static bool required_bytes(int64_t n, int64_t k, size_t & bytes);
 
     int8_t *   b        = nullptr;
     uint32_t * carriers = nullptr;
@@ -130,6 +132,9 @@ class hp1_operands {
 // dst, the layer identity, the residual route of the resolved matmul options
 // and the tile counts of the PoTal tile plan (activation_rows_per_stripe =
 // its stripe rows). false if a size does not fit or a buffer cannot be allocated.
+// Canonical static weight view only: no activation/output allocation or execution.
+bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args);
+
 bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
                const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
                const potal_tile_plan & plan, ggml_gemmini_args_t & args);
