@@ -370,13 +370,21 @@ struct host_tensor {
         t.data = bytes.data();
     }
     size_t count() const { return (size_t) (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]); }
+    size_t offset(size_t i) const {
+        size_t result = 0;
+        for (int d = 0; d < 4; ++d) {
+            result += (i % size_t(t.ne[d])) * t.nb[d];
+            i /= size_t(t.ne[d]);
+        }
+        return result;
+    }
     float  get(size_t i) const {
-        if (t.type == GGML_TYPE_F16) { ggml_fp16_t h; std::memcpy(&h, bytes.data() + 2 * i, 2); return ggml_fp16_to_fp32(h); }
-        float v; std::memcpy(&v, bytes.data() + 4 * i, 4); return v;
+        if (t.type == GGML_TYPE_F16) { ggml_fp16_t h; std::memcpy(&h, bytes.data() + offset(i), 2); return ggml_fp16_to_fp32(h); }
+        float v; std::memcpy(&v, bytes.data() + offset(i), 4); return v;
     }
     void set(size_t i, float v) {
-        if (t.type == GGML_TYPE_F16) { const ggml_fp16_t h = ggml_fp32_to_fp16(v); std::memcpy(bytes.data() + 2 * i, &h, 2); }
-        else std::memcpy(bytes.data() + 4 * i, &v, 4);
+        if (t.type == GGML_TYPE_F16) { const ggml_fp16_t h = ggml_fp32_to_fp16(v); std::memcpy(bytes.data() + offset(i), &h, 2); }
+        else std::memcpy(bytes.data() + offset(i), &v, 4);
     }
 };
 
@@ -387,6 +395,7 @@ struct att_spec {
     uint32_t     seed;
     bool         boundary;
     int64_t      batches = 1;
+    int          output_layout = 0;
 };
 
 void transfer_boundaries() {
@@ -456,6 +465,20 @@ void attention_case(const att_spec & c) {
                 for (int64_t k = 0; k < c.KV; ++k) b.set(row * c.KV + k, k == (int64_t) (row % c.KV) ? 1.0f : 0.0f);
         }
         out.shape(GGML_TYPE_F32, { c.D, c.T, c.HQ, c.batches });
+    }
+    if (c.output_layout) {
+        out.t.nb[0] = c.output_layout == 2 ? 8 : 4;
+        out.t.nb[1] = out.t.nb[0] * size_t(out.t.ne[0]) + 12;
+        out.t.nb[2] = out.t.nb[1] * size_t(out.t.ne[1]) + 20;
+        out.t.nb[3] = out.t.nb[2] * size_t(out.t.ne[2]) + 28;
+        if (c.output_layout == 3) {
+            out.t.nb[3] = out.t.nb[1] * size_t(out.t.ne[1]) + 20;
+            out.t.nb[2] = out.t.nb[3] * size_t(out.t.ne[3]) + 28;
+        }
+        size_t extent = sizeof(float);
+        for (int d = 0; d < 4; ++d) extent += size_t(out.t.ne[d] - 1) * out.t.nb[d];
+        out.bytes.assign(extent + 16, 0x5a);
+        out.t.data = out.bytes.data();
     }
     out.t.op     = GGML_OP_MUL_MAT;
     out.t.src[0] = &a.t;
@@ -530,6 +553,9 @@ void attention_case(const att_spec & c) {
     }
     }
     // attention::execute takes the scalar-Index paired runner (contract section 5), on the H2 emulator.
+    auto expected_storage = out.bytes;
+    for (size_t i = 0; i < want.size(); ++i)
+        std::memcpy(expected_storage.data() + out.offset(i), &want[i], sizeof(float));
     potal_test::h2_emulator h2;
     issue_observer observer{h2.sink(), qk ? POTAL_ISSUE_ATTN_QK : POTAL_ISSUE_ATTN_PV};
     potal_issue_counters issue_before;
@@ -547,12 +573,13 @@ void attention_case(const att_spec & c) {
     const bool counters_ok = observer.check(c.name, issue_before);
     size_t diff = 0;
     double max_abs = 0;
-    const float * got = reinterpret_cast<const float *>(out.bytes.data());
     for (size_t i = 0; i < want.size(); ++i) {
-        diff += !same_bits(got[i], want[i]);
-        max_abs = std::max(max_abs, std::fabs((double) got[i] - (double) want[i]));
+        const float got = out.get(i);
+        diff += !same_bits(got, want[i]);
+        max_abs = std::max(max_abs, std::fabs((double) got - (double) want[i]));
     }
-    const bool ok = counters_ok && res.status == POTAL_OK && !res.fatal && !prep_fail && !int_mis && !scale_mis && !base_mis && !diff;
+    const bool ok = counters_ok && res.status == POTAL_OK && !res.fatal && !prep_fail && !int_mis &&
+        !scale_mis && !base_mis && !diff && out.bytes == expected_storage;
     char b2[512];
     std::snprintf(b2, sizeof(b2),
                   "D=%" PRId64 " KV=%" PRId64 " T=%" PRId64 " heads=%" PRId64 "/%" PRId64 " stripes=%zu stripe_rows=%zu "
@@ -571,9 +598,10 @@ void attention_case(const att_spec & c) {
     if (qk) observer.expected.w4_attn_qk_digit_jobs = strict.jobs;
     else observer.expected.w4_attn_pv_digit_jobs = strict.jobs;
     bool strict_ok = strict.status == POTAL_OK && !strict.fatal &&
+        strict.strict_tasks == stripes &&
         strict.loops == res.loops && strict.fences == res.fences &&
         strict.scale_writes == res.scale_writes && strict.scale_releases == res.scale_releases &&
-        observer.check(c.name, issue_before);
+        observer.check(c.name, issue_before) && out.bytes == expected_storage;
     for (size_t i = 0; i < want.size(); ++i) strict_ok = strict_ok && same_bits(out.get(i), want[i]);
     verdict("STRICT", c.name, strict_ok, "independent golden, GQA/batch/stripe reuse and unchanged commands");
 
@@ -773,6 +801,10 @@ int main(int argc, char ** argv) {
         { "qk-prefix-tail", att::role::qk, 33, 3, 129, 1, 2, 27, false },
         { "pv-decode-batches", att::role::pv, 64, 37, 1, 2, 4, 26, true, 2 },
         { "pv-boundary-tails", att::role::pv, 64, 70, 33, 2, 14, 24, true },
+        { "qk-row-gaps-ring", att::role::qk, 64, 70, 129, 2, 6, 31, true, 1, 1 },
+        { "pv-element-gaps-ring", att::role::pv, 17, 33, 65, 2, 4, 32, true, 2, 2 },
+        { "qk-permuted-ring", att::role::qk, 33, 17, 129, 1, 2, 33, true, 2, 3 },
+        { "pv-singleton-layout", att::role::pv, 1, 33, 1, 1, 2, 34, true, 2, 3 },
     };
     for (const auto & c : att_cases) isolated(c.r == att::role::qk ? "QK" : "PV", c.name, [&] { attention_case(c); });
     std::printf(failed ? "W4A4_GOLDEN FAIL cases=%d failed=%d\n" : "W4A4_GOLDEN PASS cases=%d\n", cases, failed);

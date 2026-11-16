@@ -283,6 +283,7 @@ void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size
     require(rows != 0 && begin < size_t(tensor.ne[1]) && rows <= size_t(tensor.ne[1]) - begin);
     out.rows = rows;
     out.k = size_t(tensor.ne[0]);
+    out.limb_count = 0;
     require(!shifts || (operation == role::qk && shifts->size() == out.k));
     parts.shifts = shifts;
     out.kp = padded_k(out.k);
@@ -888,11 +889,14 @@ result execute(ggml_tensor * op, const paired_runner & paired, pv_algorithm algo
         for (size_t batch = 0; batch < size_t(op->ne[3]); ++batch) {
             for (size_t head = 0; head < size_t(op->ne[2]); ++head) {
                 for (size_t i = 0; i < rows; ++i) {
-                    for (size_t j = 0; j < n; ++j) {
-                        auto * destination = static_cast<char *>(op->data) + batch * op->nb[3] +
-                                            head * op->nb[2] + i * op->nb[1] + j * op->nb[0];
-                        const float value = staged[((batch * size_t(op->ne[2]) + head) * rows + i) * n + j];
-                        std::memcpy(destination, &value, sizeof(value));
+                    auto * destination = static_cast<char *>(op->data) + batch * op->nb[3] +
+                                        head * op->nb[2] + i * op->nb[1];
+                    const float * source = staged.data() + ((batch * size_t(op->ne[2]) + head) * rows + i) * n;
+                    if (op->nb[0] == sizeof(float)) {
+                        std::memcpy(destination, source, n * sizeof(float));
+                    } else {
+                        for (size_t j = 0; j < n; ++j)
+                            std::memcpy(destination + j * op->nb[0], source + j, sizeof(float));
                     }
                 }
             }
@@ -969,10 +973,13 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
         std::thread::id issuer_thread;
         std::atomic<uint64_t> cpu_work_on_issuer_thread{ 0 }, cpu_work_on_issuer_cpu{ 0 };
     } st;
-    st.streams.resize(T);
-    st.parts.resize(T);
+    // Admission retires the previous alias only after reconstruction and job
+    // destruction. Retain CPU capacities; completion flags remain task-indexed.
+    const size_t slots = std::min(T, capacity);
+    st.streams.resize(slots);
+    st.parts.resize(slots);
     st.stage_done.assign(T, 0);
-    for (size_t i = 0; i < T; ++i) {
+    for (size_t i = 0; i < slots; ++i) {
         st.streams[i].algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
     }
     const auto fail = [&](potal_status status, const char * stage, bool fatal) {
@@ -1088,6 +1095,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 });
                 if (st.failed) return;
             }
+            const size_t slot = i % capacity;
             const size_t half = (task.rows + 1) / 2;
             const size_t row_begin = worker == 0 ? 0 : half, row_end = worker == 0 ? half : task.rows;
             {
@@ -1104,14 +1112,14 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                         }
                         plan = &current;
                     }
-                    init_activation(b, task.head, task.batch, task.begin, task.rows, operation, st.streams[i],
-                                    st.parts[i], true, plan);
+                    init_activation(b, task.head, task.batch, task.begin, task.rows, operation, st.streams[slot],
+                                    st.parts[slot], true, plan);
                     std::lock_guard<std::mutex> lock(st.m);
                     st.stage_done[i] = 1;
                     st.cv.notify_all();
                 }
-                local_activation(b, task.head, task.batch, task.begin, row_begin, row_end, operation, st.streams[i],
-                                 st.parts[i]);
+                local_activation(b, task.head, task.batch, task.begin, row_begin, row_end, operation, st.streams[slot],
+                                 st.parts[slot]);
                 span.work = row_end - row_begin;
             }
             std::lock_guard<std::mutex> lock(st.m);
@@ -1125,6 +1133,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
         size_t current_ab = SIZE_MAX, current_ah = SIZE_MAX;
         for (size_t i = 0; i < T; ++i) {
             const strict_task & task = tasks[i];
+            const size_t slot = i % capacity;
             {
                 std::unique_lock<std::mutex> lock(st.m);
                 wait_for(lock, tl::stage::attn_fold, uint32_t(i), [&] { return st.failed || st.stage_done[i] == 3; });
@@ -1134,7 +1143,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
             if (task.ab != current_ab || task.ah != current_ah) {
                 tl::scoped_span span(tl::active(), tl::stage::attn_stationary, run_id, layer, uint32_t(i), tl::no_id);
                 auto prepared = std::make_shared<stationary>();
-                prepare_weight(a, task.ah, task.ab, operation, *prepared, st.parts[i].shifts);
+                prepare_weight(a, task.ah, task.ab, operation, *prepared, st.parts[slot].shifts);
                 weight = std::move(prepared);
                 workspace.weights = {};
                 current_ab = task.ab;
@@ -1143,10 +1152,8 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
             std::unique_ptr<strict_job> job;
             {
                 tl::scoped_span span(tl::active(), tl::stage::attn_fold, run_id, layer, uint32_t(i), tl::no_id);
-                fold_activation(operation, st.streams[i], st.parts[i]);
-                st.parts[i] = activation_parts{};
-                job = stage_job(i, st.streams[i], weight, operation, &workspace);
-                st.streams[i] = stream{};
+                fold_activation(operation, st.streams[slot], st.parts[slot]);
+                job = stage_job(i, st.streams[slot], weight, operation, &workspace);
                 span.work = job->gemms.size();
             }
             std::lock_guard<std::mutex> lock(st.m);
@@ -1217,11 +1224,14 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
         for (size_t batch = 0; batch < size_t(op->ne[3]); ++batch) {
             for (size_t head = 0; head < size_t(op->ne[2]); ++head) {
                 for (size_t i = 0; i < rows; ++i) {
-                    for (size_t j = 0; j < n; ++j) {
-                        auto * destination = static_cast<char *>(op->data) + batch * op->nb[3] +
-                                            head * op->nb[2] + i * op->nb[1] + j * op->nb[0];
-                        const float value = staged[((batch * size_t(op->ne[2]) + head) * rows + i) * n + j];
-                        std::memcpy(destination, &value, sizeof(value));
+                    auto * destination = static_cast<char *>(op->data) + batch * op->nb[3] +
+                                        head * op->nb[2] + i * op->nb[1];
+                    const float * source = staged.data() + ((batch * size_t(op->ne[2]) + head) * rows + i) * n;
+                    if (op->nb[0] == sizeof(float)) {
+                        std::memcpy(destination, source, n * sizeof(float));
+                    } else {
+                        for (size_t j = 0; j < n; ++j)
+                            std::memcpy(destination + j * op->nb[0], source + j, sizeof(float));
                     }
                 }
             }

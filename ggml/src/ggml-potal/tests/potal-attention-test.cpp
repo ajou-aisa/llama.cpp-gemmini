@@ -1827,7 +1827,8 @@ struct thread_owner final : ggml::potal::stripe_owner {
 };
 
 void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repeat, ggml_type wt, ggml_type at,
-                 uint32_t seed, int weight_exponent = 0, int stream_exponent = 0, size_t batches = 1) {
+                 uint32_t seed, int weight_exponent = 0, int stream_exponent = 0, size_t batches = 1,
+                 int output_layout = 0, bool digit_transitions = false) {
     graph g(r,k,n,m,false,heads,repeat,batches,1,wt,at);
     uint32_t s = seed;
     const auto next = [&s] { s = s * 1664525u + 1013904223u; return s >> 8; };
@@ -1843,16 +1844,56 @@ void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repe
             for (size_t x = 0; x < k; ++x) {
                 const float u = float(next() % 65536) / 65535.0f;
                 // QK: per-block magnitudes over several exponents (anchor rank, outliers, upper limbs).
-                const float input = r == role::pv ? u : std::ldexp(u - 0.5f,int((x/32 + i + next() % 3) % 7) - 2);
+                const float input = digit_transitions && r == role::qk
+                    ? ((h + b) % 4 == 0 ? (x < 32 ? 0x1p20f : 1.0f) : 0.0f)
+                    : r == role::pv ? u : std::ldexp(u - 0.5f,int((x/32 + i + next() % 3) % 7) - 2);
                 g.a.set(x,i,std::ldexp(input, stream_exponent),h,b);
             }
     const std::string name = std::string(r == role::qk ? "strict QK " : "strict PV ") + std::to_string(k) + "x" +
                              std::to_string(m) + "x" + std::to_string(n) + " heads " + std::to_string(heads) + "x" +
                              std::to_string(repeat) + " batches " + std::to_string(batches);
+    const char * policy = std::getenv("POTAL_QK_POLICY");
+    if (digit_transitions && (!policy || std::strcmp(policy, "legacy") == 0)) {
+        stream high, zero;
+        check(name + " fixture crosses five-to-one limb counts",
+              attention::prepare_stream(g.a.t, 0, 0, 0, m, role::qk, high) == POTAL_OK &&
+              attention::prepare_stream(g.a.t, 1, 0, 0, m, role::qk, zero) == POTAL_OK &&
+              high.limb_count == 5 && zero.limb_count == 1);
+    }
     plain_runner sequential;
     const auto want = attention::execute(&g.out.t,[&](const potal_stripe_gemm_desc & d) { return sequential.run(d); });
     if (!check(name + " sequential reference executes", want.status == POTAL_OK)) return;
-    const auto expected = g.out.storage;
+    auto expected = g.out.storage;
+    if (output_layout != 0) {
+        auto & out = g.out.t;
+        out.nb[0] = output_layout == 2 ? 8 : 4;
+        out.nb[1] = out.nb[0] * n + 12;
+        out.nb[2] = out.nb[1] * m + 20;
+        out.nb[3] = out.nb[2] * heads * repeat + 28;
+        if (output_layout == 3) {
+            out.nb[3] = out.nb[1] * m + 20;
+            out.nb[2] = out.nb[3] * batches + 28;
+        }
+        size_t extent = sizeof(float);
+        for (int d = 0; d < 4; ++d) extent += size_t(out.ne[d] - 1) * out.nb[d];
+        g.out.storage.assign(extent + 16, 0x5a);
+        out.data = g.out.storage.data();
+        auto strided_expected = g.out.storage;
+        for (size_t b = 0; b < batches; ++b)
+        for (size_t h = 0; h < heads * repeat; ++h)
+        for (size_t i = 0; i < m; ++i)
+        for (size_t j = 0; j < n; ++j) {
+            const size_t dense = ((b * heads * repeat + h) * m + i) * n + j;
+            std::memcpy(strided_expected.data() + g.out.offset(j, i, h, b),
+                        expected.data() + dense * sizeof(float), sizeof(float));
+        }
+        expected = std::move(strided_expected);
+        plain_runner strided;
+        const auto publication = attention::execute(&g.out.t,
+            [&](const potal_stripe_gemm_desc & d) { return strided.run(d); });
+        check(name + " sequential strided publication preserves values and holes",
+              publication.status == POTAL_OK && g.out.storage == expected);
+    }
     g.out.fill(12345.0f);
     plain_runner pipelined;
     thread_owner owner;
@@ -1867,6 +1908,8 @@ void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repe
           got.qk_limb_jobs == want.qk_limb_jobs && pipelined.calls == sequential.calls);
     check(name + " no CPU numeric step on the owner thread", got.strict_tasks > 0 &&
           got.cpu_work_on_issuer_thread == 0 && got.cpu_work_on_issuer_cpu == 0);
+    if (digit_transitions)
+        check(name + " fixture spans repeated scratch-ring wraps", got.strict_tasks > 8);
     check(name + " balanced scales, no live DMA", pipelined.emu.writes == pipelined.emu.releases &&
           pipelined.emu.scales.empty() && !pipelined.emu.in_flight);
     for (bool fatal : {false, true}) {
@@ -1893,7 +1936,17 @@ void strict_case(role r, size_t k, size_t m, size_t n, size_t heads, size_t repe
           !unfenced.emu.scales.empty() && g.out.storage == untouched);
 }
 
+void test_reuse_layouts() {
+    strict_case(role::qk, 64, 129, 70, 2, 3, GGML_TYPE_F32, GGML_TYPE_F32,
+                31, 0, 0, 1, 1, true);
+    strict_case(role::pv, 33, 65, 17, 2, 2, GGML_TYPE_F32, GGML_TYPE_F32,
+                32, 0, 0, 2, 2);
+    strict_case(role::qk, 33, 129, 17, 1, 2, GGML_TYPE_F32, GGML_TYPE_F32,
+                33, 0, 0, 2, 3);
+}
+
 void test_strict_pipeline() {
+    test_reuse_layouts();
     strict_case(role::qk, 64, 1, 40, 2, 7, GGML_TYPE_F16, GGML_TYPE_F32, 11);     // Qwen2-like decode QK
     strict_case(role::pv, 40, 1, 64, 2, 7, GGML_TYPE_F16, GGML_TYPE_F32, 12);     // Qwen2-like decode PV
     strict_case(role::qk, 64, 70, 70, 2, 2, GGML_TYPE_F16, GGML_TYPE_F32, 13);    // prefill, several stripes
@@ -1923,6 +1976,7 @@ void test_strict_pipeline() {
 }
 
 void test_q8_residual_policy() {
+    test_reuse_layouts();
     tensor q(GGML_TYPE_F32, 96, 1);
     for (size_t k = 0; k < 96; ++k)
         q.set(k, 0, k < 32 ? 1.999f : k == 32 ? 128.0f : k < 64 ? 1.0f : 4.0f);
