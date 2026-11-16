@@ -158,10 +158,52 @@ void split(stream & out, size_t index, int64_t value) {
     out.limb_count = std::max(out.limb_count, limb);
 }
 
-void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role operation, stationary & out) {
+enum class qk_policy { legacy, residual, residual_transfer };
+
+qk_policy selected_qk_policy() {
+    const char * value = std::getenv("POTAL_QK_POLICY");
+    if (!value || std::strcmp(value, "legacy") == 0) return qk_policy::legacy;
+    if (std::strcmp(value, "residual") == 0) return qk_policy::residual;
+    require(std::strcmp(value, "residual-transfer") == 0);
+    return qk_policy::residual_transfer;
+}
+
+float transfer_value(float value, int shift) {
+    require(shift >= -16 && shift <= 16);
+    if (shift == 0) return value;
+    const float scaled = std::ldexp(value, shift);
+    require(std::isfinite(scaled) && std::ldexp(scaled, -shift) == value, POTAL_ERR_CAPACITY);
+    return scaled;
+}
+
+void make_qk_transfer(const ggml_tensor & keys, const ggml_tensor & queries,
+                      size_t head, size_t batch, std::vector<int> & shifts) {
+    input_tensor(keys, head, batch);
+    input_tensor(queries, 0, 0);
+    require(keys.ne[0] == queries.ne[0] && queries.ne[2] % keys.ne[2] == 0 &&
+            queries.ne[3] % keys.ne[3] == 0);
+    const size_t hr = size_t(queries.ne[2] / keys.ne[2]);
+    const size_t br = size_t(queries.ne[3] / keys.ne[3]);
+    const size_t prefix = std::min<size_t>(128, queries.ne[1]);
+    shifts.assign(size_t(keys.ne[0]), 0);
+    exsia::ExpScanner scanner;
+    for (size_t k = 0; k < shifts.size(); ++k) {
+        int16_t exponent = zero_exp;
+        for (size_t qb = batch * br; qb < (batch + 1) * br; ++qb)
+            for (size_t qh = head * hr; qh < (head + 1) * hr; ++qh)
+                for (size_t row = 0; row < prefix; ++row)
+                    exponent = std::max(exponent, scanner.unbiased_exp(read_value(queries, k, row, qh, qb)));
+        shifts[k] = exponent == zero_exp ? 0 : -std::clamp(int(exponent), -16, 16);
+    }
+}
+
+void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role operation, stationary & out,
+                     const std::vector<int> * shifts = nullptr) {
     input_tensor(tensor, head, batch);
     require(operation == role::qk || operation == role::pv);
     out.k = size_t(tensor.ne[0]);
+    require(!shifts || (operation == role::qk && shifts->size() == out.k));
+    if (shifts) for (int shift : *shifts) require(shift >= -16 && shift <= 16);
     out.n = size_t(tensor.ne[1]);
     out.kp = padded_k(out.k);
     const size_t blocks = out.kp / block_k;
@@ -183,6 +225,7 @@ void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role 
             int16_t e = zero_exp;
             for (size_t k = 0; k < valid; ++k) {
                 values[k] = read_value(tensor, block * block_k + k, j, head, batch);
+                if (shifts) values[k] = transfer_value(values[k], -(*shifts)[block * block_k + k]);
                 e = std::max(e, scanner.unbiased_exp(values[k]));
             }
             theta[block] = e == zero_exp ? zero_exp : int16_t(e - (operation == role::qk ? rho : bits - 2));
@@ -217,17 +260,22 @@ void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role 
 // local stage per block) and fold (stripe-wide: QK anchor and shift, P scale and quantization,
 // radix limbs). prepare_activation runs the same three steps on one thread.
 struct activation_parts {
+    const std::vector<int> * shifts = nullptr;
+    std::vector<uint32_t> selected;
     std::vector<float>   values;    // [rows][kp], zero padding
     std::vector<int16_t> exponents; // QK: [rows][kp / 32] local block exponents
 };
 
 void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin, size_t rows,
-                     role operation, stream & out, activation_parts & parts) {
+                     role operation, stream & out, activation_parts & parts,
+                     const std::vector<int> * shifts = nullptr) {
     input_tensor(tensor, head, batch);
     require(operation == role::qk || operation == role::pv);
     require(rows != 0 && begin < size_t(tensor.ne[1]) && rows <= size_t(tensor.ne[1]) - begin);
     out.rows = rows;
     out.k = size_t(tensor.ne[0]);
+    require(!shifts || (operation == role::qk && shifts->size() == out.k));
+    parts.shifts = shifts;
     out.kp = padded_k(out.k);
     const size_t count = product(rows, out.kp);
     parts.values.assign(count, 0.0f);
@@ -236,6 +284,7 @@ void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size
         limb.assign(count, 0);
     }
     parts.exponents.assign(operation == role::qk ? product(rows, out.kp / block_k) : 0, 0);
+    parts.selected.assign(shifts ? parts.exponents.size() : 0, 0);
 }
 
 void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin, size_t row_begin,
@@ -246,14 +295,14 @@ void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, siz
         for (size_t k = 0; k < out.k; ++k) {
             const float value = read_value(tensor, k, begin + i, head, batch);
             require(operation == role::qk || (value >= 0 && value <= 1));
-            parts.values[i * out.kp + k] = value;
+            parts.values[i * out.kp + k] = parts.shifts ? transfer_value(value, (*parts.shifts)[k]) : value;
         }
     }
     if (operation != role::qk || row_begin == row_end) {
         return;
     }
     exsia::Meta meta;
-    meta.rho = rho;
+    meta.rho = parts.shifts ? bits - 2 : rho;
     exsia::ExSIAState state;
     state.B_size = block_k;
     state.K_logical = out.k;
@@ -277,6 +326,7 @@ void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, siz
                                         , sample
 #endif
                                         ));
+            if (parts.shifts) parts.selected[i * blocks + block] = uint32_t(mask_word);
         }
     }
 }
@@ -292,12 +342,16 @@ void fold_activation(role operation, stream & out, activation_parts & parts) {
         // Stripe anchor rank as in ExSIA folding (folding.cpp): TOP3 takes e3 when it exists.
         const int16_t anchor = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR == 3 && top.e3 != zero_exp ? top.e3
                              : top.e2 != zero_exp ? top.e2 : top.e1 != zero_exp ? top.e1 : 0;
-        out.scale = int(anchor) - rho;
+        out.scale = int(anchor) - (parts.shifts ? bits - 2 : rho);
         for (size_t i = 0; i < out.rows; ++i) {
             for (size_t k = 0; k < out.k; ++k) {
                 const int16_t e = parts.exponents[i * blocks + k / block_k];
                 out.codes[i * out.kp + k] = exsia::detail::shift_q_i32(
                     out.codes[i * out.kp + k], e == zero_exp ? 0 : int16_t(e - anchor));
+                if (parts.shifts && e <= anchor &&
+                    !(parts.selected[i * blocks + k / block_k] & (uint32_t{1} << (k % block_k)))) {
+                    out.codes[i * out.kp + k] = std::clamp(out.codes[i * out.kp + k], -128, 127);
+                }
             }
         }
     } else {
@@ -319,9 +373,9 @@ void fold_activation(role operation, stream & out, activation_parts & parts) {
 }
 
 void prepare_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin,
-                         size_t rows, role operation, stream & out) {
+                         size_t rows, role operation, stream & out, const std::vector<int> * shifts = nullptr) {
     activation_parts parts;
-    init_activation(tensor, head, batch, begin, rows, operation, out, parts);
+    init_activation(tensor, head, batch, begin, rows, operation, out, parts, shifts);
     local_activation(tensor, head, batch, begin, 0, rows, operation, out, parts);
     fold_activation(operation, out, parts);
 }
@@ -970,23 +1024,33 @@ ggml_potal_reject check(const ggml_tensor * op, bool require_data) {
 }
 
 potal_status prepare_stationary(const ggml_tensor & tensor, size_t head, size_t batch,
-                                 role operation, stationary & out) {
+                                 role operation, stationary & out, const std::vector<int> * qk_shifts) {
     return checked([&] {
         nearest_rounding rounding;
         stationary prepared;
-        prepare_weight(tensor, head, batch, operation, prepared);
+        prepare_weight(tensor, head, batch, operation, prepared, qk_shifts);
         out = std::move(prepared);
     });
 }
 
 potal_status prepare_stream(const ggml_tensor & tensor, size_t head, size_t batch,
-                            size_t begin, size_t rows, role operation, stream & out, pv_algorithm algorithm) {
+                            size_t begin, size_t rows, role operation, stream & out, pv_algorithm algorithm,
+                            const std::vector<int> * qk_shifts) {
     return checked([&] {
         nearest_rounding rounding;
         stream prepared;
         prepared.algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
-        prepare_activation(tensor, head, batch, begin, rows, operation, prepared);
+        prepare_activation(tensor, head, batch, begin, rows, operation, prepared, qk_shifts);
         out = std::move(prepared);
+    });
+}
+
+potal_status prepare_qk_transfer(const ggml_tensor & keys, const ggml_tensor & queries,
+                                 size_t head, size_t batch, std::vector<int> & shifts) {
+    return checked([&] {
+        std::vector<int> prepared;
+        make_qk_transfer(keys, queries, head, batch, prepared);
+        shifts = std::move(prepared);
     });
 }
 
@@ -1019,6 +1083,8 @@ result execute(ggml_tensor * op, const planned_runner & run, const corrected_run
         const auto & a = *op->src[0];
         const auto & b = *op->src[1];
         const role operation = get_role(op);
+        const auto policy = operation == role::qk ? selected_qk_policy() : qk_policy::legacy;
+        const bool residual = policy != qk_policy::legacy;
         const size_t rows = size_t(b.ne[1]), n = size_t(a.ne[1]);
         potal_tile_plan plan;
         require(potal_tile_select(rows, n, padded_k(size_t(b.ne[0])), block_k / POTAL_HW_DIM, &plan) == POTAL_OK,
@@ -1031,14 +1097,17 @@ result execute(ggml_tensor * op, const planned_runner & run, const corrected_run
         for (size_t ab = 0; ab < size_t(a.ne[3]); ++ab) {
             for (size_t ah = 0; ah < size_t(a.ne[2]); ++ah) {
                 stationary weight;
-                prepare_weight(a, ah, ab, operation, weight);
+                std::vector<int> shifts;
+                if (residual) shifts.assign(size_t(a.ne[0]), 0);
+                if (policy == qk_policy::residual_transfer) make_qk_transfer(a, b, ah, ab, shifts);
+                prepare_weight(a, ah, ab, operation, weight, residual ? &shifts : nullptr);
                 for (size_t batch = ab * batch_repeat; batch < (ab + 1) * batch_repeat; ++batch) {
                     for (size_t head = ah * head_repeat; head < (ah + 1) * head_repeat; ++head) {
                         for (size_t begin = 0; begin < rows; begin += stripe_rows) {
                             stream activation;
                             activation.algorithm = operation == role::pv ? algorithm : pv_algorithm::legacy;
                             prepare_activation(b, head, batch, begin, std::min(stripe_rows, rows - begin),
-                                               operation, activation);
+                                               operation, activation, residual ? &shifts : nullptr);
                             std::vector<int64_t> integers;
                             execute_stripe(activation, weight, operation, run, corrected, report, integers);
                             for (size_t i = 0; i < activation.rows; ++i) {
@@ -1114,7 +1183,12 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
     const size_t rows = size_t(b.ne[1]), n = size_t(a.ne[1]), heads = size_t(b.ne[2]);
     std::vector<strict_task> tasks;
     std::vector<float> staged;
+    qk_policy policy = qk_policy::legacy;
+    // Plans publish with Local worker 0's stripe initialization and remain immutable.
+    std::vector<std::vector<int>> shifts;
     report.status = checked([&] {
+        policy = operation == role::qk ? selected_qk_policy() : qk_policy::legacy;
+        if (policy != qk_policy::legacy) shifts.resize(product(size_t(a.ne[2]), size_t(a.ne[3])));
         potal_tile_plan plan;
         require(potal_tile_select(rows, n, padded_k(size_t(b.ne[0])), block_k / POTAL_HW_DIM, &plan) == POTAL_OK,
                 POTAL_ERR_CAPACITY);
@@ -1285,8 +1359,18 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
                 tl::scoped_span span(tl::active(), tl::stage::attn_local, run_id, layer, uint32_t(i), uint32_t(worker));
                 note_cpu_work();
                 if (worker == 0) {
+                    const std::vector<int> * plan = nullptr;
+                    if (policy != qk_policy::legacy) {
+                        auto & current = shifts[task.ab * size_t(a.ne[2]) + task.ah];
+                        if (current.empty()) {
+                            current.assign(size_t(a.ne[0]), 0);
+                            if (policy == qk_policy::residual_transfer)
+                                make_qk_transfer(a, b, task.ah, task.ab, current);
+                        }
+                        plan = &current;
+                    }
                     init_activation(b, task.head, task.batch, task.begin, task.rows, operation, st.streams[i],
-                                    st.parts[i]);
+                                    st.parts[i], plan);
                     std::lock_guard<std::mutex> lock(st.m);
                     st.stage_done[i] = 1;
                     st.cv.notify_all();
@@ -1315,7 +1399,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
             if (task.ab != current_ab || task.ah != current_ah) {
                 tl::scoped_span span(tl::active(), tl::stage::attn_stationary, run_id, layer, uint32_t(i), tl::no_id);
                 auto prepared = std::make_shared<stationary>();
-                prepare_weight(a, task.ah, task.ab, operation, *prepared);
+                prepare_weight(a, task.ah, task.ab, operation, *prepared, st.parts[i].shifts);
                 weight = std::move(prepared);
                 // A new KV head/batch has different bytes. Pending jobs keep their
                 // own shared owners until completion, including fatal abandonment.

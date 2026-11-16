@@ -389,8 +389,46 @@ struct att_spec {
     int64_t      batches = 1;
 };
 
+void transfer_boundaries() {
+    host_tensor keys, queries;
+    keys.shape(GGML_TYPE_F32, {1, 1, 1, 1});
+    queries.shape(GGML_TYPE_F32, {1, 129, 2, 1});
+    keys.set(0, 1);
+    for (size_t i = 0; i < queries.count(); ++i) queries.set(i, 2);
+    queries.set(128, 65536);
+    queries.set(257, 131072);
+    std::vector<int> shifts;
+    verdict("TRANSFER", "prefix-excludes-tail",
+            att::prepare_qk_transfer(keys.t, queries.t, 0, 0, shifts) == POTAL_OK && shifts == std::vector<int>{-1},
+            "rows >= 128 do not select the channel exponent");
+
+    att::stationary weight;
+    weight.n = 777;
+    keys.set(0, std::numeric_limits<float>::denorm_min());
+    shifts = {16};
+    verdict("TRANSFER", "underflow-rejected",
+            att::prepare_stationary(keys.t, 0, 0, att::role::qk, weight, &shifts) == POTAL_ERR_CAPACITY && weight.n == 777,
+            "lossy scaling must not publish prepared weights");
+    shifts = {std::numeric_limits<int>::min()};
+    verdict("TRANSFER", "invalid-shift-rejected",
+            att::prepare_stationary(keys.t, 0, 0, att::role::qk, weight, &shifts) == POTAL_ERR_INVALID_ARGUMENT,
+            "validate before negating an externally supplied shift");
+
+    att::stream activation;
+    activation.rows = 777;
+    queries.set(0, std::numeric_limits<float>::max());
+    shifts = {16};
+    verdict("TRANSFER", "overflow-rejected",
+            att::prepare_stream(queries.t, 0, 0, 0, 1, att::role::qk, activation,
+                                att::default_pv_algorithm, &shifts) == POTAL_ERR_CAPACITY && activation.rows == 777,
+            "lossy scaling must not publish prepared queries");
+}
+
 void attention_case(const att_spec & c) {
     const bool qk = c.r == att::role::qk;
+    const char * policy = std::getenv("POTAL_QK_POLICY");
+    const bool residual = qk && policy && std::strcmp(policy, "legacy") != 0;
+    const bool transfer = residual && std::strcmp(policy, "residual-transfer") == 0;
     std::mt19937 rng(c.seed);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     host_tensor a, b, out;
@@ -439,13 +477,27 @@ void attention_case(const att_spec & c) {
     std::string why;
     for (size_t batch = 0; batch < size_t(c.batches); ++batch) {
     for (size_t ah = 0; ah < (size_t) c.HK; ++ah) {
+        std::vector<int> shifts(K, 0);
+        if (transfer) {
+            for (size_t k = 0; k < K; ++k) {
+                float maximum = 0;
+                for (size_t head = ah * hr; head < (ah + 1) * hr; ++head)
+                    for (size_t row = 0; row < std::min<size_t>(128, rows); ++row)
+                        maximum = std::max(maximum, std::fabs(b.get(((batch * c.HQ + head) * rows + row) * K + k)));
+                shifts[k] = maximum == 0 ? 0 : -std::clamp(std::ilogb(maximum), -16, 16);
+            }
+            std::vector<int> actual;
+            verdict("TRANSFER", c.name,
+                    att::prepare_qk_transfer(a.t, b.t, ah, batch, actual) == POTAL_OK && actual == shifts,
+                    "independent channel maxima across grouped query heads");
+        }
         gold::att_stationary gs;
-        if (!gold::att_prepare_stationary([&](size_t kk, size_t j) { return a.get(((batch * c.HK + ah) * n + j) * K + kk); }, K, n, qk, gs, why)) {
+        if (!gold::att_prepare_stationary([&](size_t kk, size_t j) { return std::ldexp(a.get(((batch * c.HK + ah) * n + j) * K + kk), -shifts[kk]); }, K, n, qk, gs, why)) {
             verdict(qk ? "QK" : "PV", c.name, false, "reason=golden_" + why);
             return;
         }
         att::stationary fw;
-        const bool fw_ok = att::prepare_stationary(a.t, ah, batch, c.r, fw) == POTAL_OK;
+        const bool fw_ok = att::prepare_stationary(a.t, ah, batch, c.r, fw, residual ? &shifts : nullptr) == POTAL_OK;
         for (size_t head = ah * hr; head < (ah + 1) * hr; ++head)
             for (size_t begin = 0; begin < rows; begin += stripe_rows) {
                 ++stripes;
@@ -453,8 +505,8 @@ void attention_case(const att_spec & c) {
                 gold::att_stream     st;
                 std::vector<int64_t> gi;
                 std::vector<float>   gf;
-                if (!gold::att_prepare_stream([&](size_t i, size_t kk) { return b.get(((batch * c.HQ + head) * rows + begin + i) * K + kk); },
-                                              r, K, qk, anchor, st, why) ||
+                if (!gold::att_prepare_stream([&](size_t i, size_t kk) { return std::ldexp(b.get(((batch * c.HQ + head) * rows + begin + i) * K + kk), shifts[kk]); },
+                                              r, K, qk, anchor, st, why, residual) ||
                     !gold::att_multiply(st, gs, gi, gf, why)) {
                     verdict(qk ? "QK" : "PV", c.name, false, "reason=golden_" + why);
                     return;
@@ -464,7 +516,8 @@ void attention_case(const att_spec & c) {
                     for (size_t j = 0; j < n; ++j) want[((batch * c.HQ + head) * rows + begin + i) * n + j] = gf[i * n + j];
                 att::stream          fs;
                 std::vector<int64_t> fi;
-                if (!fw_ok || att::prepare_stream(b.t, head, batch, begin, r, c.r, fs) != POTAL_OK ||
+                if (!fw_ok || att::prepare_stream(b.t, head, batch, begin, r, c.r, fs,
+                                                 att::default_pv_algorithm, residual ? &shifts : nullptr) != POTAL_OK ||
                     att::reference(fs, fw, c.r, fi) != POTAL_OK || fi.size() != gi.size()) {
                     ++prep_fail;
                     continue;
@@ -711,11 +764,13 @@ int main(int argc, char ** argv) {
     for (const auto & c : dense_cases) isolated("D", c.name, [&] { dense_case(c); });
     isolated("MERGE", "main-residual", [] { test_main_merge(); });
     isolated("UPPER", "direct-upper", [] { test_upper_decode(); });
+    isolated("TRANSFER", "transfer-boundaries", [] { transfer_boundaries(); });
     const att_spec att_cases[] = {
         { "qk-random", att::role::qk, 64, 5, 3, 2, 4, 21, false },
         { "qk-boundary-tails", att::role::qk, 64, 37, 33, 2, 14, 22, true },
         { "pv-random", att::role::pv, 64, 5, 3, 2, 4, 23, false },
         { "qk-decode-batches", att::role::qk, 64, 37, 1, 2, 4, 25, true, 2 },
+        { "qk-prefix-tail", att::role::qk, 33, 3, 129, 1, 2, 27, false },
         { "pv-decode-batches", att::role::pv, 64, 37, 1, 2, 4, 26, true, 2 },
         { "pv-boundary-tails", att::role::pv, 64, 70, 33, 2, 14, 24, true },
     };
