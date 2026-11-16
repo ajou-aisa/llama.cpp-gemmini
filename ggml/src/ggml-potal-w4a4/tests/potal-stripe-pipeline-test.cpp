@@ -134,10 +134,11 @@ struct node {
     hp1_weight       weight;
     bool             ok = false;
 
-    node(size_t M_, size_t N_, size_t K_, uint32_t seed, float outlier) : M(M_), N(N_), K(K_) {
+    node(size_t M_, size_t N_, size_t K_, uint32_t seed, float outlier,
+         ggml_type weight_type = GGML_TYPE_Q8_HP1) : M(M_), N(N_), K(K_) {
         ggml_init_params ip = { (M * K + N * K) * 8 + 4 * 1024 * 1024, nullptr, false };
         ctx.reset(ggml_init(ip));
-        w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_HP1, (int64_t) K, (int64_t) N);
+        w = ggml_new_tensor_2d(ctx.get(), weight_type, (int64_t) K, (int64_t) N);
         x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, (int64_t) K, (int64_t) M);
         y = ggml_mul_mat(ctx.get(), w, x);
         std::mt19937                    rng(seed);
@@ -149,7 +150,7 @@ struct node {
                 wf[n * K + k] = nd(rng) * mag[(k / 32 + n) % 4];
             }
         }
-        ggml_quantize_chunk(GGML_TYPE_Q8_HP1, wf.data(), w->data, 0, (int64_t) N, (int64_t) K, nullptr);
+        ggml_quantize_chunk(weight_type, wf.data(), w->data, 0, (int64_t) N, (int64_t) K, nullptr);
         set_activations(seed + 1, outlier);
         s                       = { (int64_t) M, (int64_t) N, (int64_t) K };
         ggml_gemmini_args_t args;
@@ -1694,7 +1695,38 @@ void test_strict(bool timeline_only = false) {
 
 } // namespace
 
+#include "attention-measurement-check.hpp"
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--linear-measurement") == 0) {
+        check("measurement role map", roles_host_map());
+        setenv("GGML_POTAL_HART_ROLES", "ON", 1);
+        for (size_t rows : {size_t(1), size_t(112)}) {
+            node nd(rows, 64, 64, 177, 400.0f, GGML_TYPE_MXINT4);
+            check("measurement paired tile geometry", nd.ok &&
+                  potal_frozen_plan(nd.M, nd.N, nd.K, 1, 1, 64 / D, 32 / D, &nd.plan) == POTAL_OK);
+            gated_runner serial_runner, strict_runner;
+            recorder serial_events, strict_events;
+            ::potal::timeline::set_recording(false);
+            const auto serial = run_pipeline(nd, 2, serial_runner, serial_events, {}, true, true, {}, true, true);
+            const std::vector<float> expected(nd.dst(), nd.dst() + nd.M * nd.N);
+            ::potal::timeline::set_recording(true);
+            const auto strict = run_pipeline(nd, 2, strict_runner, strict_events, {}, true, true, {}, true, true);
+            std::printf("measurement fixture=%d off=%d on=%d equal=%d issuer_prepares=%llu stripes=%llu expected=%zu\n",
+                        nd.ok, serial.report.ok, strict.report.ok, bitwise(nd.dst(), expected),
+                        (unsigned long long)strict.report.counts.prepares_on_issuer_thread,
+                        (unsigned long long)strict.report.counts.stripes_semantic_completed, nd.stripes());
+            check("W4 measurement rows=" + std::to_string(rows) + " strict recording OFF/ON bitwise equal",
+                  nd.ok && serial.report.ok && strict.report.ok && bitwise(nd.dst(), expected) &&
+                  strict.report.counts.prepares_on_issuer_thread == 0 &&
+                  strict.report.counts.stripes_semantic_completed == nd.stripes());
+        }
+        return failures == 0 && (!::potal::timeline::enabled() || ::potal::timeline::flush()) ? 0 : 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--attention-measurement") == 0) {
+        const bool ok = attention_measurement_check();
+        return ok && (!::potal::timeline::enabled() || ::potal::timeline::flush()) ? 0 : 1;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--strict-timeline") == 0) {
         test_strict(true);
         if (::potal::timeline::enabled()) check("STRICT timeline flush", ::potal::timeline::flush());

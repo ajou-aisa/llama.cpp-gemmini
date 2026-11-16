@@ -207,6 +207,8 @@ void make_qk_transfer(const ggml_tensor & keys, const ggml_tensor & queries,
 
 void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role operation, stationary & out,
                      const std::vector<int> * shifts = nullptr) {
+    ::potal::timeline::scoped_span measured(operation == role::qk
+        ? ::potal::timeline::stage::attn_k_prepare : ::potal::timeline::stage::attn_v_prepare);
     input_tensor(tensor, head, batch);
     require(operation == role::qk || operation == role::pv);
     out.k = size_t(tensor.ne[0]);
@@ -300,6 +302,8 @@ void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size
 
 void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin, size_t row_begin,
                       size_t row_end, role operation, stream & out, activation_parts & parts) {
+    ::potal::timeline::scoped_span measured(operation == role::qk
+        ? ::potal::timeline::stage::attn_q_local : ::potal::timeline::stage::attn_p_read);
     require(row_begin <= row_end && row_end <= out.rows);
     const size_t blocks = out.kp / block_k;
     for (size_t i = row_begin; i < row_end; ++i) {
@@ -343,6 +347,8 @@ void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, siz
 }
 
 void fold_activation(role operation, stream & out, activation_parts & parts) {
+    ::potal::timeline::scoped_span measured(operation == role::qk
+        ? ::potal::timeline::stage::attn_q_fold_digits : ::potal::timeline::stage::attn_p_quant_digits);
     const size_t blocks = out.kp / block_k;
     exsia::ExpScanner scanner;
     if (operation == role::qk) {
@@ -660,6 +666,7 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
     const size_t n = weight.n;
     const auto start = std::chrono::steady_clock::now();
     std::vector<double> scales;
+    ::potal::timeline::scoped_span scale_span(::potal::timeline::stage::attn_output_scales);
     if (job.rows > 1) {
         scales.resize(n);
         for (size_t j = 0; j < n; ++j) {
@@ -667,6 +674,7 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
             scales[j] = exponent >= -1022 && exponent <= 960 ? std::ldexp(1.0, exponent) : 0;
         }
     }
+    scale_span.close();
     const auto store = [&](size_t i, size_t j, int64_t code) {
         const double decoded = !scales.empty() && scales[j] != 0
             ? static_cast<double>(code) * scales[j]
@@ -676,6 +684,7 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
         staged[((task.batch * heads + task.head) * rows_total + task.begin + i) * n + j] = value;
     };
     if (operation == role::qk) {
+        ::potal::timeline::scoped_span measured(::potal::timeline::stage::attn_qk_recon_dequant);
         // One row's ordered terms replace the full stripe INT64 intermediate.
         struct term { const int32_t * values; size_t limb; };
         std::vector<term> terms;
@@ -700,7 +709,10 @@ void reconstruct_job(const strict_job & job, role operation, const strict_task &
         }
     } else {
         std::vector<int64_t> out;
+        ::potal::timeline::scoped_span int_span(::potal::timeline::stage::attn_pv_reconstruct);
         merge_job(job, operation, out);
+        int_span.close();
+        ::potal::timeline::scoped_span dequant_span(::potal::timeline::stage::attn_pv_dequant_store);
         if (job.rows == 1) {
             for (size_t j = 0; j < n; ++j) {
                 const float value = static_cast<float>(std::ldexp(static_cast<double>(out[j]),
@@ -1153,6 +1165,7 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
             {
                 tl::scoped_span span(tl::active(), tl::stage::attn_fold, run_id, layer, uint32_t(i), tl::no_id);
                 fold_activation(operation, st.streams[slot], st.parts[slot]);
+                tl::scoped_span plan_span(tl::stage::attn_plan_staging);
                 job = stage_job(i, st.streams[slot], weight, operation, &workspace);
                 span.work = job->gemms.size();
             }

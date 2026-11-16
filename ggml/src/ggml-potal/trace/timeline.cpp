@@ -28,6 +28,7 @@ namespace detail {
 bool                        g_on   = false;
 bool                        g_detail = false;
 bool                        g_coarse = false;
+bool                        g_cpu = false;
 std::atomic<bool>           g_rec{ true };
 thread_local thread_ring *  t_ring = nullptr;
 void                        init() noexcept;
@@ -316,6 +317,8 @@ void init_once() {
     const char * profile = std::getenv("POTAL_TIMELINE_PROFILE");
     detail::g_detail = profile != nullptr && std::strcmp(profile, "detail") == 0;
     detail::g_coarse = profile != nullptr && std::strcmp(profile, "coarse") == 0;
+    const char * cpu = std::getenv("POTAL_TIMELINE_CPU");
+    detail::g_cpu = cpu != nullptr && std::strcmp(cpu, "1") == 0;
     const char * reuse = std::getenv("POTAL_TIMELINE_REUSE");
     s.reuse            = reuse != nullptr && std::strcmp(reuse, "1") == 0;
     s.cpu_to_hart = read_cpu_to_hart();
@@ -399,6 +402,17 @@ const char * stage_name(uint16_t id) {
         case stage::model_prefill: return "model.prefill";
         case stage::model_decode: return "model.decode";
         case stage::model_token: return "model.token";
+        case stage::attn_k_prepare: return "attn.k.quant_limbs_pack";
+        case stage::attn_v_prepare: return "attn.v.quant_limbs_pack";
+        case stage::attn_q_local: return "attn.q.read_local";
+        case stage::attn_p_read: return "attn.p.read";
+        case stage::attn_q_fold_digits: return "attn.q.fold_digits";
+        case stage::attn_p_quant_digits: return "attn.p.quant_digits";
+        case stage::attn_output_scales: return "attn.output_scales";
+        case stage::attn_qk_recon_dequant: return "attn.qk.recon_dequant_fused";
+        case stage::attn_pv_reconstruct: return "attn.pv.reconstruct_int64";
+        case stage::attn_pv_dequant_store: return "attn.pv.dequant_store";
+        case stage::attn_plan_staging: return "attn.plan_staging";
         case stage::acc_scale_write: return "acc.scale_write";
         case stage::acc_index_scalar: return "acc.index_scalar";
         case stage::acc_queue_install: return "acc.queue_install";
@@ -484,6 +498,8 @@ uint16_t register_thread(role r, int hart_id, int cpu_id) noexcept {
             }
             ti->ring.cur_op    = 0;
             ti->ring.cur_phase = 0;
+            ti->ring.pinned_cpu = ti->affinity_ok ? cpu_id : -1;
+            ti->ring.direct_all = !ti->affinity_ok;
             s.reused.fetch_add(1, std::memory_order_relaxed);
             t_info         = ti;
             t_guard.ti     = ti;
@@ -496,10 +512,12 @@ uint16_t register_thread(role r, int hart_id, int cpu_id) noexcept {
     const uint32_t cap = r == role::issuer ? parse_count("POTAL_TIMELINE_ISSUER_EVENTS", s.events_cap) : s.events_cap;
     if (ti != nullptr) {
         ti->ring.events = alloc_zeroed<record_t>(cap);
+        if (detail::g_cpu) ti->ring.cpu_samples = alloc_zeroed<cpu_sample>(cap);
         ti->anchors     = alloc_zeroed<anchor_t>(s.anchors_cap);
         ti->runs        = alloc_zeroed<run_t>(s.anchors_cap);
     }
-    if (ti == nullptr || ti->ring.events == nullptr || ti->anchors == nullptr || ti->runs == nullptr) {
+    if (ti == nullptr || ti->ring.events == nullptr || ti->anchors == nullptr || ti->runs == nullptr ||
+        (detail::g_cpu && ti->ring.cpu_samples == nullptr)) {
         std::fprintf(stderr, "potal timeline: cannot allocate the ring of a %s thread; it records nothing\n",
                      role_name(r));
         s.rejected_threads.fetch_add(1, std::memory_order_relaxed);
@@ -524,6 +542,8 @@ uint16_t register_thread(role r, int hart_id, int cpu_id) noexcept {
                           CPU_ISSET(cpu_id, &got) && ti->cpu_start == cpu_id &&
                           (hart_id < 0 || ti->hart_start == hart_id);
     }
+    ti->ring.pinned_cpu = ti->affinity_ok ? cpu_id : -1;
+    ti->ring.direct_all = !ti->affinity_ok;
     {
         std::lock_guard<std::mutex> lk(s.reg_mu);
         const uint32_t              n = s.nthreads.load(std::memory_order_relaxed);
@@ -757,6 +777,33 @@ bool flush() noexcept {
     if (std::fclose(f) != 0 || write_error || std::rename(tmp.c_str(), s.path.c_str()) != 0) {
         std::fprintf(stderr, "potal timeline: writing %s failed: %s\n", s.path.c_str(), std::strerror(errno));
         return false;
+    }
+    if (detail::g_cpu) {
+        const std::string path = s.path + ".cpu.csv";
+        const std::string cpu_tmp = path + ".tmp";
+        FILE * cpu = std::fopen(cpu_tmp.c_str(), "w");
+        if (cpu == nullptr) return false;
+        std::fprintf(cpu, "slot,seq,stage,event,run,layer,stripe,tile,mono_ns,thread_ns,process_ns,cpu,cycles,instructions,thread_valid,process_valid,counters_valid,counter_source\n");
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto & ring = s.threads[i]->ring;
+            for (uint32_t j = 0; j < ring.head.load(std::memory_order_relaxed); ++j) {
+                const auto & sample = ring.cpu_samples[j];
+                if (sample.mono_ns == 0) continue;
+                const auto & e = ring.events[j];
+                std::fprintf(cpu, "%u,%u,%u,%u,%u,%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%" PRIu64 ",%" PRIu64 ",%d,%d,%d,%s\n",
+                    i, j, e.stage, e.event_type, e.run_id, e.layer_id, e.stripe_id, e.tile_id,
+                    sample.mono_ns, sample.thread_ns, sample.process_ns, sample.cpu, sample.cycles,
+                    sample.instructions, sample.thread_valid, sample.process_valid, sample.counters_valid,
+#if defined(__riscv) && __riscv_xlen == 64
+                    "riscv_hart_csr"
+#else
+                    "unavailable"
+#endif
+                );
+            }
+        }
+        const bool error = std::ferror(cpu) != 0;
+        if (std::fclose(cpu) != 0 || error || std::rename(cpu_tmp.c_str(), path.c_str()) != 0) return false;
     }
     s.flushed_signature = signature(s);
     return true;

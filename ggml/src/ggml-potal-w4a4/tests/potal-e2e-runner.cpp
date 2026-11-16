@@ -7,6 +7,7 @@
 // inert unless POTAL_TIMELINE is set.
 #include "llama.h"
 #include "ggml-potal.h"
+#include "../trace/cpu-sample.hpp"
 #include "../include/potal.h"
 
 #include <algorithm>
@@ -204,8 +205,13 @@ struct Step {
     // I25X: cycle_end/cpu_end are taken where t_token is taken.
     uint64_t cycle_start = 0, cycle_end = 0;
     int cpu_start = -1, cpu_end = -1;
+    bool pinned_start = false, pinned_end = false;
     int traced = 0;
-    uint64_t cycles() const { return cycle_end >= cycle_start && cycle_end ? cycle_end - cycle_start : 0; }
+    bool cycles_valid() const {
+        return ::potal::timeline::valid_cycle_interval(cycle_start, cycle_end, cpu_start, cpu_end,
+                                                     pinned_start, pinned_end);
+    }
+    uint64_t cycles() const { return cycles_valid() ? cycle_end - cycle_start : 0; }
 };
 
 // Median of a vector (empty -> caller checks).
@@ -284,6 +290,7 @@ int main(int argc, char ** argv) try {
         st.t_start = now_ns();
         st.cycle_start = read_cycle();
         st.cpu_start = cur_cpu();
+        st.pinned_start = ::potal::timeline::pinned_to_cpu(st.cpu_start);
         const int rc = llama_decode(ctx, batch);
         llama_synchronize(ctx);
         st.t_end = now_ns();
@@ -304,6 +311,7 @@ int main(int argc, char ** argv) try {
         st.t_token = now_ns();
         st.cycle_end = read_cycle();
         st.cpu_end = cur_cpu();
+        st.pinned_end = ::potal::timeline::pinned_to_cpu(st.cpu_end);
         ggml_backend_potal_timeline_mark(ST_TOKEN, EV_INSTANT, uint32_t(s), uint64_t(tok));
         st.token = tok;
         tokens[s] = tok;
@@ -318,9 +326,9 @@ int main(int argc, char ** argv) try {
         }
         if (!stats_ok) { st.status = "stats_unavailable"; run_status = "stats_unavailable"; }
         else if (failed(st.d)) { st.status = "counters_failed"; run_status = "counters_failed"; }
-        std::printf("E2E_STEP s=%d latency_ns=%llu token=%d cycles=%llu traced=%d\n", s,
+        std::printf("E2E_STEP s=%d latency_ns=%llu token=%d cycles=%llu traced=%d cycles_valid=%d\n", s,
                     static_cast<unsigned long long>(st.t_end - st.t_start), tok,
-                    static_cast<unsigned long long>(st.cycles()), st.traced);
+                    static_cast<unsigned long long>(st.cycles()), st.traced, st.cycles_valid() ? 1 : 0);
         if (prefill)
             std::printf("E2E_PREFILL_DONE ttft_ns=%llu\n",
                         static_cast<unsigned long long>(st.t_token - st.t_start));
@@ -363,7 +371,7 @@ int main(int argc, char ** argv) try {
         E2E_TIMES(E2E_THDR)
 #undef E2E_THDR
         f << ",graph_count,logits_finite,status";
-        f << ",cycle_start,cycle_end,cycles,cpu_start,cpu_end,traced\n";
+        f << ",cycle_start,cycle_end,cycles,cpu_start,cpu_end,traced,cycles_valid\n";
         for (int s = 0; s < done; ++s) {
             const Step & st = steps[s];
             add(total, st.d);
@@ -377,8 +385,10 @@ int main(int argc, char ** argv) try {
             E2E_TIMES(E2E_TVAL)
 #undef E2E_TVAL
             f << ',' << st.d.graphs << ',' << st.logits_finite << ',' << st.status;
-            f << ',' << st.cycle_start << ',' << st.cycle_end << ',' << st.cycles() << ',' << st.cpu_start
-              << ',' << st.cpu_end << ',' << st.traced << '\n';
+            f << ',' << st.cycle_start << ',' << st.cycle_end << ',';
+            if (st.cycles_valid()) f << st.cycles();
+            f << ',' << st.cpu_start << ',' << st.cpu_end << ',' << st.traced << ','
+              << (st.cycles_valid() ? 1 : 0) << '\n';
         }
     }
     int generated = 0;
@@ -452,15 +462,19 @@ int main(int argc, char ** argv) try {
               << "\ntimeline_dropped=" << tl_dropped << "\ntimeline_overflowed_threads=" << tl_overflow
               << "\ntimeline_threads=" << tl_threads;
         // I25X: cycles/ns measured start-of-decode to token-sampled (the TTFT interval for step 0).
-        if (done > 0 && steps[0].t_token) f << "\nttft_cycles=" << steps[0].cycles();
+        f << "\ncycle_metric=caller_hart_delta_including_sampling_not_wall_cycles";
+        if (done > 0 && steps[0].t_token && steps[0].cycles_valid()) f << "\nttft_cycles=" << steps[0].cycles();
         else f << "\nttft_cycles=NA";
         std::vector<uint64_t> dec_cyc, dec_tr_ns, dec_untr_ns;
+        bool all_decode_cycles_valid = true;
         for (int s = 1; s < done; ++s) {
             if (!steps[s].t_token) continue;
             dec_cyc.push_back(steps[s].cycles());
+            all_decode_cycles_valid = all_decode_cycles_valid && steps[s].cycles_valid();
             (steps[s].traced ? dec_tr_ns : dec_untr_ns).push_back(steps[s].t_token - steps[s].t_start);
         }
-        if (dec_cyc.empty()) f << "\ntpot_median_cycles=NA"; else f << "\ntpot_median_cycles=" << median_u64(dec_cyc);
+        if (dec_cyc.empty() || !all_decode_cycles_valid) f << "\ntpot_median_cycles=NA";
+        else f << "\ntpot_median_cycles=" << median_u64(dec_cyc);
         if (dec_tr_ns.empty()) f << "\ntpot_median_traced_ns=NA"; else f << "\ntpot_median_traced_ns=" << median_u64(dec_tr_ns);
         if (dec_untr_ns.empty()) f << "\ntpot_median_untraced_ns=NA"; else f << "\ntpot_median_untraced_ns=" << median_u64(dec_untr_ns);
         f << "\nstatus=" << run_status << "\nexit=" << (ok ? 0 : 1) << '\n';

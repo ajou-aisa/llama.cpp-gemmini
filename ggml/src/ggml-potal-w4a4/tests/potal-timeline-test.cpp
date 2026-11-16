@@ -469,6 +469,8 @@ int child_capi() {
     return g_failures == 0 ? 0 : 1;
 }
 
+#include "../../ggml-potal/tests/timeline-cpu-check.hpp"
+
 int spawn_child(const char * mode, const std::vector<std::string> & extra_env) {
     std::vector<std::string> env;
     for (char ** e = environ; *e != nullptr; ++e) {
@@ -501,6 +503,7 @@ int spawn_child(const char * mode, const std::vector<std::string> & extra_env) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--child=cpu") == 0) return child_cpu();
     if (argc == 2 && std::strcmp(argv[1], "--child=disabled") == 0) {
         return child_disabled();
     }
@@ -553,6 +556,7 @@ int main(int argc, char ** argv) {
         std::vector<std::string> env;
     };
     const std::vector<extra_mode> extra = {
+        { "cpu", { "POTAL_TIMELINE=" + main_path + ".cpu-mode.csv", "POTAL_TIMELINE_CPU=1" } },
         { "reuse", { "POTAL_TIMELINE=" + main_path + ".reuse.csv", "POTAL_TIMELINE_REUSE=1" } },
         { "noreuse", { "POTAL_TIMELINE=" + main_path + ".noreuse.csv" } },
         { "gate", { "POTAL_TIMELINE=" + main_path + ".gate.csv" } },
