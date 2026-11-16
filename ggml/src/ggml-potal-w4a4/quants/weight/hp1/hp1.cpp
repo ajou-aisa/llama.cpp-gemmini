@@ -5,6 +5,8 @@
 #include "quants/common/weight_route.hpp"
 #include "potal-int4.h"
 
+#include <gemmini_params.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -126,16 +128,39 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
 
     // The validated reader decodes GGUF offset-binary half-block order.
     // Transpose logical J-by-K codes, then pack adjacent output columns.
-    for (size_t k = 0; k < args.K; ++k) {
-        uint8_t *dst = reinterpret_cast<uint8_t *>(B) + k * (ldb / 2);
-        std::memset(dst, 0, ldb / 2);
-        for (size_t n = 0; n < args.J; ++n) {
-            const auto code = wreader::read_code_validated(args, plan, n, k);
-            if (!code.ok()) {
-                if (reader != nullptr) *reader = code.status;
+    // Keep all metadata/row checks above: rejected inputs retain their partial
+    // carrier/scale writes and never touch B. Validated storage is immutable.
+    // Resolve a native block once per column and K tile, not once per code.
+    static_assert(DIM >= 2 && DIM % 2 == 0, "packed column tiles must start on byte boundaries");
+    constexpr size_t tile_k = DIM < block_k ? DIM : block_k;
+    uint16_t local_k[DIM];
+    int32_t values[DIM * DIM];
+    for (size_t k0 = 0; k0 < args.K; k0 += tile_k) {
+        const size_t nk = std::min(tile_k, args.K - k0);
+        for (size_t i = 0; i < nk; ++i) {
+            local_k[i] = static_cast<uint16_t>(k0 % block_k + i);
+            std::memset(reinterpret_cast<uint8_t *>(B) + (k0 + i) * (ldb / 2), 0, ldb / 2);
+        }
+        for (size_t n0 = 0; n0 < args.J; n0 += DIM) {
+            const size_t nn = std::min(static_cast<size_t>(DIM), args.J - n0);
+            size_t resolutions = 0;
+            const auto rs = wreader::read_code_tile_validated(
+                args, plan, k0 / block_k, local_k, nk, n0, nn, values, resolutions);
+            if (rs != wreader::WeightReaderStatus::Success) {
+                if (reader != nullptr) *reader = rs;
                 return status::metadata;
             }
-            potal_int4_set(dst, n, static_cast<int8_t>(code.value));
+            for (size_t i = 0; i < nk; ++i) {
+                uint8_t * dst = reinterpret_cast<uint8_t *>(B) + (k0 + i) * (ldb / 2) + n0 / 2;
+                size_t n = 0;
+                for (; n + 1 < nn; n += 2) {
+                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * DIM + n]),
+                                                    static_cast<int8_t>(values[i * DIM + n + 1]));
+                }
+                if (n < nn) {
+                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * DIM + n]), 0);
+                }
+            }
         }
     }
     *st = s;
