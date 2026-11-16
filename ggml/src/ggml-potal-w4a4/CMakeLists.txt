@@ -443,8 +443,12 @@ add_executable(potal-weight-pack-test tests/potal-weight-pack-test.cpp ${POTAL_B
 potal_add_backend_settings(potal-weight-pack-test)
 target_compile_definitions(potal-weight-pack-test PRIVATE GGML_GEMMINI_TESTING)
 target_link_libraries(potal-weight-pack-test PRIVATE ggml)
+add_executable(potal-plan-deps-test tests/potal-plan-deps-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-plan-deps-test)
+target_link_libraries(potal-plan-deps-test PRIVATE ggml)
 if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-weight-pack-test COMMAND potal-weight-pack-test)
+    add_test(NAME potal-plan-deps-test COMMAND potal-plan-deps-test)
 endif()
 
 if (POTAL_E4B2_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")

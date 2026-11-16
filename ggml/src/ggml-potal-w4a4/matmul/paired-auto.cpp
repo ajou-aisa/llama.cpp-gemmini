@@ -668,6 +668,7 @@ struct plan_builder {
     void retire(potal_paired_residency & r) {
         potal_paired_op op = base(potal_paired_op_kind::pair_retire, r);
         const size_t    id = add(op);
+        plan.ops[id].deps.reserve(1 + r.windows);
         dep(id, r.main_gemm_op, true);
         for (size_t o = r.first_residual_op; r.first_residual_op != no_index && o <= r.last_residual_op; ++o) {
             if (plan.ops[o].kind == potal_paired_op_kind::residual_gemm && plan.ops[o].residency == r.index) {
@@ -855,6 +856,7 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
                 op.first           = p == 0;
                 op.last            = p + 1 == tile.k_panels;
                 const size_t id    = b.add(op);
+                b.plan.ops[id].deps.reserve(3);
                 b.dep(id, load_a, false);
                 b.dep(id, load_b, false);
                 b.dep(id, b.plan.scale_windows[sw_main].program_op, false);
@@ -974,6 +976,7 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
                     op.first           = p == first_panel && w == first_window;
                     op.last            = p == last_panel && w == last_window;
                     const size_t id    = b.add(op);
+                    b.plan.ops[id].deps.reserve(4);
                     b.dep(id, index_op, false);
                     b.dep(id, load_r, false);
                     b.dep(id, load_b, false);
@@ -1477,9 +1480,30 @@ struct validator {
                     if (st.windows_seen != panel.windows.size() || st.residual_gemms.size() != panel.windows.size()) {
                         return fail(op, "retire before every residual window of the panel was executed");
                     }
-                    for (size_t gemm : st.residual_gemms) {
-                        if (!has_dep(op, gemm, true)) {
-                            return fail(op, "retire without completion of residual gemm " + num(gemm));
+                    if (st.residual_gemms.size() >= 2 &&
+                        std::is_sorted(op.deps.begin(), op.deps.end(),
+                                       [](const potal_paired_dep & a, const potal_paired_dep & b) { return a.op < b.op; })) {
+                        auto dep = op.deps.begin();
+                        // Residual GEMMs were recorded in op-id order. Duplicate dependencies
+                        // retain has_dep's existential completion semantics.
+                        for (size_t gemm : st.residual_gemms) {
+                            while (dep != op.deps.end() && dep->op < gemm) {
+                                ++dep;
+                            }
+                            bool complete = false;
+                            while (dep != op.deps.end() && dep->op == gemm) {
+                                complete |= dep->complete;
+                                ++dep;
+                            }
+                            if (!complete) {
+                                return fail(op, "retire without completion of residual gemm " + num(gemm));
+                            }
+                        }
+                    } else {
+                        for (size_t gemm : st.residual_gemms) {
+                            if (!has_dep(op, gemm, true)) {
+                                return fail(op, "retire without completion of residual gemm " + num(gemm));
+                            }
                         }
                     }
                     st.retired          = true;
