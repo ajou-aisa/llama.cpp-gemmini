@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace ggml::gemmini::quants::act::exsia {
@@ -252,6 +253,7 @@ struct StripeState {
         false; // promotes every block above the selected stripe anchor to outliers
 
     BitMask       outlier_mask; // bitmask indicating outlier positions in a stripe
+    std::shared_ptr<std::vector<int8_t>> main_high;
     StripeScratch scratch;
 #if EXSIA_STAGE_PROFILE_ENABLED
     uint64_t selected_positions = 0; // final logical mask positions, including zero residuals

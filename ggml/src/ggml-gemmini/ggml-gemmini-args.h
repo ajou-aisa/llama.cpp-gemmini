@@ -148,6 +148,7 @@ typedef struct ggml_gemmini_args_t {
     // borrowed.
     act::Meta          act_quant{};
     int folding_anchor = GGML_GEMMINI_EXSIA_STRIPE_ANCHOR;
+    bool prefold_main2 = false;
     act::ResidualRoute residual_route = act::ResidualRoute::ws_packet;
     const ggml::gemmini::quants::act::exsia::StripeReadySink * exsia_stripe_ready_sink = nullptr;
 

@@ -1,10 +1,12 @@
 #include "folding.hpp"
+#include "wide-main.hpp"
 #include "exsia_shift.hpp"
 #include "ggml-gemmini-args.h"
 #include "../../../ggml-gemmini-evaluation-observer.hpp"
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -200,6 +202,53 @@ bool StripeFolding::run(Meta &                           meta,
     GGML_ASSERT(stripe.outlier_mask.cols >= state.K_padded);
     if (stripe.outlier_mask.rows != stripe.row_count() || stripe.outlier_mask.cols < state.K_padded)
         return false;
+
+    stripe.main_high.reset();
+    if (args.prefold_main2) {
+#if GGML_GEMMINI_ENABLE_RMD && (GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS == 8)
+        if (!args.exsia_stripe_ready_sink ||
+            args.residual_route != residual::ResidualRoute::ws_packet ||
+            args.A.bits != GGML_GEMMINI_ACTIVATION_BITS)
+            return false;
+        auto high = std::make_shared<std::vector<int8_t>>(stripe.row_count() * args.K, 0);
+        for (size_t row = stripe.row_start; row < stripe.row_end; ++row) {
+            const size_t lr = stripe.local_row(row);
+            for (size_t b = 0; b < state.blocks_per_row; ++b) {
+                const int16_t e = stripe_block_exp[lr * state.blocks_per_row + b];
+                const detail::PreparedShift shift(e == neg_inf ? 0 : int(e) - stripe.e_s);
+                const size_t end = std::min(args.K, (b + 1) * state.B_size);
+                for (size_t col = b * state.B_size; col < end; ++col) {
+                    const int32_t u = shift(stripe_q_wide[lr * state.K_padded + col]);
+                    const bool selected = stripe.outlier_mask.is_set(lr, col);
+                    int8_t low = 0, upper = 0;
+                    if (!selected && !split_wide_main<GGML_GEMMINI_ACTIVATION_BITS>(u, low, upper)) {
+                        std::fprintf(stderr, "[POTAL_MAIN2] range overflow row=%zu col=%zu value=%d bits=%d\n",
+                                     row, col, u, GGML_GEMMINI_ACTIVATION_BITS);
+                        return false;
+                    }
+                    if (!args.A.set(row, col, low)) return false;
+                    (*high)[lr * args.K + col] = upper;
+                    const int32_t rem = selected ? u : 0;
+                    if (rem && !rmd_builder.add_residual(lr, col, rem)) return false;
+#if EXSIA_VALIDATION
+                    residual[row * state.K_padded + col] = rem;
+#endif
+#if EXSIA_STAGE_PROFILE_ENABLED
+                    stripe.selected_positions += selected;
+                    stripe.residual_nnz += rem != 0;
+#endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+                    if (args.evaluation_context) args.evaluation_context->position(row, col, selected, rem != 0);
+#endif
+                }
+            }
+        }
+        stripe.main_high = std::move(high);
+        return true;
+#else
+        return false;
+#endif
+    }
 
 #if !(GGML_GEMMINI_ACT_QUANT_METRICS || EXSIA_STAGE_PROFILE_ENABLED)
     if (state.B_size <= 64 && dense_rows_writable(args.A, stripe.row_end, args.K))

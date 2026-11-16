@@ -581,6 +581,7 @@ bool ExSIA::run(Meta &                  meta,
         event.quantization_end_ns   = slot.quantization_end_ns;
         event.rmd_packet            = slot.rmd_packet;
         event.direct_residual       = slot.direct_residual;
+        event.main_high             = slot.stripe.main_high;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         event.evaluation_context = args.evaluation_context;
 #endif

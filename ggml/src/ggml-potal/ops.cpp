@@ -544,6 +544,11 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
                         "GEMMINI_STRIPE_JOB_CAPACITY)");
     }
     const options::MatmulInvocationMode mode        = resolved.options.mode;
+    const char * main2 = std::getenv("GGML_POTAL_LINEAR_MAIN2");
+    if (main2 && (std::strcmp(main2, "0") != 0 && std::strcmp(main2, "1") != 0))
+        return hp1_fail(st, node, layer, "options", "GGML_POTAL_LINEAR_MAIN2 must be 0 or 1");
+    if (main2 && std::strcmp(main2, "1") == 0 && mode != options::MatmulInvocationMode::stripe_pipeline)
+        return hp1_fail(st, node, layer, "options", "Main2 requires STRIPE_PIPELINE");
     const ggml::gemmini::RmdBackend     rmd_backend = resolved.options.rmd_backend;
     bool roles_invalid = false;
     const bool roles = hart_roles_requested(roles_invalid);

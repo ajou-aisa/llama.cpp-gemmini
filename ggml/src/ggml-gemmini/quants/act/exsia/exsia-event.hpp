@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 #include <optional>
 #include <functional>
 #include <string>
@@ -42,6 +43,8 @@ struct StripeReadyEvent {
     // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
     ggml::gemmini::rmd::StripePacketHandle             rmd_packet;
     ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
+    // Signed high Main digits, stripe-local row-major, retained through the synchronous handoff.
+    std::shared_ptr<const std::vector<int8_t>> main_high;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     std::shared_ptr<evaluation::Invocation> evaluation_context;
 #endif

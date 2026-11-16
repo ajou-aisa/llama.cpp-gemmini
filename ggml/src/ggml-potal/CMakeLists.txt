@@ -589,6 +589,13 @@ endif()
 # immutability of accepted stripes, failure wake-up, no partial commit, the
 # event order and debug JSONL order of every run, no weight revalidation.
 add_executable(potal-stripe-pipeline-test tests/potal-stripe-pipeline-test.cpp ${POTAL_BACKEND_SOURCES})
+add_executable(potal-main2-test ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-potal/tests/potal-main2-test.cpp ${POTAL_BACKEND_SOURCES})
+potal_add_backend_settings(potal-main2-test)
+target_include_directories(potal-main2-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(potal-main2-test PRIVATE ggml)
+if (NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME potal-main2-test COMMAND potal-main2-test)
+endif()
 potal_add_backend_settings(potal-stripe-pipeline-test)
 target_include_directories(potal-stripe-pipeline-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # The Gemmini reader's call counters (this target only): no weight revalidation inside a run.

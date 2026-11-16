@@ -145,6 +145,7 @@ struct stripe_run::slot {
     exsia::StripeMetadataSnapshot meta;
     double                        activation_scale = 0; // float(2^theta), as ActivationMetadataView::scale
     rmd::StripePacketHandle       packet;
+    std::shared_ptr<const std::vector<int8_t>> main_high;
     gemmini_trace_context         trace{};
     uint64_t                      accepted_ns           = 0;
     uint64_t                      quantization_start_ns = 0;
@@ -181,6 +182,9 @@ struct stripe_run::stripe_work {
         ~dma_block() { std::free(p); }
         void abandon() { p = nullptr; }
     } paired_rc;
+    dma_block high_a, high_c;
+    potal_paired_prepared high_job;
+    potal_paired_report high_report;
     pipeline_counts counts;
     stripe_completion done;
     bool paired_route = false;
@@ -260,6 +264,8 @@ bool stripe_run::begin(std::string & why) {
 }
 
 std::string stripe_run::check_event(const exsia::StripeReadyEvent & e, size_t rows) const {
+    if (e.main_high && (!cfg_.strict_issuer || e.main_high->size() != rows * k_))
+        return "Main2 requires the strict issuer and a complete high-digit stripe";
     if (!e.activation_metadata || e.activation_metadata->theta == std::numeric_limits<int16_t>::min()) {
         return "stripe without a post-fold theta";
     }
@@ -547,6 +553,7 @@ bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_ar
         s->meta                  = *e.activation_metadata;
         s->activation_scale      = (double) std::ldexp(1.0f, s->meta.theta);
         s->packet                = e.rmd_packet;
+        s->main_high             = e.main_high;
         s->trace                 = gemmini_trace_capture();
         s->quantization_start_ns = e.quantization_start_ns;
         s->quantization_end_ns   = e.quantization_end_ns;
@@ -919,6 +926,40 @@ bool stripe_run::prepare_job(slot & s, prep_outcome & out) {
                      " step=" + (stage != nullptr ? stage : "-") + ": " + why;
         return false;
     }
+    if (s.main_high) {
+        const size_t rows = s.row_end - s.row_begin;
+        work->high_a.p = dma_alloc(rows * (lda_ / 2));
+        work->high_c.p = dma_alloc(rows * ldc_ * sizeof(int32_t));
+        if (!work->high_a.p || !work->high_c.p) {
+            out.stage = "main2_alloc";
+            out.detail = "out of memory for high Main operands";
+            return false;
+        }
+        if (potal_int4_pack_rows(static_cast<uint8_t *>(work->high_a.p), rows * (lda_ / 2), lda_ / 2,
+                                s.main_high->data(), k_, rows, k_) != POTAL_OK) {
+            out.stage = "main2_pack";
+            out.detail = "invalid signed INT4 high Main digit";
+            return false;
+        }
+        potal_paired_tile_plan high_tile;
+        potal_paired_execution_plan high_plan;
+        potal_paired_status hs = potal_paired_plan_stripe(*work->paired_main, rows, n_, k_, nullptr,
+                                                        high_tile, high_plan, &why);
+        if (hs == potal_paired_status::ok) {
+            auto high = paired_request(s, *work);
+            high.a = static_cast<const int8_t *>(work->high_a.p);
+            high.c_main = static_cast<int32_t *>(work->high_c.p);
+            high.residual = nullptr;
+            high.c_residual = nullptr;
+            high.plan = &high_plan;
+            hs = potal_paired_prepare(high, std::move(high_plan), work->high_job, &stage, &why);
+        }
+        if (hs != potal_paired_status::ok) {
+            out.stage = "main2_prepare";
+            out.detail = std::string(potal_paired_status_name(hs)) + ": " + why;
+            return false;
+        }
+    }
     s.prepared = std::move(work);
     out.ok = true;
     return true;
@@ -1025,180 +1066,197 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             prep_outcome p = prepare_paired(s, *work, static_cast<bool>(runners.paired));
             if (!p.ok) return failed(p.stage, p.status, false, p.detail);
         }
-        if (cfg_.strict_issuer && (!paired_route || !work->job.ready || !runners.paired)) {
+        if (cfg_.strict_issuer && (!paired_route || !work->job.ready || !runners.paired ||
+                                  (s.main_high && !work->high_job.ready))) {
             return failed("strict_issuer", POTAL_ERR_INVALID_ARGUMENT, false,
                           "stripe reached the issuer without a prepared paired job or paired runner");
         }
 
         if (paired_route) {
-            // 1+2. Main and Residual GEMMs as one paired execution on the owner thread:
-            //      planned again (deterministic), staged, issued, read back, drained.
-            potal_paired_request pq = paired_request(s, *work);
-            if (cfg_.strict_issuer) {
-                pq.plan     = nullptr; // moved into the prepared job by potal_paired_prepare (hart 3)
-                pq.prepared = &work->job;
-            }
-            emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
-            const potal_paired_status pst = runners.paired(pq, paired);
-            gemm_fatal                    = gemm_fatal || paired.fatal;
-            if (paired.fatal) {
-                paired_rc.abandon();
-            }
-            const potal_paired_counts & pc = paired.counts;
-            n.paired_main_loop_ws += pc.main_loop_ws;
-            n.paired_residual_loop_ws += pc.residual_loop_ws;
-            n.paired_index_configs += pc.index_configs;
-            n.paired_index_writes += pc.index_writes;
-            n.paired_readbacks += pc.readbacks;
-            n.paired_readback_tiles += pc.readback_tiles;
-            n.paired_fences += pc.fences;
-            n.paired_drains += pc.drains;
-            n.paired_prefetch_loads += pc.prefetch_loads;
-            n.paired_prefetch_mvins += pc.prefetch_mvins;
-            n.paired_prefetch_ldb_only += pc.prefetch_ldb_only;
-            n.paired_prefetch_bytes_declared += pc.prefetch_bytes_declared;
-            n.paired_resident_main_loop_ws += pc.resident_main_loop_ws;
-            n.paired_residual_prefetch_issue_s += pc.residual_prefetch_issue_s;
-            n.paired_main_prefetch_issue_s += pc.main_prefetch_issue_s;
-            if (cfg_.paired_stream != potal_paired_stream_mode::off)
-                n.paired_stream_loops += pc.main_loop_ws + pc.residual_loop_ws;
-            n.paired_stream_pair_waits += pc.stream_pair_waits;
-            n.paired_stream_local_releases += pc.stream_local_releases;
-            n.paired_stream_batches += pc.stream_batches;
-            n.paired_stream_capacity_boundaries += pc.stream_capacity_boundaries;
-            n.paired_residual_staging_bytes += pc.residual_staging_bytes;
-            n.paired_residual_pitch_padding_bytes += pc.residual_pitch_padding_bytes;
-            n.paired_residual_valid_bytes += pc.residual_valid_bytes;
-            n.paired_residual_load_bytes_declared += pc.residual_load_bytes_declared;
-            n.scale_writes += pc.scale_writes;
-            n.scale_releases += pc.scale_releases;
-            n.tlb_flushes += pc.tlb_flushes;
-            n.scale_s += pc.scale_s;
-            n.issue_s += pc.issue_s;
-            n.fence_s += pc.fence_s;
-            n.last_generation = paired.last_generation != 0 ? paired.last_generation : n.last_generation;
-            {
-                stripe_event ev = pst == potal_paired_status::ok
-                                      ? advance(s, slot_state::paired_done, stripe_event_kind::paired_end)
-                                      : event_of(stripe_event_kind::paired_end, s);
-                ev.paired      = &paired;
-                ev.rows        = rows;
-                ev.cols        = n_;
-                ev.k_compact   = decoded.k_compact;
-                ev.k_execution = paired.tile.fragments.size() * HW_DIM;
-                ev.runs        = decoded.runs.size();
-                if (pst == potal_paired_status::ok) {
-                    ev.c             = s.c;
-                    ev.ldc           = ldc_;
-                    ev.residual_c    = static_cast<const int32_t *>(paired_rc.p);
-                    ev.residual_ldc  = ldc_;
-                    ev.residual_rows = paired.plan.residual_rows.size();
+            for (unsigned limb = 0; limb < (s.main_high ? 2u : 1u); ++limb) {
+                auto & paired = limb == 0 ? work->paired : work->high_report;
+                // 1+2. Main and Residual GEMMs as one paired execution on the owner thread:
+                //      planned again (deterministic), staged, issued, read back, drained.
+                potal_paired_request pq = paired_request(s, *work);
+                if (cfg_.strict_issuer) {
+                    pq.plan     = nullptr; // moved into the prepared job by potal_paired_prepare (hart 3)
+                    pq.prepared = &work->job;
                 }
-                emit(ev);
-            }
-            if (pst != potal_paired_status::ok) {
-                return failed("paired", paired.hw_status, paired.fatal,
-                              std::string("paired status=POTAL_PAIRED_") + potal_paired_status_name(pst) + " step=" +
-                                  (paired.stage != nullptr ? paired.stage : "-") + " hw=POTAL_" +
-                                  potal_status_name(paired.hw_status) + (paired.fatal ? " fatal=1 " : " fatal=0 ") +
-                                  paired.detail);
-            }
-
-            // Temporary FireSim numeric probe. Readbacks have already been fenced.
-            const char * numeric_probe = std::getenv("POTAL_PAIRED_STAGE_DIAG");
-            if (numeric_probe != nullptr && numeric_probe[0] == '1') {
-                auto compare = [&](const char * stage,
-                                   const int32_t * got,
-                                   const std::vector<int32_t> & want,
-                                   size_t count_rows) {
-                    size_t bad = 0;
-                    for (size_t rr = 0; rr < count_rows; ++rr) {
-                        for (size_t col = 0; col < n_; ++col) {
-                            const int32_t actual = got[rr * ldc_ + col];
-                            const int32_t expected = want[rr * ldc_ + col];
-                            if (actual != expected) {
-                                if (bad < 8) {
-                                    std::fprintf(stderr,
-                                        "[POTAL_STAGE_DIAG] stage=%s row=%zu col=%zu "
-                                        "got=%d want=%d\n",
-                                        stage, rr, col, actual, expected);
-                                }
-                                ++bad;
-                            }
-                        }
+                if (limb != 0) {
+                    pq.a = static_cast<const int8_t *>(work->high_a.p);
+                    pq.c_main = static_cast<int32_t *>(work->high_c.p);
+                    pq.residual = nullptr;
+                    pq.c_residual = nullptr;
+                    pq.plan = nullptr;
+                    pq.prepared = &work->high_job;
+                }
+                auto begin = advance(s, slot_state::paired_running, stripe_event_kind::paired_begin);
+                begin.detail = s.main_high ? (limb == 0 ? "main_low_with_residual" : "main_high") : nullptr;
+                emit(begin);
+                const potal_paired_status pst = runners.paired(pq, paired);
+                gemm_fatal                    = gemm_fatal || paired.fatal;
+                if (paired.fatal) {
+                    paired_rc.abandon();
+                    work->high_a.abandon();
+                    work->high_c.abandon();
+                }
+                const potal_paired_counts & pc = paired.counts;
+                n.paired_main_loop_ws += pc.main_loop_ws;
+                n.paired_residual_loop_ws += pc.residual_loop_ws;
+                n.paired_index_configs += pc.index_configs;
+                n.paired_index_writes += pc.index_writes;
+                n.paired_readbacks += pc.readbacks;
+                n.paired_readback_tiles += pc.readback_tiles;
+                n.paired_fences += pc.fences;
+                n.paired_drains += pc.drains;
+                n.paired_prefetch_loads += pc.prefetch_loads;
+                n.paired_prefetch_mvins += pc.prefetch_mvins;
+                n.paired_prefetch_ldb_only += pc.prefetch_ldb_only;
+                n.paired_prefetch_bytes_declared += pc.prefetch_bytes_declared;
+                n.paired_resident_main_loop_ws += pc.resident_main_loop_ws;
+                n.paired_residual_prefetch_issue_s += pc.residual_prefetch_issue_s;
+                n.paired_main_prefetch_issue_s += pc.main_prefetch_issue_s;
+                if (cfg_.paired_stream != potal_paired_stream_mode::off)
+                    n.paired_stream_loops += pc.main_loop_ws + pc.residual_loop_ws;
+                n.paired_stream_pair_waits += pc.stream_pair_waits;
+                n.paired_stream_local_releases += pc.stream_local_releases;
+                n.paired_stream_batches += pc.stream_batches;
+                n.paired_stream_capacity_boundaries += pc.stream_capacity_boundaries;
+                n.paired_residual_staging_bytes += pc.residual_staging_bytes;
+                n.paired_residual_pitch_padding_bytes += pc.residual_pitch_padding_bytes;
+                n.paired_residual_valid_bytes += pc.residual_valid_bytes;
+                n.paired_residual_load_bytes_declared += pc.residual_load_bytes_declared;
+                n.scale_writes += pc.scale_writes;
+                n.scale_releases += pc.scale_releases;
+                n.tlb_flushes += pc.tlb_flushes;
+                n.scale_s += pc.scale_s;
+                n.issue_s += pc.issue_s;
+                n.fence_s += pc.fence_s;
+                n.last_generation = paired.last_generation != 0 ? paired.last_generation : n.last_generation;
+                {
+                    stripe_event ev = pst == potal_paired_status::ok
+                                          ? advance(s, slot_state::paired_done, stripe_event_kind::paired_end)
+                                          : event_of(stripe_event_kind::paired_end, s);
+                    ev.paired      = &paired;
+                    ev.detail      = s.main_high ? (limb == 0 ? "main_low_with_residual" : "main_high") : nullptr;
+                    ev.rows        = rows;
+                    ev.cols        = n_;
+                    ev.k_compact   = limb == 0 ? decoded.k_compact : 0;
+                    ev.k_execution = paired.tile.fragments.size() * HW_DIM;
+                    ev.runs        = limb == 0 ? decoded.runs.size() : 0;
+                    if (pst == potal_paired_status::ok) {
+                        ev.c             = pq.c_main;
+                        ev.ldc           = ldc_;
+                        ev.residual_c    = pq.c_residual;
+                        ev.residual_ldc  = ldc_;
+                        ev.residual_rows = paired.plan.residual_rows.size();
                     }
-                    std::fprintf(stderr,
-                        "[POTAL_STAGE_DIAG] stage=%s bad=%zu total=%zu\n",
-                        stage, bad, count_rows * n_);
-                    std::fflush(stderr);
-                };
+                    emit(ev);
+                }
+                if (pst != potal_paired_status::ok) {
+                    return failed("paired", paired.hw_status, paired.fatal,
+                                  std::string("paired status=POTAL_PAIRED_") + potal_paired_status_name(pst) + " step=" +
+                                      (paired.stage != nullptr ? paired.stage : "-") + " hw=POTAL_" +
+                                      potal_status_name(paired.hw_status) + (paired.fatal ? " fatal=1 " : " fatal=0 ") +
+                                      paired.detail);
+                }
 
-                std::vector<int32_t> main_ref(rows * ldc_, 0);
-                reference_gemm_i32(
-                    s.a, lda_,
-                    w_.b, w_.ldb,
-                    w_.carriers, w_.cstride,
-                    SCALE_BLOCK_K,
-                    rows, n_, k_,
-                    main_ref.data(), ldc_);
-                compare("MAIN_INT32", s.c, main_ref, rows);
-
-                if (s.packet && !decoded.rows.empty()) {
-                    namespace hp1ref = ggml::gemmini::quants::hp1;
-
-                    std::vector<int32_t> residual_ref(
-                        decoded.rows.size() * ldc_, 0);
-
-                    for (size_t rr = 0; rr < decoded.rows.size(); ++rr) {
-                        for (size_t col = 0; col < n_; ++col) {
-                            int32_t acc = 0;
-                            bool first = true;
-                            size_t compact_base = 0;
-
-                            for (const auto & run : decoded.runs) {
-                                const uint32_t carrier =
-                                    w_.carriers[run.block_id * w_.cstride + col];
-
-                                for (size_t f = 0; f < run.local_k.size();
-                                     f += HW_DIM) {
-                                    int32_t partial = 0;
-                                    const size_t end =
-                                        std::min(f + HW_DIM, run.local_k.size());
-
-                                    for (size_t x = f; x < end; ++x) {
-                                        const size_t original_k =
-                                            (size_t) run.block_id * SCALE_BLOCK_K +
-                                            run.local_k[x];
-                                        const int32_t digit =
-                                            decoded.digits[
-                                                rr * decoded.k_compact +
-                                                compact_base + x];
-                                        const int32_t weight =
-                                            potal_int4_get(reinterpret_cast<const uint8_t *>(w_.b) +
-                                                original_k * (w_.ldb / 2), col);
-                                        partial += digit * weight;
+                // Temporary FireSim numeric probe. Readbacks have already been fenced.
+                const char * numeric_probe = std::getenv("POTAL_PAIRED_STAGE_DIAG");
+                if (numeric_probe != nullptr && numeric_probe[0] == '1') {
+                    auto compare = [&](const char * stage,
+                                       const int32_t * got,
+                                       const std::vector<int32_t> & want,
+                                       size_t count_rows) {
+                        size_t bad = 0;
+                        for (size_t rr = 0; rr < count_rows; ++rr) {
+                            for (size_t col = 0; col < n_; ++col) {
+                                const int32_t actual = got[rr * ldc_ + col];
+                                const int32_t expected = want[rr * ldc_ + col];
+                                if (actual != expected) {
+                                    if (bad < 8) {
+                                        std::fprintf(stderr,
+                                            "[POTAL_STAGE_DIAG] stage=%s row=%zu col=%zu "
+                                            "got=%d want=%d\n",
+                                            stage, rr, col, actual, expected);
                                     }
-
-                                    const int32_t value =
-                                        hp1ref::apply_validated(partial, carrier);
-
-                                    acc = first ? value :
-                                        hp1ref::accumulate(acc, value);
-                                    first = false;
+                                    ++bad;
                                 }
-                                compact_base += run.local_k.size();
                             }
-                            residual_ref[rr * ldc_ + col] = acc;
                         }
+                        std::fprintf(stderr,
+                            "[POTAL_STAGE_DIAG] stage=%s bad=%zu total=%zu\n",
+                            stage, bad, count_rows * n_);
+                        std::fflush(stderr);
+                    };
+
+                    std::vector<int32_t> main_ref(rows * ldc_, 0);
+                    reference_gemm_i32(
+                        s.a, lda_,
+                        w_.b, w_.ldb,
+                        w_.carriers, w_.cstride,
+                        SCALE_BLOCK_K,
+                        rows, n_, k_,
+                        main_ref.data(), ldc_);
+                    compare("MAIN_INT32", s.c, main_ref, rows);
+
+                    if (s.packet && !decoded.rows.empty()) {
+                        namespace hp1ref = ggml::gemmini::quants::hp1;
+
+                        std::vector<int32_t> residual_ref(
+                            decoded.rows.size() * ldc_, 0);
+
+                        for (size_t rr = 0; rr < decoded.rows.size(); ++rr) {
+                            for (size_t col = 0; col < n_; ++col) {
+                                int32_t acc = 0;
+                                bool first = true;
+                                size_t compact_base = 0;
+
+                                for (const auto & run : decoded.runs) {
+                                    const uint32_t carrier =
+                                        w_.carriers[run.block_id * w_.cstride + col];
+
+                                    for (size_t f = 0; f < run.local_k.size();
+                                         f += HW_DIM) {
+                                        int32_t partial = 0;
+                                        const size_t end =
+                                            std::min(f + HW_DIM, run.local_k.size());
+
+                                        for (size_t x = f; x < end; ++x) {
+                                            const size_t original_k =
+                                                (size_t) run.block_id * SCALE_BLOCK_K +
+                                                run.local_k[x];
+                                            const int32_t digit =
+                                                decoded.digits[
+                                                    rr * decoded.k_compact +
+                                                    compact_base + x];
+                                            const int32_t weight =
+                                                potal_int4_get(reinterpret_cast<const uint8_t *>(w_.b) +
+                                                    original_k * (w_.ldb / 2), col);
+                                            partial += digit * weight;
+                                        }
+
+                                        const int32_t value =
+                                            hp1ref::apply_validated(partial, carrier);
+
+                                        acc = first ? value :
+                                            hp1ref::accumulate(acc, value);
+                                        first = false;
+                                    }
+                                    compact_base += run.local_k.size();
+                                }
+                                residual_ref[rr * ldc_ + col] = acc;
+                            }
+                        }
+
+                        compare(
+                            "RESIDUAL_INT32",
+                            static_cast<const int32_t *>(paired_rc.p),
+                            residual_ref, decoded.rows.size());
                     }
-
-                    compare(
-                        "RESIDUAL_INT32",
-                        static_cast<const int32_t *>(paired_rc.p),
-                        residual_ref, decoded.rows.size());
                 }
-            }
 
+            }
             n.paired_stripes++;
             // Packet properties, route-independent; residual_execution_k stays the serial
             // route's K32-padded K (a paired stripe executes fragments x DIM, see paired_end).
@@ -1407,17 +1465,19 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
         // 3. CPU: reconstruct residuals, then convert Main during checked merge.
         set_state(s, slot_state::reconstruct_merge);
         float * out = out_.data() + s.row_begin * n_;
-        if (!s.packet) {
+        if (!s.packet && !s.main_high) {
             role_span dequantizing(cfg_, 43, s.stripe_id, s.index);
             for (size_t r = 0; r < rows; ++r) {
                 reconstruct_row(s.c + r * ldc_, n_, s.activation_scale, w_.scale, out + r * n_, 1);
             }
         }
-        if (s.packet) {
+        if (s.packet || s.main_high) {
             {
             role_span reconstructing(cfg_, 42, s.stripe_id, s.index);
             emit(event_of(stripe_event_kind::radix_reconstruct_begin, s));
+            if (!s.packet) correction.values.assign(rows * n_, 0);
             const rmd::RmdStatus composed =
+                !s.packet ? rmd::RmdStatus::success :
                 paired_route ? residual::reconstruct_rows(*s.packet, paired.plan.residual_rows,
                                                           static_cast<const int32_t *>(paired_rc.p), ldc_, n_, correction)
                              : residual::reconstruct(*s.packet, req, correction);
@@ -1438,16 +1498,38 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
             // The prepared weight (validated once, immutable) gives the channel
             // scales: no HP1 metadata pass per stripe.
             size_t               nonzero = 0;
-            const rmd::RmdStatus merged  = residual::merge_main_residual_hp1(w_, s.row_begin, s.row_end, s.meta, correction,
+            rmd::RmdStatus merged = rmd::RmdStatus::success;
+            if (s.main_high) {
+                constexpr int64_t radix = int64_t{1} << GGML_GEMMINI_ACTIVATION_BITS;
+                const auto * high = static_cast<const int32_t *>(work.high_c.p);
+                for (size_t row = 0; row < rows; ++row) {
+                    for (size_t col = 0; col < n_; ++col) {
+                        const size_t cell = row * n_ + col, acc = row * ldc_ + col;
+                        const int64_t main = int64_t(s.c[acc]) + radix * int64_t(high[acc]);
+                        int64_t value;
+                        if (__builtin_add_overflow(main, correction.values[cell], &value))
+                            return failed("main2_merge", POTAL_OK, false, "INT64 reconstruction overflow");
+                        const float f = float(double(value) * s.activation_scale * double(w_.scale[col]));
+                        uint32_t encoding;
+                        std::memcpy(&encoding, &f, sizeof(f));
+                        if ((encoding & 0x7f800000u) == 0x7f800000u)
+                            return failed("main2_merge", POTAL_OK, false, "nonfinite reconstructed output");
+                        out[cell] = f;
+                        nonzero += correction.values[cell] != 0;
+                    }
+                }
+            } else {
+                merged = residual::merge_main_residual_hp1(w_, s.row_begin, s.row_end, s.meta, correction,
                                                                        {s.c, ldc_, s.activation_scale},
                                                                        out_.data(), m_, n_, 1, &nonzero);
+            }
             if (merged != rmd::RmdStatus::success) {
                 return failed("merge", POTAL_OK, false, rmd::rmd_status_message(merged));
             }
             n.merges_completed++;
-            n.residual_nonempty_packets++;
+            n.residual_nonempty_packets += s.packet ? 1 : 0;
             n.corrections_nonzero += nonzero;
-            done.residual            = true;
+            done.residual            = bool(s.packet);
             done.corrections_nonzero = nonzero;
             {
                 stripe_event ev = event_of(stripe_event_kind::merge_end, s);
@@ -1481,6 +1563,7 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
             counts_.stripes_semantic_completed++;
             s.state = slot_state::free;
             s.packet.reset();
+            s.main_high.reset();
             s.generation++;
             outstanding_--;
             completed_++;
@@ -1546,6 +1629,12 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     bool strict_invalid = false;
     run_cfg.strict_issuer = cfg.strict_issuer || strict_issuer_requested(strict_invalid);
     if (strict_invalid) return refuse("options", "GGML_POTAL_STRICT_ISSUER must be ON/OFF/1/0");
+    const char * main2 = std::getenv("GGML_POTAL_LINEAR_MAIN2");
+    if (main2 && std::strcmp(main2, "0") != 0 && std::strcmp(main2, "1") != 0)
+        return refuse("options", "GGML_POTAL_LINEAR_MAIN2 must be 0 or 1");
+    args.prefold_main2 = main2 && std::strcmp(main2, "1") == 0;
+    if (args.prefold_main2 && (!run_cfg.strict_issuer || !run_cfg.hart_roles || !cfg.paired || !cfg.residual))
+        return refuse("options", "Main2 requires ROLES, STRICT_ISSUER, Paired and compensation");
     bool hw_invalid = false;
     const bool hw_requested = ::potal::hw_window::requested(hw_invalid);
     if (hw_invalid) return refuse("options", "GGML_POTAL_STRICT_HW_TIMELINE must be ON/OFF/1/0");
