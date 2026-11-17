@@ -836,6 +836,26 @@ stripe_run::prep_outcome stripe_run::prepare_paired(slot & s, stripe_work & work
         } else {
             ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
                                            tile, routing, &why);
+            if (ps == potal_paired_status::residual_acc_capacity &&
+                cfg_.paired_ktile_scale_reuse && !j8k8_ffn) {
+                // The packet is already validated. Narrow only output columns:
+                // retain the producer's I/anchor and K, and recheck every capacity.
+                const auto hw = potal_paired_hw_geometry();
+                const size_t residual_tiles = decoded.rows.size() / hw.dim +
+                                              (decoded.rows.size() % hw.dim != 0);
+                const size_t max_j = std::min(hw.acc_rows / 2 / hw.dim, hw.work_ids) / residual_tiles;
+                if (max_j != 0 && max_j < paired_main->tile_J) {
+                    const auto frozen = potal_frozen_plan(rows, n_, k_, paired_main->tile_I, max_j,
+                                                         paired_main->tile_K, paired_main->passes_per_block,
+                                                         &selected_main);
+                    if (frozen != POTAL_OK) {
+                        return refuse("paired_plan", frozen, false, "ACC1-limited Main plan rejected");
+                    }
+                    paired_main = &selected_main;
+                    ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, &decoded,
+                                                 tile, routing, &why);
+                }
+            }
         }
         if (ps == potal_paired_status::ok && diagnostic_index) {
             // Smaller Index Windows must not enlarge the normal paired Main K panel.

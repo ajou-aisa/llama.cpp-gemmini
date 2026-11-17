@@ -142,6 +142,8 @@ struct dense_spec {
     size_t       M, N, K;
     uint32_t     seed;
     bool         boundary;
+    size_t       expected_lane_rows = 0;
+    size_t       expected_main_j = 0;
 };
 
 struct dense_node {
@@ -183,6 +185,15 @@ bool make_dense(const dense_spec & c, dense_node & nd) {
     }
     float * v = static_cast<float *>(nd.x->data);
     for (size_t m = 0; m < c.M; ++m) {
+        if (c.expected_lane_rows) {
+            // Top-3 exponent 0, rho 2: two upper lanes per row. Code 7 shifted
+            // by 14 in the first row adds one lane beyond code 4's single digit.
+            const float blocks[] = { 16384.0f, 256.0f, 1.0f, 1.0f };
+            for (size_t k = 0; k < c.K; ++k)
+                v[m * c.K + k] = c.expected_lane_rows == 129 && m == 0 && k < 32 ?
+                    28672.0f : blocks[k / 32];
+            continue;
+        }
         for (size_t k = 0; k < c.K; ++k) v[m * c.K + k] = nd01(rng) * (1.0f + 0.5f * (float) (m % 3)) * (k / 32 % 2 ? 4.0f : 1.0f);
         if (m % 2 == 0) v[m * c.K + (m * 7) % c.K] = 60.0f * (m % 4 ? -1.0f : 1.0f);
         if (c.boundary && m % 5 == 1)
@@ -260,6 +271,15 @@ void dense_case(const dense_spec & c) {
         verdict("D", c.name, false, "reason=golden_" + why);
         return;
     }
+    if (c.expected_lane_rows &&
+        (plan.tile_I != 2 || plan.tile_J != 2 || g.theta != std::vector<int16_t>{-2} ||
+         g.lane_c.size() != c.expected_lane_rows)) {
+        char b[192];
+        std::snprintf(b, sizeof(b), "reason=capacity_fixture producer_I=%zu producer_J=%zu lane_rows=%zu expected=%zu",
+                      (size_t) plan.tile_I, (size_t) plan.tile_J, g.lane_c.size(), c.expected_lane_rows);
+        verdict("D", c.name, false, b);
+        return;
+    }
     exsia_cross_check(c, nd, plan, g);
 
     const hp1_shape     s = { (int64_t) c.M, (int64_t) c.N, (int64_t) c.K };
@@ -286,7 +306,7 @@ void dense_case(const dense_spec & c) {
     std::vector<int32_t>          main_c(c.M * c.N, 0);
     std::vector<uint8_t>          main_seen(c.M, 0);
     std::map<std::pair<uint8_t, uint32_t>, std::vector<int32_t>> lane_c;
-    size_t                        calls = 0, capture_errors = 0;
+    size_t                        calls = 0, capture_errors = 0, plan_errors = 0;
     potal_test::emu_session       es;
     potal_test::h2_emulator       h2;
     issue_observer                observer{h2.sink()};
@@ -300,6 +320,11 @@ void dense_case(const dense_spec & c) {
         const potal_paired_status st = potal_paired_run_session(q, &sink, rep);
         std::lock_guard<std::mutex> lock(mu);
         ++calls;
+        if (c.expected_lane_rows &&
+            (!req.ktile_scale_reuse || req.main_plan == nullptr ||
+             req.main_plan->tile_I != plan.tile_I || req.main_plan->tile_K != plan.tile_K ||
+             req.main_plan->tile_J != c.expected_main_j))
+            ++plan_errors;
         if (st != potal_paired_status::ok) return st;
         if (req.row_begin + req.rows > c.M || req.n != c.N) { ++capture_errors; return st; }
         for (size_t m = 0; m < req.rows; ++m) {
@@ -338,17 +363,17 @@ void dense_case(const dense_spec & c) {
     }
     const pipeline_counts & pc = report.counts;
     const bool ok = counters_ok && report.ok && !report.fatal && pc.paired_fallback_stripes == 0 && pc.paired_stripes == g.theta.size() &&
-                    h2.errors.empty() && !h2.scale_miss && !capture_errors && !unseen && !main_mis && !lane_mis &&
+                    h2.errors.empty() && !h2.scale_miss && !capture_errors && !plan_errors && !unseen && !main_mis && !lane_mis &&
                     !lane_val_mis && !out_mis;
     char b[640];
     std::snprintf(b, sizeof(b),
                   "M=%zu N=%zu K=%zu stripes=%zu stripe_rows=%zu paired=%" PRIu64 " fallback=%" PRIu64 " calls=%zu "
                   "main_int32_mismatch=%zu rows_unseen=%zu lane_rows fork=%zu golden=%zu set_mismatch=%zu "
-                  "residual_int32_mismatch=%zu f32_differing=%zu/%zu max_abs=%.6g capture_errors=%zu h2_errors='%s' "
+                  "residual_int32_mismatch=%zu f32_differing=%zu/%zu max_abs=%.6g capture_errors=%zu plan_errors=%zu h2_errors='%s' "
                   "stage=%s detail='%s'",
                   c.M, c.N, c.K, g.theta.size(), plan.tile_I * POTAL_HW_DIM, (uint64_t) pc.paired_stripes,
                   (uint64_t) pc.paired_fallback_stripes, calls, main_mis, unseen, fork_keys.size(), gold_keys.size(),
-                  lane_mis, lane_val_mis, out_mis, c.M * c.N, max_abs, capture_errors, h2.errors.c_str(),
+                  lane_mis, lane_val_mis, out_mis, c.M * c.N, max_abs, capture_errors, plan_errors, h2.errors.c_str(),
                   report.stage ? report.stage : "-", report.detail.c_str());
     verdict("D", c.name, ok, b);
 }
@@ -788,6 +813,8 @@ int main(int argc, char ** argv) {
         { "dense-random", 33, 40, 160, 11, false },
         { "dense-boundary", 37, 45, 192, 12, true },
         { "dense-qwen-k896", 32, 64, 896, 13, true },
+        { "dense-acc1-128-j2", 64, 64, 128, 14, false, 128, 2 },
+        { "dense-acc1-129-j1", 64, 64, 128, 14, false, 129, 1 },
     };
     for (const auto & c : dense_cases) isolated("D", c.name, [&] { dense_case(c); });
     isolated("MERGE", "main-residual", [] { test_main_merge(); });

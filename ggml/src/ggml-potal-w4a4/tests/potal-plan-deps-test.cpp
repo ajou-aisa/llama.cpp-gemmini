@@ -288,6 +288,39 @@ int main(int argc, char ** argv) try {
     manifest results;
     results.verbose = verbose;
     size_t checks = 0;
+    if (repetitions == 0) {
+        // A caller may narrow J, but the frozen-plan validator must keep both
+        // the 128-row J2 boundary and the absolute 256-row J1 boundary checked.
+        for (size_t lanes : {size_t(128), size_t(129), size_t(256), size_t(257)}) {
+            residual::decoded_packet d;
+            d.k_compact = 1;
+            residual::run run;
+            run.block_id = 0;
+            run.local_k = {0};
+            d.runs.push_back(run);
+            for (size_t i = 0; i < lanes; ++i)
+                d.rows.push_back({uint8_t(i / 64), uint32_t(i % 64)});
+            d.digits.assign(lanes, 1);
+            for (size_t j : {size_t(2), size_t(1)}) {
+                potal_tile_plan main;
+                require(potal_frozen_plan(64, 64, 128, 2, j, 4, 1, &main) == POTAL_OK,
+                        "ACC boundary Main plan");
+                potal_paired_tile_plan tile;
+                potal_paired_execution_plan plan;
+                std::string why;
+                const auto status = potal_paired_plan_stripe(main, 64, 64, 128, &d, tile, plan, &why);
+                const bool fits = lanes <= (j == 2 ? 128 : 256);
+                require(status == (fits ? potal_paired_status::ok : potal_paired_status::residual_acc_capacity),
+                        "ACC boundary status");
+                if (fits) {
+                    require(tile.tile_I == 2 && tile.tile_J == j && tile.tile_K_main == 4 &&
+                            tile.tile_K == 4 && tile.residual_acc_rows <= hw.acc_rows / 2,
+                            "ACC boundary geometry changed I/K");
+                }
+                ++checks;
+            }
+        }
+    }
     for (const auto & f : fixtures) {
         const auto d = packet(f);
         potal_paired_execution_plan reference;
