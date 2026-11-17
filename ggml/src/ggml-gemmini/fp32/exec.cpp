@@ -20,6 +20,7 @@
 #include <tuple>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 
 namespace ggml::gemmini::fp32 {
 namespace {
@@ -173,6 +174,10 @@ void begin_graph(uint64_t graph, const std::string & directory) {
 }
 void start_runtime(int issuer_cpu, const std::vector<int> & cpus) {
     require(!runtime && cpus.size() == 4, "runtime requires exactly four lane CPUs");
+#if defined(__riscv)
+    // Gemmini cannot take page faults (its DMA ignores TLB pf/ae): keep every page resident before use.
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) throw std::runtime_error("FP32 mlockall failed");
+#endif
     auto all = cpus;
     all.push_back(issuer_cpu);
     std::sort(all.begin(), all.end());
