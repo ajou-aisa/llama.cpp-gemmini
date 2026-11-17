@@ -49,6 +49,8 @@ a cross-file atomic transaction; an OS error during publication is reported.
 
 All stage definitions, run/thread metadata, affinity checks, clock anchors,
 dropped/overflow counters and event values are retained. The converter performs
+UTF-8 decoding and encoding for textual metadata, preserving non-ASCII identifiers
+and paths from the CSV writer. Binary control lines remain ASCII. It performs
 the same op/phase fallback from RUN metadata as the CSV writer. Sparse CPU
 samples remain associated with the original thread slot and sequence number.
 Existing parser interpretation of missing/invalid counters is unchanged.

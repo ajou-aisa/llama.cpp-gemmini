@@ -82,6 +82,27 @@ def test_preserves_existing_output(trace: Path, tmp_path: Path) -> None:
     assert destination.read_text() == "original measurement\n"
 
 
+def test_preserves_utf8_metadata(trace: Path, tmp_path: Path) -> None:
+    # Given a real writer whose metadata contains UTF-8 identifiers and paths.
+    model_id = "\ubaa8\ub378-Qwen"
+    path = tmp_path / "\ub85c\uadf8"
+    env = dict(os.environ, POTAL_TIMELINE=str(path), POTAL_TIMELINE_CPU="1",
+               POTAL_TIMELINE_MODEL_ID=model_id)
+    subprocess.run([str(trace.parent / "writer"), "3"], env=env, check=True)
+    original_meta = next(row for row in Path(str(path) + ".csv").read_bytes().splitlines()
+                         if row.startswith(b"META,"))
+    assert ("model_id=" + model_id).encode("utf-8") in original_meta
+
+    # When the completed binary is converted on the host.
+    destination = tmp_path / "restored.csv"
+    assert convert(Path(str(path) + ".binary"), destination) == 6
+
+    # Then metadata bytes and CPU samples match the existing CSV writer.
+    restored_meta = next(row for row in destination.read_bytes().splitlines() if row.startswith(b"META,"))
+    assert restored_meta == original_meta
+    assert Path(str(destination) + ".cpu.csv").read_bytes() == Path(str(path) + ".csv.cpu.csv").read_bytes()
+
+
 def test_writer_without_cpu_creates_only_timeline(trace: Path, tmp_path: Path) -> None:
     path = tmp_path / "trace"
     env = dict(os.environ, POTAL_TIMELINE=str(path), POTAL_TIMELINE_EVENTS="64", POTAL_TIMELINE_CPU="0")

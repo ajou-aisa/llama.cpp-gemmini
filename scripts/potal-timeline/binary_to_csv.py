@@ -37,7 +37,7 @@ def transcode(stream: BinaryIO, output: TextIO, cpu: TextIO | None) -> int:
     output.write("# potal_timeline v1\n")
     while True:
         raw = line(stream)
-        text = raw.decode("ascii")
+        text = raw.decode("utf-8")
         output.write(text)
         cols = text.rstrip("\n").split(",")
         if raw.startswith(b"T,"):
@@ -104,7 +104,7 @@ def convert(source: Path, destination: Path) -> int:
         stream.seek(0)
         with TemporaryDirectory(prefix="potal-convert-", dir=destination.parent) as folder, ExitStack() as stack:
             tmp = Path(folder)
-            out = stack.enter_context((tmp / "timeline.csv").open("w", encoding="ascii", newline=""))
+            out = stack.enter_context((tmp / "timeline.csv").open("w", encoding="utf-8", newline=""))
             cpu = stack.enter_context((tmp / "cpu.csv").open("w", encoding="ascii", newline="")) if has_cpu else None
             total = transcode(stream, out, cpu)
             stack.close()
