@@ -124,6 +124,7 @@ int main(int argc, char ** argv) try {
     check(bool(csv) && bool(tokens), "cannot create result files");
     std::printf("FP32_BEGIN route=%s prompt=%d gen=%d ctx=%d ubatch=%d issuer=%d lanes=%s\n",
                 route, prompt_n, generated, ctx_n, ubatch, issuer, get("--lane-cpus","1,2,3,4").c_str());
+    std::fflush(stdout);
     const uint64_t start = now();
     llama_token input = 0;
     for (int step = 0; step < generated; ++step) {
