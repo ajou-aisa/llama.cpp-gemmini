@@ -40,6 +40,20 @@ inline uint64_t clock_ns(clockid_t clock, bool & valid) noexcept {
     return valid ? uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec) : 0;
 }
 
+// Command-window samples must not call clocks, the scheduler, or issue CPU/RoCC fences.
+// Affinity is verified at thread registration and again in the exported thread metadata.
+inline cpu_sample sample_issue_cpu(int pinned_cpu) noexcept {
+    cpu_sample out;
+    out.cpu = pinned_cpu;
+#if defined(__riscv) && __riscv_xlen == 64
+    if (pinned_cpu >= 0) {
+        __asm__ volatile("rdcycle %0\n\trdinstret %1" : "=r"(out.cycles), "=r"(out.instructions) : : "memory");
+        out.counters_valid = true;
+    }
+#endif
+    return out;
+}
+
 inline cpu_sample sample_cpu(int pinned_cpu, bool model_boundary) noexcept {
     cpu_sample out;
     const int before = sched_getcpu();

@@ -3221,6 +3221,7 @@ struct executor {
     }
 
     potal_paired_status scale_program(const potal_paired_op & op) {
+        op_span descriptor(*this, 125, op.id, nullptr, 1);
         const potal_paired_scale_window & w   = report.plan.scale_windows[op.scale_window];
         const potal_paired_k_panel &      pan = report.tile.panels[op.panel];
         const uint32_t                    gen = next_generation();
@@ -3231,6 +3232,7 @@ struct executor {
             hw_generation[w.index] = hw_generation[scale_owner[w.index]];
             report.counts.scale_reused_windows++;
             report.counts.scale_reused_columns += w.blocks * (w.j_tiles * hw.dim - group_pad_j(op.j_group));
+            descriptor.done();
             return potal_paired_status::ok;
         }
         const size_t col_base = op.j_group * report.tile.tile_J * hw.dim;
@@ -3245,7 +3247,11 @@ struct executor {
                 block_carriers[b] = req.weight->carriers + block * req.weight->cstride + col_base;
             }
             uint64_t written = 0;
-            const potal_status st = potal_paired_scale_write_columns(session, &columns, block_carriers, &written);
+            descriptor.done();
+            descriptor.finish();
+            const potal_status st = timeline_call(::potal::timeline::stage::acc_scale_columns_api, op.id,
+                w.blocks * (w.j_tiles * hw.dim - pad_j),
+                [&] { return potal_paired_scale_write_columns(session, &columns, block_carriers, &written); });
             report.issued = true;
             report.counts.scale_writes += written;
             const double elapsed = seconds_since(t);
@@ -3253,6 +3259,8 @@ struct executor {
             if (profile) scale_write_s += elapsed;
             return st == POTAL_OK ? potal_paired_status::ok : hw_fail("scale_write", st, &op);
         }
+        descriptor.done();
+        descriptor.finish();
         for (size_t b = 0; b < w.blocks; ++b) {
             // Main: scale block of the panel; Residual: the fragment's original block.
             const size_t block = w.residual ? report.tile.fragments[pan.windows[op.window].fragment_begin + b].block_id
@@ -3480,6 +3488,7 @@ struct executor {
                 return hw_fail("fence", st, &op);
             }
         }
+        op_span descriptor(*this, 121, op.id, nullptr, 1);
         potal_paired_loop_ws l   = {};
         l.loop.a                 = req.a + pan.k_begin;
         l.loop.b                 = req.weight->b + pan.k_begin * req.weight->ldb + op.j_group * t.tile_J * hw.dim;
@@ -3503,6 +3512,8 @@ struct executor {
         l.a_offset_tiles         = 0;
         l.resident_b             = 0;
         l.indexed                = 0;
+        descriptor.done();
+        descriptor.finish();
         const potal_paired_status st = issue_loop(l, "main_loop_ws", op);
         if (st == potal_paired_status::ok) {
             report.counts.main_loop_ws++;
@@ -3516,12 +3527,15 @@ struct executor {
         const bool sample = index_profile.op == op.id;
         const uint64_t t0 = sample ? index_profile_cycles() : 0;
         const uint64_t writes_before = sample ? report.counts.index_writes : 0;
+        op_span descriptor(*this, 123, op.id, nullptr, 1);
         potal_index_config cfg;
         cfg.pair          = (uint32_t) op.index_buffer;
         cfg.b_sp_base     = (uint32_t) op.index_b_base;
         cfg.j_tiles       = (uint32_t) op.index_j_tiles;
         cfg.source_k_rows = (uint32_t) op.index_source_k_rows;
         cfg.active_rows   = (uint32_t) op.index_active_rows;
+        descriptor.done();
+        descriptor.finish();
         if (index_queue) {
             potal_index_queue_result result{};
             const uint64_t commands = potal_paired_session_query(session).commands;
@@ -3547,6 +3561,7 @@ struct executor {
         const uint64_t t1 = sample ? index_profile_cycles() : 0;
         report.counts.index_configs++;
         auto * write_record = window_begin(window_kind::index_write, op.id, 0);
+        op_span entries(*this, 127, op.id, &report.counts.index_writes, 0);
         for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
             const potal_paired_index_entry & en = report.plan.index_entries[e];
             potal_index_write                w  = { (uint32_t) en.slot, (uint32_t) en.resident_k };
@@ -3563,6 +3578,8 @@ struct executor {
             }
             report.counts.index_writes++;
         }
+        entries.done();
+        entries.finish();
         window_end(write_record, st);
         const uint64_t t2 = sample ? index_profile_cycles() : 0;
         if (sample) {
@@ -3590,6 +3607,7 @@ struct executor {
             return hw_fail("fence", ds, &op);
         }
         auto * descriptor_record = window_begin(window_kind::descriptor, op.id, 0);
+        op_span descriptor(*this, 122, op.id, nullptr, 1);
         size_t wi = 0;
         while (wi < staging.windows.size() && !(staging.windows[wi].panel == op.panel && staging.windows[wi].index == op.window)) {
             ++wi;
@@ -3628,6 +3646,8 @@ struct executor {
         l.resident_b             = 1;
         l.indexed                = 1;
         window_end(descriptor_record, POTAL_OK);
+        descriptor.done();
+        descriptor.finish();
         const potal_paired_status st = issue_loop(l, "residual_loop_ws", op);
         if (st == potal_paired_status::ok) {
             if (window_diag) {
@@ -3643,6 +3663,7 @@ struct executor {
             return hw_fail("fence", ds, &op);
         }
         const potal_paired_tile_plan & t = report.tile;
+        op_span descriptor(*this, 124, op.id, nullptr, 1);
         potal_acc_readback r;
         r.acc_bank = (uint32_t) op.acc_bank;
         r.i_tiles  = (uint32_t) (op.acc_bank == 0 ? t.tile_I : t.residual_row_tiles);
@@ -3652,6 +3673,8 @@ struct executor {
         const size_t col = op.j_group * t.tile_J * hw.dim;
         r.c   = (op.acc_bank == 0 ? req.c_main : req.c_residual) + col;
         r.ldc = op.acc_bank == 0 ? req.ldc_main : req.ldc_residual;
+        descriptor.done();
+        descriptor.finish();
         const auto         tm = time_now();
         const potal_status st = issue_readback(r, op.id);
         const double elapsed = seconds_since(tm);

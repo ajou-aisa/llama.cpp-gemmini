@@ -368,6 +368,13 @@ const char * stage_name(uint16_t id) {
         case stage::acc_release_window: return "acc.release_window";
         case stage::acc_index_window: return "acc.index_window";
         case stage::acc_gemm_op: return "acc.gemm_op";
+        case stage::issue_main_descriptor: return "issue.main_descriptor";
+        case stage::issue_residual_descriptor: return "issue.residual_descriptor";
+        case stage::issue_index_descriptor: return "issue.index_descriptor";
+        case stage::issue_readback_descriptor: return "issue.readback_descriptor";
+        case stage::issue_scale_descriptor: return "issue.scale_descriptor";
+        case stage::acc_scale_columns_api: return "acc.scale_columns_api";
+        case stage::acc_index_entries_api: return "acc.index_entries_api";
         case stage::acc_readback_op: return "acc.readback_op";
         case stage::node_setup: return "node.setup";
         case stage::exsia_role_setup: return "exsia.role_setup";

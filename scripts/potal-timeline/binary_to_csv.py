@@ -9,6 +9,7 @@ import argparse
 import os
 from contextlib import ExitStack
 from pathlib import Path
+from issuer_stages import counter_only_stage
 from tempfile import TemporaryDirectory
 from typing import BinaryIO, TextIO
 
@@ -78,8 +79,11 @@ def transcode(stream: BinaryIO, output: TextIO, cpu: TextIO | None) -> int:
         previous = start - 1
         for parts in CPU.iter_unpack(exact(stream, sampled * CPU.size)):
             sample = Sample(*parts)
-            if not previous < sample.seq < start + count or sample.seq < start or sample.flags & ~7 or sample.reserved or not sample.mono:
+            if not previous < sample.seq < start + count or sample.seq < start or sample.flags & ~7 or sample.reserved:
                 raise FormatError("invalid CPU sample identity or flags")
+            event = events[sample.seq - start]
+            if not sample.mono and (not counter_only_stage(event.stage) or event.kind not in (1, 2) or sample.flags & 3):
+                raise FormatError("invalid counter-only CPU sample")
             if cpu is None:
                 raise FormatError("unexpected CPU payload")
             cpu.write(sample.csv(events[sample.seq - start], config["counter_source"]))

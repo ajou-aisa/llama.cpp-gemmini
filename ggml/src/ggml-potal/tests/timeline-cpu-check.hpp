@@ -26,17 +26,22 @@ int child_cpu() {
     ggml_backend_potal_timeline_mark(82, 2, 7, 0);
     CHECK(tl::flush());
     const auto rows = rows_of(std::string(path) + ".cpu.csv", "0");
-    CHECK(rows.size() == 6);
-    const std::vector<std::string> stages = {"82", "118", "118", "119", "119", "82"};
+    CHECK(rows.size() == 8);
+    const std::vector<std::string> stages = {"82", "118", "118", "119", "119", "33", "33", "82"};
     for (size_t i = 0; i < rows.size() && i < stages.size(); ++i) {
         const auto & row = rows[i];
         CHECK(row.size() == 18);
         if (row.size() != 18) continue;
         CHECK(row[2] == stages[i] && row[6] == "7");
-        CHECK(row[14] == "1"); // actual CLOCK_THREAD_CPUTIME_ID sample
-        CHECK(row[15] == (i == 0 || i == 5 ? "1" : "0"));
+        const bool command = row[2] == "33";
+        CHECK(row[14] == (command ? "0" : "1"));
+        CHECK(row[15] == (i == 0 || i == 7 ? "1" : "0"));
         CHECK(row[16] == "0"); // unpinned caller cannot produce valid hart cycles
-        if (i > 0) CHECK(std::stoull(row[8]) >= std::stoull(rows[i - 1][8]));
+        if (command) {
+            CHECK(row[8] == "0" && row[9] == "0" && row[10] == "0");
+        } else if (i > 0) {
+            CHECK(std::stoull(row[8]) >= std::stoull(rows[i - 1][8]));
+        }
     }
     return g_failures == 0 ? 0 : 1;
 }

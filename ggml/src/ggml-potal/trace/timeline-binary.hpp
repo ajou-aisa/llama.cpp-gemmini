@@ -66,7 +66,9 @@ inline bool write_ring(FILE * f, const detail::thread_ring & ring) noexcept {
         if (samples) {
             for (uint32_t j = start; j < start + count; ++j) {
                 const auto & s = ring.cpu_samples[j];
-                if (s.mono_ns == 0) continue;
+                const auto & e = ring.events[j];
+                if (s.mono_ns == 0 && !(issue_counter_stage(static_cast<stage>(e.stage)) &&
+                    (e.event_type == uint8_t(event::begin) || e.event_type == uint8_t(event::end)))) continue;
                 const uint32_t flags = uint32_t(s.thread_valid) | (uint32_t(s.process_valid) << 1) |
                                        (uint32_t(s.counters_valid) << 2);
                 samples[sampled++] = {s.mono_ns, s.thread_ns, s.process_ns, s.cycles, s.instructions,
