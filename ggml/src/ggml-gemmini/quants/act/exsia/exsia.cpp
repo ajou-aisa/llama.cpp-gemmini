@@ -1,5 +1,6 @@
 #include <gemmini/trace-context.hpp>
 #include "exsia.hpp"
+#include "strict-profile.hpp"
 
 #include "../../../ggml-gemmini-telemetry.hpp"
 #include "../../../residual/rmd/rmd-compose.hpp"
@@ -358,7 +359,8 @@ bool ExSIA::run(Meta &                  meta,
                       run_cpu_wall.resume();)
     EXSIA_PROFILE_COLLECT(ProfileInterval run_profile; start_profile_interval(run_profile);)
     EXSIA_PROFILE_LOG(const char * mode =
-                          requested_mode_ == ExSIAState::ExecutionMode::Sequential ? "Sequential"
+                          roles ? "StrictRoles"
+                          : requested_mode_ == ExSIAState::ExecutionMode::Sequential ? "Sequential"
                           : requested_mode_ == ExSIAState::ExecutionMode::LocalParallel
                               ? "LocalParallel"
                               : "LocalFoldingPipeline";)
@@ -804,6 +806,9 @@ bool ExSIA::run(Meta &                  meta,
 #endif
         };
         const auto event = [&](unsigned stage, unsigned type, size_t s, size_t task = SIZE_MAX, uint32_t edge = 0) {
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+            if (s < stripe_profiles.size()) strict_profile_boundary(stripe_profiles[s], stage, type, task);
+#endif
 #if GGML_POTAL_TIMELINE_HOOKS
             if (::potal::timeline::enabled())
                 ::potal::timeline::record(static_cast<::potal::timeline::stage>(stage),
@@ -871,6 +876,12 @@ bool ExSIA::run(Meta &                  meta,
             try {
                 if (!trace_role(3)) return;
                 const auto prepare = [&](size_t s) {
+                    EXSIA_PROFILE_COLLECT(
+                        auto & profile = stripe_profiles[s];
+                        profile.stripe_idx = s;
+                        profile.row_start = s * rows_per_stripe;
+                        profile.row_end = std::min(profile.row_start + rows_per_stripe, args.I);
+                        profile.team_size = 3;)
                     event(10, 1, s);
                     auto & slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
                     const size_t r0 = s * rows_per_stripe, r1 = std::min(r0 + rows_per_stripe, args.I);
@@ -913,6 +924,20 @@ bool ExSIA::run(Meta &                  meta,
                         stop(ExSIAState::FailureCode::LocalBlockFailure, s);
                         return;
                     }
+#if EXSIA_STAGE_PROFILE_ENABLED
+                    auto & stats = stripe_profiles[s].stats;
+                    for (const auto & task : local_workspace_.local_tasks) {
+                        const auto & from = task.cycle_stats;
+                        stats.p0.merge(from.p0);
+                        stats.p1.merge(from.p1);
+                        stats.p2.merge(from.p2);
+                        stats.p3.merge(from.p3);
+                        stats.forced_recompute_count += from.forced_recompute_count;
+                        stats.p3_bypass_no_int_count += from.p3_bypass_no_int_count;
+                        stats.p3_bypass_same_scale_count += from.p3_bypass_same_scale_count;
+                        stats.p3_replay_count += from.p3_replay_count;
+                    }
+#endif
                     // s-1 was released by the previous iteration. Locals for
                     // s+1 now overlap this iteration's ordered folding of s.
                     if (s + 1 < num_stripes && !prepare(s + 1)) return;

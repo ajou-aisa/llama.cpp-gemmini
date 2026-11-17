@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include "cpu-sample.hpp"
 
 namespace potal::timeline {
 
@@ -101,6 +102,17 @@ enum class stage : uint16_t {
     model_prefill            = 82,  // application: prompt evaluation up to the first token
     model_decode             = 83,  // application: one decode step (stripe field = step index)
     model_token              = 84,  // application: instant, one sampled token (work = token id)
+    attn_k_prepare           = 110,
+    attn_v_prepare           = 111,
+    attn_q_local             = 112,
+    attn_p_read              = 113,
+    attn_q_fold_digits       = 114,
+    attn_p_quant_digits      = 115,
+    attn_output_scales       = 116,
+    attn_qk_recon_dequant    = 117, // fused loop; not float-only dequant
+    attn_pv_reconstruct      = 118,
+    attn_pv_dequant_store    = 119,
+    attn_plan_staging        = 120,
 };
 
 enum class event : uint8_t {
@@ -155,6 +167,8 @@ namespace detail {
 
 struct thread_ring {
     record_t *            events;
+    cpu_sample *          cpu_samples; // optional diagnostic sidecar, indexed by event seq
+    int                   pinned_cpu;
     uint32_t              capacity;
     std::atomic<uint32_t> head;  // owner thread stores (relaxed); flush reads after quiescence
     std::atomic<uint32_t> dropped;
@@ -171,6 +185,7 @@ extern bool g_on;
 extern bool g_detail;
 // POTAL_TIMELINE_PROFILE=coarse: no per-command accelerator (acc.*) spans; see op_profile().
 extern bool g_coarse;
+extern bool g_cpu;
 // set_recording() gate (default on): off drops every record before any ring write.
 extern std::atomic<bool> g_rec;
 extern thread_local thread_ring * t_ring;
@@ -303,6 +318,15 @@ inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uin
     } else {
         e.reserved = 0;
     }
+    // Never insert clock syscalls inside accelerator command windows.
+    if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end) &&
+        !(static_cast<uint16_t>(st) >= 26 && static_cast<uint16_t>(st) <= 49 &&
+          st != stage::final_reconstruct_int64 && st != stage::final_dequant_merge)) {
+        auto & sample = r->cpu_samples[h];
+        sample = sample_cpu(r->pinned_cpu, st == stage::model_inference ||
+                            st == stage::model_prefill || st == stage::model_decode);
+        e.reserved = sample.mono_ns;
+    }
     r->head.store(h + 1, std::memory_order_relaxed);
 }
 
@@ -333,6 +357,21 @@ struct scoped_span {
     uint32_t run_id, layer_id, stripe_id, tile_id;
     uint64_t work   = 0;
     uint8_t  status = 0;
+
+    // Child of the current thread's last event; strict pipelines establish context before calling helpers.
+    explicit scoped_span(stage s) noexcept : on(false), st(s), run_id(0), layer_id(0), stripe_id(no_id), tile_id(no_id) {
+        if (!active() || !detail::g_cpu || !detail::g_rec.load(std::memory_order_relaxed)) return;
+        const auto * ring = detail::t_ring;
+        const uint32_t h = ring->head.load(std::memory_order_relaxed);
+        if (h == 0) return;
+        const auto & parent = ring->events[h - 1];
+        run_id = parent.run_id;
+        layer_id = parent.layer_id;
+        stripe_id = parent.stripe_id;
+        tile_id = parent.tile_id;
+        on = true;
+        record(st, event::begin, 0, run_id, layer_id, stripe_id, tile_id, no_id, 0, 0);
+    }
 
     scoped_span(bool enable, stage s, uint32_t run, uint32_t layer, uint32_t stripe, uint32_t tile) noexcept :
         on(enable), st(s), run_id(run), layer_id(layer), stripe_id(stripe), tile_id(tile) {

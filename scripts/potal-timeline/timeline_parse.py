@@ -86,7 +86,7 @@ def load(path, rep):
     end_count = None
     with open(path, newline="") as f:
         for lineno, line in enumerate(f, 1):
-            line = line.rstrip("\n")
+            line = line.rstrip("\r\n")
             if not line:
                 continue
             if line.startswith("#END,events="):

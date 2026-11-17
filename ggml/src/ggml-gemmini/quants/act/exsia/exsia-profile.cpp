@@ -517,6 +517,7 @@ static const char * profile_cycle_status_name(ProfileCycleStatus status) {
 }
 
 static inline size_t expected_profile_team_size(const char * mode) {
+    if (std::strcmp(mode, "StrictRoles") == 0) return 3;
     return std::strcmp(mode, "Sequential") == 0 ? 1 : EXSIA_OMP_THREAD_COUNT;
 }
 
