@@ -2,6 +2,11 @@
 
 Python 3.12 stdlib only. Always run with `python3 -I`.
 
+Binary shutdown exports use `POTAL_TIMELINE_FORMAT=binary`; see
+[FireSim binary export](../../docs/backend/POTAL-BINARY-TIMELINE.md).
+Convert first with `python3 scripts/potal-timeline/binary_to_csv.py TRACE.bin --out TRACE.csv`
+(without `-I`, for the adjacent format module). The existing CSV tools below are unchanged.
+
 ## CLI
     python3 -I timeline_parse.py TRACE.csv [--out DIR] [--strict] [--failed-runs 3,5-7] [--wfi-tol-ns 2000]
     python3 -I plot_timeline.py DIR [--out FILE] [--run RUN_ID] [--t0-ns N] [--t1-ns N]
