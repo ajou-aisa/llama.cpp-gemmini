@@ -12,7 +12,7 @@
 // register_thread, begin_run, end_run, anchor(), thread exit and (for the
 // flushing thread) flush. Never take one inside a hart0 RoCC issue window.
 //
-// flush() writes the CSV (also registered with atexit). It requires the
+// flush() writes CSV, or binary with POTAL_TIMELINE_FORMAT=binary (also at exit). It requires the
 // recording threads to be quiescent: call it after the measured graph, never
 // inside a node.
 #pragma once
@@ -255,7 +255,7 @@ uint32_t next_edge_id() noexcept;
 // Extra anchor on the calling thread. Never inside a RoCC issue window.
 void anchor() noexcept;
 
-// Writes the CSV to the POTAL_TIMELINE path (overwrites). Returns false when
+// Writes CSV or opt-in binary to POTAL_TIMELINE (overwrites). Returns false when
 // disabled (nothing written) or when the file cannot be written (one stderr line).
 bool flush() noexcept;
 
