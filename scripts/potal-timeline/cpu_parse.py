@@ -11,11 +11,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, NewType
+from issuer_stages import counter_only_stage, measurement_kind
 
 Slot = NewType("Slot", int)
 SpanKey = tuple[Slot, int, int, int, int, int]
 FIELDS: Final = ("slot", "stage", "run", "layer", "stripe", "tile", "wall_ns", "thread_ns",
-                 "process_ns", "cycles", "instructions", "ipc", "counter_status", "counter_source")
+                 "process_ns", "cycles", "instructions", "ipc", "counter_status", "counter_source",
+                 "measurement_kind")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,10 @@ def load(path: Path) -> list[Sample]:
 
 
 def delta(begin: Sample, end: Sample) -> tuple[int | float | str, ...]:
+    counter_only = begin.mono_ns == 0 or end.mono_ns == 0
+    if counter_only and (begin.mono_ns != end.mono_ns or not counter_only_stage(begin.key[1]) or
+                         begin.thread_valid or end.thread_valid or begin.process_valid or end.process_valid):
+        raise TraceError(f"invalid counter-only interval: {begin.key}")
     if end.mono_ns < begin.mono_ns:
         raise TraceError(f"wall counter regression: {begin.key}")
     thread: int | str = ""
@@ -91,8 +97,9 @@ def delta(begin: Sample, end: Sample) -> tuple[int | float | str, ...]:
                 cycles = end.cycles - begin.cycles
                 instructions = end.instructions - begin.instructions
                 ipc = instructions / cycles if cycles else ""
-    return (*begin.key, end.mono_ns - begin.mono_ns, thread, process, cycles, instructions,
-            ipc, status, begin.source)
+    wall: int | str = "" if counter_only else end.mono_ns - begin.mono_ns
+    return (*begin.key, wall, thread, process, cycles, instructions,
+            ipc, status, begin.source, measurement_kind(begin.key[1]))
 
 
 def paired(samples: list[Sample]) -> list[tuple[int | float | str, ...]]:

@@ -113,7 +113,19 @@ enum class stage : uint16_t {
     attn_pv_reconstruct      = 118,
     attn_pv_dequant_store    = 119,
     attn_plan_staging        = 120,
+    issue_main_descriptor    = 121,
+    issue_residual_descriptor = 122,
+    issue_index_descriptor   = 123,
+    issue_readback_descriptor = 124,
+    issue_scale_descriptor   = 125,
+    acc_scale_columns_api    = 126,
+    acc_index_entries_api    = 127,
 };
+
+inline bool issue_counter_stage(stage st) noexcept {
+    const auto id = static_cast<uint16_t>(st);
+    return (id >= 26 && id <= 39) || (id >= 45 && id <= 49) || (id >= 121 && id <= 127);
+}
 
 enum class event : uint8_t {
     begin        = 1,
@@ -312,14 +324,16 @@ inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uin
     // wait. Waits and handoffs (never inside a RoCC issue window) carry CLOCK_MONOTONIC.
     if (mono != 0) {
         e.reserved = mono;
-    } else if (r->direct_all || ev == event::wait_begin || ev == event::wait_end || ev == event::handoff_send ||
+    } else if ((!issue_counter_stage(st) && r->direct_all) || ev == event::wait_begin || ev == event::wait_end || ev == event::handoff_send ||
                ev == event::handoff_recv) {
         e.reserved = detail::mono_ns();
     } else {
         e.reserved = 0;
     }
     // Never insert clock syscalls inside accelerator command windows.
-    if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end) &&
+    if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end) && issue_counter_stage(st)) {
+        r->cpu_samples[h] = sample_issue_cpu(r->pinned_cpu);
+    } else if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end) &&
         !(static_cast<uint16_t>(st) >= 26 && static_cast<uint16_t>(st) <= 49 &&
           st != stage::final_reconstruct_int64 && st != stage::final_dequant_merge)) {
         auto & sample = r->cpu_samples[h];
