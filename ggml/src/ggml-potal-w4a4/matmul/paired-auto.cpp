@@ -758,7 +758,20 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
 
     // The ACC1 chain of every J group: first / last (panel, window) with residual work.
     size_t first_panel = no_index, first_window = no_index, last_panel = no_index, last_window = no_index;
+    size_t windows = 0, entries = 0;
+    bool sized = true;
     for (const potal_paired_k_panel & panel : tile.panels) {
+        sized = sized && add(windows, panel.windows.size(), windows);
+        for (const potal_paired_index_window & window : panel.windows) {
+            // Count emitted entries, including filler before the last fragment.
+            // Malformed geometry is still handled by the ordinary builder/validator.
+            size_t count = 0;
+            sized = sized && window.fragment_begin < window.fragment_end &&
+                    window.fragment_end <= tile.fragments.size() &&
+                    mul(window.fragment_end - window.fragment_begin - 1, D, count) &&
+                    add(count, tile.fragments[window.fragment_end - 1].count, count) &&
+                    add(entries, count, entries);
+        }
         if (panel.windows.empty()) {
             continue;
         }
@@ -768,6 +781,25 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
         }
         last_panel  = panel.index;
         last_window = panel.windows.size() - 1;
+    }
+    // Each residency emits six ops and three transitions; each residual
+    // window adds five ops. ACC0 and, when present, ACC1 complete once per J.
+    // These are capacity hints only: leave unsafe sizes to the existing path.
+    size_t residencies = 0, scales = 0, transitions = 0, ops = 0, residual_ops = 0, completes = 0;
+    if (sized && mul(tile.j_groups, tile.k_panels, residencies) &&
+        mul(tile.j_groups, windows, windows) && mul(tile.j_groups, entries, entries) &&
+        add(residencies, windows, scales) && mul(residencies, 3, transitions) &&
+        mul(residencies, 6, ops) && mul(windows, 5, residual_ops) &&
+        add(ops, residual_ops, ops) && mul(tile.j_groups, first_panel != no_index ? 2 : 1, completes) &&
+        add(ops, completes, ops) &&
+        ops <= b.plan.ops.max_size() && entries <= b.plan.index_entries.max_size() &&
+        scales <= b.plan.scale_windows.max_size() && residencies <= b.plan.residencies.max_size() &&
+        transitions <= b.plan.transitions.max_size()) {
+        b.plan.ops.reserve(ops);
+        b.plan.index_entries.reserve(entries);
+        b.plan.scale_windows.reserve(scales);
+        b.plan.residencies.reserve(residencies);
+        b.plan.transitions.reserve(transitions);
     }
     const size_t last_J = tile.j_tiles - (tile.j_groups - 1) * tile.tile_J;
 
