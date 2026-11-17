@@ -1335,7 +1335,10 @@ potal_paired_jk_cost actual_jk_cost(const potal_paired_execution_plan & e, size_
     potal_paired_jk_cost c;
     c.main_loops = e.main_gemms;
     c.residual_loops = e.residual_gemms;
-    c.index_writes = e.index_entries.size();
+    for (const auto & op : e.ops) {
+        if (op.kind == potal_paired_op_kind::index_program)
+            c.index_writes += op.entry_end - op.entry_begin;
+    }
     for (const auto & w : e.scale_windows) {
         const auto & residency = e.residencies[w.residency];
         bool alias = reuse && w.residual;

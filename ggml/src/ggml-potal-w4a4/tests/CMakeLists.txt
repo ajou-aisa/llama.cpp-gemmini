@@ -52,3 +52,13 @@ if (NOT CMAKE_CROSSCOMPILING)
     add_test(NAME potal-w4a4-counters-test COMMAND potal-w4a4-golden-test dense-random)
     set_tests_properties(potal-w4a4-counters-test PROPERTIES PASS_REGULAR_EXPRESSION "W4A4_COUNTERS dense-random PASS")
 endif()
+
+# Native command-level regression for shared same-stripe Index payload storage.
+if (NOT CMAKE_CROSSCOMPILING)
+    add_executable(potal-index-payload-test ${CMAKE_CURRENT_LIST_DIR}/potal-index-payload-test.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-index-payload-test)
+    target_include_directories(potal-index-payload-test PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+    target_link_libraries(potal-index-payload-test PRIVATE ggml)
+    add_test(NAME potal-index-payload-test COMMAND potal-index-payload-test)
+    set_tests_properties(potal-index-payload-test PROPERTIES TIMEOUT 60)
+endif()

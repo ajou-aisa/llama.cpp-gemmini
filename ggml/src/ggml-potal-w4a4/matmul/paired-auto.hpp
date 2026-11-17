@@ -394,7 +394,7 @@ struct potal_paired_execution_plan {
     potal_paired_tile_plan                    tile;
     std::vector<residual::lane_row>           residual_rows; // Residual A / C row i = (lane, source row): provenance
     std::vector<potal_paired_op>              ops;
-    std::vector<potal_paired_index_entry>     index_entries;
+    std::vector<potal_paired_index_entry>     index_entries; // different ops may reference the same entry range
     std::vector<potal_paired_scale_window>    scale_windows;
     std::vector<potal_paired_residency>       residencies;
     std::vector<potal_paired_pair_transition> transitions;

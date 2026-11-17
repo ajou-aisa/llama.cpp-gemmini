@@ -787,7 +787,7 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
     // These are capacity hints only: leave unsafe sizes to the existing path.
     size_t residencies = 0, scales = 0, transitions = 0, ops = 0, residual_ops = 0, completes = 0;
     if (sized && mul(tile.j_groups, tile.k_panels, residencies) &&
-        mul(tile.j_groups, windows, windows) && mul(tile.j_groups, entries, entries) &&
+        mul(tile.j_groups, windows, windows) &&
         add(residencies, windows, scales) && mul(residencies, 3, transitions) &&
         mul(residencies, 6, ops) && mul(windows, 5, residual_ops) &&
         add(ops, residual_ops, ops) && mul(tile.j_groups, first_panel != no_index ? 2 : 1, completes) &&
@@ -804,6 +804,9 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
     const size_t last_J = tile.j_tiles - (tile.j_groups - 1) * tile.tile_J;
 
     for (size_t g = 0; g < tile.j_groups; ++g) {
+        // Every J group uses the same panel/window Index payload. Only the
+        // per-op Index header (B base, J width, buffer) changes between groups.
+        size_t entry_cursor = 0;
         const size_t j_tiles_g = g + 1 == tile.j_groups ? last_J : tile.tile_J;
         const size_t pad_j     = g + 1 == tile.j_groups ? tile.pad_J : 0;
         for (size_t p = 0; p < tile.k_panels; ++p) {
@@ -923,9 +926,9 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
                     op.index_active_rows        = win.active_rows;
                     op.b_sp_begin               = b_begin;
                     op.b_sp_rows                = b_rows;
-                    op.entry_begin              = b.plan.index_entries.size();
+                    op.entry_begin              = entry_cursor;
                     op.same_buffer_predecessor  = b.last_indexed_gemm[q];
-                    for (size_t f = win.fragment_begin; f < win.fragment_end; ++f) {
+                    for (size_t f = win.fragment_begin; g == 0 && f < win.fragment_end; ++f) {
                         const potal_paired_fragment & fr   = tile.fragments[f];
                         const size_t                  slot0 = (f - win.fragment_begin) * D;
                         const size_t first_k = potal_paired_fragment_original_k(*residual, fr, 0, hw);
@@ -950,7 +953,8 @@ potal_paired_status potal_make_execution_plan(const potal_paired_tile_plan & til
                             }
                         }
                     }
-                    op.entry_end = b.plan.index_entries.size();
+                    op.entry_end = g == 0 ? b.plan.index_entries.size() : entry_cursor + win.active_rows;
+                    entry_cursor = op.entry_end;
                     index_op     = b.add(op);
                     b.dep(index_op, load_b, false);
                     b.dep(index_op, b.last_indexed_gemm[q], false); // same buffer: hardware-stalled while busy
@@ -2540,15 +2544,18 @@ struct executor {
             const auto & w = report.tile.panels[window.panel].windows[window.index];
             report.counts.residual_load_bytes_declared += staging.rows * potal_int4_row_bytes(w.active_rows) * report.tile.j_groups;
         }
-        // Useful packed bytes per row: count each byte with a non-filler slot once.
-        for (size_t e = 0; e < plan.index_entries.size(); ++e) {
-            const auto & entry = plan.index_entries[e];
-            if (entry.filler) continue;
-            const bool previous_low = entry.slot % 2 != 0 && e != 0 &&
-                plan.index_entries[e - 1].slot + 1 == entry.slot && !plan.index_entries[e - 1].filler;
-            if (!previous_low) report.counts.residual_valid_bytes += staging.rows;
+        // Staging is shared across J groups. Count group 0's useful packed
+        // bytes, for both shared and caller-supplied expanded entry storage.
+        for (const auto & op : plan.ops) {
+            if (op.kind != potal_paired_op_kind::index_program || op.j_group != 0) continue;
+            for (size_t e = op.entry_begin; e < op.entry_end; ++e) {
+                const auto & entry = plan.index_entries[e];
+                if (entry.filler) continue;
+                const bool previous_low = entry.slot % 2 != 0 && e != op.entry_begin &&
+                    plan.index_entries[e - 1].slot + 1 == entry.slot && !plan.index_entries[e - 1].filler;
+                if (!previous_low) report.counts.residual_valid_bytes += staging.rows;
+            }
         }
-        report.counts.residual_valid_bytes /= report.tile.j_groups;
         const char * manifest = std::getenv("POTAL_STREAM_MANIFEST");
         if (manifest && std::strcmp(manifest, "1") == 0) {
             size_t ordinal = 0;
