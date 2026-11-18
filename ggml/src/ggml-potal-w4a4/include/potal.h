@@ -840,7 +840,9 @@ potal_status potal_paired_h2_close(potal_paired_session **session);
  * A software sink must supply counter with the same borrowed sink.ctx.
  * No timing or hardware claim follows from software-sink values. */
 #define POTAL_PREFETCH_OBSERVATION_TAG UINT64_C(0x504f425300000000)
-#define POTAL_PREFETCH_OBSERVATION_CAPABILITY UINT64_C(0x504f425302200407)
+/* RTL signatures carry the physical DIM in bits [23:16] (0x20 at DIM32). */
+#define POTAL_CAPABILITY_DIM_FIELD ((uint64_t) POTAL_HW_DIM << 16)
+#define POTAL_PREFETCH_OBSERVATION_CAPABILITY (UINT64_C(0x504f425302000407) | POTAL_CAPABILITY_DIM_FIELD)
 typedef potal_status (*potal_observation_counter_fn)(void *ctx,
     const potal_paired_cmd_record *record, uint64_t *value);
 
@@ -883,9 +885,9 @@ typedef struct potal_stream_config {
 } potal_stream_config;
 
 #define POTAL_STREAM_TAG UINT64_C(0x4853384800000000)
-#define POTAL_STREAM_CAPABILITY UINT64_C(0x4853384802200403)
+#define POTAL_STREAM_CAPABILITY (UINT64_C(0x4853384802000403) | POTAL_CAPABILITY_DIM_FIELD)
 #define POTAL_STREAM_EARLY_TAG UINT64_C(0x4853384801000000)
-#define POTAL_STREAM_EARLY_CAPABILITY UINT64_C(0x4853384802200407)
+#define POTAL_STREAM_EARLY_CAPABILITY (UINT64_C(0x4853384802000407) | POTAL_CAPABILITY_DIM_FIELD)
 
 typedef struct potal_stream_panel_status {
     potal_h2_ref ref;
@@ -930,7 +932,7 @@ potal_status potal_paired_stream_counters_end(potal_paired_session *,
  * Main on the other pair, and a later checked global drain before consumers.
  * Its status response acknowledges admission only. No CPU fence is omitted. */
 #define POTAL_LDB_ONLY_TAG UINT64_C(0x504f4c4400000000)
-#define POTAL_LDB_ONLY_CAPABILITY UINT64_C(0x504f4c4402200401)
+#define POTAL_LDB_ONLY_CAPABILITY (UINT64_C(0x504f4c4402000401) | POTAL_CAPABILITY_DIM_FIELD)
 #define POTAL_LDB_ONLY_TRACE_RESET (POTAL_LDB_ONLY_TAG | UINT64_C(0x100))
 #define POTAL_LDB_ONLY_TRACE_READ (POTAL_LDB_ONLY_TAG | UINT64_C(0x200))
 #define POTAL_LDB_ONLY_TRACE_FIELDS 28

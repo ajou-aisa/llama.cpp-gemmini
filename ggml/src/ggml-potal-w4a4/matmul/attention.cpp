@@ -14,6 +14,7 @@
 #include <cfenv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -38,8 +39,14 @@ namespace {
 namespace exsia = ggml::gemmini::quants::act::exsia;
 constexpr int16_t zero_exp = std::numeric_limits<int16_t>::min();
 constexpr int bits = 4, code_bits = 8, radix = 16, bias = 8, rho = 6;
-static_assert(POTAL_HW_DIM == 32 && block_k == POTAL_HW_DIM, "W4 attention requires DIM32/K32");
+// Admitted: (DIM32, Bk32) and every DIM with Bk64; (DIM16, Bk32) stays refused (untested).
+constexpr bool supported_geometry = POTAL_HW_DIM == 32 || POTAL_SCALE_BLOCK_K == 64;
+constexpr const char * unsupported_geometry =
+    "W4 attention supports DIM32/Bk32 and Bk64 at DIM16/32/64; Linear geometry is separate";
 namespace rmd = ggml::gemmini::rmd;
+// Packed carriers ([kp / block_k][n]) and the planner's scale block are one quantity.
+static_assert(block_k == quants::weight::hp1::block_k && block_k == rmd::kBlockSize,
+              "attention, HP1 and RMD scale blocks must agree");
 
 void require(bool condition, potal_status status = POTAL_ERR_INVALID_ARGUMENT) {
     if (!condition) {
@@ -48,6 +55,10 @@ void require(bool condition, potal_status status = POTAL_ERR_INVALID_ARGUMENT) {
 }
 
 template<class F> potal_status checked(F && action) {
+    if (!supported_geometry) {
+        std::fprintf(stderr, "%s\n", unsupported_geometry);
+        return POTAL_ERR_UNSUPPORTED;
+    }
     try {
         action();
         return POTAL_OK;
@@ -274,7 +285,7 @@ struct activation_parts {
     std::vector<int16_t> exponents; // QK: [rows][kp / 32] local block exponents
     bool main_only = false;
     const std::vector<int> * shifts = nullptr;
-    std::vector<uint32_t> selected; // One mask per K32 block, disjoint across Local workers.
+    std::vector<uint64_t> selected; // One mask per Bk block, disjoint across Local workers.
 };
 
 void init_activation(const ggml_tensor & tensor, size_t head, size_t batch, size_t begin, size_t rows,
@@ -341,7 +352,7 @@ void local_activation(const ggml_tensor & tensor, size_t head, size_t batch, siz
                                         , sample
 #endif
                                         ));
-            if (parts.shifts) parts.selected[i * blocks + block] = uint32_t(mask_word);
+            if (parts.shifts) parts.selected[i * blocks + block] = mask_word;
         }
     }
 }
@@ -366,7 +377,7 @@ void fold_activation(role operation, stream & out, activation_parts & parts) {
                 out.codes[i * out.kp + k] = exsia::detail::shift_q_i32(
                     out.codes[i * out.kp + k], e == zero_exp ? 0 : int16_t(e - anchor));
                 if (parts.shifts && e <= anchor &&
-                    !(parts.selected[i * blocks + k / block_k] & (uint32_t{1} << (k % block_k)))) {
+                    !(parts.selected[i * blocks + k / block_k] & (uint64_t{1} << (k % block_k)))) {
                     out.codes[i * out.kp + k] = std::clamp(out.codes[i * out.kp + k], -8, 7);
                 }
             }
@@ -452,18 +463,53 @@ void integer_reference(const stream & activation, const stationary & weight, rol
                        std::vector<int64_t> & out) {
     validate_prepared(activation, weight, operation);
     out.assign(product(activation.rows, weight.n), 0);
+    constexpr size_t D = POTAL_HW_DIM;
+    // Hardware lowering: Main (limb 0) is one D-wide pass per D K. Upper limbs use the paired
+    // fragments: per D-row execution slice and block, the ascending K support over all upper
+    // limbs and rows of the slice, chunked into <= D compact K (decode_upper, potal_paired_fragments).
+    // Each pass or fragment is SCU-shifted by its block carrier and Sat32-added in order.
+    std::vector<std::vector<std::vector<uint32_t>>> fragments((activation.rows + D - 1) / D);
+    for (size_t slice = 0; slice < fragments.size(); ++slice) {
+        const size_t row_end = std::min(activation.rows, (slice + 1) * D);
+        for (size_t block = 0; block < activation.kp / block_k; ++block) {
+            std::vector<uint32_t> support;
+            for (size_t k = block * block_k; k < (block + 1) * block_k; ++k) {
+                bool used = false;
+                for (size_t limb = 1; limb < activation.limb_count && !used; ++limb)
+                    for (size_t i = slice * D; i < row_end && !used; ++i)
+                        used = activation.limbs[limb][i * activation.kp + k] != 0;
+                if (used) support.push_back(uint32_t(k));
+            }
+            for (size_t f = 0; f < support.size(); f += D)
+                fragments[slice].emplace_back(support.begin() + f,
+                                              support.begin() + std::min(support.size(), f + D));
+        }
+    }
     // Gemmini scaled_add order: stationary pass, main, then original upper lanes.
     for (size_t pass = 0; pass < (operation == role::qk ? 2u : 1u); ++pass) {
         for (size_t limb = 0; limb < activation.limb_count; ++limb) {
             for (size_t i = 0; i < activation.rows; ++i) {
+                const auto & row_fragments = fragments[i / D];
+                const int8_t * a = activation.limbs[limb].data() + i * activation.kp;
                 for (size_t j = 0; j < weight.n; ++j) {
                     int32_t acc = 0;
-                    for (size_t begin = 0; begin < activation.kp; begin += block_k) {
-                        int32_t partial = 0;
-                        for (size_t k = begin; k < begin + block_k; ++k)
-                            partial += int32_t(activation.limbs[limb][i * activation.kp + k]) *
-                                       weight.limbs[pass][k * weight.n + j];
-                        acc = sat32(int64_t(acc) + scu(partial, weight.carriers[(begin / block_k) * weight.n + j], 0));
+                    const auto add = [&](int32_t partial, size_t k) {
+                        acc = sat32(int64_t(acc) + scu(partial, weight.carriers[(k / block_k) * weight.n + j], 0));
+                    };
+                    if (limb == 0) {
+                        for (size_t begin = 0; begin < activation.kp; begin += D) {
+                            int32_t partial = 0;
+                            for (size_t k = begin; k < begin + D; ++k)
+                                partial += int32_t(a[k]) * weight.limbs[pass][k * weight.n + j];
+                            add(partial, begin);
+                        }
+                    } else {
+                        for (const auto & fragment : row_fragments) {
+                            int32_t partial = 0;
+                            for (const uint32_t k : fragment)
+                                partial += int32_t(a[k]) * weight.limbs[pass][k * weight.n + j];
+                            add(partial, fragment.front());
+                        }
                     }
                     reconstruct(out[i * weight.n + j], acc, limb + pass);
                 }
@@ -566,9 +612,9 @@ std::unique_ptr<strict_job> stage_job(size_t task, const stream & activation,
                 require(bool(g.upper_c), POTAL_ERR_CAPACITY);
             }
             potal_tile_plan selected_plan;
-            require(potal_tile_select(g.rows, weight->n, activation.kp, 1, &selected_plan) == POTAL_OK,
+            require(potal_tile_select(g.rows, weight->n, activation.kp, block_k / POTAL_HW_DIM, &selected_plan) == POTAL_OK,
                     POTAL_ERR_CAPACITY);
-            require(potal_frozen_plan(g.rows, weight->n, activation.kp, 1, 1, selected_plan.tile_K, 1,
+            require(potal_frozen_plan(g.rows, weight->n, activation.kp, 1, 1, selected_plan.tile_K, block_k / POTAL_HW_DIM,
                                       &g.main) == POTAL_OK, POTAL_ERR_CAPACITY);
             auto & req = g.request;
             req.stripe_id = task;
@@ -846,6 +892,11 @@ potal_status column_bias(const stationary & weight, std::vector<int64_t> & out) 
 
 result execute(ggml_tensor * op, const paired_runner & paired, pv_algorithm algorithm) {
     result report;
+    if (!supported_geometry) {
+        report.status = POTAL_ERR_UNSUPPORTED;
+        report.stage = unsupported_geometry;
+        return report;
+    }
     if (check(op, true) != GGML_POTAL_REJECT_NONE || !paired || algorithm != default_pv_algorithm) {
         report.status = POTAL_ERR_INVALID_ARGUMENT;
         report.stage = "attention_contract";
@@ -923,6 +974,11 @@ result execute(ggml_tensor * op, const paired_runner & paired, pv_algorithm algo
 result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<int, 5> & role_cpus, bool pin,
                       pv_algorithm algorithm) {
     result report;
+    if (!supported_geometry) {
+        report.status = POTAL_ERR_UNSUPPORTED;
+        report.stage = unsupported_geometry;
+        return report;
+    }
     if (check(op, true) != GGML_POTAL_REJECT_NONE || algorithm != default_pv_algorithm) {
         report.status = POTAL_ERR_INVALID_ARGUMENT;
         report.stage = "attention_contract";
@@ -1257,6 +1313,11 @@ result execute_strict(ggml_tensor * op, stripe_owner & owner, const std::array<i
 
 result execute_strict_hardware(ggml_tensor * op) {
     result report;
+    if (!supported_geometry) {
+        report.status = POTAL_ERR_UNSUPPORTED;
+        report.stage = unsupported_geometry;
+        return report;
+    }
     std::array<int, 5> cpus{};
     std::string why;
     if (!cached_role_cpus(cpus, why)) {

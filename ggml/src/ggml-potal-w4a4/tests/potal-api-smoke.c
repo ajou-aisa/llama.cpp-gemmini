@@ -23,7 +23,7 @@
 #include "potal_hw_params.h"
 #include "potal_rocc.h"
 
-#if POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32
+#if POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32 && POTAL_HW_DIM != 64
 #error "potal-api-smoke requires DIM16 or DIM32"
 #endif
 

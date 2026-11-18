@@ -15,15 +15,26 @@ option(POTAL_ENABLE_OPENMP "Add the OpenMP worker mode to potal-multicore-smoke 
 
 potal_configure_hw_params("${CMAKE_BINARY_DIR}/generated")
 
+set(POTAL_SCALE_BLOCK_K "32" CACHE STRING "W4 logical scale block K (native storage remains 32)")
+set_property(CACHE POTAL_SCALE_BLOCK_K PROPERTY STRINGS 32 64)
+math(EXPR _potal_scale_rem "${POTAL_SCALE_BLOCK_K} % ${POTAL_HW_DIM}")
+if(NOT POTAL_SCALE_BLOCK_K MATCHES "^(32|64)$" OR NOT _potal_scale_rem EQUAL 0)
+    message(FATAL_ERROR "W4 POTAL_SCALE_BLOCK_K must be 32 or 64 and a multiple of DIM=${POTAL_HW_DIM}")
+endif()
+
 # The shared validator retains its W8 contract. Validate the packed fork's
 # additional identity and exact geometry locally, without changing that file.
 file(READ "${POTAL_HW_PARAMS}" _potal_w4_header)
 string(REPLACE "\n" "\n\n" _potal_w4_header "\n${_potal_w4_header}\n")
 string(REPLACE ";" "<SEMICOLON>" _potal_w4_header "${_potal_w4_header}")
-foreach(_pair IN ITEMS "DIM=32" "BANK_NUM=4" "BANK_ROWS=2048" "ACC_ROWS=512"
-        "MAX_BYTES=64" "MAX_BLOCK_LEN=4" "MAX_BLOCK_LEN_ACC=1"
+math(EXPR _potal_w4_bank_rows "64 * ${POTAL_HW_DIM}")
+math(EXPR _potal_w4_acc_rows "16 * ${POTAL_HW_DIM}")
+math(EXPR _potal_w4_row_bytes "${POTAL_HW_DIM} / 2")
+math(EXPR _potal_w4_block_len "64 / ${_potal_w4_row_bytes}")
+foreach(_pair IN ITEMS "DIM=${POTAL_HW_DIM}" "BANK_NUM=4" "BANK_ROWS=${_potal_w4_bank_rows}" "ACC_ROWS=${_potal_w4_acc_rows}"
+        "MAX_BYTES=64" "MAX_BLOCK_LEN=${_potal_w4_block_len}"
         "POTAL_SCALE_SLOT_BITS=8" "POTAL_INDEX_ENTRIES=64"
-        "POTAL_INPUT_BITS=4" "POTAL_ACC_BITS=32" "POTAL_PACKING_ABI=1" "POTAL_SP_ROW_BYTES=16")
+        "POTAL_INPUT_BITS=4" "POTAL_ACC_BITS=32" "POTAL_PACKING_ABI=1" "POTAL_SP_ROW_BYTES=${_potal_w4_row_bytes}")
     string(REPLACE "=" ";" _parts "${_pair}")
     list(GET _parts 0 _name)
     list(GET _parts 1 _expected)
@@ -32,19 +43,34 @@ foreach(_pair IN ITEMS "DIM=32" "BANK_NUM=4" "BANK_ROWS=2048" "ACC_ROWS=512"
         message(FATAL_ERROR "PoTal W4A4 requires ${_name}=${_expected}, got ${_actual}")
     endif()
 endforeach()
+# The generator writes MAX_BLOCK_LEN_ACC either as 1 or as its derivation
+# (MAX_BYTES/(DIM*4)); both must evaluate to one full-ACC row per MVOUT.
+string(REGEX MATCHALL "\n[ \t]*#[ \t]*define[ \t]+MAX_BLOCK_LEN_ACC[ \t][^\n]*\n" _potal_w4_acc_len "${_potal_w4_header}")
+list(LENGTH _potal_w4_acc_len _potal_w4_acc_count)
+if(NOT _potal_w4_acc_count EQUAL 1 OR NOT _potal_w4_acc_len MATCHES
+   "^\n[ \t]*#[ \t]*define[ \t]+MAX_BLOCK_LEN_ACC[ \t]+(1|\\(MAX_BYTES/\\(DIM\\*4\\)\\))[ \t\r]*\n$")
+    message(FATAL_ERROR "PoTal W4A4 requires one MAX_BLOCK_LEN_ACC defined as 1 or (MAX_BYTES/(DIM*4))")
+endif()
+math(EXPR _potal_w4_acc_value "64 / (${POTAL_HW_DIM} * 4)")
+if(CMAKE_MATCH_1 STREQUAL "1")
+    set(_potal_w4_acc_value 1)
+endif()
+if(NOT _potal_w4_acc_value EQUAL 1)
+    message(FATAL_ERROR "PoTal W4A4 requires MAX_BLOCK_LEN_ACC=1, got ${_potal_w4_acc_value}")
+endif()
 _potal_hw_typedef("${_potal_w4_header}" full_t int64_t)
 get_filename_component(_potal_w4_basename "${POTAL_HW_PARAMS}" NAME)
-if(NOT _potal_w4_basename STREQUAL "gemmini_potal_w4a4_d32_params.h")
-    message(FATAL_ERROR "PoTal W4A4 requires gemmini_potal_w4a4_d32_params.h")
+if(NOT _potal_w4_basename STREQUAL "gemmini_potal_w4a4_d${POTAL_HW_DIM}_params.h")
+    message(FATAL_ERROR "PoTal W4A4 requires gemmini_potal_w4a4_d${POTAL_HW_DIM}_params.h")
 endif()
 file(READ "${POTAL_HW_GENERATED_DIR}/potal_build_manifest.txt" _potal_w4_manifest)
 string(REPLACE "precision=A8W8 elem_t=int8_t acc_t=int32_t"
-    "precision=W4A4 elem_t=int8_t(logical) acc_t=int32_t packing_abi=1 sp_row_bytes=16"
+    "precision=W4A4 elem_t=int8_t(logical) acc_t=int32_t packing_abi=1 sp_row_bytes=${_potal_w4_row_bytes}\nscale_block_k=${POTAL_SCALE_BLOCK_K}\nnative_storage_block_k=32"
     _potal_w4_manifest "${_potal_w4_manifest}")
 file(WRITE "${POTAL_HW_GENERATED_DIR}/potal_build_manifest.txt" "${_potal_w4_manifest}")
 
 add_library(potal-api STATIC potal.c)
-target_compile_definitions(potal-api PUBLIC POTAL_W4A4=1)
+target_compile_definitions(potal-api PUBLIC POTAL_W4A4=1 POTAL_SCALE_BLOCK_K=${POTAL_SCALE_BLOCK_K})
 target_include_directories(potal-api PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${POTAL_HW_GENERATED_DIR})
@@ -166,7 +192,7 @@ endif()
 
 # Hardware smoke test: RISC-V only, for the bounded DIM16/DIM32 GEMM path.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
-    if (POTAL_HW_DIM EQUAL 16 OR POTAL_HW_DIM EQUAL 32)
+    if (POTAL_HW_DIM EQUAL 16 OR POTAL_HW_DIM EQUAL 32 OR POTAL_HW_DIM EQUAL 64)
         add_executable(potal-api-smoke tests/potal-api-smoke.c)
         target_link_libraries(potal-api-smoke PRIVATE potal-api)
         set_target_properties(potal-api-smoke PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
@@ -206,8 +232,8 @@ endif()
 
 # ---- GGML backend (GGML_POTAL=ON) -------------------------------------------
 
-if (NOT POTAL_HW_DIM EQUAL 16 AND NOT POTAL_HW_DIM EQUAL 32)
-    message(FATAL_ERROR "GGML_POTAL: MUL_MAT offload requires DIM16 or DIM32 (header DIM=${POTAL_HW_DIM})")
+if (NOT POTAL_HW_DIM MATCHES "^(16|32|64)$")
+    message(FATAL_ERROR "GGML_POTAL: MUL_MAT offload requires DIM16/32/64 (header DIM=${POTAL_HW_DIM})")
 endif()
 if (GGML_BACKEND_DL)
     message(FATAL_ERROR "GGML_POTAL supports static backend registration only (GGML_BACKEND_DL=OFF)")
@@ -224,8 +250,9 @@ if (NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL "4" OR NOT GGML_GEMMINI_WEIGHT_BIT
     message(FATAL_ERROR "GGML_POTAL_W4A4 requires GGML_GEMMINI_ACTIVATION_BITS=4 and GGML_GEMMINI_WEIGHT_BITS=4 "
                         "(got ${GGML_GEMMINI_ACTIVATION_BITS}/${GGML_GEMMINI_WEIGHT_BITS})")
 endif()
-if (NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL "32")
-    message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_BLOCK_SIZE must be 32, the MXINT4 scale block (got ${GGML_GEMMINI_BLOCK_SIZE})")
+if (NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL POTAL_SCALE_BLOCK_K)
+    message(FATAL_ERROR "GGML_POTAL: GGML_GEMMINI_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE} must equal "
+                        "POTAL_SCALE_BLOCK_K=${POTAL_SCALE_BLOCK_K} (activation group = W4 scale block)")
 endif()
 # Execution modes (matmul/options.hpp): FULL runs every activation algorithm
 # and, under RMD, the CPU (cpu_direct) residual; STRIPE_PIPELINE runs EXSIA

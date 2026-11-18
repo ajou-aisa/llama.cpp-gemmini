@@ -181,6 +181,8 @@ static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 b
 typedef block_q4_0 block_q4_h0;
 
 #define QK4_HP QK4_0
+// Bk=64 MXINT4 shares one block exponent across two adjacent block_q4_hp1 halves.
+#define QK4_HP_B64 (2*QK4_HP)
 typedef struct {
     uint8_t  qs[QK4_HP / 2]; // same low-half/high-half mapping as block_q4_0
     int16_t  m;

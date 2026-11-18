@@ -34,7 +34,7 @@ class RmdBitmapBuilder {
     std::vector<uint16_t>         limb_masks_;
     std::vector<int8_t>           digits_; // storage; only [0, digit_count_) is live
     size_t                        digit_count_ = 0;
-    std::vector<std::array<uint32_t, kMaxNativeRadixLanes>> block_lane_masks_;
+    std::vector<std::array<KMask, kMaxNativeRadixLanes>> block_lane_masks_;
     std::vector<uint64_t>                                   lane_rows_;
     std::vector<uint8_t>                                    row_seen_;
     std::vector<uint32_t>                                   block_indices_, row_ranks_;

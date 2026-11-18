@@ -16,14 +16,24 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
 namespace ggml::gemmini::rmd {
 
 constexpr size_t kArrayDim               = DIM;
+#if defined(POTAL_W4A4) && POTAL_W4A4
+#ifndef POTAL_SCALE_BLOCK_K
+#define POTAL_SCALE_BLOCK_K 32
+#endif
+constexpr size_t kNativeWeightScaleGroup = POTAL_SCALE_BLOCK_K;
+#else
 constexpr size_t kNativeWeightScaleGroup = 32;
+#endif
 constexpr size_t kBlockSize              = kNativeWeightScaleGroup;
+using KMask = std::conditional_t<kBlockSize == 64, uint64_t, uint32_t>;
+static_assert(kBlockSize == 32 || kBlockSize == 64, "supported scale groups are 32 and 64");
 constexpr size_t kMaxNativeRadixLanes    = 9;
 
 // Full INT32 residuals need up to 9/5/3 balanced INT4/8/16 digits. The extra
@@ -36,7 +46,8 @@ static_assert(kBlockSize > 0, "native weight scale group must be positive");
 static_assert(kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
               "Gemmini DIM and native weight scale group must divide one another");
 
-constexpr uint32_t kPacketVersion = 7;
+// The wider W4 K support is a distinct schema. W8/default32 retain version 7.
+constexpr uint32_t kPacketVersion = kBlockSize == 64 ? 8 : 7;
 
 enum class DigitStorage : uint8_t {
     invalid      = 0,
@@ -101,7 +112,7 @@ struct LaneGroupDescriptor {
     std::vector<uint8_t>                           lane_positions;
     std::array<uint32_t, kMaxNativeRadixLanes + 1> row_offsets{};
     std::vector<uint16_t>                          row_ids;
-    uint32_t k_mask                 = 0; // original block-local K, shared by the group's lanes
+    KMask k_mask                    = 0; // original block-local K, shared by the group's lanes
     uint16_t padded_k_count         = 0;
     uint32_t activation_offset      = 0;
     uint32_t activation_byte_offset = 0;
@@ -120,7 +131,7 @@ struct BlockDescriptor {
     uint16_t active_lane_mask  = 0; // bit l set when lane l carries a nonzero digit
     uint8_t  active_lane_count = 0;
     std::array<uint8_t, kMaxNativeRadixLanes>  lane_ids{};     // position -> lane id
-    std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{}; // lane id -> original block-local K
+    std::array<KMask, kMaxNativeRadixLanes> lane_k_masks{}; // lane id -> original block-local K
     std::vector<LaneGroupDescriptor>           groups;
 
     uint32_t k_index_offset         = 0; // into StripePacket::k_indices (block-local K)

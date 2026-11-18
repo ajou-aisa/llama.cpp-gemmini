@@ -4,6 +4,7 @@
 #include "quants/weight/hp1/hp1.hpp"
 #include "ggml-gemmini-args.h"
 #include "quants/common/hp1_scu.hpp"
+#include "ggml.h"
 
 #include <gemmini_params.h>
 
@@ -46,7 +47,7 @@ hp::status scalar(const ggml_gemmini_args_t & a, int8_t * B, size_t ldb,
         }
         return hp::status::route;
     }
-    if (!p.hp1_carriers || p.scales.block_size != 32) return hp::status::route;
+    if (!p.hp1_carriers || p.scales.block_size != 32 || a.K % hp::block_k != 0) return hp::status::route;
     if (reader) *reader = RS::Success;
     hp::stats s;
     bool have_m = false, have_scale = false;
@@ -59,13 +60,18 @@ hp::status scalar(const ggml_gemmini_args_t & a, int8_t * B, size_t ldb,
         const float scale = cs.column_scale;
         if (bits(scale) & 0x80000000u) return hp::status::channel_scale;
         const bool zero = bits(scale) == 0;
-        for (size_t b = 0; b < a.native_blocks_per_row; ++b) {
+        for (size_t b = 0; b < a.native_blocks_per_row; b += hp::block_k / 32) {
             const auto c = wr::read_hp1_carrier_validated(a, p, n, b);
             if (!c.ok()) {
                 if (reader) *reader = c.status;
                 return hp::status::metadata;
             }
             if (bits(c.column_scale) != bits(scale)) return hp::status::scale_mismatch;
+            if constexpr (hp::block_k == 64) {
+                const auto other = wr::read_hp1_carrier_validated(a, p, n, b + 1);
+                if (!other.ok()) { if (reader) *reader = other.status; return hp::status::metadata; }
+                if (other.carrier != c.carrier || bits(other.column_scale) != bits(scale)) return hp::status::pair_mismatch;
+            }
             if (c.carrier == ggml::gemmini::quants::hp1::zero_carrier) {
                 ++s.zero_blocks;
             } else {
@@ -77,9 +83,9 @@ hp::status scalar(const ggml_gemmini_args_t & a, int8_t * B, size_t ldb,
                 s.shift_blocks += m > 0 ? 1 : 0;
                 have_m = true;
             }
-            carriers[b * stride + n] = c.carrier;
+            carriers[(b / (hp::block_k / 32)) * stride + n] = c.carrier;
         }
-        s.blocks += a.native_blocks_per_row;
+        s.blocks += a.native_blocks_per_row / (hp::block_k / 32);
         scales[n] = scale;
         if (zero) {
             ++s.zero_rows;
@@ -151,8 +157,8 @@ std::vector<block_q4_hp1> fixture(size_t N, size_t K) {
     for (size_t n = 0; n < N; ++n) {
         for (size_t b = 0; b < K / 32; ++b) {
             auto & q = blocks[n * (K / 32) + b];
-            q.m = (n % 7 == 3 || (n + b) % 5 == 2) ? INT16_MIN :
-                  static_cast<int16_t>((n + b) % 3 == 0 ? 32767 : (n + b) % 33);
+            q.m = (n % 7 == 3 || (n + b / (hp::block_k / 32)) % 5 == 2) ? INT16_MIN :
+                  static_cast<int16_t>((n + b / (hp::block_k / 32)) % 3 == 0 ? 32767 : (n + b / (hp::block_k / 32)) % 33);
             q.channel_scale = n % 7 == 3 ? 0.0f : 0.125f * (1 + n % 9);
             // Every nibble, including -8, both half-blocks, and distinct columns.
             // Even zero-carrier blocks retain nonzero payload: packing is not math.
@@ -244,7 +250,7 @@ void compare(const char * name, const ggml_gemmini_args_t & a, size_t ldb, size_
 int main() {
     for (size_t N : {size_t(1), size_t(2), size_t(15), size_t(16), size_t(17),
                      size_t(31), size_t(32), size_t(33), size_t(65)}) {
-        for (size_t K : {size_t(32), size_t(64), size_t(96)}) {
+        for (size_t K : {size_t(hp::block_k), size_t(2 * hp::block_k), size_t(3 * hp::block_k)}) {
             const auto blocks = fixture(N, K);
             for (size_t gap : {size_t(0), size_t(10)}) {
                 char name[80];
@@ -254,7 +260,7 @@ int main() {
             }
         }
     }
-    const size_t N = 33, K = 96, ldb = 48, stride = 40;
+    const size_t N = 33, K = 3 * hp::block_k, ldb = 48, stride = 40;
     const auto original = fixture(N, K);
     auto check = [&](const char * name, hp::status want, auto mutate) {
         auto blocks = original;
@@ -281,16 +287,43 @@ int main() {
         b[0].channel_scale = -1.0f;
         b.back().padding[0] = 1;
     });
-    check("late-scale-mismatch", hp::status::scale_mismatch, [](auto & b, auto &) {
-        b[4 * 3 + 1].channel_scale *= 2.0f;
+    check("late-scale-mismatch", hp::block_k == 64 ? hp::status::pair_mismatch : hp::status::scale_mismatch, [](auto & b, auto &) {
+        b[4 * (3 * hp::block_k / 32) + 1].channel_scale *= 2.0f;
     });
     check("negative-scale", hp::status::channel_scale, [](auto & b, auto &) {
-        b[4 * 3].channel_scale = -1.0f;
+        b[4 * (3 * hp::block_k / 32)].channel_scale = -1.0f;
     });
     check("negative-zero", hp::status::channel_scale, [](auto & b, auto &) {
-        b[3 * 3].channel_scale = -0.0f;
+        b[3 * (3 * hp::block_k / 32)].channel_scale = -0.0f;
     });
-    check("zero-scale-live-carrier", hp::status::channel_scale, [](auto & b, auto &) { b[3 * 3 + 1].m = 0; });
+    check("zero-scale-live-carrier", hp::block_k == 64 ? hp::status::pair_mismatch : hp::status::channel_scale, [](auto & b, auto &) { b[3 * (3 * hp::block_k / 32) + 1].m = 0; });
+    if constexpr (hp::block_k == 64) {
+        check("late-group-scale-mismatch", hp::status::scale_mismatch, [](auto & b, auto &) {
+            b[4 * 6 + 2].channel_scale *= 2.0f;
+            b[4 * 6 + 3].channel_scale *= 2.0f;
+        });
+        check("zero-scale-live-group", hp::status::channel_scale, [](auto & b, auto &) {
+            b[3 * 6 + 2].m = b[3 * 6 + 3].m = 0;
+        });
+        // Real quantizers: ordinary MXINT4 chooses each native32 exponent alone and is
+        // refused; the Bk64 quantizer shares one exponent per 64-K group and is accepted.
+        std::vector<float> wf(N * K);
+        for (size_t i = 0; i < wf.size(); ++i)
+            wf[i] = float(int(i % 7) - 3) * ((i / 32) % 2 ? 8.0f : 0.25f);
+        check("bk32-quantized-model", hp::status::pair_mismatch, [&](auto & b, auto &) {
+            ggml_quantize_chunk(GGML_TYPE_MXINT4, wf.data(), b.data(), 0, N, K, nullptr);
+        });
+        check("bk64-quantized-model", hp::status::ok, [&](auto & b, auto &) {
+            ggml_quantize_chunk_mxint4_b64(wf.data(), b.data(), 0, N, K);
+        });
+        check("native-pair-m-mismatch", hp::status::pair_mismatch, [](auto & b, auto &) {
+            b[0].m = 0; b[1].m = 1;
+        });
+        check("zero-half-in-live-group", hp::status::ok, [](auto & b, auto &) {
+            b[0].m = b[1].m = 2;
+            std::fill_n(b[0].qs, 16, uint8_t(0x88));
+        });
+    }
     check("truncated-bytes", hp::status::route, [](auto &, auto & a) { --a.native_weight_bytes; });
     check("truncated-count", hp::status::route, [](auto &, auto & a) { --a.native_block_count; });
     check("wrong-row-blocks", hp::status::route, [](auto &, auto & a) { ++a.native_blocks_per_row; });

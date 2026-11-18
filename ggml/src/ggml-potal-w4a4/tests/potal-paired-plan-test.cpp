@@ -24,7 +24,8 @@ using namespace potal_test;
 
 namespace {
 
-constexpr uint32_t PPB = 32 / PD;
+constexpr uint32_t PPB = POTAL_SCALE_BLOCK_K / PD; // 32 / PD was 0 at DIM64
+static_assert(PPB > 0, "a scale block is at least one DIM pass");
 
 bool plan_limits_hold(const paired_tile_plan & p) {
     return p.tile_I * p.tile_K * PD <= p.partition_rows && p.tile_K * p.tile_J * PD <= p.weight_bank_rows &&

@@ -27,6 +27,8 @@
 //   acc  = pass p (K0, K1 | V): main << 4p, upper lane l << 4(l + 1 + p), checked per add;
 //          PV + 8 * colsum; F32 = float(ldexp(double(acc), stream_scale + base[j]))
 
+#include "potal_hw_params.h" // generated geometry constants only (physical DIM)
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -44,7 +46,11 @@ __extension__ typedef __int128 i128;
 
 constexpr int16_t  NEG                = std::numeric_limits<int16_t>::min();
 constexpr uint32_t ZERO_CARRIER       = 0x80000000u;
-constexpr size_t   BK                 = 32;
+#ifndef POTAL_SCALE_BLOCK_K
+#define POTAL_SCALE_BLOCK_K 32
+#endif
+constexpr size_t   BK                 = POTAL_SCALE_BLOCK_K;
+constexpr size_t   PHYSICAL_DIM       = POTAL_HW_DIM;
 constexpr int      PE_BITS            = 4;
 constexpr int      RADIX              = 16;
 constexpr int      DENSE_RHO          = PE_BITS - 2;
@@ -169,21 +175,22 @@ struct top3 {
 struct mxint4_weight {
     size_t                n = 0, k = 0;
     std::vector<int8_t>   q;       // [n][k]
-    std::vector<uint32_t> carrier; // [k / 32][n]
+    std::vector<uint32_t> carrier; // [k / BK][n]
     std::vector<float>    scale;   // [n]
 };
 
-// data: n rows of k / 32 blocks, row stride row_bytes. false (why) on a malformed block.
+// data: n rows of k / 32 native blocks (BK / 32 equal halves per scale group), row stride
+// row_bytes. false (why) on a malformed block or an unequal native pair.
 inline bool decode_mxint4(const uint8_t * data, size_t row_bytes, size_t n, size_t k, mxint4_weight & w,
                           std::string & why) {
-    if (k == 0 || k % BK != 0 || n == 0 || row_bytes < k / BK * MXINT4_BLOCK_BYTES) { why = "shape"; return false; }
+    if (k == 0 || k % BK != 0 || n == 0 || row_bytes < k / 32 * MXINT4_BLOCK_BYTES) { why = "shape"; return false; }
     const size_t blocks = k / BK;
     w.n = n; w.k = k;
     w.q.assign(n * k, 0);
     w.carrier.assign(blocks * n, ZERO_CARRIER);
     w.scale.assign(n, 0.0f);
     for (size_t j = 0; j < n; ++j)
-        for (size_t b = 0; b < blocks; ++b) {
+        for (size_t b = 0; b < k / 32; ++b) {
             const uint8_t * blk = data + j * row_bytes + b * MXINT4_BLOCK_BYTES;
             int16_t m; float s;
             std::memcpy(&m, blk + 16, 2);
@@ -193,10 +200,13 @@ inline bool decode_mxint4(const uint8_t * data, size_t row_bytes, size_t n, size
             if (b == 0) w.scale[j] = s;
             else if (std::memcmp(&s, &w.scale[j], 4) != 0) { why = "channel_scale_differs_within_row"; return false; }
             if (m != NEG && m < 0) { why = "negative_m"; return false; }
-            w.carrier[b * n + j] = m == NEG ? ZERO_CARRIER : (uint32_t) m;
+            const uint32_t carrier = m == NEG ? ZERO_CARRIER : (uint32_t) m;
+            const size_t logical = b / (BK / 32);
+            if (b % (BK / 32) && w.carrier[logical * n + j] != carrier) { why = "native_pair_mismatch"; return false; }
+            w.carrier[logical * n + j] = carrier;
             for (size_t i = 0; i < 16; ++i) {
-                w.q[j * k + b * BK + i]      = (int8_t) ((blk[i] & 15) - 8);
-                w.q[j * k + b * BK + i + 16] = (int8_t) ((blk[i] >> 4) - 8);
+                w.q[j * k + b * 32 + i]      = (int8_t) ((blk[i] & 15) - 8);
+                w.q[j * k + b * 32 + i + 16] = (int8_t) ((blk[i] >> 4) - 8);
             }
         }
     return true;
@@ -221,10 +231,10 @@ struct dense_result {
 inline void scu_row(const int8_t * a, const mxint4_weight & w, int32_t * c) {
     for (size_t j = 0; j < w.n; ++j) {
         int32_t acc = 0;
-        for (size_t b = 0; b < w.k / BK; ++b) {
-            int64_t raw = 0;
-            for (size_t i = 0; i < BK; ++i) raw += (int64_t) a[b * BK + i] * w.q[j * w.k + b * BK + i];
-            acc = acc_add(acc, scu(raw, w.carrier[b * w.n + j]));
+        for (size_t begin = 0; begin < w.k; begin += PHYSICAL_DIM) {
+            i128 raw = 0;
+            for (size_t i = begin; i < begin + PHYSICAL_DIM; ++i) raw += (i128) a[i] * w.q[j * w.k + i];
+            acc = acc_add(acc, scu((int64_t) raw, w.carrier[(begin / BK) * w.n + j]));
         }
         c[j] = acc;
     }
@@ -296,7 +306,27 @@ inline bool dense(const float * x, size_t m, size_t k, const mxint4_weight & w, 
         for (size_t l = 0; l < lanes.size(); ++l) {
             if (std::all_of(lanes[l].begin(), lanes[l].end(), [](int8_t d) { return d == 0; })) continue;
             std::vector<int32_t> c(n);
-            scu_row(lanes[l].data(), w, c.data());
+            // Compact support is the union of all residual lanes/source rows in this stripe.
+            for (size_t j = 0; j < n; ++j) {
+                int32_t acc = 0;
+                const size_t r0 = row / rows_per_stripe * rows_per_stripe;
+                for (size_t b = 0; b < BPR; ++b) {
+                    std::vector<size_t> support;
+                    for (size_t local = 0; local < BK; ++local) {
+                        bool live = false;
+                        for (size_t rr = r0; rr < std::min(m, r0 + rows_per_stripe); ++rr)
+                            live = live || r.residual[rr * k + b * BK + local] != 0;
+                        if (live) support.push_back(b * BK + local);
+                    }
+                    for (size_t f = 0; f < support.size(); f += PHYSICAL_DIM) {
+                        i128 raw = 0;
+                        for (size_t i = f; i < std::min(support.size(), f + PHYSICAL_DIM); ++i)
+                            raw += (i128) lanes[l][support[i]] * w.q[j * k + support[i]];
+                        acc = acc_add(acc, scu((int64_t) raw, w.carrier[b * n + j]));
+                    }
+                }
+                c[j] = acc;
+            }
             i128 place = 1;
             for (size_t p = 0; p < l; ++p) place *= RADIX;
             for (size_t j = 0; j < n; ++j) corr[row * n + j] += (i128) c[j] * place;
@@ -333,7 +363,7 @@ struct att_stationary {
     bool                  qk = true;
     size_t                k = 0, n = 0, kp = 0;
     std::vector<int16_t>  base;     // [n]
-    std::vector<uint32_t> carriers; // [kp / 32][n]
+    std::vector<uint32_t> carriers; // [kp / BK][n]
     std::vector<int8_t>   c0, c1;   // [kp][n]: K0/K1, or V
     std::vector<int64_t>  colsum;   // PV: [n]
 };
@@ -462,23 +492,58 @@ bool att_prepare_stream(Get get, size_t rows, size_t k, bool qk, int anchor, att
     return true;
 }
 
-// One digit-pair SCU GEMM: a [rows][kp] x stationary digits b [kp][n].
-inline std::vector<int32_t> att_gemm(const std::vector<int8_t> & a, const std::vector<int8_t> & b,
-                                     const att_stationary & w, size_t rows) {
+// Main digit-pair SCU GEMM: a [rows][kp] x stationary digits b [kp][n]. Every LOOP_WS pass is
+// PHYSICAL_DIM K wide, SCU-shifted by its BK block carrier and Sat32-added in ascending K.
+inline std::vector<int32_t> att_gemm_main(const std::vector<int8_t> & a, const std::vector<int8_t> & b,
+                                          const att_stationary & w, size_t rows) {
     std::vector<int32_t> c(rows * w.n, 0);
     for (size_t i = 0; i < rows; ++i)
         for (size_t j = 0; j < w.n; ++j) {
             int32_t acc = 0;
-            for (size_t blk = 0; blk < w.kp / BK; ++blk) {
-                int64_t raw = 0;
-                for (size_t t = 0; t < BK; ++t) {
-                    const size_t kk = blk * BK + t;
-                    raw += (int64_t) a[i * w.kp + kk] * b[kk * w.n + j];
-                }
-                acc = acc_add(acc, scu(raw, w.carriers[blk * w.n + j]));
+            for (size_t begin = 0; begin < w.kp; begin += PHYSICAL_DIM) {
+                i128 raw = 0;
+                for (size_t kk = begin; kk < begin + PHYSICAL_DIM; ++kk)
+                    raw += (i128) a[i * w.kp + kk] * b[kk * w.n + j];
+                acc = acc_add(acc, scu((int64_t) raw, w.carriers[(begin / BK) * w.n + j]));
             }
             c[i * w.n + j] = acc;
         }
+    return c;
+}
+
+// Upper-lane SCU GEMMs, one result [rows][n] per lane. Per PHYSICAL_DIM-row execution slice and BK
+// block, the compact K support is the ascending union over all lanes and rows of the slice; it is
+// cut into fragments of <= PHYSICAL_DIM compact K, each one SCU (block carrier) + Sat32 add.
+inline std::vector<std::vector<int32_t>> att_gemm_upper(const std::vector<std::vector<int8_t>> & lanes,
+                                                        const std::vector<int8_t> & b, const att_stationary & w,
+                                                        size_t rows) {
+    std::vector<std::vector<int32_t>> c(lanes.size(), std::vector<int32_t>(rows * w.n, 0));
+    for (size_t r0 = 0; r0 < rows; r0 += PHYSICAL_DIM) {
+        const size_t r1 = std::min(rows, r0 + PHYSICAL_DIM);
+        std::vector<std::vector<size_t>> fragments;
+        for (size_t blk = 0; blk < w.kp / BK; ++blk) {
+            std::vector<size_t> support;
+            for (size_t t = 0; t < BK; ++t) {
+                bool live = false;
+                for (const auto & lane : lanes)
+                    for (size_t i = r0; i < r1; ++i) live = live || lane[i * w.kp + blk * BK + t] != 0;
+                if (live) support.push_back(blk * BK + t);
+            }
+            for (size_t f = 0; f < support.size(); f += PHYSICAL_DIM)
+                fragments.emplace_back(support.begin() + f, support.begin() + std::min(support.size(), f + PHYSICAL_DIM));
+        }
+        for (size_t l = 0; l < lanes.size(); ++l)
+            for (size_t i = r0; i < r1; ++i)
+                for (size_t j = 0; j < w.n; ++j) {
+                    int32_t acc = 0;
+                    for (const auto & fragment : fragments) {
+                        i128 raw = 0;
+                        for (size_t kk : fragment) raw += (i128) lanes[l][i * w.kp + kk] * b[kk * w.n + j];
+                        acc = acc_add(acc, scu((int64_t) raw, w.carriers[(fragment.front() / BK) * w.n + j]));
+                    }
+                    c[l][i * w.n + j] = acc;
+                }
+    }
     return c;
 }
 
@@ -499,11 +564,12 @@ inline bool att_multiply(const att_stream & s, const att_stationary & w, std::ve
     const size_t passes = w.qk ? 2 : 1;
     for (size_t p = 0; p < passes; ++p) {
         const std::vector<int8_t> & st = p == 0 ? w.c0 : w.c1;
-        const auto main = att_gemm(s.main, st, w, s.rows);
+        const auto main = att_gemm_main(s.main, st, w, s.rows);
         for (size_t i = 0; i < main.size(); ++i)
             if (!scaled_add(ints[i], main[i], PE_BITS * (int) p)) { why = "int64_overflow"; return false; }
-        for (size_t l = 0; l < s.upper.size(); ++l) {
-            const auto up = att_gemm(s.upper[l], st, w, s.rows);
+        const auto upper = att_gemm_upper(s.upper, st, w, s.rows);
+        for (size_t l = 0; l < upper.size(); ++l) {
+            const auto & up = upper[l];
             for (size_t i = 0; i < up.size(); ++i)
                 if (!scaled_add(ints[i], up[i], PE_BITS * ((int) l + 1 + (int) p))) { why = "int64_overflow"; return false; }
         }
@@ -517,6 +583,32 @@ inline bool att_multiply(const att_stream & s, const att_stationary & w, std::ve
             out[i * w.n + j] = f;
         }
     return true;
+}
+
+// Exact wide dot (no SCU or ACC saturation), same digits, shifts and PV bias as att_multiply:
+// exact[i][j] = sum_p sum_digits sum_k a * b * 2^carrier(k / BK) * 16^shift. Diagnostic only.
+inline void att_exact(const att_stream & s, const att_stationary & w, std::vector<i128> & exact) {
+    exact.assign(s.rows * w.n, 0);
+    const size_t passes = w.qk ? 2 : 1;
+    for (size_t p = 0; p < passes; ++p) {
+        const std::vector<int8_t> & st = p == 0 ? w.c0 : w.c1;
+        for (size_t d = 0; d <= s.upper.size(); ++d) {
+            const std::vector<int8_t> & a = d == 0 ? s.main : s.upper[d - 1];
+            for (size_t i = 0; i < s.rows; ++i)
+                for (size_t j = 0; j < w.n; ++j) {
+                    i128 sum = 0;
+                    for (size_t kk = 0; kk < w.kp; ++kk) {
+                        const uint32_t car = w.carriers[(kk / BK) * w.n + j];
+                        if (car == ZERO_CARRIER) continue;
+                        sum += (i128) a[i * w.kp + kk] * st[kk * w.n + j] * ((i128) 1 << car);
+                    }
+                    exact[i * w.n + j] += sum * ((i128) 1 << (PE_BITS * (d + p)));
+                }
+        }
+    }
+    if (!w.qk)
+        for (size_t i = 0; i < s.rows; ++i)
+            for (size_t j = 0; j < w.n; ++j) exact[i * w.n + j] += (i128) w.colsum[j] * ZERO_POINT;
 }
 
 } // namespace w4a4_golden

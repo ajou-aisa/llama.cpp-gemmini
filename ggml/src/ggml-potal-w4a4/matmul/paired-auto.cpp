@@ -615,7 +615,11 @@ struct plan_builder {
     plan_builder(const potal_paired_tile_plan & t, const residual::decoded_packet * r, const potal_paired_geometry & g) :
         tile(t),
         residual(r),
-        hw(g) {}
+        hw(g) {
+        plan.schema_dim = g.dim;
+        plan.schema_block_k = g.block_k;
+        plan.packet_schema = residual::rmd::kPacketVersion;
+    }
 
     size_t add(potal_paired_op op) {
         op.id = plan.ops.size();
@@ -1129,6 +1133,10 @@ struct validator {
     bool run() {
         const potal_paired_tile_plan & tile = plan.tile;
         const size_t                   D    = hw.dim;
+        if (plan.schema_dim != D || plan.schema_block_k != hw.block_k ||
+            plan.packet_schema != residual::rmd::kPacketVersion) {
+            return fail("plan DIM/Bk/packet schema mismatch");
+        }
         if (D == 0 || tile.tile_K == 0 || tile.k_panels == 0 || tile.j_groups == 0 ||
             tile.panels.size() != tile.k_panels) {
             return fail("tile plan incomplete");
@@ -4481,7 +4489,9 @@ potal_paired_status potal_paired_prepare(const potal_paired_request & req, potal
             return refuse(potal_paired_status::invalid_argument, "plan", "the given plan describes another request");
         }
         potal_paired_status st = potal_paired_status::ok;
-        if (!req.plan_validated) {
+        if (!req.plan_validated || plan.schema_dim != hw.dim || plan.schema_block_k != hw.block_k ||
+            plan.packet_schema != residual::rmd::kPacketVersion ||
+            t.passes_per_block * hw.dim != hw.block_k) {
             ::potal::timeline::scoped_span validate(::potal::timeline::active(), ::potal::timeline::stage::prep_validate,
                 uint32_t(req.run_id), ::potal::timeline::no_id, uint32_t(req.stripe_id), ::potal::timeline::no_id);
             st = potal_validate_execution_plan(plan, has_residual ? req.residual : nullptr, why, hw);

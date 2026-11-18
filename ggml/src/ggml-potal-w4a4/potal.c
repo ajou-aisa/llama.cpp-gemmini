@@ -38,8 +38,9 @@ _Static_assert(MAX_BYTES == POTAL_HW_MAX_BYTES, "MAX_BYTES differs from adapter"
 _Static_assert(sizeof(elem_t) == 1 && (elem_t)-1 < 0, "INT4 logical scalars use int8_t");
 _Static_assert(sizeof(acc_t) == 4 && (acc_t)-1 < 0, "PoTal API requires signed 32-bit acc_t");
 _Static_assert(POTAL_INPUT_BITS == 4 && POTAL_ACC_BITS == 32 &&
-               POTAL_PACKING_ABI == 1 && POTAL_SP_ROW_BYTES == 16 && DIM == 32,
-               "PoTal W4A4 requires packed INT4 DIM32 ABI 1");
+               POTAL_PACKING_ABI == 1 && POTAL_SP_ROW_BYTES == DIM / 2 &&
+               (DIM == 16 || DIM == 32 || DIM == 64),
+               "PoTal W4A4 requires packed INT4 DIM16/32/64 ABI 1");
 
 /* ---- RTL field layout ---------------------------------------------------- */
 
@@ -277,7 +278,7 @@ potal_status potal_gemm_ws_check(const potal_gemm_ws *g) {
         return POTAL_ERR_CAPACITY;
     }
 
-    if (g->flags != 0 || (POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32) ||
+    if (g->flags != 0 || (POTAL_HW_DIM != 16 && POTAL_HW_DIM != 32 && POTAL_HW_DIM != 64) ||
         g->m != dim || g->n != dim || g->k % dim != 0 || k_tiles > VALIDATED_K_TILES) {
         return POTAL_ERR_UNSUPPORTED;
     }

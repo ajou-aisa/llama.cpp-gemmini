@@ -43,9 +43,9 @@ class RmdStripeBuilder {
     };
 
     struct BlockAccum {
-        static_assert(kBlockSize <= 32, "block-local K mask must fit uint32_t");
-        uint32_t                                   k_mask = 0;
-        std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{};
+        static_assert(kBlockSize <= std::numeric_limits<KMask>::digits, "block-local K mask must fit");
+        KMask                                      k_mask = 0;
+        std::array<KMask, kMaxNativeRadixLanes> lane_k_masks{};
         uint16_t                                   lane_mask = 0;
         std::vector<uint16_t> row_lane_masks; // original row -> nonzero limb bits
     };

@@ -61,6 +61,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q8_HP2",   LLAMA_FTYPE_MOSTLY_Q8_HP2,   " Q8 HP2 quantization",                  },
     { "Q8_CHANNEL", LLAMA_FTYPE_MOSTLY_Q8_CHANNEL, " Gemmini channel-scale Q8 quantization", },
     { "MXINT4",   LLAMA_FTYPE_MOSTLY_MXINT4,   " block32 symmetric MXINT4 quantization", },
+    { "MXINT4_B64", LLAMA_FTYPE_MOSTLY_MXINT4_B64, " block64 shared-exponent MXINT4 (stored as MXINT4)", },
     { "Q16_0",    LLAMA_FTYPE_MOSTLY_Q16_0,    " symmetric Q16 quantization",           },
     { "Q16_H1",   LLAMA_FTYPE_MOSTLY_Q16_H1,   " row-scale Q16 quantization",           },
     { "Q16_HP1",  LLAMA_FTYPE_MOSTLY_Q16_HP1,  " power-of-two Q16 quantization",        },

@@ -6591,6 +6591,22 @@ size_t ggml_quantize_chunk(
     return result;
 }
 
+size_t ggml_quantize_chunk_mxint4_b64(
+        const float * src,
+               void * dst,
+            int64_t   start,
+            int64_t   nrows,
+            int64_t   n_per_row) {
+    GGML_ASSERT(start % n_per_row == 0);
+
+    const size_t start_row = start / n_per_row;
+    const size_t row_size  = ggml_row_size(GGML_TYPE_MXINT4, n_per_row);
+    const size_t result    = quantize_q4_hp1_b64(src + start, (char *) dst + start_row * row_size, nrows, n_per_row);
+    GGML_ASSERT(result == 0 || result == nrows * row_size);
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_log_set(ggml_log_callback log_callback, void * user_data) {

@@ -338,9 +338,10 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
     if (fences_invalid) {
         return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_FENCES must be RTL or CONSERVATIVE");
     }
-    if (ktile_invalid || (ktile && (!paired_request || !options::compensation || POTAL_HW_DIM != 32))) {
+    if (ktile_invalid || (ktile && (!paired_request || !options::compensation ||
+                                  POTAL_HW_DIM != 32 || POTAL_SCALE_BLOCK_K != 32))) {
         return hp1_fail(st, node, layer, "options",
-                        "GGML_POTAL_PAIRED_KTILE must be ON/OFF/1/0; ON requires DIM32 Paired compensation");
+                        "GGML_POTAL_PAIRED_KTILE must be ON/OFF/1/0; ON requires DIM32/Bk32 Paired compensation");
     }
     if (prefetch_invalid || (prefetch && !ktile)) {
         return hp1_fail(st, node, layer, "options",
@@ -351,7 +352,7 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
                         "GGML_POTAL_PAIRED_EARLY_PREFETCH must be ON/OFF/1/0; ON requires checked next-K prefetch");
     }
     if (stream_invalid || (stream != potal_paired_stream_mode::off &&
-        (!paired_request || !options::compensation || POTAL_HW_DIM != 32 || !ktile ||
+        (!paired_request || !options::compensation || POTAL_HW_DIM != 32 || POTAL_SCALE_BLOCK_K != 32 || !ktile ||
          prefetch || early || conservative))) {
         return hp1_fail(st, node, layer, "options",
                         "GGML_POTAL_PAIRED_STREAM must be OFF/BOUNDED/CONTINUOUS/CONTINUOUS_EARLY; stream requires DIM32 Paired K-tile "

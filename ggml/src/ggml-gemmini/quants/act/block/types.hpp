@@ -10,7 +10,7 @@
 namespace ggml::gemmini::quants::act::block {
 
 inline constexpr size_t kGroupSize = ggml::gemmini::rmd::kNativeWeightScaleGroup;
-static_assert(kGroupSize == 32);
+static_assert(kGroupSize == 32 || kGroupSize == 64);
 
 struct Meta {
     size_t                  rows = 0;

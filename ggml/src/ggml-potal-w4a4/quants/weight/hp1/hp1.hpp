@@ -27,7 +27,10 @@ namespace ggml::potal::quants::weight::hp1 {
 
 namespace wreader = ggml::gemmini::quants::wreader;
 
-constexpr uint32_t block_k = 32; // QK4_HP, the K extent of one scale block
+#ifndef POTAL_SCALE_BLOCK_K
+#define POTAL_SCALE_BLOCK_K 32
+#endif
+constexpr uint32_t block_k = POTAL_SCALE_BLOCK_K; // logical scale group, not native storage
 
 enum class status {
     ok,
@@ -36,6 +39,7 @@ enum class status {
     metadata,       // wreader::validate() failed (see the reader status)
     channel_scale,  // negative, or 0 in a row with a non-zero block
     scale_mismatch, // blocks of one row carry different channel_scale bits
+    pair_mismatch,  // Bk64 requires equal metadata in the two native32 halves
 };
 
 const char * status_name(status s);

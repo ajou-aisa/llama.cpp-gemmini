@@ -51,6 +51,7 @@ int cur_cpu() { return sched_getcpu(); }
 
 struct Options {
     std::string model, out;
+    std::string prompt_file;
     int n_prompt = 1024, n_gen = 1024, n_ctx = -1, n_ubatch = -1, threads = 1;
     bool trace_prefill = false, check_logits = false, offload_kqv = true;
     std::set<int> trace_steps;
@@ -76,13 +77,14 @@ Options parse(int argc, char ** argv) {
         if (key == "--help" || key == "-h") {
             std::puts("potal-e2e-runner --model GGUF --out DIR [--prompt-tokens N=1024] [--gen-tokens M=1024]\n"
                       "  [--ctx C=N+M] [--ubatch U=N] [--threads T=1] [--trace-prefill 0|1]\n"
-                      "  [--trace-steps i,j,...] [--check-logits 0|1] [--offload-kqv 0|1]");
+                      "  [--trace-steps i,j,...] [--check-logits 0|1] [--offload-kqv 0|1] [--prompt-file IDS]");
             std::exit(0);
         }
         if (++i == argc) throw std::runtime_error("missing value for " + key);
         const std::string v = argv[i];
         if (key == "--model") o.model = v;
         else if (key == "--out") o.out = v;
+        else if (key == "--prompt-file") o.prompt_file = v;
         else if (key == "--prompt-tokens") o.n_prompt = to_int(key, v);
         else if (key == "--gen-tokens") o.n_gen = to_int(key, v);
         else if (key == "--ctx") o.n_ctx = to_int(key, v);
@@ -243,9 +245,22 @@ int main(int argc, char ** argv) try {
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> prompt(o.n_prompt);
-    for (int i = 0; i < o.n_prompt; ++i) {
-        prompt[i] = llama_token((uint64_t(i) * 7919u + 13u) % 150000u);
-        if (prompt[i] >= n_vocab) throw std::runtime_error("prompt id exceeds vocab");
+    if (o.prompt_file.empty()) {
+        for (int i = 0; i < o.n_prompt; ++i) {
+            prompt[i] = llama_token((uint64_t(i) * 7919u + 13u) % 150000u);
+            if (prompt[i] >= n_vocab) throw std::runtime_error("prompt id exceeds vocab");
+        }
+    } else {
+        std::ifstream ids(o.prompt_file);
+        if (!ids) throw std::runtime_error("cannot open --prompt-file " + o.prompt_file);
+        std::vector<long long> read;
+        for (long long id; ids >> id;) read.push_back(id);
+        if (!ids.eof()) throw std::runtime_error("--prompt-file has a non-integer token");
+        if (read.size() != size_t(o.n_prompt)) throw std::runtime_error("--prompt-file token count != --prompt-tokens");
+        for (int i = 0; i < o.n_prompt; ++i) {
+            if (read[i] < 0 || read[i] >= n_vocab) throw std::runtime_error("prompt id exceeds vocab");
+            prompt[i] = llama_token(read[i]);
+        }
     }
 
     auto cp = llama_context_default_params();
@@ -429,7 +444,8 @@ int main(int argc, char ** argv) try {
         f << "model=" << o.model << "\nprompt_tokens=" << o.n_prompt << "\ngen_tokens=" << o.n_gen
           << "\nctx=" << o.n_ctx << "\nubatch=" << o.n_ubatch << "\nn_batch=" << cp.n_batch << "\nctx_effective=" << llama_n_ctx(ctx)
           << "\nn_batch_effective=" << llama_n_batch(ctx)
-          << "\nthreads=" << o.threads << "\nprompt_formula=(i*7919+13)%150000"
+          << "\nthreads=" << o.threads << "\nprompt_formula="
+          << (o.prompt_file.empty() ? std::string("(i*7919+13)%150000") : "file:" + o.prompt_file)
           << "\ncheck_logits=" << o.check_logits << "\noffload_kqv=" << o.offload_kqv << "\ntrace_prefill=" << o.trace_prefill << "\ntrace_steps=";
         bool first = true;
         for (int s : o.trace_steps) { f << (first ? "" : ",") << s; first = false; }

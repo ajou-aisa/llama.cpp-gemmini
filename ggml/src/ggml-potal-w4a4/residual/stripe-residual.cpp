@@ -154,8 +154,8 @@ bool fast_decode_rows(const rmd::StripePacket & packet, const std::vector<size_t
             for (size_t k = 0; k < block.compact_k_count; ++k) {
                 const size_t index = (size_t) block.k_index_offset + k;
                 if (index >= packet.k_indices.size() || packet.k_indices[index] >= rmd::kBlockSize) return false;
-                const uint32_t bit = uint32_t{ 1 } << packet.k_indices[index];
-                if ((g->k_mask & bit) != 0) e.k_slot[k] = __builtin_popcount(g->k_mask & (bit - 1));
+                const rmd::KMask bit = rmd::KMask{ 1 } << packet.k_indices[index];
+                if ((g->k_mask & bit) != 0) e.k_slot[k] = __builtin_popcountll(g->k_mask & (bit - 1));
                 if ((size_t) std::max<int32_t>(e.k_slot[k], 0) >= g->padded_k_count) return false;
             }
             // read_group_digit: group metadata and payload extent checks.

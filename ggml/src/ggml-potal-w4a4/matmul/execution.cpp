@@ -40,7 +40,8 @@
 #    include <thread>
 #endif
 
-static_assert(POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32, "ggml-potal requires DIM16 or DIM32");
+static_assert(POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32 || POTAL_HW_DIM == 64,
+              "ggml-potal requires DIM16/32/64");
 
 namespace ggml::potal {
 

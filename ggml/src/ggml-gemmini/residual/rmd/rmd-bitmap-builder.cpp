@@ -18,8 +18,8 @@
 namespace ggml::gemmini::rmd {
 namespace {
 
-unsigned population(uint32_t mask) {
-    return static_cast<unsigned>(__builtin_popcount(mask));
+unsigned population(KMask mask) {
+    return static_cast<unsigned>(__builtin_popcountll(mask));
 }
 
 size_t tiles(size_t count) {
@@ -35,8 +35,8 @@ uint8_t decompose(int32_t                                      residual,
                   int8_t *                                     packed,
                   uint16_t &                                   mask,
                   size_t &                                     count,
-                  std::array<uint32_t, kMaxNativeRadixLanes> & lane_masks,
-                  uint32_t                                     k_bit,
+                  std::array<KMask, kMaxNativeRadixLanes> & lane_masks,
+                  KMask                                     k_bit,
                   uint64_t *                                   lane_rows,
                   size_t                                       row_words,
                   uint64_t                                     row_bit) {
@@ -69,7 +69,7 @@ std::array<uint8_t, kMaxNativeRadixLanes> partition(const BlockDescriptor & bloc
                                                     size_t                  row_count) {
     std::array<uint8_t, kMaxNativeRadixLanes>  best{};
     std::array<uint8_t, kMaxNativeRadixLanes>  assignment{};
-    std::array<uint32_t, kMaxNativeRadixLanes> masks{};
+    std::array<KMask, kMaxNativeRadixLanes> masks{};
     std::array<size_t, kMaxNativeRadixLanes>   counts{};
     const size_t                               budget = tiles(block.compact_k_count);
     if (budget == 1 || block.active_lane_count == 1)
@@ -93,7 +93,7 @@ std::array<uint8_t, kMaxNativeRadixLanes> partition(const BlockDescriptor & bloc
             return;
         }
         for (size_t group = 0; group < groups + (groups < budget); ++group) {
-            const uint32_t old_mask = masks[group];
+            const KMask old_mask = masks[group];
             masks[group] |= block.lane_k_masks[block.lane_ids[lane]];
             ++counts[group];
             assignment[lane] = static_cast<uint8_t>(group);
@@ -209,7 +209,7 @@ bool RmdBitmapBuilder::emit(size_t row, size_t k, int32_t residual) {
     uint16_t                                 mask  = 0;
     size_t                                   count = 0;
     const size_t                             block = k / kBlockSize;
-    const uint32_t                           k_bit = uint32_t{1} << (k % kBlockSize);
+    const KMask                           k_bit = KMask{1} << (k % kBlockSize);
     uint64_t *                               lane_rows =
         lane_rows_.data() + block * metadata_.lane_capacity * row_words_ + row / 64;
     const uint64_t row_bit    = uint64_t{1} << (row % 64);
@@ -301,7 +301,7 @@ StripePacketHandle RmdBitmapBuilder::finish() {
             block.lane_k_masks   = block_lane_masks_[block_id];
             block.block_id       = static_cast<uint32_t>(block_id);
             block.global_k_begin = static_cast<uint32_t>(block_id * kBlockSize);
-            uint32_t block_mask  = 0;
+            KMask block_mask  = 0;
             for (size_t lane = 0; lane < packet->lane_capacity; ++lane) {
                 block_mask |= block.lane_k_masks[lane];
                 if (block.lane_k_masks[lane])
@@ -334,7 +334,7 @@ StripePacketHandle RmdBitmapBuilder::finish() {
             }
             block.k_index_offset = static_cast<uint32_t>(packet->k_indices.size());
             for (size_t k = 0; k < kBlockSize; ++k) {
-                if (block_mask & (uint32_t{1} << k))
+                if (block_mask & (KMask{1} << k))
                     packet->k_indices.push_back(static_cast<uint16_t>(k));
             }
             block.activation_offset      = static_cast<uint32_t>(activation_values);
@@ -434,8 +434,8 @@ StripePacketHandle RmdBitmapBuilder::finish() {
                 }
                 // Shared by every lane of this cell: block, K bit/rank mask, row word and bit.
                 const auto &     block      = packet->blocks[block_indices[block_id]];
-                const uint32_t   k_bit      = uint32_t{1} << (k % kBlockSize);
-                const uint32_t   lower_k    = k_bit - 1;
+                const KMask   k_bit      = KMask{1} << (k % kBlockSize);
+                const KMask   lower_k    = k_bit - 1;
                 const uint64_t   row_bit    = uint64_t{1} << (row % 64);
                 const uint64_t   lower_rows = row_bit - 1;
                 const size_t     row_base   = block_id * packet->lane_capacity * row_words_ + row / 64;

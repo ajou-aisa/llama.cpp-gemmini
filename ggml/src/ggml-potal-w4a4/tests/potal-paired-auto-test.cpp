@@ -54,7 +54,8 @@ using namespace potal_test;
 
 namespace {
 
-constexpr uint32_t PPB = 32 / PD;
+constexpr uint32_t PPB = POTAL_SCALE_BLOCK_K / PD; // 32 / PD was 0 at DIM64: K += PPB never advanced
+static_assert(PPB > 0, "a scale block is at least one DIM pass");
 // The long-K fixture keeps one complete Main I group on either physical geometry.
 constexpr size_t MULTI_ROWS = PD == 32 ? 64 : 80;
 constexpr size_t MULTI_J_GROUPS = PD == 32 ? 3 : 2;

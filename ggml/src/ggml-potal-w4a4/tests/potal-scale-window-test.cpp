@@ -22,7 +22,8 @@
 
 namespace {
 
-constexpr size_t MAX_RECORDS = 20000;
+// "all slots" writes and releases every column of every slot: 2 * 256 * DIM records.
+constexpr size_t MAX_RECORDS = std::max<size_t>(20000, 2 * POTAL_SCALE_ENTRIES * POTAL_HW_DIM + 4096);
 constexpr uint32_t DIM = POTAL_HW_DIM;
 constexpr uint32_t BAD_CARRIER = 0x7FFFFFFFu;
 

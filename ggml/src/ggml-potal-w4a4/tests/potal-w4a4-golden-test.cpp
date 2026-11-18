@@ -33,6 +33,7 @@
 #include "quants/act/exsia/types.hpp"
 #include "quants/act/quantize.hpp"
 #include "residual/rmd/rmd-types.hpp"
+#include "residual/rmd/rmd-builder.hpp"
 #include "residual/rmd/rmd-bitmap-builder.hpp"
 
 #include <algorithm>
@@ -43,6 +44,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <sched.h>
 #include <set>
 #include <string>
 #include <sys/wait.h>
@@ -84,7 +86,7 @@ struct issue_observer {
         if (rec->funct == POTAL_FUNCT_LOOP_WS) {
             const bool residual = (rec->rs1 >> 62) & 1;
             const uint64_t macs = (self.bounds & 65535) * ((self.bounds >> 16) & 65535) *
-                ((self.bounds >> 32) & 65535) * UINT64_C(32768);
+                ((self.bounds >> 32) & 65535) * (uint64_t(POTAL_HW_DIM) * POTAL_HW_DIM * POTAL_HW_DIM);
             auto & e = self.expected;
             if (self.operation == POTAL_ISSUE_ATTN_QK) {
                 ++e.w4_attn_qk_gemm_issues;
@@ -164,15 +166,18 @@ bool make_dense(const dense_spec & c, dense_node & nd) {
     const float mag[] = { 0.02f, 0.08f, 0.3f, 0.01f };
     for (size_t n = 0; n < c.N; ++n)
         for (size_t k = 0; k < c.K; ++k) {
-            float m = mag[(k / 32 + n) % 4];
+            float m = mag[(k / gold::BK + n) % 4];
             if (c.boundary) {
-                if (k / 32 == 1 && n % 3 == 0) m = 0.0f;           // zero block: m = INT16_MIN
-                if (k / 32 == 2 && n % 4 == 1) m = 4.0e3f;         // carrier >= 32 against 1e-7 blocks
-                if (k / 32 == 0 && n % 4 == 1) m = 1.0e-7f;
+                if (k / gold::BK == 1 && n % 3 == 0) m = 0.0f;           // zero block: m = INT16_MIN
+                if (k / gold::BK == 2 && n % 4 == 1) m = 4.0e3f;         // carrier >= 32 against 1e-7 blocks
+                if (k / gold::BK == 0 && n % 4 == 1) m = 1.0e-7f;
             }
             wf[n * c.K + k] = nd01(rng) * m;
         }
-    ggml_quantize_chunk(GGML_TYPE_MXINT4, wf.data(), nd.w->data, 0, (int64_t) c.N, (int64_t) c.K, nullptr);
+    if constexpr (gold::BK == 64)
+        ggml_quantize_chunk_mxint4_b64(wf.data(), nd.w->data, 0, c.N, c.K);
+    else
+        ggml_quantize_chunk(GGML_TYPE_MXINT4, wf.data(), nd.w->data, 0, (int64_t) c.N, (int64_t) c.K, nullptr);
     if (c.boundary) {
         // Hardware-domain code -8 (GGUF encoders emit [-7,7]): low nibble 0 of a nonzero block.
         const size_t row_bytes = ggml_row_size(GGML_TYPE_MXINT4, (int64_t) c.K);
@@ -190,12 +195,16 @@ bool make_dense(const dense_spec & c, dense_node & nd) {
             // by 14 in the first row adds one lane beyond code 4's single digit.
             const float blocks[] = { 16384.0f, 256.0f, 1.0f, 1.0f };
             for (size_t k = 0; k < c.K; ++k)
-                v[m * c.K + k] = c.expected_lane_rows == 129 && m == 0 && k < 32 ?
-                    28672.0f : blocks[k / 32];
+                v[m * c.K + k] = c.expected_lane_rows % 2 == 1 && m == 0 && k < gold::BK ?
+                    28672.0f : blocks[k / gold::BK];
             continue;
         }
         for (size_t k = 0; k < c.K; ++k) v[m * c.K + k] = nd01(rng) * (1.0f + 0.5f * (float) (m % 3)) * (k / 32 % 2 ? 4.0f : 1.0f);
         if (m % 2 == 0) v[m * c.K + (m * 7) % c.K] = 60.0f * (m % 4 ? -1.0f : 1.0f);
+        // Keep the INT32_MAX exception live after merging two native groups:
+        // the masked huge values must not lower the remaining group's exponent.
+        if (c.boundary && gold::BK == 64 && m % 5 == 1)
+            std::fill_n(v + m * c.K, c.K, 1024.0f);
         if (c.boundary && m % 5 == 1)
             for (size_t k = 32; k < 64 && k < c.K; ++k) v[m * c.K + k] = (k % 2 ? -1.0f : 1.0f) * 4.0e10f; // saturates INT32
         if (c.boundary && m % 7 == 3) v[m * c.K + (m * 13) % c.K] = 2.5f * 1024.0f; // exact tie after scaling
@@ -259,7 +268,7 @@ void exsia_cross_check(const dense_spec & c, const dense_node & nd, const potal_
 void dense_case(const dense_spec & c) {
     dense_node nd;
     potal_tile_plan plan;
-    if (!make_dense(c, nd) || potal_tile_select(c.M, c.N, c.K, 32 / POTAL_HW_DIM, &plan) != POTAL_OK) {
+    if (!make_dense(c, nd) || potal_tile_select(c.M, c.N, c.K, gold::BK / POTAL_HW_DIM, &plan) != POTAL_OK) {
         verdict("D", c.name, false, "reason=fixture_or_tile_select");
         return;
     }
@@ -272,7 +281,7 @@ void dense_case(const dense_spec & c) {
         return;
     }
     if (c.expected_lane_rows &&
-        (plan.tile_I != 2 || plan.tile_J != 2 || g.theta != std::vector<int16_t>{-2} ||
+        (plan.tile_I != c.M / POTAL_HW_DIM || plan.tile_J != 2 || g.theta != std::vector<int16_t>{-2} ||
          g.lane_c.size() != c.expected_lane_rows)) {
         char b[192];
         std::snprintf(b, sizeof(b), "reason=capacity_fixture producer_I=%zu producer_J=%zu lane_rows=%zu expected=%zu",
@@ -298,9 +307,27 @@ void dense_case(const dense_spec & c) {
     cfg.job_capacity             = 1;
     cfg.residual                 = options::compensation;
     cfg.paired                   = true;
-    cfg.paired_ktile_scale_reuse = POTAL_HW_DIM == 32;
+    cfg.paired_ktile_scale_reuse = POTAL_HW_DIM == 32 && gold::BK == 32 &&
+                                  c.expected_lane_rows <= 8 * POTAL_HW_DIM;
     cfg.layer                    = "w4a4-golden";
     cfg.backend                  = "EMULATED";
+    if (c.expected_lane_rows > 8 * POTAL_HW_DIM) {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        std::vector<int> cpus;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
+            for (int cpu = 0; cpu < CPU_SETSIZE && cpus.size() < 5; ++cpu)
+                if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+        if (cpus.size() != 5) {
+            verdict("D", c.name, false, "strict host test requires five available CPUs");
+            return;
+        }
+        const std::string map = std::to_string(cpus[0]) + "," + std::to_string(cpus[1]) + "," +
+            std::to_string(cpus[2]) + "," + std::to_string(cpus[3]) + "," + std::to_string(cpus[4]);
+        setenv("GGML_POTAL_HART_MAP", map.c_str(), 1);
+        setenv("GGML_POTAL_PLAN_VALIDATED_REUSE", "ON", 1);
+        cfg.hart_roles = cfg.strict_issuer = true;
+    }
 
     std::mutex                    mu;
     std::vector<int32_t>          main_c(c.M * c.N, 0);
@@ -321,7 +348,7 @@ void dense_case(const dense_spec & c) {
         std::lock_guard<std::mutex> lock(mu);
         ++calls;
         if (c.expected_lane_rows &&
-            (!req.ktile_scale_reuse || req.main_plan == nullptr ||
+            (req.ktile_scale_reuse != cfg.paired_ktile_scale_reuse || req.main_plan == nullptr ||
              req.main_plan->tile_I != plan.tile_I || req.main_plan->tile_K != plan.tile_K ||
              req.main_plan->tile_J != c.expected_main_j))
             ++plan_errors;
@@ -421,9 +448,19 @@ struct att_spec {
     bool         boundary;
     int64_t      batches = 1;
     int          output_layout = 0;
+    bool         saturate = false; // PV: alternate V blocks 2^10 / 2^-12 -> carriers ~22, Sat32 expected
 };
 
+// Attention is admitted at (DIM32, Bk32) and at every DIM with Bk64; (DIM16, Bk32) stays refused.
+constexpr bool attention_refused = !(POTAL_HW_DIM == 32 || gold::BK == 64);
+
 void transfer_boundaries() {
+    if constexpr (attention_refused) {
+        ggml_tensor t{}; std::vector<int> shifts;
+        verdict("TRANSFER", "unsupported-geometry", att::prepare_qk_transfer(t, t, 0, 0, shifts) == POTAL_ERR_UNSUPPORTED,
+                "DIM32/Bk32 attention only");
+        return;
+    }
     host_tensor keys, queries;
     keys.shape(GGML_TYPE_F32, {1, 1, 1, 1});
     queries.shape(GGML_TYPE_F32, {1, 129, 2, 1});
@@ -459,6 +496,15 @@ void transfer_boundaries() {
 }
 
 void attention_case(const att_spec & c) {
+    if constexpr (attention_refused) {
+        ggml_tensor t{}; att::stationary w; att::stream a; std::vector<int64_t> out;
+        const bool ok = att::prepare_stationary(t, 0, 0, c.r, w) == POTAL_ERR_UNSUPPORTED &&
+                        att::prepare_stream(t, 0, 0, 0, 1, c.r, a) == POTAL_ERR_UNSUPPORTED &&
+                        att::reference(a, w, c.r, out) == POTAL_ERR_UNSUPPORTED &&
+                        att::execute(nullptr, {}).status == POTAL_ERR_UNSUPPORTED;
+        verdict("ATTENTION", c.name, ok, "explicit runtime refusal outside DIM32/Bk32");
+        return;
+    }
     const bool qk = c.r == att::role::qk;
     const char * policy = std::getenv("POTAL_QK_POLICY");
     const bool residual = qk && policy && std::strcmp(policy, "legacy") != 0;
@@ -481,6 +527,9 @@ void attention_case(const att_spec & c) {
         a.shape(GGML_TYPE_F16, { c.KV, c.D, c.HK, c.batches });
         b.shape(GGML_TYPE_F32, { c.KV, c.T, c.HQ, c.batches });
         for (size_t i = 0; i < a.count(); ++i) a.set(i, nd(rng) * 0.5f * ((i / 32) % 3 == 2 ? 300.0f : 1.0f));
+        if (c.saturate)
+            for (size_t i = 0; i < a.count(); ++i)
+                a.set(i, nd(rng) * ((i % size_t(c.KV)) / gold::BK % 2 ? 0x1p+10f : 0x1p-12f));
         for (size_t row = 0; row < (size_t) (c.T * c.HQ * c.batches); ++row) {
             std::vector<double> e(c.KV);
             double sum = 0;
@@ -513,14 +562,14 @@ void attention_case(const att_spec & c) {
     const size_t rows = (size_t) c.T, n = (size_t) a.t.ne[1], K = (size_t) a.t.ne[0];
     const size_t hr = (size_t) (c.HQ / c.HK);
     potal_tile_plan plan;
-    if (potal_tile_select(rows, n, (K + 31) / 32 * 32, att::block_k / POTAL_HW_DIM, &plan) != POTAL_OK) {
+    if (potal_tile_select(rows, n, (K + gold::BK - 1) / gold::BK * gold::BK, att::block_k / POTAL_HW_DIM, &plan) != POTAL_OK) {
         verdict(qk ? "QK" : "PV", c.name, false, "reason=tile_select");
         return;
     }
     const size_t stripe_rows = plan.tile_I * POTAL_HW_DIM;
     std::vector<float> want(out.count(), 0.0f);
     size_t stripes = 0, int_mis = 0, scale_mis = 0, prep_fail = 0, max_lanes = 0;
-    size_t base_mis = 0;
+    size_t base_mis = 0, sat_vs_exact = 0;
     int    fork_scale = 0, golden_scale = 0;
     std::string why;
     for (size_t batch = 0; batch < size_t(c.batches); ++batch) {
@@ -560,6 +609,9 @@ void attention_case(const att_spec & c) {
                     return;
                 }
                 max_lanes = std::max(max_lanes, st.upper.size());
+                std::vector<gold::i128> exact;
+                gold::att_exact(st, gs, exact);
+                for (size_t i = 0; i < gi.size(); ++i) sat_vs_exact += exact[i] != (gold::i128) gi[i];
                 for (size_t i = 0; i < r; ++i)
                     for (size_t j = 0; j < n; ++j) want[((batch * c.HQ + head) * rows + begin + i) * n + j] = gf[i * n + j];
                 att::stream          fs;
@@ -614,6 +666,10 @@ void attention_case(const att_spec & c) {
                   res.stage ? res.stage : "-", res.jobs, prep_fail, int_mis, scale_mis, fork_scale, golden_scale, base_mis, diff,
                   want.size(), max_abs);
     verdict(qk ? "QK" : "PV", c.name, ok, b2);
+    // Saturating vs exact wide dot: reported, not failed (cases certified by saturation differ per DIM).
+    std::printf("ATT_EXACT %s sat_vs_exact=%zu/%zu\n", c.name, sat_vs_exact, want.size());
+    if (c.saturate)
+        verdict("SATURATE", c.name, sat_vs_exact > 0, "forced V exponent spread must saturate an SCU/ACC step");
 
     std::fill(out.bytes.begin(), out.bytes.end(), 0x5a);
     observer.expected = {};
@@ -649,7 +705,7 @@ void test_main_merge() {
 
     constexpr size_t cols = 7, rows = 3, ldc = 11, stride = 19;
     hp1_weight weight;
-    if (!weight.allocate(cols, 32)) {
+    if (!weight.allocate(cols, gold::BK)) {
         check("fused merge weight allocation", false);
         return;
     }
@@ -708,15 +764,20 @@ void test_main_merge() {
 }
 
 void test_upper_decode() {
+    if constexpr (attention_refused) {
+        verdict("UPPER", "unsupported-geometry", att::execute(nullptr, {}).status == POTAL_ERR_UNSUPPORTED,
+                "attention upper lowering is not admitted");
+        return;
+    }
     namespace rmd = ggml::gemmini::rmd;
     bool equal = true;
     const int32_t edges[] = {INT32_MIN, INT32_MAX, -129, -128, -9, -8, -1, 0, 1, 7, 8, 127, 128};
     for (auto role : {att::role::qk, att::role::pv})
     for (bool zero : {false, true})
-    for (size_t rows : {1u, 3u, 33u})
-    for (size_t k : {1u, 31u, 32u, 33u, 257u}) {
+    for (size_t rows : {1u, 3u, 15u, 17u, 33u, 65u})
+    for (size_t k : {1u, 31u, 32u, 33u, 63u, 64u, 65u, 129u, 257u}) {
         att::stream a;
-        a.rows = rows + 1; a.k = k; a.kp = (k + 31) / 32 * 32; a.limb_count = 1;
+        a.rows = rows + 1; a.k = k; a.kp = (k + gold::BK - 1) / gold::BK * gold::BK; a.limb_count = 1;
         a.codes.assign(a.rows * a.kp, 0);
         a.limbs[0].assign(a.codes.size(), 0);
         for (size_t row = 0; row < a.rows; ++row) for (size_t col = 0; col < k; ++col) {
@@ -743,6 +804,25 @@ void test_upper_decode() {
         equal = equal && got->k_compact == reference.k_compact && got->digits == reference.digits &&
                 got->rows.size() == reference.rows.size() && got->runs.size() == reference.runs.size();
         if (!equal) break;
+        // Independent support: one ascending run per block with a nonzero upper value, local K < BK
+        // (bits 32..63 at Bk64), exactly the nonzero (block, local) positions.
+        std::vector<std::vector<uint16_t>> support(a.kp / gold::BK);
+        for (size_t col = 0; col < k; ++col) {
+            bool live = false;
+            for (size_t row = 0; row < rows; ++row) {
+                const size_t index = (row + 1) * a.kp + col;
+                live = live || (int64_t(a.codes[index]) - a.limbs[0][index] - (role == att::role::pv ? 8 : 0)) / 16 != 0;
+            }
+            if (live) support[col / gold::BK].push_back(uint16_t(col % gold::BK));
+        }
+        size_t run = 0;
+        for (size_t block = 0; block < support.size() && equal; ++block) {
+            if (support[block].empty()) continue;
+            equal = run < got->runs.size() && got->runs[run].block_id == block && got->runs[run].local_k == support[block];
+            ++run;
+        }
+        equal = equal && run == got->runs.size();
+        if (!equal) break;
         for (size_t i = 0; i < got->rows.size(); ++i)
             equal = equal && got->rows[i].lane == reference.rows[i].lane &&
                     got->rows[i].source_row == reference.rows[i].source_row;
@@ -751,6 +831,64 @@ void test_upper_decode() {
                     got->runs[i].local_k == reference.runs[i].local_k;
     }
     verdict("UPPER", "direct residual rows match packet decode including INT32 boundaries", equal, "");
+}
+
+void test_residual_masks() {
+    namespace rmd = ggml::gemmini::rmd;
+    bool ok = true;
+    for (size_t count : {size_t(1), size_t(16), size_t(17), size_t(32), size_t(33), size_t(64)}) {
+        if (count > gold::BK) continue;
+        constexpr size_t rows = 33;
+        std::vector<int32_t> expected(rows * gold::BK, 0);
+        std::vector<uint64_t> selection((expected.size() + 63) / 64, UINT64_MAX);
+        rmd::RmdStripeBuilder checked;
+        rmd::RmdBitmapBuilder bitmap;
+        checked.reset(0, 0, rows, gold::BK, 7, 4);
+        bitmap.reset(0, 0, rows, gold::BK, 7, 4, selection, gold::BK);
+        const int32_t values[] = {INT32_MIN, INT32_MAX, -129, 17, -3};
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t local = 0; local < gold::BK; ++local) {
+                // Ascending sparse supports include K31, K32 and K63.
+                const bool selected = local >= gold::BK - count;
+                if (!selected) continue;
+                const int32_t value = values[(row + local) % 5];
+                expected[row * gold::BK + local] = value;
+                ok = checked.add_residual(row, local, value) && bitmap.emit(row, local, value) && ok;
+            }
+        }
+        const auto first = checked.finish(), second = bitmap.finish();
+        ok = first && second && ok;
+        if (!first || !second) continue;
+        for (const auto & packet : {first, second}) {
+            ok = packet->block_size == gold::BK && packet->version == rmd::kPacketVersion &&
+                 packet->blocks.front().compact_k_count == count && ok;
+            residual::decoded_packet slow, fast;
+            setenv("GGML_POTAL_FAST_DECODE", "OFF", 1);
+            ok = residual::decode_packet(*packet, slow) == rmd::RmdStatus::success && ok;
+            setenv("GGML_POTAL_FAST_DECODE", "ON", 1);
+            ok = residual::decode_packet(*packet, fast) == rmd::RmdStatus::success &&
+                 slow.digits == fast.digits && slow.k_compact == fast.k_compact && ok;
+            std::vector<gold::i128> rebuilt(expected.size(), 0);
+            for (size_t rr = 0; rr < fast.rows.size(); ++rr) {
+                gold::i128 place = 1;
+                for (size_t lane = 0; lane < fast.rows[rr].lane; ++lane) place *= 16;
+                size_t compact = 0;
+                for (const auto & run : fast.runs) {
+                    for (size_t local : run.local_k) {
+                        rebuilt[fast.rows[rr].source_row * gold::BK + local] +=
+                            gold::i128(fast.digits[rr * fast.k_compact + compact++]) * place;
+                    }
+                }
+            }
+            for (size_t i = 0; i < expected.size(); ++i) ok = rebuilt[i] == expected[i] && ok;
+            auto bad = *packet;
+            bad.blocks.front().lane_k_masks[0] ^= rmd::KMask{1} << (gold::BK - 1);
+            ok = rmd::validate_packet(bad) == rmd::RmdStatus::invalid_packet && ok;
+        }
+    }
+    unsetenv("GGML_POTAL_FAST_DECODE");
+    verdict("RESIDUAL", "K-support-builder-bitmap-fast-wide-reference", ok,
+            "compact 1/16/17/32/33/64; K31/32/63; signed INT32 carry lanes; malformed support");
 }
 
 // One case in a child process: a crash in the lowering under test is a FAIL of that case only.
@@ -802,7 +940,7 @@ int main(int argc, char ** argv) {
                 (int) POTAL_INPUT_BITS,
 #endif
                 potal_hw_params_sha256());
-    const bool w4 = GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4 && POTAL_HW_DIM == 32 &&
+    const bool w4 = GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4 && (POTAL_HW_DIM == 16 || POTAL_HW_DIM == 32 || POTAL_HW_DIM == 64) &&
                     anchor == 3 && GGML_GEMMINI_EXSIA_SIGMA == 2 && options::compensation &&
                     options::activation_quant == options::ActivationQuantAlgo::EXSIA;
     if (!w4) {
@@ -810,14 +948,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const dense_spec dense_cases[] = {
-        { "dense-random", 33, 40, 160, 11, false },
+        { "dense-random", 33, 40, gold::BK == 32 ? 160u : 192u, 11, false },
         { "dense-boundary", 37, 45, 192, 12, true },
         { "dense-qwen-k896", 32, 64, 896, 13, true },
-        { "dense-acc1-128-j2", 64, 64, 128, 14, false, 128, 2 },
-        { "dense-acc1-129-j1", 64, 64, 128, 14, false, 129, 1 },
+        { "dense-acc1-128-j2", 2 * POTAL_HW_DIM, 2 * POTAL_HW_DIM, 4 * gold::BK, 14, false, 4 * POTAL_HW_DIM, 2 },
+        { "dense-acc1-129-j1", 2 * POTAL_HW_DIM, 2 * POTAL_HW_DIM, 4 * gold::BK, 14, false, 4 * POTAL_HW_DIM + 1, 1 },
+        { "dense-acc1-row-slices", 4 * POTAL_HW_DIM, 2 * POTAL_HW_DIM, 4 * gold::BK, 14, false, 8 * POTAL_HW_DIM + 1, 1 },
     };
     for (const auto & c : dense_cases) isolated("D", c.name, [&] { dense_case(c); });
     isolated("MERGE", "main-residual", [] { test_main_merge(); });
+    isolated("RESIDUAL", "residual-mask-boundaries", [] { test_residual_masks(); });
     isolated("UPPER", "direct-upper", [] { test_upper_decode(); });
     isolated("TRANSFER", "transfer-boundaries", [] { transfer_boundaries(); });
     const att_spec att_cases[] = {
@@ -832,6 +972,9 @@ int main(int argc, char ** argv) {
         { "pv-element-gaps-ring", att::role::pv, 17, 33, 65, 2, 4, 32, true, 2, 2 },
         { "qk-permuted-ring", att::role::qk, 33, 17, 129, 1, 2, 33, true, 2, 3 },
         { "pv-singleton-layout", att::role::pv, 1, 33, 1, 1, 2, 34, true, 2, 3 },
+        { "qk-kv-511", att::role::qk, 64, 511, 65, 1, 2, 35, true },
+        { "pv-kv-513", att::role::pv, 64, 513, 65, 1, 2, 36, true },
+        { "pv-forced-saturation", att::role::pv, 64, 256, 33, 1, 2, 37, false, 1, 0, true },
     };
     for (const auto & c : att_cases) isolated(c.r == att::role::qk ? "QK" : "PV", c.name, [&] { attention_case(c); });
     std::printf(failed ? "W4A4_GOLDEN FAIL cases=%d failed=%d\n" : "W4A4_GOLDEN PASS cases=%d\n", cases, failed);

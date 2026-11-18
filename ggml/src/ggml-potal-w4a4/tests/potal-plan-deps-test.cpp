@@ -24,7 +24,8 @@ using namespace ggml::potal;
 
 namespace {
 
-static_assert(POTAL_W4A4 == 1 && POTAL_HW_DIM == 32, "requires the separate W4 DIM32 build");
+static_assert(POTAL_W4A4 == 1, "requires the separate W4 build");
+constexpr size_t D = POTAL_HW_DIM, BK = POTAL_SCALE_BLOCK_K, PPB = BK / D;
 static_assert(residual::digit_bits == 4, "requires radix-16 residuals");
 
 void require(bool ok, const std::string & why) {
@@ -125,13 +126,18 @@ struct fixture {
     bool tails;
 };
 
+// One activation bank (64 DIM-row K tiles) holds the single-panel Main A plus one
+// Residual A row tile: at most 63 / PPB whole blocks (15 at DIM16/Bk64), else 28.
+// Names keep the DIM32/Bk32 window counts.
+constexpr size_t NB = std::min<size_t>(28, 63 / PPB);
 const fixture fixtures[] = {
-    {"windows-0", 1, 32, 896, 1, 28, 0, 1, false},
-    {"windows-1", 1, 32, 896, 1, 28, 2, 1, false},
-    {"windows-2", 1, 32, 896, 1, 28, 4, 1, false},
-    {"windows-14", 1, 32, 896, 1, 28, 28, 1, false},
-    {"multi-panel-group-tail", 33, 97, 2048, 2, 16, 64, 1, true},
-    {"sparse-empty-panels", 33, 97, 2048, 2, 16, 2, 48, true},
+    {"windows-0", 1, D, NB * BK, 1, NB * PPB, 0, 1, false},
+    {"windows-1", 1, D, NB * BK, 1, NB * PPB, 2, 1, false},
+    {"windows-2", 1, D, NB * BK, 1, NB * PPB, 4, 1, false},
+    {"windows-14", 1, D, NB * BK, 1, NB * PPB, NB, 1, false},
+    // Main K panel: 16 DIM tiles (half an activation bank at I2), whole blocks.
+    {"multi-panel-group-tail", D + 1, 3 * D + 1, 64 * BK, 2, 16 / PPB * PPB, 64, 1, true},
+    {"sparse-empty-panels", D + 1, 3 * D + 1, 64 * BK, 2, 16 / PPB * PPB, 2, 48, true},
 };
 
 residual::decoded_packet packet(const fixture & f) {
@@ -143,7 +149,7 @@ residual::decoded_packet packet(const fixture & f) {
     for (size_t b = 0; b < f.runs; ++b) {
         residual::run r;
         r.block_id = static_cast<uint32_t>(b * f.spacing);
-        const size_t count = f.tails ? 1 + b % 32 : 1;
+        const size_t count = f.tails ? 1 + b % BK : 1;
         for (size_t x = 0; x < count; ++x) r.local_k.push_back(static_cast<uint16_t>(x));
         d.k_compact += count;
         d.runs.push_back(std::move(r));
@@ -156,7 +162,7 @@ residual::decoded_packet packet(const fixture & f) {
 potal_paired_status build(const fixture & f, const residual::decoded_packet & d,
                           potal_paired_execution_plan & e, std::string & why) {
     potal_tile_plan main;
-    if (potal_frozen_plan(f.rows, f.n, f.k, (f.rows + 31) / 32, f.j, f.main_k, 1, &main) != POTAL_OK) {
+    if (potal_frozen_plan(f.rows, f.n, f.k, (f.rows + D - 1) / D, f.j, f.main_k, PPB, &main) != POTAL_OK) {
         why = "frozen Main fixture refused";
         return potal_paired_status::invalid_argument;
     }
@@ -174,8 +180,10 @@ bool depends(const potal_paired_op & op, size_t id) {
 void regression(const fixture & f, const residual::decoded_packet & d,
                 const potal_paired_execution_plan & e, manifest & results, size_t & checks) {
     if (f.runs <= 28 && !f.tails) {
-        require(e.residencies.size() == 1 && e.residencies[0].windows == f.runs / 2,
-                std::string(f.name) + ": wrong physical W4 window count");
+        require(e.residencies.size() == 1 && e.residencies[0].windows == (f.runs + 64 / D - 1) / (64 / D),
+                std::string(f.name) + ": wrong physical W4 window count residencies=" +
+                    std::to_string(e.residencies.size()) + " windows=" +
+                    std::to_string(e.residencies.empty() ? 0 : e.residencies[0].windows));
     } else {
         require(e.tile.k_panels > 1 && e.tile.j_groups > 1 && e.residencies.size() > 2,
                 std::string(f.name) + ": missing pair reuse / K panels / J groups");
@@ -283,15 +291,18 @@ int main(int argc, char ** argv) try {
         require(argc == 1, "usage: potal-plan-deps-test [--manifest | --bench N]");
     }
     const auto hw = potal_paired_hw_geometry();
-    require(hw.dim == 32 && hw.bank_num == 4 && hw.bank_rows == 2048 && hw.acc_rows == 512 &&
-            hw.index_entries == 64 && hw.block_k == 32, "not the W4 DIM32/Index64 geometry");
+    require(hw.dim == D && hw.bank_num == 4 && hw.bank_rows == 64 * D && hw.acc_rows == 16 * D &&
+            hw.index_entries == 64 && hw.block_k == BK, "not the selected W4/Index64 geometry");
     manifest results;
     results.verbose = verbose;
     size_t checks = 0;
     if (repetitions == 0) {
         // A caller may narrow J, but the frozen-plan validator must keep both
-        // the 128-row J2 boundary and the absolute 256-row J1 boundary checked.
-        for (size_t lanes : {size_t(128), size_t(129), size_t(256), size_t(257)}) {
+        // the 4*DIM-row J2 boundary and the absolute 8*DIM-row J1 boundary checked
+        // (128/256 at DIM32); other DIMs also check 128/129 lanes against their ACC_ROWS.
+        std::vector<size_t> boundary_lanes = {4 * D, 4 * D + 1, 8 * D, 8 * D + 1};
+        if (D != 32) boundary_lanes.insert(boundary_lanes.end(), {size_t(128), size_t(129)});
+        for (size_t lanes : boundary_lanes) {
             residual::decoded_packet d;
             d.k_compact = 1;
             residual::run run;
@@ -299,22 +310,22 @@ int main(int argc, char ** argv) try {
             run.local_k = {0};
             d.runs.push_back(run);
             for (size_t i = 0; i < lanes; ++i)
-                d.rows.push_back({uint8_t(i / 64), uint32_t(i % 64)});
+                d.rows.push_back({uint8_t(i / (2 * D)), uint32_t(i % (2 * D))});
             d.digits.assign(lanes, 1);
             for (size_t j : {size_t(2), size_t(1)}) {
                 potal_tile_plan main;
-                require(potal_frozen_plan(64, 64, 128, 2, j, 4, 1, &main) == POTAL_OK,
+                require(potal_frozen_plan(2 * D, 2 * D, 4 * BK, 2, j, 4 * PPB, PPB, &main) == POTAL_OK,
                         "ACC boundary Main plan");
                 potal_paired_tile_plan tile;
                 potal_paired_execution_plan plan;
                 std::string why;
-                const auto status = potal_paired_plan_stripe(main, 64, 64, 128, &d, tile, plan, &why);
-                const bool fits = lanes <= (j == 2 ? 128 : 256);
+                const auto status = potal_paired_plan_stripe(main, 2 * D, 2 * D, 4 * BK, &d, tile, plan, &why);
+                const bool fits = (lanes + D - 1) / D * j <= hw.acc_rows / 2 / D; // ACC1 holds 8 row tiles
                 require(status == (fits ? potal_paired_status::ok : potal_paired_status::residual_acc_capacity),
                         "ACC boundary status");
                 if (fits) {
-                    require(tile.tile_I == 2 && tile.tile_J == j && tile.tile_K_main == 4 &&
-                            tile.tile_K == 4 && tile.residual_acc_rows <= hw.acc_rows / 2,
+                    require(tile.tile_I == 2 && tile.tile_J == j && tile.tile_K_main == 4 * PPB &&
+                            tile.tile_K == 4 * PPB && tile.residual_acc_rows <= hw.acc_rows / 2,
                             "ACC boundary geometry changed I/K");
                 }
                 ++checks;

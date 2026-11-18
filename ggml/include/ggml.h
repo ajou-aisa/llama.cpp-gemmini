@@ -2133,6 +2133,14 @@ extern "C" {
                    int64_t   n_per_row,
                const float * imatrix);
 
+    // GGML_TYPE_MXINT4 with one block exponent per 64 K elements (Bk=64); returns 0 on invalid input.
+    GGML_API size_t ggml_quantize_chunk_mxint4_b64(
+               const float * src,
+                      void * dst,
+                   int64_t   start,
+                   int64_t   nrows,
+                   int64_t   n_per_row);
+
 #ifdef __cplusplus
     // restrict not standard in C++
 #    if defined(__GNUC__)

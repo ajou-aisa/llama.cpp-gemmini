@@ -172,6 +172,78 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
     return true;
 }
 
+// Bk=64 MXINT4: theta = ilogb(amax over 64 K) - 2, written into both block_q4_hp1 halves of the group,
+// so the GGUF type and CPU decode stay MXINT4. A zero half inside a nonzero group keeps the shared m
+// with zero codes; INT16_MIN marks an all-zero group in both halves.
+static bool quantize_q4_hp1_b64_input_valid(const float * x, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        if (!isfinite(x[i])) {
+            return false;
+        }
+    }
+
+    for (int64_t g = 0; g < k; g += QK4_HP_B64) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK4_HP_B64; ++j) {
+            amax = MAX(amax, fabsf(x[g + j]));
+        }
+        if (amax > 0.0f && ldexpf(1.0f, q4_hp1_block_exponent(amax)) == 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool quantize_row_q4_hp1_b64_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_RESTRICT y, int64_t k) {
+    if (x == NULL || y == NULL || k <= 0 || k % QK4_HP_B64 != 0 || !quantize_q4_hp1_b64_input_valid(x, k)) {
+        return false;
+    }
+
+    const int64_t ng = k / QK4_HP_B64;
+    float channel_scale = 0.0f;
+    bool channel_set = false;
+    for (int64_t g = 0; g < ng; ++g) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK4_HP_B64; ++j) {
+            amax = MAX(amax, fabsf(x[g*QK4_HP_B64 + j]));
+        }
+        if (amax > 0.0f) {
+            const float group_scale = ldexpf(1.0f, q4_hp1_block_exponent(amax));
+            channel_scale = channel_set ? MIN(channel_scale, group_scale) : group_scale;
+            channel_set = true;
+        }
+    }
+
+    memset(y, 0, (size_t) (k / QK4_HP) * sizeof(*y));
+    const int channel_exponent = channel_set ? ilogbf(channel_scale) : 0;
+    for (int64_t g = 0; g < ng; ++g) {
+        const float * xg = x + g*QK4_HP_B64;
+        float amax = 0.0f;
+        for (int j = 0; j < QK4_HP_B64; ++j) {
+            amax = MAX(amax, fabsf(xg[j]));
+        }
+        for (int h = 0; h < 2; ++h) {
+            block_q4_hp1 * b = &y[2*g + h];
+            const float * xb = xg + h*QK4_HP;
+            b->channel_scale = channel_scale;
+            if (amax == 0.0f) {
+                b->m = INT16_MIN;
+                continue;
+            }
+
+            const int group_exponent = q4_hp1_block_exponent(amax);
+            const float group_scale = ldexpf(1.0f, group_exponent);
+            b->m = (int16_t) (group_exponent - channel_exponent);
+            for (int j = 0; j < QK4_HP/2; ++j) {
+                const int q0 = MIN(7, MAX(-7, mxint_round_to_even(xb[j] / group_scale)));
+                const int q1 = MIN(7, MAX(-7, mxint_round_to_even(xb[QK4_HP/2 + j] / group_scale)));
+                b->qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
+            }
+        }
+    }
+    return true;
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -2373,6 +2445,27 @@ size_t quantize_q4_hp1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     char * qrow = (char *) dst;
     for (int64_t row = 0; row < nrow; ++row) {
         if (!quantize_row_q4_hp1_ref(src + row*n_per_row, (block_q4_hp1 *) qrow, n_per_row)) {
+            return 0;
+        }
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q4_hp1_b64(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row) {
+    if (src == NULL || dst == NULL || nrow <= 0 || n_per_row <= 0 || n_per_row % QK4_HP_B64 != 0) {
+        return 0;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_q4_hp1_b64_input_valid(src + row*n_per_row, n_per_row)) {
+            return 0;
+        }
+    }
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXINT4, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_row_q4_hp1_b64_ref(src + row*n_per_row, (block_q4_hp1 *) qrow, n_per_row)) {
             return 0;
         }
         qrow += row_size;

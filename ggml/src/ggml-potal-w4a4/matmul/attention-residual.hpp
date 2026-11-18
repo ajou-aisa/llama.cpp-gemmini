@@ -13,7 +13,6 @@ namespace ggml::potal::attention::detail {
 // lane/source-row order without a temporary compact StripePacket.
 inline std::shared_ptr<const residual::decoded_packet> decode_upper(
         const stream & activation, size_t row_begin, size_t rows, role operation) {
-    constexpr size_t block_k = 32;
     constexpr int bits = 4, radix = 16, bias = 8;
     namespace rmd = ggml::gemmini::rmd;
     const auto require = [](bool valid, potal_status status = POTAL_ERR_INVALID_ARGUMENT) {
@@ -32,7 +31,7 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
     struct event { uint32_t k; uint16_t row; uint8_t lane; int8_t digit; };
     std::vector<event> events;
     const size_t capacity = rmd::balanced_radix_contract(bits).lane_capacity;
-    std::vector<uint32_t> k_masks(activation.kp / block_k, 0);
+    std::vector<uint64_t> k_masks(activation.kp / block_k, 0);
     std::vector<size_t> row_map(product(capacity, rows), SIZE_MAX);
     for (size_t row = 0; row < rows; ++row) {
         for (size_t k = 0; k < activation.k; ++k) {
@@ -46,7 +45,7 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
                 value = (value - digit) / radix;
                 if (digit) {
                     events.push_back({uint32_t(k), uint16_t(row), lane, int8_t(digit)});
-                    k_masks[k / block_k] |= uint32_t{1} << (k % block_k);
+                    k_masks[k / block_k] |= uint64_t{1} << (k % block_k);
                     row_map[lane * rows + row] = 0;
                 }
                 ++lane;
@@ -60,7 +59,7 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
         residual::run run;
         run.block_id = uint32_t(block);
         for (size_t k = 0; k < block_k; ++k) {
-            if (!(k_masks[block] & (uint32_t{1} << k))) continue;
+            if (!(k_masks[block] & (uint64_t{1} << k))) continue;
             run.local_k.push_back(uint16_t(k));
             k_map[block * block_k + k] = out->k_compact++;
         }

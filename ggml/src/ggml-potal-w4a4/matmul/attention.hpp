@@ -10,7 +10,11 @@
 
 namespace ggml::potal::attention {
 
-constexpr size_t block_k = 32;
+#ifndef POTAL_SCALE_BLOCK_K
+#define POTAL_SCALE_BLOCK_K 32
+#endif
+constexpr size_t block_k = POTAL_SCALE_BLOCK_K;
+static_assert(block_k % POTAL_HW_DIM == 0, "attention scale block must be whole DIM passes");
 constexpr size_t max_limbs = 9; // INT32_MAX needs the ninth balanced radix-16 carry digit.
 
 enum class role { none, qk, pv };
@@ -24,7 +28,7 @@ ggml_potal_reject check(const ggml_tensor * op, bool require_data);
 struct stationary {
     size_t k = 0, n = 0, kp = 0;
     std::vector<int16_t> base;
-    std::vector<uint32_t> carriers; // [kp / 32][n], zero carrier or exponent difference.
+    std::vector<uint32_t> carriers; // [kp / block_k][n], zero carrier or exponent difference.
     std::array<std::vector<int8_t>, 2> limbs; // [kp][n]; K lower/upper, or V.
 };
 

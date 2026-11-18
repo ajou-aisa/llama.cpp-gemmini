@@ -70,7 +70,7 @@ constexpr size_t paired_partition_rows = paired_sp_bank_rows / 2; // Main | Resi
 // POTAL_HW_ACC_ROWS (hardware-required: export the bank count).
 constexpr size_t paired_acc_banks      = 2;
 constexpr size_t paired_acc_bank_rows  = (size_t) POTAL_HW_ACC_ROWS / paired_acc_banks;
-constexpr size_t paired_block_k        = 32; // HP1 scale block = one residual run (rmd::kBlockSize)
+constexpr size_t paired_block_k        = prmd::kBlockSize; // logical scale group, not native storage
 
 static_assert(paired_sp_banks == 2 * paired_sp_pairs, "paired layout: one activation and one weight bank per pair");
 static_assert(paired_block_k % paired_dim == 0, "a scale block is a whole number of DIM passes");

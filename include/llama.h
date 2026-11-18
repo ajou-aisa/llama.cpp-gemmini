@@ -198,6 +198,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q16_0         = 45,
         LLAMA_FTYPE_MOSTLY_Q16_H1        = 46,
         LLAMA_FTYPE_MOSTLY_Q16_HP1       = 47,
+        LLAMA_FTYPE_MOSTLY_MXINT4_B64    = 48, // MXINT4 storage, one block exponent per 64 K
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

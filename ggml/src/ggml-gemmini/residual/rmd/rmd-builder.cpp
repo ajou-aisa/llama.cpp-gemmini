@@ -41,7 +41,7 @@ bool checked_activation_sizes(uint8_t  digit_bits,
     return digit_bits == 16 && checked_mul(value_count, sizeof(int16_t), byte_count);
 }
 
-void choose_lane_partition(const std::array<uint32_t, kMaxNativeRadixLanes> & lane_support,
+void choose_lane_partition(const std::array<KMask, kMaxNativeRadixLanes> & lane_support,
                            uint8_t                                            lane_count,
                            size_t                                             row_count,
                            uint8_t                                            lane_position,
@@ -51,7 +51,7 @@ void choose_lane_partition(const std::array<uint32_t, kMaxNativeRadixLanes> & la
                            size_t                                             baseline_calls,
                            size_t &                                           best_i_tiles) {
     if (lane_position == lane_count) {
-        std::array<uint32_t, kMaxNativeRadixLanes> group_support{};
+        std::array<KMask, kMaxNativeRadixLanes> group_support{};
         std::array<size_t, kMaxNativeRadixLanes>   group_lanes{};
         for (uint8_t lane = 0; lane < lane_count; ++lane) {
             group_support[assignment[lane]] |= lane_support[lane];
@@ -61,7 +61,7 @@ void choose_lane_partition(const std::array<uint32_t, kMaxNativeRadixLanes> & la
         size_t i_tiles = 0;
         for (uint8_t group = 0; group < group_count; ++group) {
             const size_t k_tiles =
-                (static_cast<size_t>(__builtin_popcount(group_support[group])) + kArrayDim - 1) /
+                (static_cast<size_t>(__builtin_popcountll(group_support[group])) + kArrayDim - 1) /
                 kArrayDim;
             calls += k_tiles;
             i_tiles += k_tiles * (align_up(group_lanes[group] * row_count, kArrayDim) / kArrayDim);
@@ -382,10 +382,10 @@ RmdStatus read_packet_digit(const StripePacket &    packet,
             return RmdStatus::invalid_packet;
         }
         // The public K index is block-compact; group masks use original local K.
-        const uint32_t bit = uint32_t{1} << packet.k_indices[index];
+        const KMask bit = KMask{1} << packet.k_indices[index];
         absent             = (selected->k_mask & bit) == 0;
         // Selected bits below this K give its rank in the group's packed row.
-        group_k = static_cast<size_t>(__builtin_popcount(selected->k_mask & (bit - 1)));
+        group_k = static_cast<size_t>(__builtin_popcountll(selected->k_mask & (bit - 1)));
     }
     int32_t         staged = 0;
     const RmdStatus status = read_group_digit(packet,
@@ -469,7 +469,7 @@ bool RmdStripeBuilder::add_residual(size_t local_row, size_t original_k, int32_t
         if (accum.row_lane_masks.empty())
             accum.row_lane_masks.resize(row_count_, 0);
         // K bits retain original block-local coordinates; OR unions this stripe's rows.
-        accum.k_mask |= uint32_t{1} << block_local_k;
+        accum.k_mask |= KMask{1} << block_local_k;
         uint16_t active_lanes = 0;
         for (uint8_t lane = 0; lane < digits.lane_capacity; ++lane) {
             if (digits.digits[lane] == 0) {
@@ -477,7 +477,7 @@ bool RmdStripeBuilder::add_residual(size_t local_row, size_t original_k, int32_t
             }
             // Keep original lane IDs so pruning cannot change the radix exponent.
             active_lanes |= static_cast<uint16_t>(1u << lane);
-            accum.lane_k_masks[lane] |= uint32_t{1} << block_local_k;
+            accum.lane_k_masks[lane] |= KMask{1} << block_local_k;
             entries_.push_back({
                 static_cast<uint32_t>(block_id),
                 static_cast<uint32_t>(local_row),
@@ -571,7 +571,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
                 return nullptr;
             }
             descriptor.global_k_begin    = static_cast<uint32_t>(global_k_begin);
-            const size_t compact_k_count = static_cast<size_t>(__builtin_popcount(accum.k_mask));
+            const size_t compact_k_count = static_cast<size_t>(__builtin_popcountll(accum.k_mask));
             descriptor.compact_k_count   = static_cast<uint16_t>(compact_k_count);
             const size_t padded_k        = align_up(compact_k_count, kArrayDim);
             if (padded_k == 0) {
@@ -597,7 +597,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
             descriptor.active_lane_count = lane_count;
 
             // Fix the final groups before allocating payload; each entry is packed once.
-            std::array<uint32_t, kMaxNativeRadixLanes> lane_support{};
+            std::array<KMask, kMaxNativeRadixLanes> lane_support{};
             for (uint8_t lane = 0; lane < lane_count; ++lane) {
                 lane_support[lane] = descriptor.lane_k_masks[descriptor.lane_ids[lane]];
             }
@@ -638,7 +638,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
                     group_mask |= uint16_t{1} << descriptor.lane_ids[lane];
                 size_t packed_rows = 0;
                 for (uint16_t mask : accum.row_lane_masks)
-                    packed_rows += __builtin_popcount(mask & group_mask);
+                    packed_rows += __builtin_popcountll(mask & group_mask);
                 group.row_ids.reserve(packed_rows);
                 for (size_t group_lane = 0; group_lane < group.lane_positions.size();
                      ++group_lane) {
@@ -653,7 +653,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
                     group.row_offsets[group_lane + 1] = static_cast<uint32_t>(group.row_ids.size());
                 }
                 group.padded_k_count = static_cast<uint16_t>(
-                    align_up(static_cast<size_t>(__builtin_popcount(group.k_mask)), kArrayDim));
+                    align_up(static_cast<size_t>(__builtin_popcountll(group.k_mask)), kArrayDim));
                 size_t values = 0, bytes = 0;
                 size_t value_offset = 0, byte_offset = 0;
                 if (!checked_activation_sizes(
@@ -690,8 +690,8 @@ StripePacketHandle RmdStripeBuilder::finish() {
 
             // Compact K index table for this block: ascending, deduplicated, block local.
             // ctz finds the lowest set bit; x & (x - 1) removes it. Never call ctz(0).
-            for (uint32_t remaining = accum.k_mask; remaining != 0; remaining &= remaining - 1) {
-                const uint16_t local_k = static_cast<uint16_t>(__builtin_ctz(remaining));
+            for (KMask remaining = accum.k_mask; remaining != 0; remaining &= remaining - 1) {
+                const uint16_t local_k = static_cast<uint16_t>(__builtin_ctzll(remaining));
                 packet->k_indices.push_back(local_k);
             }
 
@@ -732,10 +732,10 @@ StripePacketHandle RmdStripeBuilder::finish() {
             const BlockPacking &        packing    = packing_by_block[entry.block_id];
             const BlockDescriptor &     descriptor = packet->blocks[packing.block_index];
             const LaneGroupDescriptor & group = descriptor.groups[packing.group_ids[entry.lane]];
-            const uint32_t              bit   = uint32_t{1} << entry.block_local_k;
+            const KMask              bit   = KMask{1} << entry.block_local_k;
             // bit - 1 selects lower K positions; their popcount is the packed index.
             const size_t group_k =
-                static_cast<size_t>(__builtin_popcount(group.k_mask & (bit - 1)));
+                static_cast<size_t>(__builtin_popcountll(group.k_mask & (bit - 1)));
             const RmdStatus write =
                 write_packet_digit(*packet,
                                    group,
@@ -991,10 +991,10 @@ RmdStatus validate_packet(const StripePacket & packet) {
                 group.row_offsets[group.lane_positions.size()] != group.row_ids.size() ||
                 group.k_mask == 0 ||
                 group.padded_k_count !=
-                    align_up(static_cast<size_t>(__builtin_popcount(group.k_mask)), kArrayDim)) {
+                    align_up(static_cast<size_t>(__builtin_popcountll(group.k_mask)), kArrayDim)) {
                 return RmdStatus::invalid_packet;
             }
-            uint32_t support = 0;
+            KMask support = 0;
             for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
                 const uint8_t position = group.lane_positions[lane];
                 if (position >= block.active_lane_count ||
@@ -1092,25 +1092,25 @@ RmdStatus validate_packet(const StripePacket & packet) {
     // Every stored lane is active, while padded rows and K slots decode to zero.
     size_t rebuilt_residual_event_count = 0;
     for (const BlockDescriptor & block : packet.blocks) {
-        std::array<uint32_t, kMaxNativeRadixLanes>                         rebuilt_lane_k_masks{};
-        std::array<std::array<uint32_t, kBlockSize>, kMaxNativeRadixLanes> group_k_bits{};
+        std::array<KMask, kMaxNativeRadixLanes>                         rebuilt_lane_k_masks{};
+        std::array<std::array<KMask, kBlockSize>, kMaxNativeRadixLanes> group_k_bits{};
         std::array<std::array<uint32_t, kMaxNativeRadixLanes>, kMaxNativeRadixLanes> row_cursors{};
         for (size_t group_index = 0; group_index < block.groups.size(); ++group_index) {
             std::copy_n(block.groups[group_index].row_offsets.begin(),
                         block.groups[group_index].lane_positions.size(),
                         row_cursors[group_index].begin());
             size_t k_count = 0;
-            for (uint32_t remaining = block.groups[group_index].k_mask; remaining != 0;
+            for (KMask remaining = block.groups[group_index].k_mask; remaining != 0;
                  remaining &= remaining - 1) {
                 // Unsigned negation isolates the lowest original-K bit, including K=31.
-                group_k_bits[group_index][k_count++] = remaining & (0u - remaining);
+                group_k_bits[group_index][k_count++] = remaining & (KMask{0} - remaining);
             }
         }
         for (size_t row = 0; row < packet.row_count; ++row) {
-            uint32_t row_k_mask = 0;
+            KMask row_k_mask = 0;
             for (size_t group_index = 0; group_index < block.groups.size(); ++group_index) {
                 const LaneGroupDescriptor & group = block.groups[group_index];
-                const size_t k_count = static_cast<size_t>(__builtin_popcount(group.k_mask));
+                const size_t k_count = static_cast<size_t>(__builtin_popcountll(group.k_mask));
                 for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
                     const uint8_t lane_id = block.lane_ids[group.lane_positions[lane]];
                     auto &        cursor  = row_cursors[group_index][lane];
@@ -1124,7 +1124,7 @@ RmdStatus validate_packet(const StripePacket & packet) {
                         row_nonzero = true;
                         if (k >= k_count)
                             return false;
-                        const uint32_t bit = group_k_bits[group_index][k];
+                        const KMask bit = group_k_bits[group_index][k];
                         rebuilt_lane_k_masks[lane_id] |= bit;
                         row_k_mask |= bit;
                         return true;
@@ -1153,7 +1153,7 @@ RmdStatus validate_packet(const StripePacket & packet) {
                         return RmdStatus::invalid_packet;
                 }
             }
-            rebuilt_residual_event_count += static_cast<size_t>(__builtin_popcount(row_k_mask));
+            rebuilt_residual_event_count += static_cast<size_t>(__builtin_popcountll(row_k_mask));
         }
         // Real lane rows are adjacent; only the tail of the complete group is padding.
         for (const LaneGroupDescriptor & group : block.groups) {
@@ -1180,11 +1180,11 @@ RmdStatus validate_packet(const StripePacket & packet) {
             if (rebuilt_lane_k_masks[block.lane_ids[position]] == 0)
                 return RmdStatus::invalid_packet;
         }
-        uint32_t selected_k_mask = 0, rebuilt_k_mask = 0;
+        KMask selected_k_mask = 0, rebuilt_k_mask = 0;
         for (size_t k = 0; k < block.compact_k_count; ++k) {
-            selected_k_mask |= uint32_t{1} << packet.k_indices[block.k_index_offset + k];
+            selected_k_mask |= KMask{1} << packet.k_indices[block.k_index_offset + k];
         }
-        for (uint32_t support : rebuilt_lane_k_masks)
+        for (KMask support : rebuilt_lane_k_masks)
             rebuilt_k_mask |= support;
         if (selected_k_mask != rebuilt_k_mask)
             return RmdStatus::invalid_packet;

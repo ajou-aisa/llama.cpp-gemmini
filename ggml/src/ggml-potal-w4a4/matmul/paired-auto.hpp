@@ -391,6 +391,8 @@ struct potal_paired_pair_state {
 };
 
 struct potal_paired_execution_plan {
+    size_t schema_dim = 0, schema_block_k = 0;
+    uint32_t packet_schema = 0;
     potal_paired_tile_plan                    tile;
     std::vector<residual::lane_row>           residual_rows; // Residual A / C row i = (lane, source row): provenance
     std::vector<potal_paired_op>              ops;

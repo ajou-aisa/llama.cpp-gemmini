@@ -10,7 +10,8 @@
 #include <algorithm>
 #include <cstring>
 
-static_assert(QK4_HP == ggml::potal::quants::weight::hp1::block_k, "HP1 scale block differs from QK4_HP");
+static_assert(QK4_HP == 32 && (POTAL_SCALE_BLOCK_K == 32 || POTAL_SCALE_BLOCK_K == 64),
+              "HP1 native32 storage supports logical scale groups 32/64");
 
 namespace ggml::potal::quants::weight::hp1 {
 
@@ -34,6 +35,9 @@ const char * status_name(status s) {
         case status::metadata:       return "metadata";
         case status::channel_scale:  return "channel_scale";
         case status::scale_mismatch: return "scale_mismatch";
+        case status::pair_mismatch:
+            return "pair_mismatch (Bk64 build: native32 halves of a 64-K group differ in m/channel_scale; "
+                   "requantize with MXINT4_B64, a Bk32 MXINT4 model is not accepted)";
     }
     return "unknown";
 }
@@ -63,7 +67,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
         }
         return status::route;
     }
-    if (!plan.hp1_carriers || plan.scales.block_size != block_k) {
+    if (!plan.hp1_carriers || plan.scales.block_size != QK4_HP || args.K % block_k != 0) {
         return status::route;
     }
     // A valid plan already passed wreader::validate() inside the resolver.
@@ -72,6 +76,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
     }
 
     const size_t nb = args.native_blocks_per_row;
+    constexpr size_t halves = block_k / QK4_HP;
     stats        s;
     bool         have_m     = false;
     bool         have_scale = false;
@@ -89,7 +94,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
             return status::channel_scale;
         }
         const bool zero_scale = scale_bits == 0;
-        for (size_t b = 0; b < nb; ++b) {
+        for (size_t b = 0; b < nb; b += halves) {
             const wreader::Hp1CarrierResult c = wreader::read_hp1_carrier_validated(args, plan, n, b);
             if (!c.ok()) {
                 if (reader != nullptr) {
@@ -99,6 +104,16 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
             }
             if (float_bits(c.column_scale) != scale_bits) {
                 return status::scale_mismatch;
+            }
+            if constexpr (halves == 2) {
+                const auto other = wreader::read_hp1_carrier_validated(args, plan, n, b + 1);
+                if (!other.ok()) {
+                    if (reader != nullptr) *reader = other.status;
+                    return status::metadata;
+                }
+                if (other.carrier != c.carrier || float_bits(other.column_scale) != scale_bits) {
+                    return status::pair_mismatch;
+                }
             }
             if (c.carrier == ggml::gemmini::quants::hp1::zero_carrier) {
                 s.zero_blocks++;
@@ -113,9 +128,9 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
                 s.shift_blocks += m > 0 ? 1 : 0;
                 have_m = true;
             }
-            carriers[b * cstride + n] = c.carrier;
+            carriers[(b / halves) * cstride + n] = c.carrier;
         }
-        s.blocks += nb;
+        s.blocks += nb / halves;
         channel_scale[n] = row_scale;
         if (zero_scale) {
             s.zero_rows++;
@@ -132,20 +147,20 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
     // carrier/scale writes and never touch B. Validated storage is immutable.
     // Resolve a native block once per column and K tile, not once per code.
     static_assert(DIM >= 2 && DIM % 2 == 0, "packed column tiles must start on byte boundaries");
-    constexpr size_t tile_k = DIM < block_k ? DIM : block_k;
+    constexpr size_t tile_k = DIM < QK4_HP ? DIM : QK4_HP;
     uint16_t local_k[DIM];
     int32_t values[DIM * DIM];
     for (size_t k0 = 0; k0 < args.K; k0 += tile_k) {
         const size_t nk = std::min(tile_k, args.K - k0);
         for (size_t i = 0; i < nk; ++i) {
-            local_k[i] = static_cast<uint16_t>(k0 % block_k + i);
+            local_k[i] = static_cast<uint16_t>(k0 % QK4_HP + i);
             std::memset(reinterpret_cast<uint8_t *>(B) + (k0 + i) * (ldb / 2), 0, ldb / 2);
         }
         for (size_t n0 = 0; n0 < args.J; n0 += DIM) {
             const size_t nn = std::min(static_cast<size_t>(DIM), args.J - n0);
             size_t resolutions = 0;
             const auto rs = wreader::read_code_tile_validated(
-                args, plan, k0 / block_k, local_k, nk, n0, nn, values, resolutions);
+                args, plan, k0 / QK4_HP, local_k, nk, n0, nn, values, resolutions);
             if (rs != wreader::WeightReaderStatus::Success) {
                 if (reader != nullptr) *reader = rs;
                 return status::metadata;

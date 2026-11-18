@@ -161,7 +161,7 @@ void test_cache_contract() {
         const auto & b = *ordinary.weight;
         same = a.bytes() == b.bytes() && a.ldb == b.ldb && a.cstride == b.cstride &&
                std::memcmp(a.b, b.b, a.k * a.ldb / packing) == 0 &&
-               std::memcmp(a.carriers, b.carriers, a.k / 32 * a.cstride * sizeof(uint32_t)) == 0 &&
+               std::memcmp(a.carriers, b.carriers, a.k / quants::weight::hp1::block_k * a.cstride * sizeof(uint32_t)) == 0 &&
                std::memcmp(a.scale, b.scale, a.n_pad * sizeof(float)) == 0;
     }
     check("eager and lazy prepared operands match byte-for-byte",

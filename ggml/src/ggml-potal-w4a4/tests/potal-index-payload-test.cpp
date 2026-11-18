@@ -30,8 +30,9 @@ namespace rmd = ggml::gemmini::rmd;
 
 namespace {
 
-static_assert(POTAL_W4A4 == 1 && POTAL_HW_DIM == 32, "native W4 DIM32 regression");
-constexpr size_t M = 3, N = 65, K = 384, LD = 96;
+static_assert(POTAL_W4A4 == 1, "native W4 regression");
+constexpr size_t D = POTAL_HW_DIM, BK = POTAL_SCALE_BLOCK_K, PPB = BK / D;
+constexpr size_t M = 3, N = 2 * D + 1, K = 12 * BK, LD = 3 * D;
 constexpr uint32_t blocks[] = {0, 1, 2, 3, 8, 9};
 
 void require(bool ok, const std::string & why) {
@@ -63,8 +64,9 @@ struct fixture {
             for (size_t k = 0; k < K; ++k)
                 values[n * K + k] = k / 32 == 4 && n % 5 == 0 ? 0.0f :
                     std::ldexp(float(int((3 * n + 5 * k) % 15) - 7), int(k / 32 % 4) - 4);
-        ggml_quantize_chunk(GGML_TYPE_MXINT4, values.data(), w->data, 0, N, K, nullptr);
-        require(potal_frozen_plan(M, N, K, 1, 2, 4, 1, &main) == POTAL_OK, "frozen Main");
+        if constexpr (BK == 64) ggml_quantize_chunk_mxint4_b64(values.data(), w->data, 0, N, K);
+        else ggml_quantize_chunk(GGML_TYPE_MXINT4, values.data(), w->data, 0, N, K, nullptr);
+        require(potal_frozen_plan(M, N, K, 1, 2, 4 * PPB, PPB, &main) == POTAL_OK, "frozen Main");
         ggml_gemmini_args_t args;
         require(init_args(w, y, {M, N, K}, "qwen2", "index-payload",
                     ggml::gemmini::residual::ResidualRoute::ws_packet, main, args) &&
@@ -75,8 +77,8 @@ struct fixture {
                     ggml_row_size(GGML_TYPE_MXINT4, K), N, K, golden, why), why);
         logical.resize(M * K);
         for (size_t i = 0; i < logical.size(); ++i) logical[i] = int(i * 5 % 16) - 8;
-        a.reset(static_cast<int8_t *>(dma_alloc(32 * K / 2)));
-        require(a && potal_int4_pack_rows(reinterpret_cast<uint8_t *>(a.get()), 32 * K / 2,
+        a.reset(static_cast<int8_t *>(dma_alloc(D * K / 2)));
+        require(a && potal_int4_pack_rows(reinterpret_cast<uint8_t *>(a.get()), D * K / 2,
                     K / 2, logical.data(), K, M, K) == POTAL_OK, "packed A4");
 
         rmd::RmdStripeBuilder builder;
@@ -84,7 +86,7 @@ struct fixture {
         for (size_t b = 0; b < 6; ++b)
             for (size_t k = 0; k < 1 + 2 * b; ++k)
                 for (size_t row = 0; row < M; ++row)
-                    require(builder.add_residual(row, blocks[b] * 32 + k,
+                    require(builder.add_residual(row, blocks[b] * BK + k,
                                 row == 0 ? 17 : row == 1 ? -3 : 5), "radix-16 residual");
         packet = builder.finish();
         require(packet && residual::decode_packet(*packet, decoded) == rmd::RmdStatus::success,
@@ -92,9 +94,9 @@ struct fixture {
         potal_paired_tile_plan tile;
         require(potal_paired_plan_stripe(main, M, N, K, &decoded, tile, shared, &why) ==
                     potal_paired_status::ok, why);
-        require(tile.j_groups == 2 && tile.k_panels == 3 && tile.residual_windows == 3 &&
-                    tile.panels[0].windows.size() == 2 && tile.panels[1].windows.empty() &&
-                    tile.residual_empty_panels == 1 && tile.residual_filler_slots > 0 && tile.pad_J != 0,
+        require(tile.j_groups == 2 && tile.k_panels == 3 && tile.residual_windows == (4 + 64 / D - 1) / (64 / D) + (2 + 64 / D - 1) / (64 / D) &&
+                    tile.panels[0].windows.size() == (4 + 64 / D - 1) / (64 / D) && tile.panels[1].windows.empty() &&
+                    tile.residual_empty_panels == 1 && (D == 64 || tile.residual_filler_slots > 0) && tile.pad_J != 0,
                 "fixture needs multiple J groups, tail, panels, windows, filler and empty panel");
 
         // Expand only storage and spans. Every op, dependency, header and counter is copied unchanged.
@@ -121,10 +123,19 @@ struct fixture {
             ++installs;
             writes += op.entry_end - op.entry_begin;
         }
-        require(unique == 117 && shared.index_entries.size() == unique &&
-                    expanded.index_entries.size() == 2 * unique && writes == 234 &&
+        size_t expected_unique = 0, expected_installs = 0;
+        for (size_t begin : {size_t(0), size_t(4)}) {
+            const size_t end = begin == 0 ? 4 : 6;
+            for (size_t f = begin; f < end; f += 64 / D) {
+                const size_t last = std::min(end, f + 64 / D) - 1;
+                expected_unique += (last - f) * D + 1 + 2 * last;
+                expected_installs += 2;
+            }
+        }
+        require(unique == expected_unique && shared.index_entries.size() == unique &&
+                    expanded.index_entries.size() == 2 * unique && writes == 2 * expected_unique &&
                     shared.index_writes == writes && expanded.index_writes == writes &&
-                    installs == 6 && shared.index_programs == installs && expanded.index_programs == installs,
+                    installs == expected_installs && shared.index_programs == installs && expanded.index_programs == installs,
                 "half the payload storage, unchanged logical installations and writes");
         require(potal_validate_execution_plan(shared, &decoded, &why) == potal_paired_status::ok &&
                     potal_validate_execution_plan(expanded, &decoded, &why) == potal_paired_status::ok,
@@ -143,7 +154,7 @@ struct fixture {
                     int64_t raw = 0;
                     for (uint16_t k : run.local_k)
                         raw += int64_t(decoded.digits[row * decoded.k_compact + compact++]) *
-                            golden.q[n * K + run.block_id * 32 + k];
+                            golden.q[n * K + run.block_id * BK + k];
                     acc = gold::acc_add(acc, gold::scu(raw, golden.carrier[run.block_id * N + n]));
                 }
                 residual_golden[row * N + n] = acc;
@@ -202,9 +213,9 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
                              bool queue, potal_paired_stream_mode stream, bool prepared, bool refuse) {
     potal_test::h2_emulator emulator;
     std::unique_ptr<int32_t, decltype(&std::free)> cm(
-        static_cast<int32_t *>(dma_alloc(32 * LD * sizeof(int32_t))), std::free);
+        static_cast<int32_t *>(dma_alloc(D * LD * sizeof(int32_t))), std::free);
     std::unique_ptr<int32_t, decltype(&std::free)> cr(
-        static_cast<int32_t *>(dma_alloc(32 * LD * sizeof(int32_t))), std::free);
+        static_cast<int32_t *>(dma_alloc(D * LD * sizeof(int32_t))), std::free);
     require(cm && cr, "readback allocation");
     uint32_t generation = 0;
     potal_paired_request req;
@@ -214,10 +225,16 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
     req.c_main = cm.get(); req.ldc_main = LD;
     req.c_residual = cr.get(); req.ldc_residual = LD;
     req.generation = &generation; req.plan = &plan;
-    req.ktile_scale_reuse = true;
+    req.ktile_scale_reuse = D == 32 && BK == 32;
     req.stream = stream;
     req.stream_counter = stream == potal_paired_stream_mode::off ? nullptr : potal_test::h2_emulator::on_counter;
     potal_paired_prepared job;
+    if (stream != potal_paired_stream_mode::off && (D != 32 || BK != 32)) {
+        const auto sink = emulator.sink(); potal_paired_report report;
+        require(potal_paired_run_session(req, &sink, report) != potal_paired_status::ok && emulator.records.empty(),
+                "unsupported stream geometry must refuse before commands");
+        return {uint64_t(report.status)};
+    }
     if (prepared) {
         auto copy = plan;
         const char * stage = nullptr;

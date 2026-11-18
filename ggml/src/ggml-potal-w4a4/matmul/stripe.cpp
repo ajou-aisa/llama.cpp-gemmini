@@ -192,6 +192,16 @@ struct stripe_run::stripe_work {
     const potal_tile_plan * paired_main = nullptr;
     bool                    diagnostic_index = false;
     potal_paired_prepared   job; // strict issuer: plan, staging, Queue entries made by the producer
+    // Execution-only slicing of independent (lane, source-row) outputs. Keep
+    // the original quantization stripe, complete K support and contribution order.
+    struct row_slice {
+        size_t begin = 0;
+        residual::decoded_packet decoded;
+        potal_tile_plan main;
+        potal_paired_execution_plan routing;
+        potal_paired_prepared job;
+    };
+    std::vector<std::unique_ptr<row_slice>> row_slices;
 };
 
 struct stripe_run::prep_outcome {
@@ -836,8 +846,7 @@ stripe_run::prep_outcome stripe_run::prepare_paired(slot & s, stripe_work & work
         } else {
             ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, s.packet ? &decoded : nullptr,
                                            tile, routing, &why);
-            if (ps == potal_paired_status::residual_acc_capacity &&
-                cfg_.paired_ktile_scale_reuse && !j8k8_ffn) {
+            if (ps == potal_paired_status::residual_acc_capacity && !j8k8_ffn) {
                 // The packet is already validated. Narrow only output columns:
                 // retain the producer's I/anchor and K, and recheck every capacity.
                 const auto hw = potal_paired_hw_geometry();
@@ -854,6 +863,37 @@ stripe_run::prep_outcome stripe_run::prepare_paired(slot & s, stripe_work & work
                     paired_main = &selected_main;
                     ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, &decoded,
                                                  tile, routing, &why);
+                } else if (max_j == 0 && cfg_.paired_stream == potal_paired_stream_mode::off &&
+                           !cfg_.paired_ktile_scale_reuse) {
+                    // Even J1 cannot hold every independent Residual output.
+                    // Each slice executes complete K reductions; no Sat32 sum
+                    // is split or regrouped. Repeated Main writes are identical.
+                    const size_t slice_rows = std::min(hw.acc_rows / 2 / hw.dim, hw.work_ids) * hw.dim;
+                    if (slice_rows == 0)
+                        return refuse("paired_plan", POTAL_ERR_CAPACITY, false, "ACC1 holds no residual row tile");
+                    for (size_t begin = 0; begin < decoded.rows.size(); begin += slice_rows) {
+                        auto part = std::make_unique<stripe_work::row_slice>();
+                        part->begin = begin;
+                        const size_t end = std::min(decoded.rows.size(), begin + slice_rows);
+                        part->decoded.runs = decoded.runs;
+                        part->decoded.k_compact = decoded.k_compact;
+                        part->decoded.rows.assign(decoded.rows.begin() + begin, decoded.rows.begin() + end);
+                        part->decoded.digits.assign(decoded.digits.begin() + begin * decoded.k_compact,
+                                                    decoded.digits.begin() + end * decoded.k_compact);
+                        const auto frozen = potal_frozen_plan(rows, n_, k_, paired_main->tile_I, 1,
+                            paired_main->tile_K, paired_main->passes_per_block, &part->main);
+                        if (frozen != POTAL_OK)
+                            return refuse("paired_plan", frozen, false, "row-sliced Main plan rejected");
+                        potal_paired_tile_plan selected;
+                        why.clear();
+                        ps = potal_paired_plan_stripe(part->main, rows, n_, k_, &part->decoded,
+                                                     selected, part->routing, &why);
+                        if (ps != potal_paired_status::ok) break;
+                        if (work.row_slices.empty()) tile = selected;
+                        work.row_slices.push_back(std::move(part));
+                    }
+                    if (ps == potal_paired_status::ok && !work.row_slices.empty())
+                        paired_main = &work.row_slices.front()->main;
                 }
             }
         }
@@ -925,19 +965,28 @@ bool stripe_run::prepare_job(slot & s, prep_outcome & out) {
                      ": the strict issuer runs paired stripes only (a serial fallback would plan on hart 0)";
         return false;
     }
-    potal_paired_request pq = paired_request(s, *work);
     // The planner validated work->routing for exactly these inputs in prepare_paired (paired_route).
     const char * reuse_env = std::getenv("GGML_POTAL_PLAN_VALIDATED_REUSE");
-    pq.plan_validated = reuse_env != nullptr && (std::strcmp(reuse_env, "ON") == 0 || std::strcmp(reuse_env, "1") == 0);
-    const char * stage = nullptr;
-    std::string  why;
-    const potal_paired_status st = potal_paired_prepare(pq, std::move(work->routing), work->job, &stage, &why);
-    if (st != potal_paired_status::ok) {
-        out.stage  = "prepare_job";
-        out.status = POTAL_OK;
-        out.detail = "stripe " + std::to_string(s.stripe_id) + ": POTAL_PAIRED_" + potal_paired_status_name(st) +
-                     " step=" + (stage != nullptr ? stage : "-") + ": " + why;
-        return false;
+    for (size_t i = 0; i < std::max(size_t(1), work->row_slices.size()); ++i) {
+        potal_paired_request pq = paired_request(s, *work);
+        auto * part = work->row_slices.empty() ? nullptr : work->row_slices[i].get();
+        if (part) {
+            pq.main_plan = &part->main;
+            pq.residual = &part->decoded;
+            pq.c_residual += part->begin * ldc_;
+        }
+        pq.plan_validated = reuse_env != nullptr && (std::strcmp(reuse_env, "ON") == 0 || std::strcmp(reuse_env, "1") == 0);
+        const char * stage = nullptr;
+        std::string why;
+        const auto st = potal_paired_prepare(pq, std::move(part ? part->routing : work->routing),
+                                             part ? part->job : work->job, &stage, &why);
+        if (st != potal_paired_status::ok) {
+            out.stage = "prepare_job";
+            out.status = POTAL_OK;
+            out.detail = "stripe " + std::to_string(s.stripe_id) + ": POTAL_PAIRED_" + potal_paired_status_name(st) +
+                         " step=" + (stage != nullptr ? stage : "-") + ": " + why;
+            return false;
+        }
     }
     s.prepared = std::move(work);
     out.ok = true;
@@ -1045,7 +1094,9 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             prep_outcome p = prepare_paired(s, *work, static_cast<bool>(runners.paired));
             if (!p.ok) return failed(p.stage, p.status, false, p.detail);
         }
-        if (cfg_.strict_issuer && (!paired_route || !work->job.ready || !runners.paired)) {
+        const bool jobs_ready = work->row_slices.empty() ? work->job.ready :
+            std::all_of(work->row_slices.begin(), work->row_slices.end(), [](const auto & part) { return part->job.ready; });
+        if (cfg_.strict_issuer && (!paired_route || !jobs_ready || !runners.paired)) {
             return failed("strict_issuer", POTAL_ERR_INVALID_ARGUMENT, false,
                           "stripe reached the issuer without a prepared paired job or paired runner");
         }
@@ -1053,13 +1104,22 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
         if (paired_route) {
             // 1+2. Main and Residual GEMMs as one paired execution on the owner thread:
             //      planned again (deterministic), staged, issued, read back, drained.
+            potal_paired_status pst = potal_paired_status::ok;
+            emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
+            for (size_t i = 0; i < std::max(size_t(1), work->row_slices.size()); ++i) {
             potal_paired_request pq = paired_request(s, *work);
+            auto * part = work->row_slices.empty() ? nullptr : work->row_slices[i].get();
+            if (part) {
+                pq.main_plan = &part->main;
+                pq.residual = &part->decoded;
+                pq.c_residual += part->begin * ldc_;
+                pq.plan = &part->routing;
+            }
             if (cfg_.strict_issuer) {
                 pq.plan     = nullptr; // moved into the prepared job by potal_paired_prepare (hart 3)
-                pq.prepared = &work->job;
+                pq.prepared = part ? &part->job : &work->job;
             }
-            emit(advance(s, slot_state::paired_running, stripe_event_kind::paired_begin));
-            const potal_paired_status pst = runners.paired(pq, paired);
+            pst = runners.paired(pq, paired);
             gemm_fatal                    = gemm_fatal || paired.fatal;
             if (paired.fatal) {
                 paired_rc.abandon();
@@ -1097,6 +1157,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
             n.issue_s += pc.issue_s;
             n.fence_s += pc.fence_s;
             n.last_generation = paired.last_generation != 0 ? paired.last_generation : n.last_generation;
+            if (pst != potal_paired_status::ok) break;
+            }
             {
                 stripe_event ev = pst == potal_paired_status::ok
                                       ? advance(s, slot_state::paired_done, stripe_event_kind::paired_end)
@@ -1112,7 +1174,8 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                     ev.ldc           = ldc_;
                     ev.residual_c    = static_cast<const int32_t *>(paired_rc.p);
                     ev.residual_ldc  = ldc_;
-                    ev.residual_rows = paired.plan.residual_rows.size();
+                    ev.residual_rows = work->row_slices.empty() ? paired.plan.residual_rows.size()
+                                                                : decoded.rows.size();
                 }
                 emit(ev);
             }
@@ -1438,7 +1501,8 @@ stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
             role_span reconstructing(cfg_, 42, s.stripe_id, s.index);
             emit(event_of(stripe_event_kind::radix_reconstruct_begin, s));
             const rmd::RmdStatus composed =
-                paired_route ? residual::reconstruct_rows(*s.packet, paired.plan.residual_rows,
+                paired_route ? residual::reconstruct_rows(*s.packet,
+                                                          work.row_slices.empty() ? paired.plan.residual_rows : work.decoded.rows,
                                                           static_cast<const int32_t *>(paired_rc.p), ldc_, n_, correction)
                              : residual::reconstruct(*s.packet, req, correction);
             if (composed != rmd::RmdStatus::success) {
@@ -1633,8 +1697,8 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     if (cfg.paired && !cfg.residual) {
         return refuse("options", "the paired route needs compensation=ON (the ws_packet residual)");
     }
-    if (cfg.paired_ktile_scale_reuse && (!cfg.paired || HW_DIM != 32)) {
-        return refuse("options", "K-tile Scale reuse requires DIM32 Paired execution");
+    if (cfg.paired_ktile_scale_reuse && (!cfg.paired || HW_DIM != 32 || SCALE_BLOCK_K != 32)) {
+        return refuse("options", "K-tile Scale reuse requires DIM32/Bk32 Paired execution");
     }
     if (cfg.paired_next_k_prefetch && !cfg.paired_ktile_scale_reuse) {
         return refuse("options", "Next-K prefetch requires K-tile Scale reuse");
