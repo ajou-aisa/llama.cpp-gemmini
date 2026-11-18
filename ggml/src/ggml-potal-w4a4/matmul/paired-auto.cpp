@@ -1681,6 +1681,24 @@ potal_paired_staging & potal_paired_staging::operator=(potal_paired_staging && o
 
 namespace {
 
+// Residual LOOP_WS passes per aliased Main slot: pass f of the window reads the
+// Main slot of block first + f / q (the hardware scale block counter advances
+// every passes_per_block passes). q = 1 when each fragment is its own block;
+// q > 1 only when Bk > DIM and q DIM fragments of one Bk block are adjacent.
+// 0: no uniform mapping, the window keeps its own slots.
+size_t scale_alias_passes(const potal_paired_tile_plan & tile, size_t begin, size_t end) {
+    const size_t n = end - begin;
+    if (n == 0) return 0;
+    const size_t first = tile.fragments[begin].block_id;
+    for (size_t q = 1; q <= tile.passes_per_block && q <= n; ++q) {
+        if (n % q != 0) continue;
+        bool uniform = true;
+        for (size_t f = 0; uniform && f < n; ++f) uniform = tile.fragments[begin + f].block_id == first + f / q;
+        if (uniform) return q;
+    }
+    return 0;
+}
+
 // K-tile Scale reuse: the physical Main owner of every logical Residual Scale window
 // (itself when not aliased). Plan-only; computed before issue.
 std::vector<size_t> compute_scale_owner(const potal_paired_execution_plan & plan, const potal_paired_tile_plan & tile) {
@@ -1698,14 +1716,14 @@ std::vector<size_t> compute_scale_owner(const potal_paired_execution_plan & plan
             main.program_op >= w.program_op || main.release_op <= w.release_op ||
             first < panel.block_begin) continue;
         const size_t offset = first - panel.block_begin;
-        if (offset > main.blocks || w.blocks > main.blocks - offset) continue;
-        bool consecutive = window.fragment_end - window.fragment_begin == w.blocks;
-        for (size_t f = window.fragment_begin; consecutive && f < window.fragment_end; ++f) {
-            consecutive = tile.fragments[f].block_id == first + f - window.fragment_begin;
-        }
+        const size_t q = window.fragment_end - window.fragment_begin == w.blocks ?
+            scale_alias_passes(tile, window.fragment_begin, window.fragment_end) : 0;
+        if (q == 0) continue;
+        const size_t blocks = w.blocks / q; // distinct Main blocks the window reads
+        if (offset > main.blocks || blocks > main.blocks - offset) continue;
         size_t slot_offset = 0, slots = 0, base = 0, end = 0;
-        if (!consecutive || !mul(offset, w.j_tiles, slot_offset) ||
-            !mul(w.blocks, w.j_tiles, slots) || !add(main.slot_base, slot_offset, base) ||
+        if (!mul(offset, w.j_tiles, slot_offset) ||
+            !mul(blocks, w.j_tiles, slots) || !add(main.slot_base, slot_offset, base) ||
             !add(base, slots, end) || end > main.slot_base + main.slots ||
             end > POTAL_HW_SCALE_ENTRIES) continue;
         scale_owner[w.index] = owner;
@@ -3687,6 +3705,8 @@ struct executor {
             const auto & window = panel.windows[op.window];
             const size_t first = report.tile.fragments[window.fragment_begin].block_id;
             l.loop.scale_base = (uint32_t) (main.slot_base + (first - panel.block_begin) * main.j_tiles);
+            // Same uniform block mapping that admitted the alias (1 at Bk == DIM).
+            l.loop.passes_per_block = (uint32_t) scale_alias_passes(report.tile, window.fragment_begin, window.fragment_end);
         }
         l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
         l.path                   = POTAL_PAIRED_RESIDUAL;
@@ -4249,10 +4269,18 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
         if (*req.generation > POTAL_GENERATION_MAX) {
             return ex.fail(potal_paired_status::invalid_argument, "request", "generation counter beyond 8 bits", POTAL_OK);
         }
-        if (req.ktile_scale_reuse && (POTAL_HW_DIM != 32 || hw.dim != 32 || hw.block_k != 32 ||
-                                     req.main_plan->passes_per_block != 1)) {
+        const bool dim32_k32 = POTAL_HW_DIM == 32 && hw.dim == 32 && hw.block_k == 32 &&
+                               req.main_plan->passes_per_block == 1;
+        const bool bk64 = hw.dim == POTAL_HW_DIM && hw.block_k == 64 &&
+                          (hw.dim == 16 || hw.dim == 32 || hw.dim == 64) &&
+                          req.main_plan->passes_per_block * hw.dim == hw.block_k;
+        if (req.ktile_scale_reuse && !dim32_k32 && !bk64) {
             return ex.fail(potal_paired_status::invalid_argument, "ktile",
-                           "K-tile Scale reuse requires physical DIM32 and K32", POTAL_ERR_UNSUPPORTED);
+                           "K-tile Scale reuse requires physical DIM32/K32 or Bk64 at DIM16/32/64", POTAL_ERR_UNSUPPORTED);
+        }
+        if ((req.next_k_prefetch || ex.streaming()) && !dim32_k32) {
+            return ex.fail(potal_paired_status::invalid_argument, req.next_k_prefetch ? "prefetch" : "stream",
+                           "prefetch and stream require physical DIM32 and K32", POTAL_ERR_UNSUPPORTED);
         }
         if (req.next_k_prefetch && !req.ktile_scale_reuse) {
             return ex.fail(potal_paired_status::invalid_argument, "prefetch",

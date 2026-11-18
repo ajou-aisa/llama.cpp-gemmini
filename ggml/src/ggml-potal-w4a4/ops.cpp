@@ -339,13 +339,13 @@ ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, cons
         return hp1_fail(st, node, layer, "options", "GGML_POTAL_PAIRED_FENCES must be RTL or CONSERVATIVE");
     }
     if (ktile_invalid || (ktile && (!paired_request || !options::compensation ||
-                                  POTAL_HW_DIM != 32 || POTAL_SCALE_BLOCK_K != 32))) {
+                                  !(POTAL_SCALE_BLOCK_K == 64 || (POTAL_HW_DIM == 32 && POTAL_SCALE_BLOCK_K == 32))))) {
         return hp1_fail(st, node, layer, "options",
-                        "GGML_POTAL_PAIRED_KTILE must be ON/OFF/1/0; ON requires DIM32/Bk32 Paired compensation");
+                        "GGML_POTAL_PAIRED_KTILE must be ON/OFF/1/0; ON requires DIM32/Bk32 or Bk64 Paired compensation");
     }
-    if (prefetch_invalid || (prefetch && !ktile)) {
+    if (prefetch_invalid || (prefetch && (!ktile || POTAL_HW_DIM != 32 || POTAL_SCALE_BLOCK_K != 32))) {
         return hp1_fail(st, node, layer, "options",
-                        "GGML_POTAL_PAIRED_PREFETCH must be ON/OFF/1/0; ON requires K-tile Scale reuse");
+                        "GGML_POTAL_PAIRED_PREFETCH must be ON/OFF/1/0; ON requires DIM32/Bk32 K-tile Scale reuse");
     }
     if (early_invalid || (early && !prefetch)) {
         return hp1_fail(st, node, layer, "options",

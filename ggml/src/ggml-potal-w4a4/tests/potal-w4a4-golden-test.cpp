@@ -68,6 +68,16 @@ void verdict(const char * group, const std::string & name, bool ok, const std::s
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
 
+// GGML_POTAL_PAIRED_KTILE unset keeps the historical default (ON only at DIM32/Bk32);
+// set, it selects K-tile wherever the route admits it (Bk32 K-tile refuses row slices).
+bool golden_ktile(size_t lane_rows) {
+    if (gold::BK == 32 && (POTAL_HW_DIM != 32 || lane_rows > 8 * POTAL_HW_DIM)) return false;
+    if (std::getenv("GGML_POTAL_PAIRED_KTILE") == nullptr) return POTAL_HW_DIM == 32 && gold::BK == 32;
+    bool invalid = false;
+    const bool on = options::paired_ktile_requested(&invalid);
+    return on && !invalid;
+}
+
 // Independent accounting from accepted sink commands, not production counters
 // or the executor's predicted loop totals. Fixed DIM32 includes all tile padding.
 struct issue_observer {
@@ -307,8 +317,7 @@ void dense_case(const dense_spec & c) {
     cfg.job_capacity             = 1;
     cfg.residual                 = options::compensation;
     cfg.paired                   = true;
-    cfg.paired_ktile_scale_reuse = POTAL_HW_DIM == 32 && gold::BK == 32 &&
-                                  c.expected_lane_rows <= 8 * POTAL_HW_DIM;
+    cfg.paired_ktile_scale_reuse = golden_ktile(c.expected_lane_rows);
     cfg.layer                    = "w4a4-golden";
     cfg.backend                  = "EMULATED";
     if (c.expected_lane_rows > 8 * POTAL_HW_DIM) {
@@ -334,6 +343,7 @@ void dense_case(const dense_spec & c) {
     std::vector<uint8_t>          main_seen(c.M, 0);
     std::map<std::pair<uint8_t, uint32_t>, std::vector<int32_t>> lane_c;
     size_t                        calls = 0, capture_errors = 0, plan_errors = 0;
+    uint64_t                      scale_writes = 0, scale_releases = 0, scale_reused = 0;
     potal_test::emu_session       es;
     potal_test::h2_emulator       h2;
     issue_observer                observer{h2.sink()};
@@ -347,6 +357,9 @@ void dense_case(const dense_spec & c) {
         const potal_paired_status st = potal_paired_run_session(q, &sink, rep);
         std::lock_guard<std::mutex> lock(mu);
         ++calls;
+        scale_writes += rep.counts.scale_writes;
+        scale_releases += rep.counts.scale_releases;
+        scale_reused += rep.counts.scale_reused_windows;
         if (c.expected_lane_rows &&
             (req.ktile_scale_reuse != cfg.paired_ktile_scale_reuse || req.main_plan == nullptr ||
              req.main_plan->tile_I != plan.tile_I || req.main_plan->tile_K != plan.tile_K ||
@@ -403,6 +416,15 @@ void dense_case(const dense_spec & c) {
                   lane_mis, lane_val_mis, out_mis, c.M * c.N, max_abs, capture_errors, plan_errors, h2.errors.c_str(),
                   report.stage ? report.stage : "-", report.detail.c_str());
     verdict("D", c.name, ok, b);
+    uint64_t fnv = 1469598103934665603ull; // output bits, comparable across K-tile ON/OFF
+    for (size_t i = 0; i < c.M * c.N; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, dst + i, 4);
+        for (int s = 0; s < 32; s += 8) fnv = (fnv ^ ((bits >> s) & 0xffu)) * 1099511628211ull;
+    }
+    std::printf("W4A4_SCALE %s ktile=%d writes=%" PRIu64 " releases=%" PRIu64 " reused_windows=%" PRIu64
+                " out_fnv=%016" PRIx64 "\n", c.name, (int) cfg.paired_ktile_scale_reuse, scale_writes,
+                scale_releases, scale_reused, fnv);
 }
 
 // ---- attention ---------------------------------------------------------------------------------

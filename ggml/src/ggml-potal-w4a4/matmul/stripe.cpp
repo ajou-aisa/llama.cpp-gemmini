@@ -864,7 +864,7 @@ stripe_run::prep_outcome stripe_run::prepare_paired(slot & s, stripe_work & work
                     ps = potal_paired_plan_stripe(*paired_main, rows, n_, k_, &decoded,
                                                  tile, routing, &why);
                 } else if (max_j == 0 && cfg_.paired_stream == potal_paired_stream_mode::off &&
-                           !cfg_.paired_ktile_scale_reuse) {
+                           (!cfg_.paired_ktile_scale_reuse || SCALE_BLOCK_K != 32)) {
                     // Even J1 cannot hold every independent Residual output.
                     // Each slice executes complete K reductions; no Sat32 sum
                     // is split or regrouped. Repeated Main writes are identical.
@@ -1697,11 +1697,14 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
     if (cfg.paired && !cfg.residual) {
         return refuse("options", "the paired route needs compensation=ON (the ws_packet residual)");
     }
-    if (cfg.paired_ktile_scale_reuse && (!cfg.paired || HW_DIM != 32 || SCALE_BLOCK_K != 32)) {
-        return refuse("options", "K-tile Scale reuse requires DIM32/Bk32 Paired execution");
+    if (cfg.paired_ktile_scale_reuse && (!cfg.paired || !(SCALE_BLOCK_K == 64 || (HW_DIM == 32 && SCALE_BLOCK_K == 32)))) {
+        return refuse("options", "K-tile Scale reuse requires DIM32/Bk32 or Bk64 Paired execution");
     }
     if (cfg.paired_next_k_prefetch && !cfg.paired_ktile_scale_reuse) {
         return refuse("options", "Next-K prefetch requires K-tile Scale reuse");
+    }
+    if (cfg.paired_next_k_prefetch && (HW_DIM != 32 || SCALE_BLOCK_K != 32)) {
+        return refuse("options", "Next-K prefetch requires DIM32/Bk32");
     }
     if (cfg.paired_early_k_prefetch && !cfg.paired_next_k_prefetch) {
         return refuse("options", "Early LdB prefetch requires checked next-K prefetch");
@@ -1710,7 +1713,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         ((cfg.paired_stream != potal_paired_stream_mode::bounded &&
           cfg.paired_stream != potal_paired_stream_mode::continuous &&
           cfg.paired_stream != potal_paired_stream_mode::continuous_early) ||
-         !cfg.paired || !cfg.paired_ktile_scale_reuse || HW_DIM != 32 ||
+         !cfg.paired || !cfg.paired_ktile_scale_reuse || HW_DIM != 32 || SCALE_BLOCK_K != 32 ||
          cfg.paired_next_k_prefetch || cfg.paired_early_k_prefetch || cfg.paired_conservative_fences)) {
         return refuse("options", "stream requires DIM32 Paired K-tile with RTL fences and without legacy prefetch");
     }

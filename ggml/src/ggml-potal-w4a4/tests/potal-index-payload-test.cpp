@@ -225,7 +225,7 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
     req.c_main = cm.get(); req.ldc_main = LD;
     req.c_residual = cr.get(); req.ldc_residual = LD;
     req.generation = &generation; req.plan = &plan;
-    req.ktile_scale_reuse = D == 32 && BK == 32;
+    req.ktile_scale_reuse = (D == 32 && BK == 32) || BK == 64;
     req.stream = stream;
     req.stream_counter = stream == potal_paired_stream_mode::off ? nullptr : potal_test::h2_emulator::on_counter;
     potal_paired_prepared job;
