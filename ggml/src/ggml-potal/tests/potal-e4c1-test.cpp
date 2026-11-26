@@ -435,7 +435,7 @@ void check_results(const paired_fixture &f, const paired_inputs &in, const expec
         }
     }
     if (in.packets[stripe]) {
-        ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot meta;
+        ggml::npu::quants::act::exsia::StripeMetadataSnapshot meta;
         meta.theta = in.theta[stripe];
         require(residual::merge_prepared_hp1(f.weight, begin, begin + v.request.rows, meta, correction,
                                             actual.data(), f.M, f.N, 1, nullptr) == grmd::RmdStatus::success,

@@ -26,8 +26,8 @@ from scripts.eval.eval_common import (
 # Producer work type -> summary population; `overall` is their union (the top-level fields).
 WORK_TYPES: Final = {"DENSE": "dense", "RESIDUAL": "residual"}
 SUMS: Final = ("delta_w_sum", "alignment_count", "updated_partial_sum_count", "total_partial_sum_count")
-DETAILED: Final = "im2p-scale-alignment-metrics"
-AGGREGATE: Final = "im2p-scale-alignment-aggregate"
+DETAILED: Final = "gemmini-scale-alignment-metrics"
+AGGREGATE: Final = "gemmini-scale-alignment-aggregate"
 MAX_OFFSET: Final = 32767
 
 

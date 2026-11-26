@@ -7,7 +7,7 @@
 //         src1 (activations) F32,    ne = {K, M}: row m holds K values
 //         dst                F32,    ne = {N, M}: row m holds N values
 //
-// Activation: ggml::gemmini::quants::quantize_activation, i.e. the algorithm
+// Activation: ggml::npu::quants::quantize_activation, i.e. the algorithm
 // GGML_GEMMINI_ACTIVATION_QUANT selects (EXSIA, TENSOR, TOKEN, BLOCK, STRIPE),
 // with its own metadata (act::Meta) and, under GGML_GEMMINI_ENABLE_RMD, its
 // residual payloads. Weight: the HP1 qs payload, one SCU carrier per
@@ -27,8 +27,8 @@
 //       dst[m][n] = sum_g C_g[m][n] * scale[m][g] * channel_scale[n]   (double)
 //
 // where C = PoTal(A, B, carriers):
-//   C[m][n] = Sat32 sum over DIM-wide K passes p of
-//             sat32((sum_{k in p} A[m][k] * B[k][n]) << carrier[p*DIM/32][n])
+//   C[m][n] = Sat32 sum over NPU_D-wide K passes p of
+//             sat32((sum_{k in p} A[m][k] * B[k][n]) << carrier[p*NPU_D/32][n])
 // The HP1 exponent is applied once, by the SCU; reconstruction uses only the
 // linear scales. With compensation ON (cpu_direct residual route) the residual
 // correction of the original Gemmini code is added to dst afterwards.
@@ -38,7 +38,7 @@
 #include "potal.h"
 
 #include "execution.hpp"
-#include "ggml-gemmini-args.h"
+#include "../../ggml-npu-common/types/matmul.hpp"
 #include "quants/weight/hp1/hp1.hpp"
 
 #include <cstddef>
@@ -127,32 +127,32 @@ class hp1_operands {
     void * blocks[2] = {};
 };
 
-// The ggml_gemmini_args_t of one MUL_MAT, set as the Gemmini backend sets it
+// The npu_matmul_args of one MUL_MAT, set as the Gemmini backend sets it
 // (ops.cpp): I = M, J = N, K, sA, sC, the q4_hp1 view of src0, the F32 view of
 // dst, the layer identity, the residual route of the resolved matmul options
 // and the tile counts of the PoTal tile plan (activation_rows_per_stripe =
 // its stripe rows). false if a size does not fit or a buffer cannot be allocated.
 // Canonical static weight view only: no activation/output allocation or execution.
-bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args);
+bool init_weight_args(const ggml_tensor * src0, npu_matmul_args & args);
 
 bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
-               const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
-               const potal_tile_plan & plan, ggml_gemmini_args_t & args);
+               const char * layer, ggml::npu::residual::ResidualRoute residual_route,
+               const potal_tile_plan & plan, npu_matmul_args & args);
 
-// src1 -> args.A and args.act_quant (ggml::gemmini::quants::quantize_activation,
+// src1 -> args.A and args.act_quant (ggml::npu::quants::quantize_activation,
 // the configured algorithm) -> ops.a. false if quantization fails.
-bool quantize_activations(const ggml_tensor * src1, ggml_gemmini_args_t & args, hp1_operands & ops);
+bool quantize_activations(const ggml_tensor * src1, npu_matmul_args & args, hp1_operands & ops);
 
 // args' q4_hp1 blocks -> ops.own (packed b / carriers / scale) (quants::weight::hp1::unpack).
 // ops must come from allocate(s).
-quants::weight::hp1::status unpack_weights(const ggml_gemmini_args_t & args, hp1_operands & ops,
+quants::weight::hp1::status unpack_weights(const npu_matmul_args & args, hp1_operands & ops,
                                            quants::weight::hp1::stats *                   stats,
-                                           ggml::gemmini::quants::wreader::WeightReaderStatus * reader = nullptr);
+                                           ggml::npu::quants::wreader::WeightReaderStatus * reader = nullptr);
 
 // args' q4_hp1 blocks -> w (allocated for args.J x args.K), w.stats included.
 // The full validation and unpacking of one weight; w is complete only when ok.
-quants::weight::hp1::status prepare_weight(const ggml_gemmini_args_t & args, hp1_weight & w,
-                                           ggml::gemmini::quants::wreader::WeightReaderStatus * reader = nullptr);
+quants::weight::hp1::status prepare_weight(const npu_matmul_args & args, hp1_weight & w,
+                                           ggml::npu::quants::wreader::WeightReaderStatus * reader = nullptr);
 
 // ---- route -----------------------------------------------------------------
 
@@ -169,7 +169,7 @@ struct route_plan {
 
 // Route of the activation metadata in args (after quantize_activations). false
 // if there is none (quantization did not run or failed).
-bool select_route(const ggml_gemmini_args_t & args, route_plan & route);
+bool select_route(const npu_matmul_args & args, route_plan & route);
 
 const char * act_route_name(act_route r);
 
@@ -188,7 +188,7 @@ struct route_result {
 
 // The route on staged operands: PoTal GEMM(s) through `run`, then the F32
 // reconstruction into args.f_out. The output is complete only when ok.
-route_result execute_route(const route_plan & route, const ggml_gemmini_args_t & args, hp1_operands & ops,
+route_result execute_route(const route_plan & route, const npu_matmul_args & args, hp1_operands & ops,
                            const tiled_runner & run);
 
 // ---- error compensation (GGML_GEMMINI_ENABLE_RMD) ---------------------------
@@ -208,7 +208,7 @@ struct compensation_result {
 // which PoTal does not have: it fails, nothing is dropped. With
 // GGML_GEMMINI_ENABLE_RMD=0 the quantizers capture nothing and this returns
 // ok with zero payloads.
-compensation_result apply_compensation(const ggml_gemmini_args_t & args);
+compensation_result apply_compensation(const npu_matmul_args & args);
 
 // Independent CPU integer reference of the PoTal GEMM (no tiling, K passes of
 // POTAL_HW_DIM in order, SCU per pass and column, Sat32 accumulation):
@@ -235,6 +235,6 @@ void reconstruct_row(const int32_t * c, size_t n, double activation_scale, const
 // packed dst rows with even logical lda (physical lda/2 bytes). The caller
 // owns rows*lda/2 bytes. Failure leaves dst untouched; padding is zeroed.
 // false if args.A is not dense A4, a digit is outside [-8,7], or extents fail.
-bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda);
+bool copy_activation_rows(const npu_matmul_args & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda);
 
 } // namespace ggml::potal

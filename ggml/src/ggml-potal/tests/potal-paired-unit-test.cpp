@@ -23,7 +23,7 @@
 
 #include "support/paired-support.hpp"
 
-#include "quants/act/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
 
 #include <map>
 #include <variant>
@@ -33,7 +33,7 @@ using namespace potal_test;
 
 namespace {
 
-namespace exsia_ns = ggml::gemmini::quants::act::exsia;
+namespace exsia_ns = ggml::npu::quants::act::exsia;
 
 struct case_result {
     bool                    ok = false;
@@ -384,10 +384,10 @@ struct node {
             }
         }
         potal_tile_plan    plan;
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         hp1_shape          s = { (int64_t) M, (int64_t) N, (int64_t) K };
         ok = potal_tile_select(M, N, K, 32 / PD, &plan) == POTAL_OK &&
-             init_args(w, y, s, "gpt2", "paired-integration", ggml::gemmini::residual::ResidualRoute::ws_packet, plan,
+             init_args(w, y, s, "gpt2", "paired-integration", ggml::npu::residual::ResidualRoute::ws_packet, plan,
                        args) &&
              weight.allocate((int64_t) N, (int64_t) K) && prepare_weight(args, weight) == quants::weight::hp1::status::ok;
     }
@@ -396,12 +396,12 @@ struct node {
 void integration(const std::string & name, node & nd, const paired_tile_plan & plan) {
     // The ExSIA stripe height is the paired plan's: quantize with its tiles.
     potal_tile_plan     exsia_plan;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_operands        o;
     hp1_shape           s = { (int64_t) nd.M, (int64_t) nd.N, (int64_t) nd.K };
     bool ok = potal_frozen_plan(nd.M, nd.N, nd.K, plan.tile_I, plan.tile_J, plan.tile_K, 32 / PD, &exsia_plan) ==
                   POTAL_OK &&
-              init_args(nd.w, nd.y, s, "gpt2", "paired-integration", ggml::gemmini::residual::ResidualRoute::ws_packet,
+              init_args(nd.w, nd.y, s, "gpt2", "paired-integration", ggml::npu::residual::ResidualRoute::ws_packet,
                         exsia_plan, args) &&
               args.activation_rows_per_stripe == plan.stripe_rows && o.allocate(s, nd.weight) &&
               quantize_activations(nd.x, args, o);

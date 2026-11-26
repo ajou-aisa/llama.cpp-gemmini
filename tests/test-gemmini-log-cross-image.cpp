@@ -1,4 +1,4 @@
-#include <gemmini/log.h>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>

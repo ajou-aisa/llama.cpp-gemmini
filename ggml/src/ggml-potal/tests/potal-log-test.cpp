@@ -21,9 +21,9 @@
 
 #include "json.hpp"
 
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
-#include <gemmini/semantic.hpp>
+#include "../../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/performance.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/semantic.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -248,7 +248,7 @@ int main(int argc, char ** argv) {
     const std::string sem_path   = dir + "/semantic-graph.jsonl";
 
     check("CPU-only build proof is false in a GGML_POTAL build",
-          !ggml::gemmini::semantic::compiled_cpu_only_build());
+          !ggml::npu::semantic::compiled_cpu_only_build());
 
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("POTAL");
     check("POTAL device registered", dev != nullptr);
@@ -268,8 +268,8 @@ int main(int argc, char ** argv) {
         ggml_backend_t direct  = ggml_backend_dev_init(dev, nullptr);
         ggml::potal::log::ensure_outputs(); // repeated setup keeps the records written so far
 
-        namespace perf     = ggml::gemmini::performance;
-        namespace semantic = ggml::gemmini::semantic;
+        namespace perf     = ggml::npu::performance;
+        namespace semantic = ggml::npu::semantic;
         perf::start_request(1);
 
         // Prefill operation under a semantic run, as llama-cli opens one.
@@ -320,7 +320,7 @@ int main(int argc, char ** argv) {
 
         ggml_backend_free(direct);
         ggml_backend_free(backend);
-        (void) ggml::gemmini::log::cycle.flush();
+        (void) ggml::npu::log::cycle.flush();
     }
 
     // ---- terminal --------------------------------------------------------

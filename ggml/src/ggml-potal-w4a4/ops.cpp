@@ -13,14 +13,14 @@
 #include "potal_hw_params.h"
 #include "trace/timeline.hpp"
 
-#include "ggml-gemmini/matmul/options.hpp" // resolve_matmul_options (shared Gemmini source)
+#include "matmul/options.hpp" // resolve_matmul_options (shared Gemmini source)
 
 // Existing Gemmini logging/cycle/trace system (ggml-gemmini-utils); no gemmini.h.
-#include <gemmini/cycle_reader.hpp>
-#include <gemmini/layer.hpp>
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
-#include <gemmini/trace-context.hpp>
+#include "../ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
+#include "../ggml-npu-common/profiling/include/npu/layer.hpp"
+#include "../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml-npu-common/profiling/include/npu/performance.hpp"
+#include "../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -37,8 +37,8 @@ namespace ggml::potal {
 namespace {
 
 using clock_type = std::chrono::steady_clock;
-namespace glog   = ggml::gemmini::log;
-namespace gcycle = ggml::gemmini::cycle;
+namespace glog   = ggml::npu::log;
+namespace gcycle = ggml::npu::cycle;
 namespace hp1    = quants::weight::hp1;
 
 double seconds_since(clock_type::time_point t0) {
@@ -79,9 +79,9 @@ using log::trace_fields;
 // packing, reconstruction) are not CPU-resource samples, so the phase's CPU
 // work wall is marked incomplete rather than silently low.
 void record_unmeasured_npu() {
-    ggml::gemmini::performance::record_npu("POTAL", "dense", "work_total_cycles", 0, false,
+    ggml::npu::performance::record_npu("POTAL", "dense", "work_total_cycles", 0, false,
                                            "unavailable_device_counter");
-    ggml::gemmini::performance::incomplete_cpu_wall("potal_host_cpu_stage_coverage_incomplete");
+    ggml::npu::performance::incomplete_cpu_wall("potal_host_cpu_stage_coverage_incomplete");
 }
 
 // ---- validated I8 x I8 single GEMM (W4-4 contract, unchanged) ----------------
@@ -199,7 +199,7 @@ ggml_status mul_mat_attention(backend_state & state, ggml_tensor * node) {
                (unsigned long long)result.jobs, (unsigned long long)result.loops,
                (unsigned long long)result.bias_updates, (unsigned long long)result.pv_bitplane_stripes,
                (unsigned long long)result.pv_bitplane_jobs, result.reconstruct_s);
-    ggml::gemmini::performance::record_npu("POTAL", "attention", "work_total_cycles", 0, false,
+    ggml::npu::performance::record_npu("POTAL", "attention", "work_total_cycles", 0, false,
                                           "unavailable_device_counter");
     return GGML_STATUS_SUCCESS;
 }
@@ -313,7 +313,7 @@ ggml_status hp1_fail(ggml_backend_potal_stats & st, ggml_tensor * node, const st
 // stripe to the hart-0 issuer at once; Main and Residual GEMMs on PoTal,
 // reconstruction and merge on the CPU, dst written once on success.
 ggml_status mul_mat_hp1_pipeline(backend_state & state, ggml_tensor * node, const std::string & layer,
-                                 ggml_gemmini_args_t & args, weight_lookup & wl, const potal_tile_plan & plan,
+                                 npu_matmul_args & args, weight_lookup & wl, const potal_tile_plan & plan,
                                  size_t job_capacity) {
     ggml_backend_potal_stats & st     = state.stats;
     const hp1_weight &         weight = *wl.weight;
@@ -533,24 +533,24 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
                                               0, ::potal::timeline::no_id, ::potal::timeline::no_id);
     st.hp1_nodes++;
     (s.m == 1 ? st.decode_shaped_nodes : st.prefill_shaped_nodes)++;
-    const std::string layer = ggml::gemmini::types::resolve_matmul_layer(state.model_arch, w->name, x->name,
+    const std::string layer = ggml::npu::types::resolve_matmul_layer(state.model_arch, w->name, x->name,
                                                                          node->name);
-    ggml::gemmini::trace::CpuStage node_stage(layer.c_str(), "potal.mul_mat_hp1",
-                                              ggml::gemmini::trace::CpuStage::Scope::envelope);
+    ggml::npu::trace::CpuStage node_stage(layer.c_str(), "potal.mul_mat_hp1",
+                                              ggml::npu::trace::CpuStage::Scope::envelope);
 
     // 0. Matmul options as the Gemmini backend resolves them (build default, GEMMINI_* environment).
-    const auto resolved = ggml::gemmini::resolve_matmul_options();
+    const auto resolved = ggml::npu::resolve_matmul_options();
     if (!resolved.ok()) {
         return hp1_fail(st, node, layer, "options",
                         "invalid matmul options (GEMMINI_MATMUL_MODE / GEMMINI_RMD_BACKEND / "
                         "GEMMINI_STRIPE_JOB_CAPACITY)");
     }
     const options::MatmulInvocationMode mode        = resolved.options.mode;
-    const ggml::gemmini::RmdBackend     rmd_backend = resolved.options.rmd_backend;
+    const ggml::npu::RmdBackend     rmd_backend = resolved.options.rmd_backend;
     bool roles_invalid = false;
     const bool roles = hart_roles_requested(roles_invalid);
     if (roles_invalid || (roles && (mode != options::MatmulInvocationMode::stripe_pipeline ||
-                                    rmd_backend != ggml::gemmini::RmdBackend::gemmini_ws_compact))) {
+                                    rmd_backend != ggml::npu::RmdBackend::npu_compact))) {
         return hp1_fail(st, node, layer, "options",
                         "GGML_POTAL_HART_ROLES must be ON/OFF/1/0; ON requires STRIPE_PIPELINE+WS");
     }
@@ -591,10 +591,10 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
         return hp1_fail(st, node, layer, "tile_select", why.c_str());
     }
 
-    ggml_gemmini_args_t args;
-    const auto          residual_route = rmd_backend == ggml::gemmini::RmdBackend::cpu_direct
-                                             ? ggml::gemmini::residual::ResidualRoute::cpu_direct
-                                             : ggml::gemmini::residual::ResidualRoute::ws_packet;
+    npu_matmul_args args;
+    const auto          residual_route = rmd_backend == ggml::npu::RmdBackend::cpu_direct
+                                             ? ggml::npu::residual::ResidualRoute::cpu_direct
+                                             : ggml::npu::residual::ResidualRoute::ws_packet;
     mm_options.close();
     ::potal::timeline::scoped_span mm_init(::potal::timeline::active(), ::potal::timeline::stage::mm_init_args, 0, 0,
                                            ::potal::timeline::no_id, ::potal::timeline::no_id);
@@ -633,7 +633,7 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
     }
     if (wl.status != hp1::status::ok) {
         const std::string why = std::string(hp1::status_name(wl.status)) + " reader=" +
-                                ggml::gemmini::quants::wreader::weight_reader_status_name(wl.reader);
+                                ggml::npu::quants::wreader::weight_reader_status_name(wl.reader);
         return hp1_fail(st, node, layer, "weight_hp1", why.c_str());
     }
     const hp1_weight & weight = *wl.weight;
@@ -665,7 +665,7 @@ ggml_status mul_mat_hp1(backend_state & state, ggml_tensor * node, int node_inde
         return hp1_fail(st, node, layer, "alloc", "out of memory for the DMA staging buffers");
     }
 
-    // 2. Activation: ggml::gemmini::quants::quantize_activation (configured algorithm).
+    // 2. Activation: ggml::npu::quants::quantize_activation (configured algorithm).
     c0            = gcycle::read();
     t             = clock_type::now();
     const bool aq = quantize_activations(x, args, ops);

@@ -19,12 +19,12 @@
 #include "ggml-quants.h"
 #include "matmul/dense.hpp"
 #include "matmul/execution.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/stripe.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
 #include "potal_hw_params.h"
-#include "quants/act/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
 #include "support/paired-h2-emulator.hpp"
 #include "support/stripe-golden.hpp"
 #include "support/stripe-owner.hpp"
@@ -641,22 +641,22 @@ struct node {
             if (outlier != 0.0f && m % 2 == 0) v[m * K + (m * 7) % K] = outlier * (m % 4 ? -1.0f : 1.0f);
         }
         s = {(int64_t) M, (int64_t) N, (int64_t) K};
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         const bool planned = frozen ? potal_frozen_plan(M, N, K, 1, 1, 64 / D, 32 / D, &plan) == POTAL_OK
                                     : potal_tile_select(M, N, K, 32 / D, &plan) == POTAL_OK;
         ok = planned && args_for(args) && weight.allocate((int64_t) N, (int64_t) K) &&
              prepare_weight(args, weight) == quants::weight::hp1::status::ok;
     }
 
-    bool args_for(ggml_gemmini_args_t & args) const {
-        return init_args(w, y, s, "gpt2", "hw-timeline-test", ggml::gemmini::residual::ResidualRoute::ws_packet, plan, args);
+    bool args_for(npu_matmul_args & args) const {
+        return init_args(w, y, s, "gpt2", "hw-timeline-test", ggml::npu::residual::ResidualRoute::ws_packet, plan, args);
     }
     size_t stripes() const { return (M + plan.tile_I * D - 1) / (plan.tile_I * D); }
     float * dst() const { return static_cast<float *>(y->data); }
 };
 
 bool golden_of(const node & nd, std::vector<float> & want) {
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_operands        o;
     return nd.args_for(args) && o.allocate(nd.s, nd.weight) && quantize_activations(nd.x, args, o) &&
            potal_test::pipeline_golden(args, o, want);
@@ -685,7 +685,7 @@ strict_run run_strict(node & nd, size_t capacity, bool on, bool host_clock = fal
     if (on) setenv("GGML_POTAL_STRICT_HW_TIMELINE", "ON", 1);
     else unsetenv("GGML_POTAL_STRICT_HW_TIMELINE");
     hwn::reset_for_test();
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     if (!nd.args_for(args)) {
         out.report.stage = "fixture";
         return out;

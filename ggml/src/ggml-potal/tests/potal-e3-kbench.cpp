@@ -32,12 +32,12 @@ struct fingerprint {
     }
 };
 
-uint64_t prepared_fingerprint(const ggml_gemmini_args_t & args) {
+uint64_t prepared_fingerprint(const npu_matmul_args & args) {
     fingerprint f;
     f.scalar(args.I); f.scalar(args.J); f.scalar(args.K);
     f.scalar(args.activation_rows_per_stripe);
     f.bytes(args.A.raw_data(), args.A.raw_size());
-    const auto * meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(&args.act_quant.storage());
+    const auto * meta = std::get_if<ggml::npu::quants::act::exsia::Meta>(&args.act_quant.storage());
     if (!meta) throw std::runtime_error("E3 requires ExSIA metadata");
     f.vector(meta->theta);
     f.scalar(meta->rmd_packets.size());
@@ -129,11 +129,11 @@ bool verify_frozen(const bench_case & c) {
     uint64_t loops[2]{}, scales[2]{};
     for (int mode = 0; mode < 2; ++mode) {
         const auto & plan = mode ? restricted : original;
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         hp1_operands o;
         hp1::stats stats;
         if (!o.allocate(shape) ||
-            !init_args(w,y,shape,"","e3_verify",ggml::gemmini::residual::ResidualRoute::ws_packet,plan,args) ||
+            !init_args(w,y,shape,"","e3_verify",ggml::npu::residual::ResidualRoute::ws_packet,plan,args) ||
             unpack_weights(args,o,&stats) != hp1::status::ok || !quantize_activations(x,args,o)) return false;
         hashes[mode] = prepared_fingerprint(args);
         std::vector<int32_t> independent(size_t(c.m*c.n));
@@ -254,7 +254,7 @@ potal_status e3_tile_select(size_t m,size_t n,size_t k,uint32_t ppb,potal_tile_p
     return POTAL_OK;
 }
 
-pipeline_report e3_run_pipeline(const ggml_tensor * x,ggml_gemmini_args_t & args,const hp1_weight & w,
+pipeline_report e3_run_pipeline(const ggml_tensor * x,npu_matmul_args & args,const hp1_weight & w,
                                 const potal_tile_plan & plan,const pipeline_config & cfg,stripe_owner & owner) {
     auto result=run_stripe_pipeline(x,args,w,plan,cfg,owner);
     if (capture_preparation && result.ok) preparation_hash=prepared_fingerprint(args);

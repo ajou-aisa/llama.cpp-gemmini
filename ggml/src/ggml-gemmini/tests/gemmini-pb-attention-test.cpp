@@ -69,7 +69,10 @@ Quantized reference_quantize(const ggml_tensor * t, size_t head, size_t batch) {
             q.scales[row*(q.k/32)+block] = scale;
             for (size_t lane = 0; lane < 32; ++lane) {
                 const double x = double(read(t, block*32+lane, row, head, batch))/double(scale);
-                const double magnitude = std::min(127.0, std::floor(std::fabs(x)+0.5));
+                const double lower = std::floor(std::fabs(x));
+                const double fraction = std::fabs(x) - lower;
+                const double magnitude = std::min(127.0, lower +
+                    (fraction > 0.5 || (fraction == 0.5 && std::fmod(lower, 2.0) != 0.0)));
                 q.codes[row*q.k+block*32+lane] = static_cast<int8_t>(x < 0 ? -magnitude : magnitude);
             }
         }

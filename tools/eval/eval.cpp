@@ -5,9 +5,9 @@
 #include "json.hpp"
 #include "log.h"
 #include "sampling.h"
-#include <gemmini/evaluation_metrics.hpp>
-#include <gemmini/host-timing.hpp>
-#include <gemmini/semantic.hpp>
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/evaluation_metrics.hpp"
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/host-timing.hpp"
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/semantic.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -20,21 +20,21 @@
 #include <stdexcept>
 
 using json = nlohmann::ordered_json;
-namespace metrics = ggml::gemmini::evaluation;
+namespace metrics = ggml::npu::evaluation;
 
 static json build_info() {
     return {{"schema", "potal-evaluation-build"}, {"version", 1},
         {"activation_metrics", GGML_GEMMINI_ACT_QUANT_METRICS},
         {"scale_metrics", GGML_GEMMINI_SCALE_METRICS},
-        {"residual_metrics", GGML_GEMMINI_RESIDUAL_METRICS}, {"cycle_sim", CYCLE_SIM},
+        {"residual_metrics", GGML_GEMMINI_RESIDUAL_METRICS},
         {"activation_bits", GGML_GEMMINI_ACTIVATION_BITS}, {"weight_bits", GGML_GEMMINI_WEIGHT_BITS},
         {"dim", GGML_GEMMINI_DIM}, {"backend", EVALUATION_BACKEND},
         {"gemmini_option", EVALUATION_GEMMINI_OPTION}, {"cuda", EVALUATION_CUDA},
         {"gemmini", EVALUATION_GEMMINI}, {"cuda_evaluation_supported", EVALUATION_CUDA != 0},
         {"activation_mode", EVALUATION_ACTIVATION_MODE}, {"block_size", EVALUATION_BLOCK_SIZE},
         {"rmd_enabled", GGML_GEMMINI_ENABLE_RMD}, {"rmd_backend", EVALUATION_RMD_BACKEND},
-        {"hp1", EVALUATION_HP1 != 0}, {"matmul_mode", EVALUATION_MATMUL_MODE},
-        {"cpu_only", ggml::gemmini::semantic::compiled_cpu_only_build()},
+        {"matmul_mode", EVALUATION_MATMUL_MODE},
+        {"cpu_only", ggml::npu::semantic::compiled_cpu_only_build()},
         {"log_cycle", LOG_CYCLE}, {"cycle_detail", CYCLE_DETAIL},
         {"ggml_cpu_cycle_log", EVALUATION_CPU_CYCLE_LOG}};
 }
@@ -87,8 +87,8 @@ static int run(int argc, char ** argv) {
 #endif
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
     int max_chunks = 1, first_chunk = 0, smoke_generated_tokens = 0;
-    bool seed_set = false, temp_set = false, chunk_index_set = false, cycle_trace = false;
-    bool first_chunk_set = false, plan_only = false, terminal_metrics_only = false;
+    bool seed_set = false, temp_set = false, chunk_index_set = false;
+    bool first_chunk_set = false, plan_only = false;
     std::string evaluation_manifest_hash;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -101,20 +101,16 @@ static int run(int argc, char ** argv) {
                 "  --scale-output-fd N (POSIX inherited pipe, exclusive with scale-output)\n"
                 "  --scale-mode detailed|aggregate (SCU: one record per coordinate, default; or integer sums\n"
                 "    per chunk/layer/work type after the same per-coordinate validation)\n"
-                "  --cycle-trace (independent zero-generation prefill trace, metrics OFF)\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
                 "  --first-chunk N (METRIC_PREFILL_256 shard: first selected chunk; --max-chunks counts from it)\n"
                 "  --plan-only (METRIC_PREFILL_256: print the native chunk plan as JSON and exit; no output)\n"
-                "  --terminal-lm-head full|metrics-only (METRIC_PREFILL_256 metric collection: metrics-only observes\n"
-                "    the terminal lm_head completely but never computes its logits; default full)\n"
-                "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
+                "  --smoke-generated-tokens 1 (CPU replay diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
                 "one thread. E2E requires chunk-index0..9; fixed greedy seed1234/temp0, EOS stopping disabled.\n"
                 "Forced tokens are FullCPU cost-only; they are never reported as sampled output.");
             return 0;
         }
         if (arg == "--build-info") { std::puts(build_info().dump().c_str()); return 0; }
-        if (arg == "--cycle-trace") { cycle_trace = true; continue; }
         if (arg == "--plan-only") { plan_only = true; continue; }
         if (arg == "--no-kv-offload") {
             params.no_kv_offload = true;
@@ -149,10 +145,7 @@ static int run(int argc, char ** argv) {
             first_chunk_set = true;
         }
         else if (arg == "--max-chunks") max_chunks = value == "0" ? -1 : positive(value);
-        else if (arg == "--terminal-lm-head") {
-            if (value != "full" && value != "metrics-only") throw std::invalid_argument("--terminal-lm-head full|metrics-only");
-            terminal_metrics_only = value == "metrics-only";
-        }
+
         else if (arg == "--smoke-generated-tokens") smoke_generated_tokens = positive(value);
         else if (arg == "--batch-size") params.n_batch = positive(value);
         else if (arg == "--ubatch-size") params.n_ubatch = positive(value);
@@ -208,35 +201,18 @@ static int run(int argc, char ** argv) {
     }
     const bool generation = workload == "E2E_GENERATION_256_128";
     const bool forced_cost_only = !forced_file.empty();
-    if (cycle_trace && (!CYCLE_SIM || generation || GGML_GEMMINI_ACT_QUANT_METRICS ||
-                       GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
-        throw std::invalid_argument("cycle trace requires independent metrics-OFF CYCLE_SIM prefill build");
     if (smoke_generated_tokens &&
         (!generation || smoke_generated_tokens != 1 ||
-         (forced_cost_only ? CYCLE_SIM != 0 : !CYCLE_SIM)))
-        throw std::invalid_argument("smoke-generated-tokens requires exactly 1 token in CYCLE_SIM free "
-                                    "generation or in a FullCPU forced cost-only replay");
+         !forced_cost_only))
+        throw std::invalid_argument("smoke-generated-tokens requires exactly 1 token in a FullCPU forced cost-only replay");
     const int generation_target = smoke_generated_tokens ? smoke_generated_tokens : 128;
     if (!generation && workload != "METRIC_PREFILL_256") throw std::invalid_argument("unknown workload");
     if (chunk_index_set && first_chunk_set) throw std::invalid_argument("--chunk-index and --first-chunk are exclusive");
-    if (plan_only && (generation || cycle_trace || forced_cost_only))
+    if (plan_only && (generation || forced_cost_only))
         throw std::invalid_argument("--plan-only describes the METRIC_PREFILL_256 chunk plan");
     // Evaluation only: the logits of a metric-only prefill are read by no metric, so the terminal lm_head may stop
     // after its observations. Never for generation, cycle traces, forced replays or builds without metrics.
-    if (terminal_metrics_only) {
-        const json build = build_info();
-        if (workload != "METRIC_PREFILL_256" || generation || cycle_trace || forced_cost_only ||
-            !(GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
-            throw std::invalid_argument("--terminal-lm-head metrics-only is limited to a METRIC_PREFILL_256 metric collection");
-        if (build["backend"] != "IM2P_SIM" || build["activation_mode"] != "EXSIA" ||
-            build["matmul_mode"] != "FULL" || build["rmd_backend"] != "WS")
-            throw std::invalid_argument("--terminal-lm-head metrics-only requires the IM2P_SIM ExSIA FULL WS route");
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-        if (metric_config.activation_path.empty() && metric_config.residual_path.empty() &&
-            metric_config.scale_path.empty() && metric_config.scale_fd < 0)
-            throw std::invalid_argument("--terminal-lm-head metrics-only requires a metric sink");
-#endif
-    }
+
     if (generation) {
         if (!chunk_index_set || first_chunk_set || first_chunk > 9 || max_chunks != 1) {
             throw std::invalid_argument("E2E requires --chunk-index0..9 and --max-chunks1");
@@ -249,8 +225,8 @@ static int run(int argc, char ** argv) {
         // A metric workload selects a contiguous chunk range only through --first-chunk (independent shards).
         throw std::invalid_argument("chunk selection and forced tokens require E2E workload");
     }
-    if (forced_cost_only && (CYCLE_SIM || !LOG_CYCLE || params.n_gpu_layers != 0 ||
-                !ggml::gemmini::semantic::compiled_cpu_only_build())) {
+    if (forced_cost_only && (!LOG_CYCLE || params.n_gpu_layers != 0 ||
+                !ggml::npu::semantic::compiled_cpu_only_build())) {
         throw std::invalid_argument("forced trajectory requires verified FullCPU cost-only build with LOG_CYCLE=1");
     }
     if (generation && (GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS)) {
@@ -329,7 +305,7 @@ static int run(int argc, char ** argv) {
             forced_tokens.push_back(llama_token(id));
         }
         common_evaluation_validate_forced(forced_tokens, llama_vocab_n_tokens(vocab),
-                !CYCLE_SIM && params.n_gpu_layers == 0 && ggml::gemmini::semantic::compiled_cpu_only_build(),
+                params.n_gpu_layers == 0 && ggml::npu::semantic::compiled_cpu_only_build(),
                 size_t(generation_target));
     }
     const auto tokens = common_evaluation_tokenize(ctx, text);
@@ -343,12 +319,10 @@ static int run(int argc, char ** argv) {
     }
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const auto mask = generation ? common_evaluation_mask::generation_last : common_evaluation_mask::perplexity_half;
-    const std::string source_role = CYCLE_SIM ? "potal_collection" :
-        EVALUATION_CUDA && params.n_gpu_layers != 0 ? "cuda" :
-        ggml::gemmini::semantic::compiled_cpu_only_build() ? "full_cpu" : "unsupported";
+    const std::string source_role = EVALUATION_CUDA && params.n_gpu_layers != 0 ? "cuda" :
+        ggml::npu::semantic::compiled_cpu_only_build() ? "full_cpu" : "unsupported";
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     metric_config.workload_id = workload;
-    metric_config.terminal_lm_head_metrics_only = terminal_metrics_only;
     auto metric_session = metrics::Session::start(metric_config);
 #endif
     std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler(
@@ -389,14 +363,10 @@ static int run(int argc, char ** argv) {
         {"kqv_offload", !params.no_kv_offload},
         {"placement_proof", "model_load_log"},
         {"placement_verified", false}, {"source_role", source_role},
-        {"target_trace_collection_enabled", (generation || cycle_trace) && CYCLE_SIM != 0},
-        {"target_trace_collection_reason", cycle_trace ? "independent_prefill_cycle_campaign" : !generation ? "metric_statistics_only" :
-            CYCLE_SIM ? "generation_target_collection" : "cycle_sim_disabled"},
         {"build", build_info()}, {"chunks", json::array()}, {"complete", false}};
     if (!generation) {
-        result["terminal_lm_head"] = terminal_metrics_only ? "metrics-only" : "full";
-        result["lm_head_numerical_execution"] = !terminal_metrics_only;
-        result["logits_materialized"] = !terminal_metrics_only;
+        result["lm_head_numerical_execution"] = true;
+        result["logits_materialized"] = true;
     }
     manifest << result.dump(2) << '\n';
     manifest.flush();
@@ -417,7 +387,7 @@ static int run(int argc, char ** argv) {
             if (setenv("GEMMINI_LOG_DIR", trace_dir.string().c_str(), 1) != 0) throw std::runtime_error("setenv failed");
 #endif
             evaluation_trace trace(params, params.model.path, 256,
-                                   generation ? generation_target : 0, forced_cost_only, cycle_trace);
+                                   generation ? generation_target : 0, forced_cost_only);
             std::vector<llama_token> prompt(tokens.begin() + chunk * 256, tokens.begin() + (chunk + 1) * 256);
             if (add_bos) prompt[0] = llama_vocab_bos(vocab);
             if (sampler) for (const auto token : prompt) common_sampler_accept(sampler.get(), token, false);
@@ -435,10 +405,6 @@ static int run(int argc, char ** argv) {
             bool eos = false;
             uint64_t logits_hash = UINT64_C(14695981039346656037);
             size_t logits_values = 0;
-            uint64_t logits_decodes = 0;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-            const uint64_t elisions_before = metric_session ? metric_session->terminal_lm_head_elisions() : 0;
-#endif
             common_log_pause(common_log_main());
             const uint64_t t0 = now_ns();
             trace.request_start();
@@ -454,12 +420,11 @@ static int run(int argc, char ** argv) {
                 trace.prefill_batch_ready(part);
                 if (trace.decode(ctx, batch)) throw std::runtime_error("prefill decode failed");
                 if (!generation && outputs != 0) {
-                    ++logits_decodes;
-                    if (!terminal_metrics_only) {  // metrics-only: the lm_head never produced these logits
+  // metrics-only: the lm_head never produced these logits
                         const size_t count = size_t(outputs) * llama_vocab_n_tokens(vocab);
                         fingerprint_logits(logits_hash, llama_get_logits(ctx), count);
                         logits_values += count;
-                    }
+
                 }
             }
             for (int sample = 0; generation && sample < generation_target; ++sample) {
@@ -495,13 +460,6 @@ static int run(int argc, char ** argv) {
             }
             char fingerprint[17];
             std::snprintf(fingerprint, sizeof(fingerprint), "%016llx", static_cast<unsigned long long>(logits_hash));
-            uint64_t elided = 0;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-            // Every logits-producing decode elided its lm_head in metrics-only mode, and none did otherwise.
-            elided = metric_session ? metric_session->terminal_lm_head_elisions() - elisions_before : 0;
-#endif
-            if (elided != (terminal_metrics_only ? logits_decodes : 0))
-                throw std::runtime_error("terminal lm_head elision does not match the requested mode");
             success = success && complete;
             trace.finish(complete);
             for (const auto & record : records) batches << record.dump() << '\n';
@@ -510,14 +468,7 @@ static int run(int argc, char ** argv) {
                 {"logits_fingerprint", fingerprint}, {"logits_fingerprint_algorithm", "fnv1a64_native_float_bytes_diagnostic"},
                 {"logits_values", logits_values}, {"logits_scope", forced_cost_only ? "last_decode_output" :
                     generation ? "last_sample_input" : "all_requested_prefill"}});
-            if (terminal_metrics_only) {  // intentional: observed lm_head, logits never computed
-                auto &row = result["chunks"].back();
-                row["logits_fingerprint"] = nullptr;
-                row["logits_fingerprint_algorithm"] = nullptr;
-                row["logits_scope"] = "not_materialized_metric_only";
-                row["logits_materialized"] = false;
-                row["lm_head_numerical_elisions"] = elided;
-            }
+
             application << json({{"schema", "potal-application-endpoints"}, {"version", 1},
                 {"chunk_id", chunk}, {"workload", workload}, {"t0_ns", t0}, {"sample_accept_ns", endpoints},
                 {"generated_tokens", generated}, {"samples", endpoints.size()}, {"actual_samples", endpoints.size()},
@@ -534,7 +485,7 @@ static int run(int argc, char ** argv) {
             for (size_t part = 0; part < prefill_times.size(); ++part) {
                 const auto &timing = prefill_times[part];
                 json service = json::parse("{\"schema\":\"potal-application-cpu\"" +
-                    ggml::gemmini::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
+                    ggml::npu::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
                 service.update({{"version", 2}, {"chunk_id", chunk}, {"stage", "prefill_batch_prepare"},
                     {"batch_index", part}, {"dispatch_id", part},
                     {"sample_index", nullptr}, {"token_id", nullptr},
@@ -544,7 +495,7 @@ static int run(int argc, char ** argv) {
             for (size_t sample = 0; sample < sampling_times.size(); ++sample) {
                 const auto & timing = sampling_times[sample];
                 json service = json::parse("{\"schema\":\"potal-application-cpu\"" +
-                    ggml::gemmini::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
+                    ggml::npu::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
                 service.update({{"version", trace.pipeline_collection() ? 2 : 1},
                     {"chunk_id", chunk}, {"stage", "sample_accept"},
                     {"sample_index", sample}, {"token_id", generated[sample]}, {"source_role", source_role},

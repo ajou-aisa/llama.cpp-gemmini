@@ -1,5 +1,5 @@
 #include "../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
-#include "../ggml/src/ggml-gemmini/quants/common/hp1_scu.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/common/hp1_scu.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace hp1 = ggml::gemmini::quants::hp1;
+namespace hp1 = ggml::npu::quants::hp1;
 using fragment = ggml_cuda_potal_attention_fragment;
 using handle = std::unique_ptr<ggml_cuda_potal_attention_weights, decltype(&ggml_cuda_potal_attention_destroy)>;
 

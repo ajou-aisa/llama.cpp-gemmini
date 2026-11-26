@@ -1,133 +1,86 @@
 if(NOT DEFINED TEST_SOURCE_DIR)
     message(FATAL_ERROR "TEST_SOURCE_DIR is required")
 endif()
-
+string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef suffix)
+set(root "${CMAKE_CURRENT_BINARY_DIR}/potal-target-profile-${suffix}")
+file(MAKE_DIRECTORY "${root}/bin")
+file(WRITE "${root}/bin/cmake" [=[#!/bin/bash
+if [[ "${1:-}" == --build ]]; then exit 86; fi
+exec "$REAL_CMAKE" "$@"
+]=])
+execute_process(COMMAND chmod +x "${root}/bin/cmake" COMMAND_ERROR_IS_FATAL ANY)
+function(configure_profile profile dim name environment arguments)
+    set(dir "${root}/${name}")
+    execute_process(COMMAND env -i "PATH=${root}/bin:$ENV{PATH}" "REAL_CMAKE=${CMAKE_COMMAND}"
+        "BUILD_DIR=${dir}" BUILD_JOBS=1 ${environment}
+        bash "${TEST_SOURCE_DIR}/build-potal-firesim.sh" "${profile}" "${dim}"
+        -DCMAKE_TOOLCHAIN_FILE:FILEPATH= -DNPU_TRANSPORT=REFERENCE -DGGML_NATIVE=OFF
+        -DGGML_OPENMP=OFF -DGGML_METAL=OFF -DLLAMA_BUILD_TESTS=OFF ${arguments}
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 86)
+        message(FATAL_ERROR "${profile}/DIM${dim} failed: ${output}\n${error}")
+    endif()
+    file(STRINGS "${dir}/CMakeCache.txt" cache)
+    set(PROFILE_CACHE "${cache}" PARENT_SCOPE)
+    set(PROFILE_DIR "${dir}" PARENT_SCOPE)
+endfunction()
 foreach(profile IN ITEMS functional performance)
     foreach(dim IN ITEMS 16 32)
-        execute_process(COMMAND env -i "PATH=$ENV{PATH}" BUILD_JOBS=1
-            bash "${TEST_SOURCE_DIR}/build-potal-firesim.sh" "${profile}" "${dim}" --dry-run
-            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-        if(NOT result EQUAL 0)
-            message(FATAL_ERROR "${profile}/DIM${dim} failed: ${output}\n${error}")
-        endif()
-        string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
-        set(config "${CMAKE_MATCH_1}")
-        set(debug 1)
-        if(profile STREQUAL performance)
+        configure_profile("${profile}" "${dim}" "${profile}-${dim}" "" "")
+        if(profile STREQUAL functional)
+            set(debug 1)
+        else()
             set(debug 0)
         endif()
-        foreach(pair IN ITEMS
-                "GGML_POTAL=ON" "GGML_GEMMINI=OFF" "GGML_BACKEND_DL=OFF"
-                "GGML_GEMMINI_EXECUTION_BACKEND=HARDWARE" "GGML_GEMMINI_OPTION=WS"
+        foreach(pair IN ITEMS "GGML_POTAL=ON" "GGML_GEMMINI=OFF" "GGML_BACKEND_DL=OFF"
                 "GGML_GEMMINI_ACTIVATION_QUANT=EXSIA" "GGML_GEMMINI_ENABLE_RMD=ON"
-                "GGML_GEMMINI_DEFAULT_RMD_BACKEND=WS"
-                "GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE"
+                "GGML_GEMMINI_DEFAULT_RMD_BACKEND=WS" "GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE"
                 "GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=2" "GGML_POTAL_PAIRED_AUTO=ON"
-                "GGML_GEMMINI_EXSIA_DEFAULT_MODE=SEQUENTIAL"
                 "GGML_GEMMINI_ACTIVATION_BITS=8" "GGML_GEMMINI_WEIGHT_BITS=8"
-                "GGML_GEMMINI_BLOCK_SIZE=32" "CYCLE_SIM=0" "CYCLE_DETAIL=0"
-                "POTAL_PLANNING_DIAGNOSTICS=OFF" "LOG_DEBUG=${debug}" "LOG_CYCLE=1"
-                "GGML_CPU_CYCLE_LOG=0" "GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=OFF"
-                "GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=OFF"
+                "GGML_GEMMINI_BLOCK_SIZE=32" "CYCLE_DETAIL=0" "LOG_DEBUG=${debug}" "LOG_CYCLE=1"
                 "POTAL_EXPECTED_DIM=${dim}" "GGML_GEMMINI_DIM=${dim}" "POTAL_TARGET_DIM=${dim}"
                 "POTAL_HW_CONFIG=FireSimQuadRocketSinglePoTalD${dim}Config")
             string(REPLACE "=" ";" fields "${pair}")
             list(GET fields 0 key)
             list(GET fields 1 expected)
-            string(JSON actual GET "${config}" effective "${key}")
-            if(NOT actual STREQUAL expected)
-                message(FATAL_ERROR "${profile}/DIM${dim}: ${key}=${actual}, expected ${expected}")
+            if(NOT PROFILE_CACHE MATCHES "${key}:[^=;]+=${expected}(;|$)")
+                message(FATAL_ERROR "${profile}/DIM${dim} wrong ${pair}")
             endif()
         endforeach()
-        string(JSON header GET "${config}" effective POTAL_HW_PARAMS)
-        string(JSON target_header GET "${config}" effective POTAL_TARGET_PARAMS)
-        if(NOT header STREQUAL target_header)
-            message(FATAL_ERROR "Profile must bind the selected header to its generated target parameters")
+        file(READ "${PROFILE_DIR}/generated/npu_config.json" geometry)
+        string(JSON actual_dim GET "${geometry}" geometry d)
+        if(NOT actual_dim STREQUAL dim)
+            message(FATAL_ERROR "profile generated wrong DIM: ${geometry}")
         endif()
-        file(STRINGS "${header}" header_dim REGEX "^#define DIM [0-9]+$")
-        if(NOT header_dim STREQUAL "#define DIM ${dim}")
-            message(FATAL_ERROR "${profile}/DIM${dim} selected wrong header: ${header}")
-        endif()
-        string(JSON build_dir GET "${config}" build_dir)
-        if(NOT build_dir MATCHES "/build-potal-firesim-d${dim}-${profile}$")
-            message(FATAL_ERROR "Profile build directory is not isolated: ${build_dir}")
+        execute_process(COMMAND "${CMAKE_COMMAND}" -S "${TEST_SOURCE_DIR}" -B "${root}/mismatch-${profile}-${dim}"
+            --preset "potal-int8-d${dim}-reference" -DPOTAL_TARGET_DIM=64 -DLLAMA_CURL=OFF
+            RESULT_VARIABLE mismatch OUTPUT_QUIET ERROR_VARIABLE diagnostic)
+        if(mismatch EQUAL 0 OR NOT diagnostic MATCHES "DIM mismatch")
+            message(FATAL_ERROR "profile accepted conflicting target DIM: ${diagnostic}")
         endif()
     endforeach()
-endforeach()
-
-foreach(profile IN ITEMS functional performance)
     foreach(precedence IN ITEMS default environment command)
-        set(overrides GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=3)
+        set(environment GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=1)
         set(arguments)
-        set(expected 3)
+        set(expected 1)
         if(NOT precedence STREQUAL default)
-            list(APPEND overrides GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=4)
-            set(expected 4)
+            list(APPEND environment GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=2)
+            set(expected 2)
         endif()
         if(precedence STREQUAL command)
-            list(APPEND arguments -DGGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=5)
-            set(expected 5)
+            set(arguments -DGGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=1)
+            set(expected 1)
         endif()
-        execute_process(COMMAND env -i "PATH=$ENV{PATH}" BUILD_JOBS=1 ${overrides}
-            bash "${TEST_SOURCE_DIR}/build-potal-firesim.sh" "${profile}" 32 --dry-run ${arguments}
-            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-        if(NOT result EQUAL 0)
-            message(FATAL_ERROR "${profile}/${precedence} failed: ${output}\n${error}")
-        endif()
-        string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
-        string(JSON actual GET "${CMAKE_MATCH_1}" effective GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY)
-        if(NOT actual STREQUAL expected)
-            message(FATAL_ERROR "${profile}/${precedence}: capacity ${actual}, expected ${expected}")
+        configure_profile("${profile}" 32 "${profile}-${precedence}" "${environment}" "${arguments}")
+        if(NOT PROFILE_CACHE MATCHES "GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY:[^=;]+=${expected}(;|$)")
+            message(FATAL_ERROR "profile environment precedence changed")
         endif()
     endforeach()
 endforeach()
-
 foreach(args IN ITEMS "functional" "functional;64" "unknown;32")
     execute_process(COMMAND bash "${TEST_SOURCE_DIR}/build-potal-firesim.sh" ${args} --dry-run
         RESULT_VARIABLE result OUTPUT_QUIET ERROR_QUIET)
     if(result EQUAL 0)
-        message(FATAL_ERROR "Invalid target profile accepted: ${args}")
+        message(FATAL_ERROR "invalid target profile accepted: ${args}")
     endif()
 endforeach()
-
-string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef suffix)
-set(test_root "${CMAKE_CURRENT_BINARY_DIR}/potal-target-profile-${suffix}")
-get_filename_component(params "${TEST_SOURCE_DIR}/../../gemmini-rocc-tests/include" ABSOLUTE)
-foreach(case IN ITEMS software-dim expected-dim target-dim config-dim)
-    set(expected 16)
-    set(software 16)
-    set(target 16)
-    set(config_dim 16)
-    if(case STREQUAL software-dim)
-        set(software 32)
-    elseif(case STREQUAL expected-dim)
-        set(expected 32)
-    elseif(case STREQUAL target-dim)
-        set(target 32)
-    else()
-        set(config_dim 32)
-    endif()
-    execute_process(COMMAND "${CMAKE_COMMAND}" -S "${TEST_SOURCE_DIR}" -B "${test_root}/${case}"
-        -DPOTAL_API_ONLY=ON -DGGML_POTAL=OFF -DGGML_GEMMINI=OFF
-        "-DPOTAL_HW_PARAMS:FILEPATH=${params}/gemmini_potal_params.h"
-        "-DPOTAL_EXPECTED_DIM=${expected}" "-DGGML_GEMMINI_DIM=${software}" "-DPOTAL_TARGET_DIM=${target}"
-        "-DPOTAL_HW_CONFIG=FireSimQuadRocketSinglePoTalD${config_dim}Config"
-        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-    if(result EQUAL 0 OR NOT error MATCHES "DIM mismatch")
-        message(FATAL_ERROR "${case} did not reject conflicting DIM values: ${output}\n${error}")
-    endif()
-endforeach()
-file(READ "${params}/gemmini_potal_params.h" original)
-string(REPLACE "#define BANK_ROWS 4096" "#define BANK_ROWS 8192" wrong_geometry "${original}")
-file(WRITE "${test_root}/wrong-geometry.h" "${wrong_geometry}")
-execute_process(COMMAND "${CMAKE_COMMAND}" -S "${TEST_SOURCE_DIR}" -B "${test_root}/geometry"
-    -DPOTAL_API_ONLY=ON -DGGML_POTAL=OFF -DGGML_GEMMINI=OFF
-    "-DPOTAL_HW_PARAMS:FILEPATH=${test_root}/wrong-geometry.h"
-    "-DPOTAL_TARGET_PARAMS:FILEPATH=${params}/gemmini_potal_params.h"
-    -DPOTAL_EXPECTED_DIM=16 -DGGML_GEMMINI_DIM=16 -DPOTAL_TARGET_DIM=16
-    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-if(result EQUAL 0 OR NOT error MATCHES "target parameter mismatch")
-    message(FATAL_ERROR "Same-DIM mismatched hardware geometry was accepted: ${output}\n${error}")
-endif()
-file(REMOVE_RECURSE "${test_root}")
-message(STATUS "PoTal FireSim target profile and DIM mismatch tests PASS")

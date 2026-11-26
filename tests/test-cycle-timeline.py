@@ -64,21 +64,6 @@ def main() -> None:
                 "inference_context": inference,
             },
             {
-                "schema": "gemmini.cycle", "version": 2,
-                "record_type": "IM2P_STRIPE_TELEMETRY", "source": "im2p_rtl",
-                "unit": "rtl_cycle", "op": "im2p.execute", "layer": "blk.0",
-                "run_id": 20, "stripe_id": 0, "slot": 0,
-                "publish_cycle": 700, "completion_cycle": 900, "latency_cycles": 200,
-                "inference_context": inference,
-            },
-            {
-                "schema": "gemmini.cycle", "version": 2,
-                "record_type": "IM2P_EXECUTION_TELEMETRY", "source": "im2p_rtl",
-                "unit": "rtl_cycle", "op": "im2p.execute", "layer": "blk.0",
-                "run_id": 20, "rtl_stripes_published": 1, "rtl_work_total_cycles": 300,
-                "inference_context": inference,
-            },
-            {
                 "schema": "gemmini.cycle", "version": 2, "record_type": "INFERENCE_EVENT",
                 "event": "operation_end", "event_sequence": 3, "execution_id": "exec-1",
                 "timestamp_ns": 1500, "cpu_interval_samples": 1, "inference_context": inference,
@@ -95,13 +80,13 @@ def main() -> None:
         assert Path(summary["traces"]["operator"]["path"]) == operator_trace_path
         assert summary["traces"]["thread"]["placed_intervals"] == 2
         assert summary["traces"]["operator"]["placed_intervals"] == 2
-        assert summary["records"] == 7
-        assert summary["normalized_rows"] == 7
+        assert summary["records"] == 5
+        assert summary["normalized_rows"] == 5
         assert summary["interval_rows"] == 2
         assert summary["event_rows"] == 3
-        assert summary["device_rows"] == 2
-        assert summary["unplaced_device_rows"] == 1
-        assert summary["kinds"] == {"cpu": 1, "device": 1, "device_summary": 1, "event": 3, "segment": 1}
+        assert summary["device_rows"] == 0
+        assert summary["unplaced_device_rows"] == 0
+        assert summary["kinds"] == {"cpu": 1, "event": 3, "segment": 1}
         assert summary["thread_count"] == 1
         assert summary["thread_ids"] == [42]
         assert summary["thread_ids_truncated"] is False
@@ -111,22 +96,14 @@ def main() -> None:
             "operations_with_count_contract": 1, "verified_operations": 1,
             "legacy_operation_ends": 0, "unverified_sequence_operations": 0,
         }
-        assert summary["stripe_coverage"] == {
-            "status": "verified", "runs_with_count_contract": 1,
-            "verified_runs": 1, "unverified_stripe_runs": 0, "stripe_rows": 1,
-        }
 
         rows = [json.loads(value) for value in rows_path.read_text(encoding="utf-8").splitlines()]
         cpu = next(row for row in rows if row.get("op") == "cpu.mul_mat")
         wait = next(row for row in rows if row.get("op") == "worker_queue_wait")
-        device = next(row for row in rows if row.get("row_type") == "device")
         assert (cpu["cycles"], cpu["wall_ns"], cpu["tid"]) == (60, 80, 42)
         assert cpu["phase"] == "decode"
         assert wait["phase"] == "decode"
-        assert device["phase"] == "decode"
         assert (wait["cycles"], wait["wall_ns"]) == (5, 250)
-        assert (device["cycle_start"], device["cycle_end"], device["cycles"]) == (700, 900, 200)
-        assert "ns_start" not in device
 
         thread_trace = json.loads(thread_trace_path.read_text(encoding="utf-8"))
         spans = [event for event in thread_trace["traceEvents"] if event.get("ph") == "X"]
@@ -134,7 +111,6 @@ def main() -> None:
         assert len(spans) == 2
         assert {event["name"] for event in spans} == {"cpu.mul_mat", "worker_queue_wait"}
         assert all(event["tid"] == 42 for event in spans)
-        assert not any(event.get("name") == "im2p.execute" for event in spans)
 
         operator_trace = json.loads(operator_trace_path.read_text(encoding="utf-8"))
         operator_spans = [event for event in operator_trace["traceEvents"] if event.get("ph") == "X"]
@@ -216,27 +192,6 @@ def main() -> None:
         result = run(missing)
         assert result.returncode == 2
         assert "CPU interval cardinality mismatch" in result.stdout
-
-        # A dropped IM2P stripe is detected against rtl_stripes_published.
-        missing_stripe = root / "missing-stripe.jsonl"
-        missing_stripe.write_text("".join([
-            line({
-                "schema": "gemmini.cycle", "version": 2,
-                "record_type": "IM2P_STRIPE_TELEMETRY", "source": "im2p_rtl",
-                "op": "im2p.execute", "layer": "blk.0", "run_id": 31,
-                "stripe_id": 0, "slot": 0, "publish_cycle": 10,
-                "completion_cycle": 20, "latency_cycles": 10,
-            }),
-            line({
-                "schema": "gemmini.cycle", "version": 2,
-                "record_type": "IM2P_EXECUTION_TELEMETRY", "source": "im2p_rtl",
-                "op": "im2p.execute", "layer": "blk.0", "run_id": 31,
-                "rtl_stripes_published": 2, "rtl_work_total_cycles": 40,
-            }),
-        ]), encoding="utf-8")
-        result = run(missing_stripe)
-        assert result.returncode == 2
-        assert "IM2P stripe cardinality mismatch" in result.stdout
 
         # Reusing a structural segment ID for another owner is an assembly hole.
         reused = root / "reused.jsonl"

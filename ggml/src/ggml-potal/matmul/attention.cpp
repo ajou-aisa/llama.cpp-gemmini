@@ -2,10 +2,10 @@
 
 #include "dense.hpp"
 #include "ggml-gemmini.h"
-#include "ggml-gemmini/quants/act/exsia/local.hpp"
-#include "ggml-gemmini/quants/act/exsia/exsia_float.hpp"
-#include "ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
-#include "ggml-gemmini/quants/common/math.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/local.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia_float.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia_shift.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
 
 #include <algorithm>
 #include <cfenv>
@@ -32,7 +32,7 @@
 namespace ggml::potal::attention {
 namespace {
 
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 constexpr int16_t zero_exp = std::numeric_limits<int16_t>::min();
 constexpr int bits = 8, radix = 256, bias = 128, rho = 14;
 
@@ -151,7 +151,7 @@ void split(stream & out, size_t index, int64_t value) {
     size_t limb = 0;
     do {
         require(limb < max_limbs, POTAL_ERR_CAPACITY);
-        const int32_t digit = ggml::gemmini::lowdigit(static_cast<uint64_t>(value), bits);
+        const int32_t digit = ggml::npu::lowdigit(static_cast<uint64_t>(value), bits);
         out.limbs[limb][index] = static_cast<int8_t>(digit);
         value = (value - digit) / radix;
         ++limb;
@@ -241,7 +241,7 @@ void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role 
                 const int32_t code = std::clamp(codes[k], operation == role::qk ? -32768 : -128,
                                                operation == role::qk ? 32639 : 127);
                 const size_t index = (block * block_k + k) * out.n + j;
-                const int32_t low = operation == role::qk ? ggml::gemmini::lowdigit(code, bits) : code;
+                const int32_t low = operation == role::qk ? ggml::npu::lowdigit(code, bits) : code;
                 out.limbs[0][index] = static_cast<int8_t>(low);
                 if (operation == role::qk) {
                     out.limbs[1][index] = static_cast<int8_t>((code - low) / radix);

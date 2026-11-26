@@ -48,7 +48,7 @@
 #include "tiling.hpp"
 
 #include "residual/stripe-residual.hpp"
-#include "residual/rmd/rmd-types.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +57,7 @@
 
 namespace ggml::potal {
 
-namespace prmd = ggml::gemmini::rmd;
+namespace prmd = ggml::npu::rmd;
 
 // ---- geometry ------------------------------------------------------------------
 

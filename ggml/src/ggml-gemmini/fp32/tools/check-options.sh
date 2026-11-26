@@ -16,7 +16,7 @@ for dim in 16 32 64; do
     printf 'OPTION off_dim_%s rc=0\n' "$dim"
 done
 for conflict in GGML_GEMMINI_PB GGML_POTAL GGML_POTAL_W4A4 GGML_POTAL_ATTENTION \
-        GGML_GEMMINI_ENABLE_A4NKS_ATTENTION GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION; do
+        GGML_GEMMINI_ENABLE_A4NKS_ATTENTION ; do
     rc=0
     cmake -S "$L" -B "$O/options/$conflict" "${base[@]}" \
         -DGGML_GEMMINI=ON -DGGML_GEMMINI_FP32=ON -DGGML_GEMMINI_DIM=8 \

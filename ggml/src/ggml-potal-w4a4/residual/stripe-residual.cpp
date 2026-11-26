@@ -3,7 +3,7 @@
 #include "potal_hw_params.h"
 #include "include/potal-int4.h"
 
-#include "residual/rmd/rmd-builder.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 #include "trace/timeline.hpp"
 
 #include <algorithm>
@@ -25,7 +25,7 @@ namespace ggml::potal::residual {
 
 namespace {
 
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 
 constexpr size_t HW_DIM = POTAL_HW_DIM; // not DIM: <gemmini_params.h> defines that macro
 constexpr size_t RUN_K  = quants::weight::hp1::block_k; // execution K of one run: one HP1 scale block

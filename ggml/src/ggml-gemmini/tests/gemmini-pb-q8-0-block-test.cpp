@@ -13,7 +13,7 @@
 #include <limits>
 #include <vector>
 
-#if defined(__AVX__) || defined(__AVX2__) || defined(__FMA__) || defined(__F16C__)
+#if defined(__AVX__) || defined(__AVX2__) || defined(__FMA__) || defined(__F16C__) || defined(__ARM_NEON)
 #error "The Q8_0 reference must compile to ggml's scalar branches."
 #endif
 
@@ -121,6 +121,10 @@ struct Observation {
 void observe(const pb::BlockObservation & o, void * opaque) {
     auto & state = *static_cast<Observation *>(opaque);
     const Case & c = *state.c;
+#if defined(GEMMINI_ROCC_MODEL)
+    check(o.config_commands == 5 && o.loop_commands == 1 && o.drains == 1,
+          "each K block executes five configs, one WS launch, and one drain");
+#endif
     check(o.block == state.next++, "ascending K blocks");
     check(o.m == c.m && o.j == c.j && o.k == 32, "per-block dimensions");
     if (state.independent_sum.empty()) state.independent_sum.assign(c.m * c.j, +0.0f);

@@ -1,11 +1,11 @@
 #include "rmd-run-aware.hpp"
 
-#include "rmd-builder.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 #include "../../ggml-gemmini-args.h"
-#include "../../quants/common/weight_reader.hpp"
-#include "../../quants/common/weight_route.hpp"
+#include "../../../ggml-npu-common/quantization/common/weight_reader.hpp"
+#include "../../../ggml-npu-common/quantization/common/weight_route.hpp"
 
-#include <gemmini.h>
+#include "matmul/execution.hpp"
 
 #include <algorithm>
 #include <array>

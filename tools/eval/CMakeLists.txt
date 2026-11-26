@@ -1,7 +1,3 @@
-set(EVALUATION_HP1 0)
-if(CYCLE_SIM OR IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
-    set(EVALUATION_HP1 1)
-endif()
 add_executable(llama-eval-workload eval.cpp evaluation-trace.cpp)
 target_compile_features(llama-eval-workload PRIVATE cxx_std_17)
 target_compile_definitions(llama-eval-workload PRIVATE
@@ -13,15 +9,8 @@ target_compile_definitions(llama-eval-workload PRIVATE
     EVALUATION_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE}
     EVALUATION_RMD_BACKEND="${GGML_GEMMINI_DEFAULT_RMD_BACKEND}"
     EVALUATION_MATMUL_MODE="${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
-    EVALUATION_HP1=${EVALUATION_HP1}
     EVALUATION_CUDA=$<BOOL:${GGML_CUDA}>
     EVALUATION_CPU_CYCLE_LOG=$<BOOL:${GGML_CPU_CYCLE_LOG}>
     EVALUATION_GEMMINI=$<BOOL:${GGML_GEMMINI}>)
-target_link_libraries(llama-eval-workload PRIVATE common llama ggml-gemmini-utils)
+target_link_libraries(llama-eval-workload PRIVATE common llama ggml-npu-profiling)
 install(TARGETS llama-eval-workload RUNTIME)
-if(LLAMA_BUILD_TESTS)
-    add_test(NAME test-evaluation-terminal-lm-head
-        COMMAND ${CMAKE_COMMAND} -DRUNNER=$<TARGET_FILE:llama-eval-workload>
-            -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-evaluation-terminal-lm-head
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-terminal-lm-head.cmake)
-endif()

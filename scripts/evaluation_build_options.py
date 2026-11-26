@@ -17,7 +17,7 @@ class InvalidEvaluationOption(ValueError):
 
 
 def validate_evaluation_options(options: Mapping[str, str]) -> None:
-    for name in (*METRIC_OPTIONS, "CYCLE_SIM", "CYCLE_DETAIL", "LOG_DEBUG",
+    for name in (*METRIC_OPTIONS, "CYCLE_DETAIL", "LOG_DEBUG",
                  "LOG_CYCLE", "LOG_DUMP", "LOG_DUMP_SCALE"):
         value = options.get(name, "0")
         if value not in ("0", "1"):

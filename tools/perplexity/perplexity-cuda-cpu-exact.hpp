@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include "ggml-gemmini-matmul-config.hpp"
+#include "npu-matmul-config.hpp"
 #include "../../ggml/src/ggml-gemmini/ggml-gpu-cpu-exact.hpp"
 #include "../../ggml/src/ggml-gemmini/matmul/attention.hpp"
 #include "../../ggml/src/ggml-gemmini/potal-sensitivity.hpp"

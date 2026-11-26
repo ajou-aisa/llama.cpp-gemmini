@@ -4,28 +4,28 @@
 #include "potal_hw_params.h"
 #include "potal-int4.h"
 
-#include "ggml-gemmini-geometry.hpp"
-#include "quants/act/dispatch.hpp"
-#include "quants/act/quantize.hpp"
-#include "quants/common/hp1_scu.hpp"
-#include "quants/common/tensor_util.hpp"
-#include "residual/direct/direct-executor.hpp"
-#include "residual/rmd/rmd-compose.hpp"
+#include "../../ggml-npu-common/types/geometry.hpp"
+#include "../../ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/common/tensor_util.hpp"
+#include "../../ggml-npu-common/residual/direct/direct-executor.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-compose.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <variant>
 
-static_assert(ggml::gemmini::quants::act::block::kGroupSize == ggml::potal::quants::weight::hp1::block_k,
+static_assert(ggml::npu::quants::act::block::kGroupSize == ggml::potal::quants::weight::hp1::block_k,
               "Block+block needs the activation group to be the HP1 scale block");
 
 namespace ggml::potal {
 
 namespace {
 
-namespace act = ggml::gemmini::quants::act;
+namespace act = ggml::npu::quants::act;
 
-constexpr size_t HW_DIM = POTAL_HW_DIM; // not DIM: <gemmini_params.h> defines that macro
+constexpr size_t HW_DIM = POTAL_HW_DIM; // not NPU_D: <gemmini_params.h> defines that macro
 constexpr size_t ALIGN  = POTAL_HW_MAX_BYTES > HW_DIM * sizeof(int32_t)
                              ? POTAL_HW_MAX_BYTES : HW_DIM * sizeof(int32_t);
 
@@ -53,7 +53,7 @@ void add_work(potal_ws_report & sum, const potal_ws_report & w) {
 }
 
 // One PoTal job over the K range [k0, k0 + k) of the staged operands.
-tiled_job job_of(const ggml_gemmini_args_t & args, const hp1_operands & ops, size_t k0, size_t k) {
+tiled_job job_of(const npu_matmul_args & args, const hp1_operands & ops, size_t k0, size_t k) {
     const size_t block = k0 / quants::weight::hp1::block_k;
     return {
         args.I, args.J, k,
@@ -86,7 +86,7 @@ void reconstruct_row(const int32_t * c, size_t n, double activation_scale, const
     }
 }
 
-bool copy_activation_rows(const ggml_gemmini_args_t & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda) {
+bool copy_activation_rows(const npu_matmul_args & args, size_t row_begin, size_t rows, int8_t * dst, size_t lda) {
     const auto &    A     = args.A;
     const uint8_t * codes = A.raw_data();
     if (codes == nullptr || args.K == 0 || A.bits != 4 || A.cols != args.K || A.row_stride_bytes != args.K ||
@@ -267,7 +267,7 @@ bool hp1_operands::allocate(const hp1_shape & s, const hp1_weight & w, const hp1
     return c != nullptr;
 }
 
-bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args) {
+bool init_weight_args(const ggml_tensor * src0, npu_matmul_args & args) {
     if (src0 == nullptr || src0->type != GGML_TYPE_MXINT4 || !is_2d(src0) ||
         src0->ne[0] <= 0 || src0->ne[1] <= 0 || src0->ne[0] % QK4_HP != 0 ||
         uint64_t(src0->ne[0]) > SIZE_MAX / sizeof(block_q4_hp1) ||
@@ -278,8 +278,8 @@ bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args) {
         (src0->ne[1] != 1 && src0->nb[1] != row)) return false;
     args.J                     = size_t(src0->ne[1]);
     args.K                     = size_t(src0->ne[0]);
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
-    args.q4_hp1_blocks          = static_cast<const block_q4_hp1 *>(ggml::gemmini::tensor_data(src0));
+    args.weight_format         = npu_matmul_args::weight_format_t::q4_hp1;
+    args.q4_hp1_blocks          = static_cast<const block_q4_hp1 *>(ggml::npu::tensor_data(src0));
     args.native_blocks_per_row = args.K / QK4_HP;
     args.native_block_count    = args.J * args.native_blocks_per_row;
     args.native_weight_bytes   = ggml_nbytes(src0);
@@ -289,8 +289,8 @@ bool init_weight_args(const ggml_tensor * src0, ggml_gemmini_args_t & args) {
 }
 
 bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s, const char * model_arch,
-               const char * layer, ggml::gemmini::residual::ResidualRoute residual_route,
-               const potal_tile_plan & plan, ggml_gemmini_args_t & args) {
+               const char * layer, ggml::npu::residual::ResidualRoute residual_route,
+               const potal_tile_plan & plan, npu_matmul_args & args) {
     if (s.m <= 0 || !init_weight_args(src0, args) || args.J != size_t(s.n) || args.K != size_t(s.k)) return false;
     args.I                     = (size_t) s.m;
     args.sA                    = args.K;
@@ -305,7 +305,7 @@ bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s,
     args.tile_I                = plan.tile_I;
     args.tile_J                = plan.tile_J;
     args.tile_K                = plan.tile_K;
-    const auto geometry        = ggml::gemmini::make_gemmini_geometry(
+    const auto geometry        = ggml::npu::make_npu_geometry(
         { { args.I, args.J, args.K }, { args.tile_I, args.tile_J, args.tile_K }, HW_DIM });
     if (!geometry.ok()) {
         return false;
@@ -314,22 +314,22 @@ bool init_args(const ggml_tensor * src0, ggml_tensor * dst, const hp1_shape & s,
     return args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
 }
 
-bool quantize_activations(const ggml_tensor * src1, ggml_gemmini_args_t & args, hp1_operands & ops) {
-    if (!ggml::gemmini::quants::quantize_activation(src1, args)) {
+bool quantize_activations(const ggml_tensor * src1, npu_matmul_args & args, hp1_operands & ops) {
+    if (!ggml::npu::quants::quantize_activation(src1, args)) {
         return false;
     }
     return copy_activation_rows(args, 0, args.I, ops.a, ops.lda);
 }
 
-quants::weight::hp1::status unpack_weights(const ggml_gemmini_args_t & args, hp1_operands & ops,
+quants::weight::hp1::status unpack_weights(const npu_matmul_args & args, hp1_operands & ops,
                                            quants::weight::hp1::stats *                   stats,
-                                           ggml::gemmini::quants::wreader::WeightReaderStatus * reader) {
+                                           ggml::npu::quants::wreader::WeightReaderStatus * reader) {
     hp1_weight & w = ops.own;
     return quants::weight::hp1::unpack(args, w.b, w.ldb, w.carriers, w.cstride, w.scale, stats, reader);
 }
 
-quants::weight::hp1::status prepare_weight(const ggml_gemmini_args_t & args, hp1_weight & w,
-                                           ggml::gemmini::quants::wreader::WeightReaderStatus * reader) {
+quants::weight::hp1::status prepare_weight(const npu_matmul_args & args, hp1_weight & w,
+                                           ggml::npu::quants::wreader::WeightReaderStatus * reader) {
     if (w.n != args.J || w.k != args.K) {
         return quants::weight::hp1::status::invalid;
     }
@@ -347,7 +347,7 @@ const char * act_route_name(act_route r) {
     return "unknown";
 }
 
-bool select_route(const ggml_gemmini_args_t & args, route_plan & route) {
+bool select_route(const npu_matmul_args & args, route_plan & route) {
     switch (args.act_quant.kind()) {
         case act::MetaKind::tensor: route = { act_route::tensor, "Tensor+block", false }; return true;
         case act::MetaKind::token:  route = { act_route::token, "Token+block", false };   return true;
@@ -359,7 +359,7 @@ bool select_route(const ggml_gemmini_args_t & args, route_plan & route) {
     return false;
 }
 
-route_result execute_route(const route_plan & route, const ggml_gemmini_args_t & args, hp1_operands & ops,
+route_result execute_route(const route_plan & route, const npu_matmul_args & args, hp1_operands & ops,
                            const tiled_runner & run) {
     route_result r;
     const auto   fail = [&](const char * stage) {
@@ -434,12 +434,12 @@ route_result execute_route(const route_plan & route, const ggml_gemmini_args_t &
     return r;
 }
 
-compensation_result apply_compensation(const ggml_gemmini_args_t & args) {
+compensation_result apply_compensation(const npu_matmul_args & args) {
     compensation_result r;
 #if GGML_GEMMINI_ENABLE_RMD
-    namespace rmd      = ggml::gemmini::rmd;
-    namespace residual = ggml::gemmini::residual;
-    const auto & packets = ggml::gemmini::quants::activation_rmd_packets(args);
+    namespace rmd      = ggml::npu::rmd;
+    namespace residual = ggml::npu::residual;
+    const auto & packets = ggml::npu::quants::activation_rmd_packets(args);
     for (const auto & packet : packets) {
         if (packet != nullptr) {
             r.payloads++;
@@ -448,7 +448,7 @@ compensation_result apply_compensation(const ggml_gemmini_args_t & args) {
             return r;
         }
     }
-    for (const auto & payload : ggml::gemmini::quants::activation_direct_residuals(args)) {
+    for (const auto & payload : ggml::npu::quants::activation_direct_residuals(args)) {
         if (payload == nullptr) {
             continue;
         }
@@ -462,7 +462,7 @@ compensation_result apply_compensation(const ggml_gemmini_args_t & args) {
         // Same calls, in the same order, as the Gemmini dense cpu_direct route.
         rmd::Correction                  correction = rmd::BlockScaledInt64Correction{};
         residual::DirectExecutionMetrics metrics;
-        if (const auto * meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(&args.act_quant.storage())) {
+        if (const auto * meta = std::get_if<ggml::npu::quants::act::exsia::Meta>(&args.act_quant.storage())) {
             metrics.run_id = meta->run_id;
         }
         rmd::RmdStatus status = residual::execute_direct_stripe(args, *payload, correction, &metrics);
@@ -487,13 +487,13 @@ compensation_result apply_compensation(const ggml_gemmini_args_t & args) {
 
 void reference_gemm_i32(const int8_t * a, size_t lda, const int8_t * b, size_t ldb, const uint32_t * carriers,
                         size_t cstride, size_t block_k, size_t M, size_t N, size_t K, int32_t * c, size_t ldc) {
-    namespace hp1 = ggml::gemmini::quants::hp1; // PoTalSCU + Sat32 ACC
+    namespace hp1 = ggml::npu::quants::hp1; // PoTalSCU + Sat32 ACC
     const size_t passes = (K + HW_DIM - 1) / HW_DIM;
     for (size_t m = 0; m < M; ++m) {
         for (size_t n = 0; n < N; ++n) {
             int32_t acc = 0;
             for (size_t p = 0; p < passes; ++p) {
-                int32_t partial = 0; // |partial| <= DIM * 128 * 128 fits easily
+                int32_t partial = 0; // |partial| <= NPU_D * 128 * 128 fits easily
                 for (size_t k = p * HW_DIM; k < K && k < (p + 1) * HW_DIM; ++k) {
                     partial += static_cast<int32_t>(potal_int4_get(
                         reinterpret_cast<const uint8_t *>(a) + m * (lda / 2), k)) *

@@ -1,10 +1,14 @@
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
 #include "ggml-gemmini-geometry.hpp"
-#include "quants/act/exsia/exsia.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia.hpp"
 
 #include <ggml.h>
 
-#include <gemmini.h>
+#include "matmul/baseline.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "matmul/execution.hpp"
+#include "reference/cpu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -106,7 +110,7 @@ bool test_owned_matmul_layer_lifetime() {
     }
 
     const auto pipeline =
-        ggml::gemmini::detail::pipeline_stripe_telemetry(copied.matmul_layer.c_str(), {});
+        ggml::npu::detail::pipeline_stripe_telemetry(copied.matmul_layer.c_str(), {});
     return check(copied.matmul_layer == expected,
                  "copied args own semantic layer after source destruction") &&
            check(moved.matmul_layer == expected,
@@ -128,7 +132,7 @@ bool test_quantization_and_exsia_semantic_layer_seam() {
     std::fflush(stderr);
     dup2(capture[1], STDERR_FILENO);
     close(capture[1]);
-    const bool quantized = ggml::gemmini::quants::act::quantize(nullptr, args);
+    const bool quantized = ggml::npu::quants::act::quantize(nullptr, args);
     std::fflush(stderr);
     dup2(saved_stderr, STDERR_FILENO);
     close(saved_stderr);
@@ -220,7 +224,6 @@ bool test_args_layout_extension() {
 
     // act_quant contains a C++ variant whose size changes with its alternatives
     // and standard library. Historical absolute offsets are not a portable ABI.
-    // The linked IM2P frontend is still checked against its compiled fingerprint
     // by CMake's frontend-pair probe; this test checks the append-only tail here.
     return check(follows(&args.native_blocks_per_row, &args.native_weight_bytes),
                  "native weight extent immediately follows its block geometry") &&
@@ -377,7 +380,7 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
     std::vector<PipelineStripeTelemetry> summaries;
     summaries.reserve(profiles.size());
     for (const auto & profile : profiles) {
-        summaries.push_back(detail::pipeline_stripe_telemetry(semantic_layer.c_str(), profile));
+        summaries.push_back(ggml::npu::detail::pipeline_stripe_telemetry(semantic_layer.c_str(), profile));
     }
     const bool canonical_ranges =
         profiles.size() == 3 && profiles[0].row_begin == 0 && profiles[0].row_end == stripe_rows &&
@@ -512,7 +515,7 @@ bool test_live_borrowed_exsia_snapshot([[maybe_unused]] bool cancel) {
     args.activation_rows_per_stripe         = DIM;
     args.transpose_B                        = true;
     args.residual_route                     = residual::ResidualRoute::cpu_direct;
-    args.weight_format                      = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format                      = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks                      = &weight;
     args.q8_hp1_block_count = args.q8_hp1_blocks_per_row = 1;
     args.native_weight_bytes                             = sizeof(weight);
@@ -888,7 +891,7 @@ bool test_generated_config_contract() {
                  "resolved job capacity matches generated config") &&
            check(config::DEFAULT_RMD_BACKEND == static_cast<int>(RmdBackend::cpu_direct) ||
                      config::DEFAULT_RMD_BACKEND ==
-                         static_cast<int>(RmdBackend::gemmini_ws_compact),
+                         static_cast<int>(RmdBackend::npu_compact),
                  "generated RMD backend default is valid") &&
            check(defaults.options.rmd_backend ==
                      static_cast<RmdBackend>(config::DEFAULT_RMD_BACKEND),
@@ -898,11 +901,11 @@ bool test_generated_config_contract() {
 }
 
 bool test_checked_geometry_contract() {
-    constexpr GemminiTileFactors tiles{5, 5, 48};
+    constexpr NpuTileFactors tiles{5, 5, 48};
     constexpr size_t             array_dim = 16;
     struct Fixture {
-        GemminiLogicalShape shape;
-        GemminiOuterCounts  outer;
+        NpuLogicalShape shape;
+        NpuOuterCounts  outer;
         size_t              ws_inner_calls;
     };
     constexpr Fixture gpt2[] = {
@@ -913,7 +916,7 @@ bool test_checked_geometry_contract() {
     };
 
     for (const auto & fixture : gpt2) {
-        const auto result = make_gemmini_geometry({fixture.shape, tiles, array_dim});
+        const auto result = make_npu_geometry({fixture.shape, tiles, array_dim});
         if (!check(result.ok(), "GPT-2 geometry accepted") ||
             !check(result.geometry.tiles.i == 5 && result.geometry.tiles.j == 5 &&
                        result.geometry.tiles.k == 48,
@@ -931,19 +934,19 @@ bool test_checked_geometry_contract() {
         }
     }
 
-    const auto zero_tile = make_gemmini_geometry({{256, 768, 768}, {0, 5, 48}, array_dim});
-    const auto tile_product_overflow = make_gemmini_geometry(
+    const auto zero_tile = make_npu_geometry({{256, 768, 768}, {0, 5, 48}, array_dim});
+    const auto tile_product_overflow = make_npu_geometry(
         {{256, 768, 768}, {std::numeric_limits<size_t>::max(), 5, 48}, array_dim});
-    const auto call_product_overflow = make_gemmini_geometry({{std::numeric_limits<size_t>::max(),
+    const auto call_product_overflow = make_npu_geometry({{std::numeric_limits<size_t>::max(),
                                                                std::numeric_limits<size_t>::max(),
                                                                std::numeric_limits<size_t>::max()},
                                                               {1, 1, 1},
                                                               1});
-    return check(zero_tile.error == GemminiGeometryError::zero_tile_factor,
+    return check(zero_tile.error == NpuGeometryError::zero_tile_factor,
                  "zero tile factor has typed rejection") &&
-           check(tile_product_overflow.error == GemminiGeometryError::overflow,
+           check(tile_product_overflow.error == NpuGeometryError::overflow,
                  "tile-row product overflow has typed rejection") &&
-           check(call_product_overflow.error == GemminiGeometryError::overflow,
+           check(call_product_overflow.error == NpuGeometryError::overflow,
                  "WS inner-call product overflow has typed rejection");
 }
 
@@ -963,7 +966,7 @@ bool test_precedence() {
     if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE &&
         !check(environment.ok() && environment.options.mode == MatmulInvocationMode::full &&
                    environment.options.job_capacity == 5 &&
-                   environment.options.rmd_backend == RmdBackend::gemmini_ws_compact &&
+                   environment.options.rmd_backend == RmdBackend::npu_compact &&
                    environment.rmd_backend_source == MatmulOptionSource::environment,
                "environment overrides build defaults")) {
         return false;
@@ -1097,7 +1100,7 @@ bool test_execution_route_propagation() {
         check(args.tiled_matmul_type == main_route,
               "CPU residual selection preserves main backend");
 
-    options.rmd_backend = RmdBackend::gemmini_ws_compact;
+    options.rmd_backend = RmdBackend::npu_compact;
     auto ws_execution   = prepare_execution(&args, options);
 #if defined(__riscv) || defined(GGML_GEMMINI_TESTING)
     const bool ws =
@@ -1192,7 +1195,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--geometry-fixture") == 0) {
         if (!test_checked_geometry_contract())
             return 1;
-        const auto result = make_gemmini_geometry({{256, 2304, 768}, {5, 5, 48}, 16});
+        const auto result = make_npu_geometry({{256, 2304, 768}, {5, 5, 48}, 16});
         std::printf("GEOMETRY stripe_rows=%zu stripe_count=%zu final_rows=%zu outer=%zu/%zu/%zu "
                     "ws_inner_calls=%zu rows=80,80,80,16\n",
                     result.geometry.stripe_rows,
@@ -1205,11 +1208,11 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--invalid-geometry-probe") == 0) {
-        const auto zero     = make_gemmini_geometry({{256, 768, 768}, {0, 5, 48}, 16});
-        const auto overflow = make_gemmini_geometry(
+        const auto zero     = make_npu_geometry({{256, 768, 768}, {0, 5, 48}, 16});
+        const auto overflow = make_npu_geometry(
             {{256, 768, 768}, {std::numeric_limits<size_t>::max(), 5, 48}, 16});
-        const bool ok = zero.error == GemminiGeometryError::zero_tile_factor &&
-                        overflow.error == GemminiGeometryError::overflow;
+        const bool ok = zero.error == NpuGeometryError::zero_tile_factor &&
+                        overflow.error == NpuGeometryError::overflow;
         std::printf("INVALID_GEOMETRY zero_tile=%d overflow=%d allocations=0\n",
                     static_cast<int>(zero.error),
                     static_cast<int>(overflow.error));

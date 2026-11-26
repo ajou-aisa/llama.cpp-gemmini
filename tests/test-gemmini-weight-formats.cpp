@@ -1,8 +1,9 @@
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-gemmini.h"
-#include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/common/weight_reader.hpp"
 #include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
@@ -17,10 +18,10 @@
 
 namespace {
 
-namespace wreader = ggml::gemmini::quants::wreader;
-namespace wroute  = ggml::gemmini::quants::wroute;
+namespace wreader = ggml::npu::quants::wreader;
+namespace wroute  = ggml::npu::quants::wroute;
 
-using Format       = ggml_gemmini_args_t::im2p_weight_format_t;
+using Format       = ggml_gemmini_args_t::weight_format_t;
 using ReaderStatus = wreader::WeightReaderStatus;
 using Route        = wroute::WeightRouteKind;
 using RouteStatus  = wroute::WeightRouteStatus;
@@ -691,10 +692,6 @@ bool test_q4_hp1_loader_contract() {
     weight->buffer       = nullptr;
     ggml_backend_buffer_free(buffer);
 
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    ggml_free(ctx);
-    return check(!supported, "IM2P_SIM must reject MXINT without an MXINT activation route");
-#else
     if (!check(supported, "production GEMMINI rejects MXINT loader metadata")) {
         ggml_free(ctx);
         return false;
@@ -752,7 +749,6 @@ bool test_q4_hp1_loader_contract() {
     ggml_backend_free(backend);
     ggml_free(ctx);
     return ok;
-#endif
 #else
     return true;
 #endif

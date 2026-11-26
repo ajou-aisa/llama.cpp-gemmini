@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,7 +9,7 @@
 
 namespace {
 
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 
 bool check(bool condition, const char * message) {
     if (!condition) {

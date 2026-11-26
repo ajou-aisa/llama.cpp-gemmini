@@ -58,7 +58,7 @@ def inputs(job: Job, dataset: Path) -> dict[str, str]:
     cache = binary.parent.parent / "CMakeCache.txt"
     config = dict(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*):[A-Za-z_]+=(.*)$", cache.read_text(), re.M))
     expected = dict(GGML_GEMMINI_ENABLE_A4NKS_ATTENTION="ON", GGML_CUDA="OFF",
-                    GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION="OFF", CYCLE_SIM="0",
+
                     GGML_GEMMINI_CUDA_CPU_EXACT="ON", GGML_GEMMINI_CUDA_RTN_ATTENTION="ON",
                     GGML_GEMMINI_ACTIVATION_QUANT="EXSIA", GGML_GEMMINI_ENABLE_RMD="ON",
                     GGML_GEMMINI_ACTIVATION_BITS=str(job["bits"]), GGML_GEMMINI_WEIGHT_BITS=str(job["bits"]),

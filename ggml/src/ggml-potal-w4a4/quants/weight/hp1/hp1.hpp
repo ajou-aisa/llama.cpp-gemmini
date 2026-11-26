@@ -16,16 +16,16 @@
 // rmd-compose enforces), the scale must not be negative, and a row with scale
 // 0 may only hold zero blocks. Nothing is dequantized and requantized.
 
-#include "quants/common/weight_reader.hpp"
+#include "../../../../ggml-npu-common/quantization/common/weight_reader.hpp"
 
 #include <cstddef>
 #include <cstdint>
 
-struct ggml_gemmini_args_t;
+struct npu_matmul_args;
 
 namespace ggml::potal::quants::weight::hp1 {
 
-namespace wreader = ggml::gemmini::quants::wreader;
+namespace wreader = ggml::npu::quants::wreader;
 
 constexpr uint32_t block_k = 32; // QK4_HP, the K extent of one scale block
 
@@ -57,7 +57,7 @@ struct stats {
 //   carriers[(k / block_k) * cstride + n]  = carrier(m)
 //   channel_scale[n]                       = the row's channel_scale
 // Outputs are partially written when the status is not ok.
-status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
+status unpack(const npu_matmul_args & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
               float * channel_scale, stats * st, wreader::WeightReaderStatus * reader = nullptr);
 
 } // namespace ggml::potal::quants::weight::hp1

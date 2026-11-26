@@ -1,11 +1,12 @@
-#include "../ggml/src/ggml-gemmini/quants/common/hp1_scu.hpp"
-#include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
-#include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
-#include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
+#include "../ggml/src/ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/common/weight_reader.hpp"
+#include "../ggml/src/ggml-npu-common/residual/direct/direct-executor.hpp"
+#include "../ggml/src/ggml-npu-common/residual/residual-capture.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-reference.hpp"
 
 #include <algorithm>
 #include <array>
@@ -582,7 +583,7 @@ struct WeightCapabilityFixture {
     block_q16_hp1       q16_hp1{};
 
     WeightCapabilityFixture(uint8_t bits, WeightFamily family) {
-        using Format               = ggml_gemmini_args_t::im2p_weight_format_t;
+        using Format               = ggml_gemmini_args_t::weight_format_t;
         args.J                     = 1;
         args.K                     = 32;
         args.block_size_k          = 32;
@@ -641,8 +642,8 @@ struct WeightCapabilityFixture {
 };
 
 bool test_weight_capability_happy_table() {
-    namespace wreader = ggml::gemmini::quants::wreader;
-    namespace wroute  = ggml::gemmini::quants::wroute;
+    namespace wreader = ggml::npu::quants::wreader;
+    namespace wroute  = ggml::npu::quants::wroute;
     struct CapabilityCase {
         uint8_t                   bits;
         WeightFamily              family;
@@ -715,7 +716,7 @@ bool test_weight_capability_happy_table() {
 }
 
 bool test_weight_capability_failure_table() {
-    namespace wroute = ggml::gemmini::quants::wroute;
+    namespace wroute = ggml::npu::quants::wroute;
     bool ok          = true;
     for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
         WeightCapabilityFixture       fixture(bits, WeightFamily::H0);
@@ -736,7 +737,7 @@ bool test_weight_capability_failure_table() {
     return ok;
 }
 
-namespace residual = ggml::gemmini::residual;
+namespace residual = ggml::npu::residual;
 namespace rmd      = ggml::gemmini::rmd;
 
 const char * weight_family_name(WeightFamily family) {
@@ -763,7 +764,7 @@ struct DirectOracleFixture {
     residual::DirectStripePayloadHandle payload;
 
     DirectOracleFixture(uint8_t bits, WeightFamily family) {
-        using Format               = ggml_gemmini_args_t::im2p_weight_format_t;
+        using Format               = ggml_gemmini_args_t::weight_format_t;
         args.I                     = 3;
         args.J                     = 2;
         args.K                     = 64;
@@ -959,7 +960,7 @@ bool test_block_direct_weight_families() {
             return false;
         }
         auto & metadata =
-            fixture.args.act_quant.storage().emplace<ggml::gemmini::quants::act::block::Meta>();
+            fixture.args.act_quant.storage().emplace<ggml::npu::quants::act::block::Meta>();
         metadata.rows = fixture.payload->row_begin + fixture.payload->row_count;
         metadata.cols = fixture.args.K;
         metadata.scales.assign(metadata.rows * 2, 1.0f);
@@ -1085,7 +1086,7 @@ bool test_direct_oracle_happy_matrix() {
 }
 
 bool test_a16_allocation_products() {
-    ggml::gemmini::quants::act::QuantizedActivationBuffer buffer;
+    ggml::npu::quants::act::QuantizedActivationBuffer buffer;
     if (!check(buffer.allocate(1, 2, 16), "A16 allocation sentinel initializes")) {
         return false;
     }
@@ -1218,7 +1219,7 @@ bool test_direct_failure_matrix() {
     add_args.I = add_args.J        = 1;
     add_args.K                     = 64;
     add_args.block_size_k          = 32;
-    add_args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+    add_args.weight_format         = ggml_gemmini_args_t::weight_format_t::q16_h1;
     add_args.q16_h1_blocks         = add_weights.data();
     add_args.native_block_count    = add_weights.size();
     add_args.native_blocks_per_row = add_weights.size();
@@ -1271,7 +1272,7 @@ struct CompactOracleFixture {
     bool                                   valid             = false;
 
     CompactOracleFixture(uint8_t bits, WeightFamily family) {
-        using Format               = ggml_gemmini_args_t::im2p_weight_format_t;
+        using Format               = ggml_gemmini_args_t::weight_format_t;
         args.I                     = rows;
         args.J                     = columns;
         args.K                     = logical_k;
@@ -1452,13 +1453,13 @@ bool compact_oracle_output(const CompactOracleFixture & fixture,
                 block.output_value_offset + lane_position * block.lane_stride_values;
             for (size_t row = 0; row < CompactOracleFixture::rows; ++row) {
                 for (size_t j = 0; j < CompactOracleFixture::columns; ++j) {
-                    using Format   = ggml_gemmini_args_t::im2p_weight_format_t;
+                    using Format   = ggml_gemmini_args_t::weight_format_t;
                     const bool hp1 = fixture.args.weight_format == Format::q4_hp1 ||
                                      fixture.args.weight_format == Format::q8_hp1;
                     if (hp1) {
-                        namespace wr    = ggml::gemmini::quants::wreader;
-                        namespace route = ggml::gemmini::quants::wroute;
-                        namespace scu   = ggml::gemmini::quants::hp1;
+                        namespace wr    = ggml::npu::quants::wreader;
+                        namespace route = ggml::npu::quants::wroute;
+                        namespace scu   = ggml::npu::quants::hp1;
                         const auto plan = route::resolve_weight_route_plan(
                             fixture.args, route::WeightScaleInfoMode::ResidualHp1Scu);
                         const auto carrier =
@@ -1568,7 +1569,7 @@ bool test_block_scale_before_sum() {
     const std::array<uint8_t, 2> affine_codes{1, 1};
     const float                  affine_scale  = 1.0f;
     const uint16_t               affine_offset = 0;
-    fixture.args.weight_format  = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    fixture.args.weight_format  = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
     fixture.args.B              = reinterpret_cast<elem_t *>(affine_weights.data());
     fixture.args.sB             = 2 * kBlockSize;
     fixture.args.transpose_B    = true;
@@ -1637,7 +1638,7 @@ bool test_block_correction_failure_atomicity() {
     RmdExecutionMetrics metrics{};
     metrics.packet_call_count = 17;
     metrics.matmul_call_count = 19;
-#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(__riscv)
+#if !defined(__riscv)
     bool ok = check(execute_rmd_stripe_ws(fixture.args, *fixture.packet, correction, &metrics) ==
                             RmdStatus::unsupported_route &&
                         direct_outputs_match(correction, correction_before) &&
@@ -1669,7 +1670,7 @@ bool test_block_correction_failure_atomicity() {
     channel_args.B  = channel_codes.data();
     channel_args.sB = channel_args.K;
     channel_args.weight_format =
-        ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+        ggml_gemmini_args_t::weight_format_t::q8_channel_dense_sidecar;
     channel_args.weight_channel_scales      = channel_scales.data();
     channel_args.weight_channel_scale_count = channel_scales.size();
     ok =
@@ -1863,7 +1864,7 @@ bool test_compact_oracle_happy_matrix() {
         std::array<int32_t, kArrayDim * kArrayDim> wide_tile{};
         wide_tile.fill(123456789);
         RmdExecutionMetrics gather_metrics{};
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         const RmdStatus gather_status =
             fixture.valid ? rmd::gather_wide_weight_tile_for_test(fixture.args,
                                                                   1,
@@ -1882,7 +1883,7 @@ bool test_compact_oracle_happy_matrix() {
                 gather_metrics.weight_values_gathered == edge_k.size() * 2 &&
                     gather_metrics.weight_baseline_address_resolutions == edge_k.size() * 2 &&
                     gather_metrics.weight_address_resolutions == 2 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         2,
                 "native gather resolves each selected column block exactly once") &&
             gather_ok;
@@ -1900,7 +1901,7 @@ bool test_compact_oracle_happy_matrix() {
         const auto valid_tile = wide_tile;
         auto       invalid_k  = edge_k;
         invalid_k.back()      = kBlockSize;
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         gather_ok =
             check(
                 rmd::gather_wide_weight_tile_for_test(fixture.args,
@@ -1915,7 +1916,7 @@ bool test_compact_oracle_happy_matrix() {
                         RmdStatus::execution_failed &&
                     wide_tile == valid_tile && gather_metrics.weight_address_resolutions == 2 &&
                     gather_metrics.weight_values_gathered == edge_k.size() * 2 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         0,
                 "late invalid K rejects before block resolution without "
                 "publishing a tile") &&
@@ -1926,7 +1927,7 @@ bool test_compact_oracle_happy_matrix() {
         single_expected[0]   = fixture.code(1, kBlockSize + single_k);
         single_expected[1]   = fixture.code(2, kBlockSize + single_k);
         gather_metrics       = {};
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         gather_ok =
             check(
                 rmd::gather_wide_weight_tile_for_test(fixture.args,
@@ -1941,13 +1942,13 @@ bool test_compact_oracle_happy_matrix() {
                     wide_tile == single_expected && gather_metrics.weight_values_gathered == 2 &&
                     gather_metrics.weight_baseline_address_resolutions == 2 &&
                     gather_metrics.weight_address_resolutions == 2 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         2,
                 "single-K native gather preserves K31, padding, and observed "
                 "address counts") &&
             gather_ok;
         single_k = kBlockSize;
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         gather_ok =
             check(
                 rmd::gather_wide_weight_tile_for_test(fixture.args,
@@ -1962,7 +1963,7 @@ bool test_compact_oracle_happy_matrix() {
                         RmdStatus::execution_failed &&
                     wide_tile == single_expected && gather_metrics.weight_values_gathered == 2 &&
                     gather_metrics.weight_address_resolutions == 2 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         0,
                 "invalid single local K preserves tile and metrics before any "
                 "read") &&
@@ -2074,7 +2075,7 @@ bool test_compact_oracle_happy_matrix() {
 }
 
 bool test_full_int32_compact_direct_agreement(size_t rows) {
-    namespace act = ggml::gemmini::quants::act;
+    namespace act = ggml::npu::quants::act;
     bool ok       = true;
     for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
         for (WeightFamily family :
@@ -2297,12 +2298,7 @@ bool test_compact_residual_metrics() {
                            RmdStatus::success,
                    "residual metrics fixture executes compact and direct"))
             return false;
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                                            \
-    !defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
-        const bool hp1_scu = false;
-#else
         const bool hp1_scu = bits == 4 || bits == 8;
-#endif
         std::vector<int64_t> expected(rows * columns, 0);
         std::vector<int64_t> direct_expected(rows * columns, 0);
         for (size_t j = 0; j < columns; ++j) {
@@ -2435,8 +2431,8 @@ bool test_compact_residual_metrics() {
 }
 
 bool test_shared_weight_merge_preparation() {
-    namespace wreader = ggml::gemmini::quants::wreader;
-    namespace act     = ggml::gemmini::quants::act;
+    namespace wreader = ggml::npu::quants::wreader;
+    namespace act     = ggml::npu::quants::act;
     WeightCapabilityFixture fixture(GGML_GEMMINI_WEIGHT_BITS, WeightFamily::HP1);
     auto &                  args = fixture.args;
 #if GGML_GEMMINI_WEIGHT_BITS == 4
@@ -2660,7 +2656,6 @@ bool test_compact_failure_matrix() {
         RmdExecutionMetrics streaming_metrics{};
         streaming_metrics.packet_call_count        = 17;
         streaming_metrics.matmul_call_count        = 19;
-        streaming_metrics.im2p_stats.fields[0]     = 23;
         streaming_metrics.residual_nnz             = 29;
         streaming_metrics.residual_min             = -31;
         streaming_metrics.required_planes          = 5;
@@ -2674,7 +2669,6 @@ bool test_compact_failure_matrix() {
                          direct_outputs_match(correction, correction_sentinel) &&
                          streaming_metrics.packet_call_count == 17 &&
                          streaming_metrics.matmul_call_count == 19 &&
-                         streaming_metrics.im2p_stats.fields[0] == 23 &&
                          streaming_metrics.residual_nnz == 29 &&
                          streaming_metrics.residual_min == -31 &&
                          streaming_metrics.required_planes == 5 &&
@@ -2694,12 +2688,12 @@ bool test_compact_failure_matrix() {
 
     for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
         WeightCapabilityFixture                              h0(bits, WeightFamily::H0);
-        const ggml::gemmini::quants::wroute::WeightRoutePlan h0_plan =
-            ggml::gemmini::quants::wroute::resolve_weight_route_plan(
-                h0.args, ggml::gemmini::quants::wroute::WeightScaleInfoMode::Residual);
-        if (ggml::gemmini::quants::wroute::weight_route_status(
-                h0_plan, ggml::gemmini::quants::wroute::WeightExecutionPath::Compact) ==
-            ggml::gemmini::quants::wroute::WeightRouteStatus::Success) {
+        const ggml::npu::quants::wroute::WeightRoutePlan h0_plan =
+            ggml::npu::quants::wroute::resolve_weight_route_plan(
+                h0.args, ggml::npu::quants::wroute::WeightScaleInfoMode::Residual);
+        if (ggml::npu::quants::wroute::weight_route_status(
+                h0_plan, ggml::npu::quants::wroute::WeightExecutionPath::Compact) ==
+            ggml::npu::quants::wroute::WeightRouteStatus::Success) {
             continue;
         }
         h0.args.A.allocate(1, kBlockSize, bits);
@@ -2715,7 +2709,7 @@ bool test_compact_failure_matrix() {
     ggml_gemmini_args_t h2_args{};
     h2_args.I = h2_args.J        = 1;
     h2_args.K                    = kBlockSize;
-    h2_args.weight_format        = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+    h2_args.weight_format        = ggml_gemmini_args_t::weight_format_t::q8_h2;
     h2_args.q8_h2_blocks         = &h2;
     h2_args.q8_h2_block_count    = 1;
     h2_args.q8_h2_blocks_per_row = 1;
@@ -2730,7 +2724,7 @@ bool test_compact_failure_matrix() {
     ggml_gemmini_args_t hp2_args{};
     hp2_args.I = hp2_args.J        = 1;
     hp2_args.K                     = kBlockSize;
-    hp2_args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+    hp2_args.weight_format         = ggml_gemmini_args_t::weight_format_t::q8_hp2;
     hp2_args.q8_hp2_blocks         = &hp2;
     hp2_args.q8_hp2_block_count    = 1;
     hp2_args.q8_hp2_blocks_per_row = 1;
@@ -2770,7 +2764,7 @@ bool test_compact_failure_matrix() {
             return false;
         CompressedOutput    output = sentinel;
         RmdExecutionMetrics metrics{};
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         const auto status = rmd::execute_rmd_stripe_gemmini_for_test(
             a4_native.args, *a4_native.packet, output, &metrics);
         ok =
@@ -2778,7 +2772,7 @@ bool test_compact_failure_matrix() {
                 status == RmdStatus::unsupported_route &&
                     compressed_outputs_match(output, sentinel) && metrics.ws_call_count == 0 &&
                     metrics.matmul_call_count == 0 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         0,
                 "A4 digits cannot enter an elem_t-addressed raw WS adapter") &&
             ok;
@@ -2806,7 +2800,7 @@ bool test_compact_failure_matrix() {
     if (truncated_native.valid) {
         CompressedOutput    output = sentinel;
         RmdExecutionMetrics metrics{};
-        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ggml::npu::quants::wreader::test_reset_weight_reader_counters();
         ok =
             check(
                 rmd::execute_rmd_stripe_gemmini_for_test(
@@ -2814,7 +2808,7 @@ bool test_compact_failure_matrix() {
                         RmdStatus::unsupported_route &&
                     compressed_outputs_match(output, sentinel) && metrics.packet_call_count == 0 &&
                     metrics.ws_call_count == 0 &&
-                    ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() ==
+                    ggml::npu::quants::wreader::test_weight_reader_code_address_resolutions() ==
                         0,
                 "truncated native weights reject before any gather or Gemmini "
                 "dispatch") &&
@@ -2874,7 +2868,6 @@ bool test_compact_failure_matrix() {
         Correction       correction          = correction_sentinel;
         metrics.packet_call_count            = 17;
         metrics.matmul_call_count            = 19;
-        metrics.im2p_stats.fields[0]         = 23;
         metrics.residual_nnz                 = 29;
         metrics.residual_max                 = 31;
         metrics.digit_nnz                    = 37;
@@ -2884,7 +2877,7 @@ bool test_compact_failure_matrix() {
                            RmdStatus::unsupported_route &&
                        direct_outputs_match(correction, correction_sentinel) &&
                        metrics.packet_call_count == 17 && metrics.matmul_call_count == 19 &&
-                       metrics.im2p_stats.fields[0] == 23 && metrics.residual_nnz == 29 &&
+                       metrics.residual_nnz == 29 &&
                        metrics.residual_max == 31 && metrics.digit_nnz == 37 &&
                        metrics.gathered_weight_host_bytes == 41,
                    "unsupported A16 HP1 stream preserves correction and existing metrics") &&
@@ -2938,7 +2931,7 @@ bool test_compact_failure_matrix() {
 } // namespace
 
 static bool test_cpu_capture_is_canonical_and_packet_free() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     TimedResidualCapture capture(ResidualRoute::cpu_direct);
     capture.reset(3, 7, 2, 64, 17);
     if (!capture.add_residual(1, 33, -129) || !capture.add_residual(0, 31, 256) ||
@@ -2968,7 +2961,7 @@ static bool test_cpu_capture_is_canonical_and_packet_free() {
 }
 
 static bool test_ws_capture_preserves_packet_contract() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     RmdStripeBuilder legacy;
     legacy.reset(3, 7, 2, 64, 17);
     legacy.add_residual(1, 33, -129);
@@ -2994,7 +2987,7 @@ static bool test_ws_capture_preserves_packet_contract() {
 }
 
 static bool test_empty_capture_and_single_sink_selection() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     TimedResidualCapture cpu(ResidualRoute::cpu_direct);
     cpu.reset(0, 0, 1, 1, 1);
     const ResidualStripePayload cpu_empty = cpu.finish();
@@ -3032,7 +3025,7 @@ static bool test_empty_capture_and_single_sink_selection() {
 }
 
 static bool test_direct_payload_slicing_and_ownership() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     static_assert(
         std::is_same_v<DirectStripePayloadHandle, std::shared_ptr<const DirectStripePayload>>,
         "direct payload ownership must be immutable");
@@ -3067,7 +3060,7 @@ static bool test_direct_payload_slicing_and_ownership() {
 }
 
 static bool test_direct_payload_validation_rejects_malformed_contracts() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     auto valid = [] {
         DirectStripePayload payload;
         payload.stripe_id = 1;
@@ -3116,7 +3109,7 @@ static bool test_direct_payload_validation_rejects_malformed_contracts() {
 }
 
 static bool test_exact_slice_validates_payload_and_dimensions() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     auto malformed       = std::make_shared<DirectStripePayload>();
     malformed->stripe_id = 7;
     malformed->row_begin = 10;
@@ -3151,7 +3144,7 @@ static bool test_exact_slice_validates_payload_and_dimensions() {
 }
 
 static bool test_direct_builder_rejects_row_interval_overflow() {
-    using namespace ggml::gemmini::residual;
+    using namespace ggml::npu::residual;
     DirectStripeBuilder builder;
     builder.reset(0, std::numeric_limits<size_t>::max(), 2, 8, 3);
     return check(builder.status() == RmdStatus::overflow,

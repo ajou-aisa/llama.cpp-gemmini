@@ -24,10 +24,10 @@
 #include "support/paired-h2-emulator.hpp"
 #include "support/stripe-owner.hpp"
 
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/paired-auto.hpp"
 #include "matmul/stripe.hpp"
-#include "quants/act/quantize.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
 
 #include <sys/mman.h>
 
@@ -219,7 +219,7 @@ std::string compare_stripe(const paired_fixture & f, const paired_inputs & in, c
         for (size_t m = 0; m < rows; ++m) {
             reconstruct_row(r.main_c.data() + m * f.N, f.N, act, f.weight.scale, out.data() + m * f.N, 1);
         }
-        ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot snap;
+        ggml::npu::quants::act::exsia::StripeMetadataSnapshot snap;
         snap.theta = in.theta[0];
         if (residual::merge_prepared_hp1(f.weight, 0, rows, snap, corr, out.data(), f.M, f.N, 1, nullptr) != grmd::RmdStatus::success) {
             return "merge";
@@ -554,7 +554,7 @@ void test_numerics() {
                   r.report.tile.main_a_rows == POTAL_HW_BANK_ROWS && r.report.tile.weight_rows == POTAL_HW_BANK_ROWS);
         if (PD == 32 && c.seed == 239)
             check("H Residual ACC half capacity reached exactly", r.report.tile.residual_acc_rows == POTAL_HW_ACC_ROWS / 2);
-        // Geometry the case name claims: explicit DIM-specific constants,
+        // Geometry the case name claims: explicit NPU_D-specific constants,
         // never expectations copied from the plan under test.
         const std::string name = c.name;
         if (name == "N single panel, one window") {
@@ -1432,7 +1432,7 @@ void test_early_execution_failures() {
 
 void test_early_saturation() {
     if (PD != 32) return;
-    // Four shifted positive/negative DIM partials saturate repeatedly.
+    // Four shifted positive/negative NPU_D partials saturate repeatedly.
     // The last unshifted block reverses sign after a K-panel boundary.
     paired_fixture f(33, 35, 160, 137,
         [](size_t block, size_t) { return int16_t(block < 4 ? 16 : 0); },
@@ -2087,7 +2087,7 @@ namespace {
 // ---- X: review follow-ups -----------------------------------------------------------
 
 // Independent golden of one stripe from the fixture's codes and carriers (SCU / Sat32 of the
-// RTL test double): Main by DIM K passes in K order; Residual per lane row by run, by DIM
+// RTL test double): Main by NPU_D K passes in K order; Residual per lane row by run, by NPU_D
 // fragment of the run's compact K, every fragment (zero ones included).
 struct direct_golden {
     std::vector<int32_t> main_c, residual_c;
@@ -2232,7 +2232,7 @@ void test_review_followups() {
 
     // More rows than one Main I group: refused before any command (never truncated).
     potal_tile_plan small = main;
-    small.tile_I = 1; // DIM rows per group
+    small.tile_I = 1; // NPU_D rows per group
     paired_fixture  f32(2 * PD, 64, 128, 78, [](size_t blk, size_t n) { return (int16_t) ((blk + n) % 2); });
     h2_emulator     emu4;
     const direct_run multi = f32.ok ? run_direct(f32, small, 2 * PD, nullptr, emu4) : direct_run{};
@@ -3652,14 +3652,14 @@ struct pipe_node {
             }
         }
         s  = { (int64_t) M, (int64_t) N, (int64_t) K };
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         ok = potal_tile_select(M, N, K, 32 / PD, &plan) == POTAL_OK && args_for(args) &&
              weight.allocate((int64_t) N, (int64_t) K) &&
              prepare_weight(args, weight) == quants::weight::hp1::status::ok;
     }
 
-    bool args_for(ggml_gemmini_args_t & args) const {
-        return init_args(w, y, s, "gpt2", "paired-pipeline-test", ggml::gemmini::residual::ResidualRoute::ws_packet,
+    bool args_for(npu_matmul_args & args) const {
+        return init_args(w, y, s, "gpt2", "paired-pipeline-test", ggml::npu::residual::ResidualRoute::ws_packet,
                          plan, args);
     }
     size_t  stripes() const { return (M + plan.tile_I * PD - 1) / (plan.tile_I * PD); }
@@ -3696,7 +3696,7 @@ pipe_result run_pipe(pipe_node & nd, size_t capacity, int mode,
                      bool prefetch = false, bool early = false,
                      potal_paired_stream_mode stream = potal_paired_stream_mode::off) {
     pipe_result         r;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     if (!nd.args_for(args)) {
         r.report.stage = "fixture";
         return r;
@@ -4339,7 +4339,7 @@ void test_auto_jk_execution() {
                     reconstruct_row(result.main_c.data() + row * f.N, f.N,
                         double(std::ldexp(1.0f, in.theta[0])), f.weight.scale, out.data() + row * f.N, 1);
                 if (has_res) {
-                    ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot snap;
+                    ggml::npu::quants::act::exsia::StripeMetadataSnapshot snap;
                     snap.theta = in.theta[0];
                     numbers = residual::merge_prepared_hp1(f.weight, 0, f.M, snap, correction,
                         out.data(), f.M, f.N, 1, nullptr) == grmd::RmdStatus::success;
@@ -4513,11 +4513,11 @@ void test_auto_jk_pipeline() {
     pipe_node dense(256, 32, 256, 43, 3000.0f, 1, 6);
     // Deterministic synthetic packet: do not assume real ExSIA outliers
     // produce two lanes for every row after stripe exponent adaptation.
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     const bool dense_fixture = dense.ok &&
         potal_frozen_plan(dense.M, dense.N, dense.K, POTAL_HW_ACC_ROWS / (2 * PD),
                           1, PPB, PPB, &dense.plan) == POTAL_OK &&
-        dense.args_for(args) && ggml::gemmini::quants::quantize_activation(dense.x, args);
+        dense.args_for(args) && ggml::npu::quants::quantize_activation(dense.x, args);
     if (dense_fixture) {
         std::vector<res_entry> entries;
         for (size_t row = 0; row < dense.M; ++row) entries.push_back({row, 0, 65537});

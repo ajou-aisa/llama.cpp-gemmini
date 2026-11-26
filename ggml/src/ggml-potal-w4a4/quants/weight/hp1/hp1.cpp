@@ -1,11 +1,10 @@
 #include "hp1.hpp"
 
-#include "ggml-gemmini-args.h"
-#include "quants/common/hp1_scu.hpp"
-#include "quants/common/weight_route.hpp"
+#include "../../../../ggml-npu-common/types/matmul.hpp"
+#include "../../../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../../../ggml-npu-common/quantization/common/weight_route.hpp"
 #include "potal-int4.h"
 
-#include <gemmini_params.h>
 
 #include <algorithm>
 #include <cstring>
@@ -16,7 +15,7 @@ namespace ggml::potal::quants::weight::hp1 {
 
 namespace {
 
-namespace wroute = ggml::gemmini::quants::wroute;
+namespace wroute = ggml::npu::quants::wroute;
 
 uint32_t float_bits(float v) {
     uint32_t bits;
@@ -38,11 +37,11 @@ const char * status_name(status s) {
     return "unknown";
 }
 
-status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
+status unpack(const npu_matmul_args & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
               float * channel_scale, stats * st, wreader::WeightReaderStatus * reader) {
     if (B == nullptr || carriers == nullptr || channel_scale == nullptr || st == nullptr || ldb < args.J ||
         cstride < args.J || (ldb & 1) ||
-        args.weight_format != ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1) {
+        args.weight_format != npu_matmul_args::weight_format_t::q4_hp1) {
         return status::invalid;
     }
     // The carrier domain the NPU consumes (as rmd-compose resolves it for HP1).
@@ -100,7 +99,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
             if (float_bits(c.column_scale) != scale_bits) {
                 return status::scale_mismatch;
             }
-            if (c.carrier == ggml::gemmini::quants::hp1::zero_carrier) {
+            if (c.carrier == ggml::npu::quants::hp1::zero_carrier) {
                 s.zero_blocks++;
             } else {
                 if (zero_scale) {
@@ -131,18 +130,18 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
     // Keep all metadata/row checks above: rejected inputs retain their partial
     // carrier/scale writes and never touch B. Validated storage is immutable.
     // Resolve a native block once per column and K tile, not once per code.
-    static_assert(DIM >= 2 && DIM % 2 == 0, "packed column tiles must start on byte boundaries");
-    constexpr size_t tile_k = DIM < block_k ? DIM : block_k;
-    uint16_t local_k[DIM];
-    int32_t values[DIM * DIM];
+    static_assert(NPU_D >= 2 && NPU_D % 2 == 0, "packed column tiles must start on byte boundaries");
+    constexpr size_t tile_k = NPU_D < block_k ? NPU_D : block_k;
+    uint16_t local_k[NPU_D];
+    int32_t values[NPU_D * NPU_D];
     for (size_t k0 = 0; k0 < args.K; k0 += tile_k) {
         const size_t nk = std::min(tile_k, args.K - k0);
         for (size_t i = 0; i < nk; ++i) {
             local_k[i] = static_cast<uint16_t>(k0 % block_k + i);
             std::memset(reinterpret_cast<uint8_t *>(B) + (k0 + i) * (ldb / 2), 0, ldb / 2);
         }
-        for (size_t n0 = 0; n0 < args.J; n0 += DIM) {
-            const size_t nn = std::min(static_cast<size_t>(DIM), args.J - n0);
+        for (size_t n0 = 0; n0 < args.J; n0 += NPU_D) {
+            const size_t nn = std::min(static_cast<size_t>(NPU_D), args.J - n0);
             size_t resolutions = 0;
             const auto rs = wreader::read_code_tile_validated(
                 args, plan, k0 / block_k, local_k, nk, n0, nn, values, resolutions);
@@ -154,11 +153,11 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
                 uint8_t * dst = reinterpret_cast<uint8_t *>(B) + (k0 + i) * (ldb / 2) + n0 / 2;
                 size_t n = 0;
                 for (; n + 1 < nn; n += 2) {
-                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * DIM + n]),
-                                                    static_cast<int8_t>(values[i * DIM + n + 1]));
+                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * NPU_D + n]),
+                                                    static_cast<int8_t>(values[i * NPU_D + n + 1]));
                 }
                 if (n < nn) {
-                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * DIM + n]), 0);
+                    dst[n / 2] = potal_int4_pack_pair(static_cast<int8_t>(values[i * NPU_D + n]), 0);
                 }
             }
         }

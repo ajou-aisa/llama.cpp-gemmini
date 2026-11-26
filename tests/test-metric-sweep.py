@@ -138,7 +138,6 @@ def write_combined_run(output: Path, options: dict[str, str], chunk_ids: list[in
         "kinds": ["activation", "residual", "scu"], "scu_collection_mode": options["--scu-mode"],
         "scu_reducer_sha256": REDUCER, "reducer_sha256": REDUCERS, "collector_sha256": COLLECTOR,
         "threads": int(options["--threads"]), "threads_batch": int(options["--threads-batch"]), "workers": workers,
-        "metric_execution": metric_run.metric_execution(options["--terminal-lm-head"]),
         "timing": {"native_collection": 1.0}})
     checksums(output)
 
@@ -153,7 +152,7 @@ class Fakes:
         self.chunks: dict[Key, list[int]] = {}
         self.sources = ""  # a later source state (commit, merge) resolves every profile to another build
 
-    def build(self, cache: Path, kind: str, precision: str, dim: int, im2p: Path, jobs: int) -> tuple[Path, bool]:
+    def build(self, cache: Path, kind: str, precision: str, dim: int, jobs: int) -> tuple[Path, bool]:
         path = cache / f"{kind}-{precision}-d{dim}{self.sources}"
         if path.exists():
             return path, True
@@ -192,7 +191,7 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> Fakes:
 
 def sweep(tmp_path: Path, *argv: str, collection: str = "separate") -> int:
     """`metric all` on the fakes; the separate collection (one run per metric kind) unless asked otherwise."""
-    return metric_sweep.main([*argv, "--im2p", str(tmp_path), "--build-cache", str(tmp_path / "cache"),
+    return metric_sweep.main([*argv, "--build-cache", str(tmp_path / "cache"),
                               "--collection", collection])
 
 
@@ -474,7 +473,7 @@ def test_reused_scu_run_without_the_split_is_refused(tmp_path: Path, fakes: Fake
 # Individual metric command: stdout contract kept, table on stderr
 
 def test_individual_campaign_keeps_stdout_and_prints_its_table_on_stderr(tmp_path: Path) -> None:
-    prepared, _ = Fakes().build(tmp_path / "cache", "activation", "a8w8", 32, tmp_path, 1)
+    prepared, _ = Fakes().build(tmp_path / "cache", "activation", "a8w8", 32, 1)
     run = tmp_path / "run"
     write_run(run, "activation", {"--model": "gpt2", "--precision": "a8w8", "--dim": "32", "--seed": "1234",
                                   "--max-chunks": "1", "--prepared-build": str(prepared)}, [0])
@@ -551,14 +550,13 @@ def test_combined_collection_is_one_forward_per_configuration(
     assert [(call[2], call[4], int(call[6]), call[0]) for call in fakes.calls] == [
         (*config, "metrics-all") for config in configs]
     options = [dict(zip(call[1::2], call[2::2])) for call in fakes.calls]
-    assert {(o["--workers"], o["--threads"], o["--threads-batch"], o["--scu-mode"], o["--terminal-lm-head"])
-            for o in options} == {("2", "4", "4", "aggregate", "metrics-only")}
+    assert {(o["--workers"], o["--threads"], o["--threads-batch"], o["--scu-mode"])
+            for o in options} == {("2", "4", "4", "aggregate")}
     assert len(fakes.builds) == len(set(fakes.builds)) == 6 and {kind for kind, _, _ in fakes.builds} == {"metrics-all"}
     summary = read_json(root / "metric-summary.json")
     assert summary["status"] == "PASS" and summary["counts"] == {
         "configurations": 12, "metric_runs": 36, "builds": 6, "native_collections": 12, "passed_configurations": 12}
-    assert summary["collection"] == {"mode": "combined", "threads": 4, "threads_batch": 4, "workers": 2,
-                                     "terminal_lm_head": "metrics-only"}
+    assert summary["collection"] == {"mode": "combined", "threads": 4, "threads_batch": 4, "workers": 2}
     first = summary["configurations"][0]
     assert first["runs"] == {kind: f"gpt2/a4w4/d16/metrics-all/{kind}" for kind in ("activation", "residual", "scu")}
     assert first["builds"]["activation"] == first["builds"]["residual"] == first["builds"]["scu"]
@@ -579,7 +577,7 @@ def test_combined_collection_is_one_forward_per_configuration(
     assert sweep(tmp_path, "--dry-run", "--threads", "4", "--workers", "2", collection="combined") == 0
     plan = capsys.readouterr().out
     for line in ("36 metric runs from 12 combined collections", "6 build configurations",
-                 "collection = combined (threads = 4, threads_batch = 4, workers = 2, terminal lm_head = metrics-only)"):
+                 "collection = combined (threads = 4, threads_batch = 4, workers = 2)"):
         assert line + "\n" in plan
     assert len([line for line in plan.splitlines() if line.startswith("  metrics-all --model")]) == 12
 
@@ -614,40 +612,6 @@ def test_resume_reuses_a_combined_run_only_with_its_threads_and_sources(tmp_path
             metric_sweep.configuration(root, recorded, ("gpt2", "a8w8", 32), runs, builds)
 
 
-def test_terminal_lm_head_mode_is_recorded_and_part_of_the_resume_identity(tmp_path: Path, fakes: Fakes) -> None:
-    # The combined collection runs the terminal lm_head metrics-only by default; full is explicit and recorded.
-    root = tmp_path / "s"
-    assert sweep(tmp_path, "--output", str(root), "--models", "gpt2", "--precisions", "a8w8", "--dims", "32",
-                 collection="combined") == 0
-    assert [dict(zip(call[1::2], call[2::2]))["--terminal-lm-head"] for call in fakes.calls] == ["metrics-only"]
-    recorded = metric_sweep.recorded(root)
-    assert recorded.terminal_lm_head == "metrics-only"
-    assert read_json(root / "metric-summary.json")["configurations"][0]["collection"]["metric_execution"] == {
-        "terminal_lm_head": "metrics-only", "lm_head_observation": "full", "lm_head_numerical_gemm": "elided",
-        "logits_materialized": False, "reason": "terminal output not consumed by the metric-only prefill"}
-    full = tmp_path / "full"
-    assert sweep(tmp_path, "--output", str(full), "--models", "gpt2", "--precisions", "a8w8", "--dims", "32",
-                 "--terminal-lm-head", "full", collection="combined") == 0
-    assert read_json(full / "metric-summary.json")["collection"]["terminal_lm_head"] == "full"
-    # The mode defines results: never changed on resume, never mixed between runs, only combined.
-    assert metric_sweep.main(["--resume", str(root), "--terminal-lm-head", "full"]) == 1
-    run = root / "gpt2/a8w8/d32/metrics-all"
-    runs: dict[str, Path] = dict.fromkeys(("activation", "residual", "scu"), run)
-    builds = {("metrics-all", "a8w8", 32): root / "builds/metrics-all-a8w8-d32"}
-    binding = read_json(run / "manifest.json")
-    for execution in (metric_run.metric_execution("full"), None):  # a run collected before terminal modes was full
-        (run / "manifest.json").unlink()
-        write_json(run / "manifest.json", {**binding, "metric_execution": execution})
-        with pytest.raises(EvaluationError, match="terminal lm_head in another mode"):
-            metric_sweep.configuration(root, recorded, ("gpt2", "a8w8", 32), runs, builds)
-    assert sweep(tmp_path, "--output", str(tmp_path / "separate"), "--terminal-lm-head", "metrics-only") == 1
-    manifest = read_json(root / "manifest.json")
-    del manifest["terminal_lm_head"]
-    (root / "manifest.json").unlink()
-    write_json(root / "manifest.json", manifest)
-    assert metric_sweep.recorded(root).terminal_lm_head == "full"
-
-
 def test_shard_plan_and_workload_merge() -> None:
     import metric_run
     # Contiguous shards cover every selected chunk exactly once; sizes differ by at most one.
@@ -677,7 +641,7 @@ from pathlib import Path
 argv = sys.argv[1:]
 if argv == ["--build-info"]:
     print(json.dumps({"schema": "potal-evaluation-build", "version": 1, "activation_metrics": 1, "residual_metrics": 1,
-                      "scale_metrics": 1, "cycle_sim": 1, "backend": "IM2P_SIM", "hp1": True, "gemmini": 1,
+                      "scale_metrics": 1, "backend": "HARDWARE", "hp1": True, "gemmini": 1,
                       "gemmini_option": "WS", "activation_bits": 8, "weight_bits": 8, "dim": 64,
                       "activation_mode": "EXSIA", "block_size": 32, "rmd_enabled": 1, "rmd_backend": "WS"}))
     sys.exit(0)
@@ -709,7 +673,7 @@ for local, chunk in enumerate(chunks):
                    "reference_invalid_reason": None, "fp_selected": fp, "potal_selected": selected,
                    "intersection": both, "union": fp + selected - both, "residual_nnz": chunk % 2,
                    "eligible_logical_blocks": 2, "unique_actual_requantized_blocks": 1, "p3_requantization_events": 2})
-stream(options["--activation-output"], "im2p-activation-quant-metrics",
+stream(options["--activation-output"], "gemmini-activation-quant-metrics",
        {"definition_status": "CONFIRMED_BY_USER", "reference_revision": "signed-row-original-bk32-population-2sigma-v1"},
        counts, {"invocation_count": count, "observation_count": count, "reference_complete": True})
 residual = []
@@ -727,7 +691,7 @@ for local, chunk in enumerate(chunks):
                            {"original_block_id": 1, "original_k_mask": 5, "compact_k_begin": 2, "compact_k_count": 2}],
                   "row_map": [{"original_lane_id": 0, "source_row": 0}, {"original_lane_id": 0, "source_row": 1},
                               {"original_lane_id": 1, "source_row": 0}]}]
-stream(options["--residual-output"], "im2p-residual-path-metrics", {}, residual,
+stream(options["--residual-output"], "gemmini-residual-path-metrics", {}, residual,
        {"invocation_count": count, "observation_count": len(residual)})
 scale = []
 for chunk in chunks:
@@ -736,16 +700,16 @@ for chunk in chunks:
                       "delta_w_sum": 2 * offset, "max_delta_w": offset, "alignment_count": 2,
                       "updated_partial_sum_count": 8 if offset else 0, "total_partial_sum_count": 8,
                       "zero_weight_count": 0})
-stream(options["--scale-output"], "im2p-scale-alignment-aggregate",
+stream(options["--scale-output"], "gemmini-scale-alignment-aggregate",
        {"scale_domain": "hp1_block_pot_to_channel_anchor", "collection_mode": "aggregate"}, scale,
        {"invocation_count": count, "observation_count": len(scale), "alignment_count": 4 * count,
         "scale_invocation_count": count})
 native = Path(options["--output-dir"])
 native.mkdir()
-elided = options["--terminal-lm-head"] == "metrics-only"
+elided = False
 logits = {"logits_materialized": False, "lm_head_numerical_elisions": 1} if elided else {}
 (native / "workload.json").write_text(json.dumps({
-    "terminal_lm_head": options["--terminal-lm-head"], "lm_head_numerical_execution": not elided,
+    "lm_head_numerical_execution": not elided,
     "logits_materialized": not elided,
     "workload": "METRIC_PREFILL_256", "complete": True, "output_mask": "second_half", "seed": int(options["--seed"]),
     "context_tokens": 256, "tokens": total * 256, "complete_chunks": total, "selected_chunks": count,
@@ -778,11 +742,10 @@ def test_combined_collection_shards_merge_exactly_and_resume_finished_shards(
     manifest = Manifest.load(manifest_path)
     monkeypatch.setenv("FAKE_CHUNKS", "7")
 
-    def collect(name: str, workers: int, reuse: Path | None = None,
-                terminal: str = "full") -> tuple[Path, dict[str, object]]:
+    def collect(name: str, workers: int, reuse: Path | None = None) -> tuple[Path, dict[str, object]]:
         root = tmp_path / name
         raws, binding = metric_run.collect_combined(runner, model, dataset, manifest_path, root / "collection", 0,
-                                                    workers, 2, 2, 60, reuse, terminal)
+                                                    workers, 2, 2, 60, reuse)
         chunks = set(range(7))
         for kind in ("activation", "residual", "scu"):
             (root / kind).mkdir()
@@ -818,13 +781,3 @@ def test_combined_collection_shards_merge_exactly_and_resume_finished_shards(
     damaged.write_text("\n".join(damaged.read_text().splitlines()[:-1]) + "\n")
     _, binding = collect("damaged", 3, tmp_path / "failed/collection")
     assert sorted(binding["reused_shards"]) == ["shard-001"]
-    # The terminal lm_head mode is part of every shard command: a metrics-only collection gives the same metrics,
-    # records its elided lm_head, and never reuses a shard of the full mode.
-    elided, binding = collect("metrics-only", 3, tmp_path / "failed/collection", "metrics-only")
-    execution, workload = binding["metric_execution"], binding["workload"]
-    assert isinstance(execution, dict) and isinstance(workload, dict)
-    assert results(elided) == results(single) and binding["reused_shards"] == {}
-    assert execution["lm_head_numerical_gemm"] == "elided"
-    assert all(row["logits_materialized"] is False for row in workload["chunks"])
-    with pytest.raises(EvaluationError, match="invalid terminal lm_head mode"):
-        collect("unknown", 3, None, "none")

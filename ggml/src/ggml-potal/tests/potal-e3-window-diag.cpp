@@ -28,7 +28,7 @@
 #include "ggml-quants.h"
 #include "matmul/dense.hpp"
 #include "matmul/paired-auto.hpp"
-#include "quants/act/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
 #include "support/paired-h2-emulator.hpp"
 #include "support/stripe-golden.hpp"
 
@@ -593,22 +593,22 @@ bool run_case(const bench_case & c, bool hardware, bool prefence) {
     auto * y = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n, c.m);
     const hp1_shape shape = { (int64_t) c.m, (int64_t) c.n, (int64_t) c.k };
     potal_tile_plan serial;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_operands operands;
     quants::weight::hp1::stats weight_stats;
     if (potal_tile_select(c.m, c.n, c.k, 32 / D, &serial) != POTAL_OK || !operands.allocate(shape) ||
-        !init_args(w, y, shape, "", "golden", ggml::gemmini::residual::ResidualRoute::ws_packet, serial, args) ||
+        !init_args(w, y, shape, "", "golden", ggml::npu::residual::ResidualRoute::ws_packet, serial, args) ||
         unpack_weights(args, operands, &weight_stats) != quants::weight::hp1::status::ok ||
         !quantize_activations(x, args, operands)) {
         record(c, 0, "failure") << " stage=preparation\n";
         return false;
     }
-    namespace exsia = ggml::gemmini::quants::act::exsia;
+    namespace exsia = ggml::npu::quants::act::exsia;
     const auto * meta = std::get_if<exsia::Meta>(&args.act_quant.storage());
     const size_t stripe_rows = serial.tile_I * D;
     const size_t stripes = (c.m + stripe_rows - 1) / stripe_rows;
     if (!meta || meta->theta.size() != stripes) return false;
-    std::map<size_t, const ggml::gemmini::rmd::StripePacket *> packets;
+    std::map<size_t, const ggml::npu::rmd::StripePacket *> packets;
     for (const auto & packet : meta->rmd_packets) {
         if (!packet || packet->stripe_id >= stripes || !packets.emplace(packet->stripe_id, packet.get()).second) return false;
     }
@@ -627,7 +627,7 @@ bool run_case(const bench_case & c, bool hardware, bool prefence) {
         const auto packet = packets.find(stripe);
         if (packet != packets.end()) {
             if (residual::decode_packet(*packet->second, operands.own, decoded) !=
-                    ggml::gemmini::rmd::RmdStatus::success ||
+                    ggml::npu::rmd::RmdStatus::success ||
                 !potal_test::residual_golden(*packet->second, c.n, D,
                     [&](size_t k, size_t n) { return (int32_t) operands.b[k * operands.ldb + n]; },
                     [&](size_t block, size_t n) { return operands.carriers[block * operands.cstride + n]; },

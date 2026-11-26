@@ -1,5 +1,6 @@
-#include "../ggml/src/ggml-gemmini/ggml-gemmini-evaluation-observer.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
+#include "../ggml/src/ggml-npu-common/profiling/evaluation-observer.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-run-aware.hpp"
 #include "../common/json.hpp"
 
@@ -41,11 +42,11 @@ int main(int argc, char **argv) {
         args->native_block_count = outputs * 2;
         args->native_blocks_per_row = 2;
         if (GGML_GEMMINI_ACTIVATION_BITS == 4) {
-            args->weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+            args->weight_format = ggml_gemmini_args_t::weight_format_t::q4_hp1;
             args->q4_hp1_blocks = q4.data();
             args->native_weight_bytes = q4.size() * sizeof(block_q4_hp1);
         } else {
-            args->weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+            args->weight_format = ggml_gemmini_args_t::weight_format_t::q8_hp1;
             args->q8_hp1_blocks = q8.data();
             args->q8_hp1_block_count = q8.size();
             args->q8_hp1_blocks_per_row = 2;

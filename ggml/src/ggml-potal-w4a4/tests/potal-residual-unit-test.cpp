@@ -46,8 +46,8 @@
 #include "support/stripe-golden.hpp"
 #include "support/stripe-owner.hpp"
 
-#include "quants/common/weight_reader.hpp"
-#include "residual/rmd/rmd-builder.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -65,9 +65,9 @@
 #include <vector>
 
 using namespace ggml::potal;
-namespace grmd = ggml::gemmini::rmd;
-namespace exsia_ns = ggml::gemmini::quants::act::exsia;
-namespace wreader  = ggml::gemmini::quants::wreader;
+namespace grmd = ggml::npu::rmd;
+namespace exsia_ns = ggml::npu::quants::act::exsia;
+namespace wreader  = ggml::npu::quants::wreader;
 
 namespace {
 
@@ -97,7 +97,7 @@ struct fixture {
     std::vector<int8_t>  codes;  // [K][N], the golden's own copy
     std::vector<int16_t> exps;   // [K / 32][N]; INT16_MIN = zero carrier
     std::vector<float>   scales; // [N]
-    ggml_gemmini_args_t  args;
+    npu_matmul_args  args;
     hp1_weight           weight;
     bool                 ok = false;
 
@@ -135,7 +135,7 @@ struct fixture {
         hp1_shape       s = { (int64_t) M, (int64_t) N, (int64_t) K };
         potal_tile_plan plan;
         ok = potal_tile_select(M, N, K, 32 / D, &plan) == POTAL_OK &&
-             init_args(w, y, s, "gpt2", "residual-unit", ggml::gemmini::residual::ResidualRoute::ws_packet, plan,
+             init_args(w, y, s, "gpt2", "residual-unit", ggml::npu::residual::ResidualRoute::ws_packet, plan,
                        args) &&
              weight.allocate((int64_t) N, (int64_t) K) && prepare_weight(args, weight) == quants::weight::hp1::status::ok;
     }
@@ -244,7 +244,7 @@ merge_outcome merge_both(const fixture & f, size_t row_begin, size_t row_end, in
     snap.theta = theta;
     m.prepared = residual::merge_prepared_hp1(f.weight, row_begin, row_end, snap, correction, m.prepared_out.data(),
                                               f.M, rs, col_stride, &m.prepared_nonzero);
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     potal_test::init_merge_args(f.args, m.gemmini_out.data(), rs, args);
     args.col_stride_f_out                = col_stride;
     grmd::BlockScaledInt64Correction copy = correction;
@@ -579,7 +579,7 @@ void test_runs() {
             dense.push_back({ row, k, (row + k) % 2 ? -300 : 255 });
         }
     }
-    run_case("A/B/D dense two-run multi-lane rows across DIM boundary", f, 0, D + 1, dense, -12);
+    run_case("A/B/D dense two-run multi-lane rows across NPU_D boundary", f, 0, D + 1, dense, -12);
 }
 
 void test_carriers() {
@@ -994,7 +994,7 @@ void test_merge() {
 } // namespace
 
 int main() {
-    std::printf("potal-residual-unit-test DIM=%u backend=EMULATED (no hardware) radix=256 lanes=%u\n",
+    std::printf("potal-residual-unit-test NPU_D=%u backend=EMULATED (no hardware) radix=256 lanes=%u\n",
                 (unsigned) POTAL_HW_DIM, (unsigned) grmd::balanced_radix_contract(8).lane_capacity);
     test_runs();
     test_carriers();

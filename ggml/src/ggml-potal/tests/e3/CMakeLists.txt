@@ -23,7 +23,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
         matmul/tiling.cpp matmul/stripe-api.cpp)
     target_include_directories(potal-e3-context-test PRIVATE ${POTAL_PRIVATE_INCLUDES})
     target_compile_definitions(potal-e3-context-test PRIVATE ${POTAL_LOG_DEFINITIONS})
-    target_link_libraries(potal-e3-context-test PRIVATE ggml ggml-gemmini-utils Threads::Threads)
+    target_link_libraries(potal-e3-context-test PRIVATE ggml ggml-npu-profiling Threads::Threads)
 endif()
 
 add_executable(potal-e3-prototype-test

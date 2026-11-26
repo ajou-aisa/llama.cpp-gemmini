@@ -1,6 +1,6 @@
 #include "potal-sensitivity.hpp"
 #include "ggml-gemmini.h"
-#include "ggml-gemmini-matmul-config.hpp"
+#include "npu-matmul-config.hpp"
 #include "../../../common/json.hpp"
 #include <algorithm>
 #include <chrono>

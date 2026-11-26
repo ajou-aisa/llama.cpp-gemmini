@@ -1,7 +1,7 @@
 #include "../pb/pb-exec.hpp"
 #include "../matmul/dense.hpp"
-#include "../quants/act/block/block.hpp"
-#include <gemmini.h>
+#include "../../ggml-npu-common/quantization/activation/block/block.hpp"
+#include "matmul/execution.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace pb = ggml::gemmini::pb;
-namespace act = ggml::gemmini::quants::act;
+namespace act = ggml::npu::quants::act;
 
 namespace {
 uint64_t checks = 0;
@@ -39,7 +39,8 @@ struct Fixture {
           raw_a(rows * depth), raw_b(cols * depth) {}
 };
 
-// Independent quantizer: frexp exponent and floor(abs(x)+0.5), not production helpers.
+// Independent quantizer: frexp exponent and floor/parity ties-to-even,
+// without the production truncation-based rounding helper.
 void quantize_reference(Fixture & f) {
     for (size_t i = 0; i < f.m; ++i) {
         for (size_t block = 0; block < f.blocks; ++block) {
@@ -53,7 +54,10 @@ void quantize_reference(Fixture & f) {
             f.sa[i * f.blocks + block] = scale;
             for (size_t k = block * 32; k < end; ++k) {
                 const double x = f.raw_a[i * f.k + k] / static_cast<double>(scale);
-                const int magnitude = static_cast<int>(std::min(127.0, std::floor(std::fabs(x) + 0.5)));
+                const double lower = std::floor(std::fabs(x));
+                const double fraction = std::fabs(x) - lower;
+                const int magnitude = static_cast<int>(std::min(127.0, lower +
+                    (fraction > 0.5 || (fraction == 0.5 && std::fmod(lower, 2.0) != 0.0))));
                 f.a[i * f.k + k] = static_cast<int8_t>(x < 0 ? -magnitude : magnitude);
             }
         }
@@ -91,14 +95,20 @@ std::vector<float> float_reference(const Fixture & f) {
 struct Observation {
     const Fixture * fixture;
     size_t next = 0;
+    std::vector<float> partial;
 };
 void observe(const pb::BlockObservation & block, void * opaque) {
     auto & observation = *static_cast<Observation *>(opaque);
     const auto & f = *observation.fixture;
+#if defined(GEMMINI_ROCC_MODEL)
+    check(block.config_commands == 5 && block.loop_commands == 1 && block.drains == 1,
+          "each K block executes five configs, one WS launch, and one drain");
+#endif
     check(block.block == observation.next++, "ascending K block order");
     check(block.m == f.m && block.j == f.j &&
           block.k == std::min(size_t{32}, f.k - block.block * 32), "observer dimensions and tail");
     const auto expected = integer_reference(f, block.block);
+    if (observation.partial.empty()) observation.partial.assign(f.m * f.j, +0.0f);
     for (size_t i = 0; i < f.m; ++i) {
         check(bits(block.s_a[i]) == bits(f.sa[i * f.blocks + block.block]), "activation scale bits");
         for (size_t k = 0; k < block.k; ++k) {
@@ -106,8 +116,15 @@ void observe(const pb::BlockObservation & block, void * opaque) {
             check(code >= -127 && code <= 127, "activation code range");
             check(code == f.a[i * f.k + block.block * 32 + k], "packed activation code");
         }
-        for (size_t j = 0; j < f.j; ++j)
+        for (size_t j = 0; j < f.j; ++j) {
             check(block.acc[i * f.j + j] == expected[i * f.j + j], "per-block INT32 bits");
+            float term = float(expected[i * f.j + j]) * f.sa[i * f.blocks + block.block];
+            term = term * f.sb[block.block * f.j + j];
+            auto &partial = observation.partial[i * f.j + j];
+            partial = partial + term;
+            check(bits(block.output[i * block.row_stride + j * block.column_stride]) == bits(partial),
+                  "per-block FP32 post-scaling bits");
+        }
     }
     for (size_t j = 0; j < f.j; ++j) {
         check(bits(block.s_b[j]) == bits(f.sb[block.block * f.j + j]), "weight scale bits");
@@ -189,6 +206,14 @@ Fixture patterned(size_t m, size_t j, size_t k) {
 
 void linear_case() {
     auto f = patterned(35, 67, 96);
+    f.raw_a[0] = 127.0f;
+    f.raw_a[1] = 2.5f;
+    f.raw_a[2] = -2.5f;
+    f.raw_a[3] = 3.5f;
+    f.raw_a[4] = -3.5f;
+    quantize_reference(f);
+    check(f.a[1] == 2 && f.a[2] == -2 && f.a[3] == 4 && f.a[4] == -4,
+          "independent MXINT ties-to-even witness");
     ggml_gemmini_args_t args{};
     args.I = f.m; args.J = f.j; args.K = f.k;
     args.tiled_matmul_type = WS;
@@ -217,7 +242,7 @@ void linear_case() {
             weight.m = (j == 0 && block == 1) ? INT16_MIN : int16_t((j + block) % 6);
             for (size_t p = 0; p < 32; ++p) weight.qs[p] = f.b[j * f.k + block * 32 + p];
         }
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks = weights.data();
     args.q8_hp1_block_count = weights.size(); args.q8_hp1_blocks_per_row = f.blocks;
     args.native_weight_bytes = weights.size() * sizeof(weights[0]);
@@ -263,7 +288,7 @@ void linear_case() {
     weights[0].qs[0] = saved_code;
     pb::reset_validated_weights();
     args.f_out = f.raw_a.data();
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+    args.weight_format = ggml_gemmini_args_t::weight_format_t::q8_h2;
     pb::reset_tiled_call_count();
     check(pb::execute_linear(args) != pb::Status::success && pb::tiled_call_count() == 0,
           "unsupported Linear fails without dispatch or fallback");

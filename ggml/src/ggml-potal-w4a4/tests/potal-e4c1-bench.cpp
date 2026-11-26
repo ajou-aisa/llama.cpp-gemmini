@@ -16,7 +16,7 @@ namespace seq = potal_test::e4c1;
 
 namespace ggml::potal {
 potal_status e4c1_tile_select(size_t, size_t, size_t, uint32_t, potal_tile_plan *);
-pipeline_report e4c1_run_pipeline(const ggml_tensor *, ggml_gemmini_args_t &, const hp1_weight &,
+pipeline_report e4c1_run_pipeline(const ggml_tensor *, npu_matmul_args &, const hp1_weight &,
                                  const potal_tile_plan &, const pipeline_config &, stripe_owner &);
 }
 
@@ -66,12 +66,12 @@ struct prepared_hash {
     }
 };
 
-uint64_t fingerprint_prepared(const ggml_gemmini_args_t & args) {
+uint64_t fingerprint_prepared(const npu_matmul_args & args) {
     prepared_hash f;
     f.scalar(args.I); f.scalar(args.J); f.scalar(args.K);
     f.scalar(args.activation_rows_per_stripe);
     f.bytes(args.A.raw_data(), args.A.raw_size());
-    const auto * meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(&args.act_quant.storage());
+    const auto * meta = std::get_if<ggml::npu::quants::act::exsia::Meta>(&args.act_quant.storage());
     require_e4c1(meta != nullptr, "missing ExSIA metadata");
     f.vector(meta->theta);
     f.scalar(meta->rmd_packets.size());
@@ -139,9 +139,9 @@ struct raw_stripe {
 std::vector<raw_stripe> * active_raw = nullptr;
 bool raw_ok = true;
 
-std::vector<raw_stripe> packet_direct_golden(const ggml_gemmini_args_t & args, const hp1_operands & o) {
-    namespace rmd = ggml::gemmini::rmd;
-    const auto * meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(&args.act_quant.storage());
+std::vector<raw_stripe> packet_direct_golden(const npu_matmul_args & args, const hp1_operands & o) {
+    namespace rmd = ggml::npu::rmd;
+    const auto * meta = std::get_if<ggml::npu::quants::act::exsia::Meta>(&args.act_quant.storage());
     require_e4c1(meta != nullptr, "raw golden metadata");
     const size_t per = args.activation_rows_per_stripe;
     std::vector<raw_stripe> result((args.I + per - 1) / per);
@@ -422,12 +422,12 @@ void controlled_case(ggml_backend_t backend, const bench_case & c, int repeats, 
         require_e4c1(original.tile_I == 1 && original.tile_J == 9 && original.tile_K == 48 &&
                      frozen.tile_I == original.tile_I && frozen.tile_J == original.tile_J,
                      "target requires original I1J9K48 and retained I/J K28");
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_operands operands;
     hp1::stats unpack_stats;
     require_e4c1(operands.allocate({c.m,c.n,c.k}) &&
         init_args(w, expected, {c.m,c.n,c.k}, "", "e4c1_prepare",
-                  ggml::gemmini::residual::ResidualRoute::ws_packet, original, args) &&
+                  ggml::npu::residual::ResidualRoute::ws_packet, original, args) &&
         unpack_weights(args, operands, &unpack_stats) == hp1::status::ok &&
         quantize_activations(x, args, operands), "independent preparation");
     const uint64_t expected_hash = fingerprint_prepared(args);
@@ -589,7 +589,7 @@ potal_status e4c1_tile_select(size_t m,size_t n,size_t k,uint32_t ppb,potal_tile
     return POTAL_OK;
 }
 
-pipeline_report e4c1_run_pipeline(const ggml_tensor * x,ggml_gemmini_args_t & args,const hp1_weight & w,
+pipeline_report e4c1_run_pipeline(const ggml_tensor * x,npu_matmul_args & args,const hp1_weight & w,
                                  const potal_tile_plan & plan,const pipeline_config & config,stripe_owner & owner) {
     auto cfg = config;
     if (diagnostic_run || capture_prepared) {

@@ -32,6 +32,83 @@
     { "name": "vulkan",   "hidden": true, "cacheVariables": { "GGML_VULKAN":      "ON" } },
 
     {
+        "name": "npu-gemmini-int8-d16", "hidden": true,
+        "description": "Gemmini INT8 D16 (gemmini-aisa 185293e8 default config)",
+        "cacheVariables": {
+            "GGML_NPU": "GEMMINI", "NPU_PRECISION": "INT8", "NPU_D": "16",
+            "NPU_SPAD_BANKS": "4", "NPU_SPAD_BANK_ROWS": "4096", "NPU_ACC_BANKS": "2", "NPU_ACC_ROWS": "1024",
+            "NPU_DMA_MAX_BYTES": "64"
+        }
+    },
+    {
+        "name": "npu-potal-int8-d16", "hidden": true,
+        "description": "PoTAL INT8 D16 (chipyard-aisa potal fab3d262, gemmini_potal_params.h)",
+        "cacheVariables": {
+            "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": "16",
+            "NPU_SPAD_BANKS": "4", "NPU_SPAD_BANK_ROWS": "4096", "NPU_ACC_BANKS": "2", "NPU_ACC_ROWS": "1024",
+            "NPU_INDEX_ENTRIES": "32", "NPU_SCALE_ENTRIES": "256", "NPU_DMA_MAX_BYTES": "64"
+        }
+    },
+    {
+        "name": "npu-potal-int8-d32", "hidden": true,
+        "description": "PoTAL INT8 D32 (gemmini_potal_d32_params.h)",
+        "cacheVariables": {
+            "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": "32",
+            "NPU_SPAD_BANKS": "4", "NPU_SPAD_BANK_ROWS": "2048", "NPU_ACC_BANKS": "2", "NPU_ACC_ROWS": "512",
+            "NPU_INDEX_ENTRIES": "64", "NPU_SCALE_ENTRIES": "256", "NPU_DMA_MAX_BYTES": "64"
+        }
+    },
+    {
+        "name": "npu-potal-int8-d64", "hidden": true,
+        "description": "PoTAL INT8 D64 (gemmini_potal_d64_params.h)",
+        "cacheVariables": {
+            "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": "64",
+            "NPU_SPAD_BANKS": "4", "NPU_SPAD_BANK_ROWS": "1024", "NPU_ACC_BANKS": "2", "NPU_ACC_ROWS": "256",
+            "NPU_INDEX_ENTRIES": "128", "NPU_SCALE_ENTRIES": "256", "NPU_DMA_MAX_BYTES": "64"
+        }
+    },
+    {
+        "name": "npu-potal-int4-d32", "hidden": true,
+        "description": "PoTAL INT4 D32 packing ABI 1 (gemmini_potal_w4a4_d32_params.h)",
+        "cacheVariables": {
+            "GGML_NPU": "POTAL", "NPU_PRECISION": "INT4", "NPU_D": "32",
+            "NPU_SPAD_BANKS": "4", "NPU_SPAD_BANK_ROWS": "2048", "NPU_ACC_BANKS": "2", "NPU_ACC_ROWS": "512",
+            "NPU_INDEX_ENTRIES": "64", "NPU_SCALE_ENTRIES": "256", "NPU_DMA_MAX_BYTES": "64"
+        }
+    },
+    { "name": "npu-reference", "hidden": true, "cacheVariables": { "NPU_TRANSPORT": "REFERENCE", "LLAMA_BUILD_TESTS": "ON" } },
+    {
+        "name": "npu-rocc", "hidden": true,
+        "cacheVariables": {
+            "NPU_TRANSPORT": "ROCC",
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/riscv64-linux.cmake"
+        }
+    },
+    {
+        "name": "npu-gemmini-int8-d32-pb", "hidden": true,
+        "inherits": [ "npu-gemmini-int8-d16" ],
+        "description": "PB D32 software geometry, matching the verified RISC-V cross-build; hardware deployment unverified",
+        "cacheVariables": {
+            "NPU_D": "32", "NPU_MATMUL_ALGORITHM": "PARTIAL_SUM",
+            "GGML_GEMMINI_COMPUTE_TYPE": "INT",
+            "GGML_GEMMINI_ACTIVATION_BITS": "8", "GGML_GEMMINI_WEIGHT_BITS": "8",
+            "GGML_GEMMINI_ACTIVATION_QUANT": "BLOCK", "GGML_GEMMINI_BLOCK_SIZE": "32",
+            "GGML_GEMMINI_ENABLE_RMD": "OFF"
+        }
+    },
+    { "name": "gemmini-int8-d32-pb-reference", "inherits": [ "base", "release", "npu-gemmini-int8-d32-pb", "npu-reference" ] },
+    { "name": "gemmini-int8-d32-pb-rocc",      "inherits": [ "base", "release", "npu-gemmini-int8-d32-pb", "npu-rocc" ] },
+    { "name": "gemmini-int8-d16-reference", "inherits": [ "base", "release", "npu-gemmini-int8-d16", "npu-reference" ] },
+    { "name": "gemmini-int8-d16-rocc",      "inherits": [ "base", "release", "npu-gemmini-int8-d16", "npu-rocc" ] },
+    { "name": "potal-int8-d16-reference",   "inherits": [ "base", "release", "npu-potal-int8-d16", "npu-reference" ] },
+    { "name": "potal-int8-d16-rocc",        "inherits": [ "base", "release", "npu-potal-int8-d16", "npu-rocc" ] },
+    { "name": "potal-int8-d32-reference",   "inherits": [ "base", "release", "npu-potal-int8-d32", "npu-reference" ] },
+    { "name": "potal-int8-d32-rocc",        "inherits": [ "base", "release", "npu-potal-int8-d32", "npu-rocc" ] },
+    { "name": "potal-int8-d64-reference",   "inherits": [ "base", "release", "npu-potal-int8-d64", "npu-reference" ] },
+    { "name": "potal-int4-d32-reference",   "inherits": [ "base", "release", "npu-potal-int4-d32", "npu-reference" ] },
+    { "name": "potal-int4-d32-rocc",        "inherits": [ "base", "release", "npu-potal-int4-d32", "npu-rocc" ] },
+
+    {
         "name": "x64-windows-llvm", "hidden": true,
         "cacheVariables": {
             "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/x64-windows-llvm.cmake"

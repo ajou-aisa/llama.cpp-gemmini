@@ -73,7 +73,7 @@ ggml_status weight_cache::prepare(const ggml_tensor * src0) {
         const key k = key_of(src0);
         if (entries_.find(k) != entries_.end()) return GGML_STATUS_SUCCESS;
 
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         if (!init_weight_args(src0, args)) {
             log::failure("potal.init", "[POTAL_INIT] weight=%s invalid shape/layout or missing static data",
                          src0->name);
@@ -88,12 +88,12 @@ ggml_status weight_cache::prepare(const ggml_tensor * src0) {
 
         std::unique_ptr<hp1_weight> w(new (std::nothrow) hp1_weight);
         if (!w || !w->allocate(src0->ne[1], src0->ne[0])) return GGML_STATUS_ALLOC_FAILED;
-        auto reader = ggml::gemmini::quants::wreader::WeightReaderStatus::Success;
+        auto reader = ggml::npu::quants::wreader::WeightReaderStatus::Success;
         const auto status = prepare_weight(args, *w, &reader);
         if (status != quants::weight::hp1::status::ok) {
             log::failure("potal.init", "[POTAL_INIT] weight=%s prepare=%s reader=%s",
                          src0->name, quants::weight::hp1::status_name(status),
-                         ggml::gemmini::quants::wreader::weight_reader_status_name(reader));
+                         ggml::npu::quants::wreader::weight_reader_status_name(reader));
             return GGML_STATUS_FAILED;
         }
         log::debug("potal.init", "[POTAL_INIT] prepared weight=%s bytes=%zu", src0->name, bytes);
@@ -110,7 +110,7 @@ ggml_status weight_cache::prepare(const ggml_tensor * src0) {
     }
 }
 
-weight_lookup weight_cache::get(const ggml_tensor * src0, const ggml_gemmini_args_t & args) {
+weight_lookup weight_cache::get(const ggml_tensor * src0, const npu_matmul_args & args) {
     weight_lookup r;
     const bool    cacheable = eligible(src0) && c_.budget != 0;
     // Held through the preparation: a second request for the same weight waits

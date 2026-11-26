@@ -1,6 +1,6 @@
 #include "../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/quants/common/hp1_scu.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/common/hp1_scu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace scu = ggml::gemmini::quants::hp1;
+namespace scu = ggml::npu::quants::hp1;
 using status = ggml_cuda_residual_status;
 using event = ggml_cuda_residual_event;
 

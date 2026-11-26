@@ -1,4 +1,5 @@
-#include <gemmini/trace-context.hpp>
+#include "../residual/rmd/rmd-executor.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 #include "dense.hpp"
 #if defined(GGML_GEMMINI_PB)
 #include "../pb/pb-exec.hpp"
@@ -7,17 +8,20 @@
 #include "../ggml-gpu-cpu-exact.hpp"
 #endif
 #include "detail.hpp"
-#include "../quants/common/weight_reader.hpp"
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/performance.hpp"
 
-#include "../quants/act/quantize.hpp"
-#include "../quants/act/dispatch.hpp"
-#include "../residual/rmd/rmd-builder.hpp"
-#include "../residual/direct/direct-builder.hpp"
-#include "../residual/direct/direct-executor.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../../ggml-npu-common/residual/direct/direct-builder.hpp"
+#include "../../ggml-npu-common/residual/direct/direct-executor.hpp"
 
-#include <gemmini.h>
+#include "baseline.hpp"
+#include "execution.hpp"
+#include "reference/cpu.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
 
 #include <algorithm>
 #include <array>
@@ -148,9 +152,9 @@ bool supports_row_slice_activation(const ggml_gemmini_args_t & args) {
 }
 
 bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
-    return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel ||
+    return args.weight_format == ggml_gemmini_args_t::weight_format_t::q8_channel ||
            args.weight_format ==
-               ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+               ggml_gemmini_args_t::weight_format_t::q8_channel_dense_sidecar;
 }
 
 bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
@@ -323,7 +327,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
             const auto & meta = std::get<quants::act::exsia::Meta>(args.act_quant.storage());
             const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(row / (args.tile_I * DIM)));
             if (theta == INT16_MIN) return MatMulStatus::invalid_contract;
-            activation_scales[row] = gemmini_detail::apply_activation_exponent(1.0f, theta, 0);
+            activation_scales[row] = apply_activation_exponent(1.0f, theta, 0);
         } else if (!activation_meta.scale(row, activation_scales[row])) {
             return MatMulStatus::invalid_contract;
         }
@@ -487,7 +491,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
                             const auto * value = args.q8_hp1_block(column_begin + column, block);
                             if (!value) { execution_valid.store(false); return; }
                             scale = value->m == INT16_MIN ? 0.0 :
-                                static_cast<double>(gemmini_ldexp_fast_pos(value->channel_scale, value->m));
+                                static_cast<double>(npu_ldexp_fast_pos(value->channel_scale, value->m));
                         } else {
                             const auto value = read_scale_validated(args, plan, column_begin + column, block);
                             if (!value.ok()) { execution_valid.store(false); return; }
@@ -578,7 +582,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
                     const block_q8_hp1 * block = args.q8_hp1_block(column, block_index);
                     if (block == nullptr) { tile_valid = false; break; }
                     scratch.weight_scales[local_column] = block->m == INT16_MIN ? 0.0 :
-                        static_cast<double>(gemmini_ldexp_fast_pos(block->channel_scale, block->m));
+                        static_cast<double>(npu_ldexp_fast_pos(block->channel_scale, block->m));
                     continue;
                 }
                 const WeightScaleResult scale =
@@ -812,9 +816,9 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
         }
         test_detail::observe_dense_dispatch();
         // GGUF Q4_0/Q8_0 blocks as stored (H0): block x block, then dequantize, on
-        // the CPU im2p path. Dense-B q8_h0 keeps the baseline route below.
-        if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q4_h0 ||
-            (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 &&
+        // the CPU block quantized path. Dense-B q8_h0 keeps the baseline route below.
+        if (args.weight_format == ggml_gemmini_args_t::weight_format_t::q4_h0 ||
+            (args.weight_format == ggml_gemmini_args_t::weight_format_t::q8_h0 &&
              args.B_blocks != nullptr)) {
             if (args.tiled_matmul_type != CPU) {
                 return MatMulStatus::unsupported;
@@ -823,7 +827,7 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
             if (gemmini_gpu::enabled()) return execute_native_matched_int_dense(args, true);
 #endif
-            return tiled_matmul_auto_im2p(&args) == DenseMatmulStatus::success
+            return gemmini_block_quantized_matmul_auto(&args) == DenseMatmulStatus::success
                        ? MatMulStatus::success
                        : MatMulStatus::invalid_contract;
         }
@@ -835,7 +839,7 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
             return execute_native_matched_int_dense(args);
         }
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-        if (gemmini_gpu::enabled() && args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1) {
+        if (gemmini_gpu::enabled() && args.weight_format == ggml_gemmini_args_t::weight_format_t::q8_hp1) {
             if (args.tiled_matmul_type != CPU) return MatMulStatus::unsupported;
             test_detail::observe_backend_dispatch(true);
             return execute_native_matched_int_dense(args, false, true);
@@ -849,7 +853,7 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
             tiled_matmul_auto_baseline(
                 &args, baseline_activation_for(args), baseline_weight_quant_t::TENSOR);
         } else {
-            using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+            using Format = ggml_gemmini_args_t::weight_format_t;
             switch (args.weight_format) {
             case Format::q8_h2:
             case Format::q8_hp1:
@@ -864,7 +868,7 @@ MatMulStatus execute_dense(ggml_gemmini_args_t & args, std::optional<uint64_t> s
             if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
                 return MatMulStatus::unsupported;
             }
-            tiled_matmul_auto_im2p(&args);
+            gemmini_block_quantized_matmul_auto(&args);
         }
         return MatMulStatus::success;
     }();
@@ -1044,7 +1048,7 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
         return key;
     }
 
-    using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+    using Format = ggml_gemmini_args_t::weight_format_t;
     switch (args.weight_format) {
     case Format::q8_0_unpacked_to_h1:
         key.weight = args.weight_i8_scale_active ? WeightRoute::tensor_i8 : WeightRoute::affine;
@@ -1321,55 +1325,55 @@ MatMulResult MatMul::run_dense(bool transactional) {
         return {MatMulStatus::unsupported, MatMulCapability::unsupported};
     }
     const auto format          = args().weight_format;
-    const bool metadata_weight = format == ggml_gemmini_args_t::im2p_weight_format_t::q4_h0 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q16_h0 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q16_h1 ||
-                                 format == ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    const bool metadata_weight = format == ggml_gemmini_args_t::weight_format_t::q4_h0 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q4_hp1 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q8_h0 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q8_hp1 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q8_h2 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q8_hp2 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q16_h0 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q16_h1 ||
+                                 format == ggml_gemmini_args_t::weight_format_t::q16_hp1;
     if (args().B == nullptr && args().B_fp32 == nullptr && !metadata_weight) {
         return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
     }
     switch (args().weight_format) {
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
+    case ggml_gemmini_args_t::weight_format_t::q8_channel:
         if (!args().has_q8_channel_direct_read_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
+    case ggml_gemmini_args_t::weight_format_t::q8_channel_dense_sidecar:
         if (!args().has_q8_channel_dense_sidecar_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q4_h0:
-    case ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1:
-    case ggml_gemmini_args_t::im2p_weight_format_t::q16_h0:
-    case ggml_gemmini_args_t::im2p_weight_format_t::q16_h1:
-    case ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1:
+    case ggml_gemmini_args_t::weight_format_t::q4_h0:
+    case ggml_gemmini_args_t::weight_format_t::q4_hp1:
+    case ggml_gemmini_args_t::weight_format_t::q16_h0:
+    case ggml_gemmini_args_t::weight_format_t::q16_h1:
+    case ggml_gemmini_args_t::weight_format_t::q16_hp1:
         if (!args().has_native_matched_width_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_h0:
+    case ggml_gemmini_args_t::weight_format_t::q8_h0:
         if (args().B_blocks != nullptr && !args().has_q8_h0_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1:
-        if (!args().has_q8_hp1_im2p_contract()) {
+    case ggml_gemmini_args_t::weight_format_t::q8_hp1:
+        if (!args().has_q8_hp1_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_h2:
-        if (!args().has_q8_h2_im2p_contract()) {
+    case ggml_gemmini_args_t::weight_format_t::q8_h2:
+        if (!args().has_q8_h2_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
-    case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2:
-        if (!args().has_q8_hp2_im2p_contract()) {
+    case ggml_gemmini_args_t::weight_format_t::q8_hp2:
+        if (!args().has_q8_hp2_contract()) {
             return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
         }
         break;
@@ -1565,7 +1569,7 @@ MatMulResult MatMul::run_full() {
 #if LOG_CYCLE
             emit_rmd_stripe_metrics(args().matmul_layer,
                                     profile,
-                                    RmdBackend::gemmini_ws_compact,
+                                    RmdBackend::npu_compact,
                                     residual_status == rmd::RmdStatus::success,
                                     rmd::rmd_status_message(residual_status),
                                     profile.rmd.residual_observations_valid ? &profile.rmd
@@ -1744,8 +1748,8 @@ MatMulStatus MatMul::finish_stripes() {
 MatMulCapability MatMul::stripe_capability(const ggml_gemmini_args_t & args) {
     const auto format       = args.weight_format;
     const auto capabilities = detail::route_capabilities(args);
-    if (format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
-        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
+    if (format == ggml_gemmini_args_t::weight_format_t::q8_h2 ||
+        format == ggml_gemmini_args_t::weight_format_t::q8_hp2 ||
         !capabilities.sliced_compensation || args.transpose_A ||
         (args.D != nullptr && !args.repeating_bias) || !supports_row_slice_activation(args)) {
         return MatMulCapability::unsupported;

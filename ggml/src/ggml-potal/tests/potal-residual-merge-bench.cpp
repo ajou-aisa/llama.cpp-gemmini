@@ -16,7 +16,7 @@
 #include "ggml-quants.h"
 #include "log.hpp"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/stripe-api.hpp"
 #include "matmul/tiling.hpp"
 #include "potal_hw_params.h"
@@ -24,8 +24,8 @@
 #include "support/gemmini-merge.hpp"
 #include "support/stripe-owner.hpp"
 
-#include "quants/act/exsia/types.hpp"
-#include "quants/common/weight_reader.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,9 +40,9 @@
 #include <vector>
 
 using namespace ggml::potal;
-namespace grmd     = ggml::gemmini::rmd;
-namespace exsia_ns = ggml::gemmini::quants::act::exsia;
-namespace wreader  = ggml::gemmini::quants::wreader;
+namespace grmd     = ggml::npu::rmd;
+namespace exsia_ns = ggml::npu::quants::act::exsia;
+namespace wreader  = ggml::npu::quants::wreader;
 
 namespace {
 
@@ -107,11 +107,11 @@ bool run_shape(size_t N, size_t K, size_t M, int reps) {
     }
     const hp1_shape     s = { (int64_t) M, (int64_t) N, (int64_t) K };
     potal_tile_plan     plan;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_weight          weight;
     hp1_operands        ops;
     if (potal_tile_select(M, N, K, 32 / D, &plan) != POTAL_OK ||
-        !init_args(w, y, s, "gpt2", "merge-bench", ggml::gemmini::residual::ResidualRoute::ws_packet, plan, args) ||
+        !init_args(w, y, s, "gpt2", "merge-bench", ggml::npu::residual::ResidualRoute::ws_packet, plan, args) ||
         !weight.allocate((int64_t) N, (int64_t) K) ||
         prepare_weight(args, weight) != quants::weight::hp1::status::ok || !ops.allocate(s, weight) ||
         !quantize_activations(x, args, ops)) {
@@ -162,7 +162,7 @@ bool run_shape(size_t N, size_t K, size_t M, int reps) {
     for (size_t i = 0; i < base.size(); ++i) {
         base[i] = 0.25f * (float) ((int) (i % 29) - 14);
     }
-    ggml_gemmini_args_t view;
+    npu_matmul_args view;
 
     // Bits and reader validations of one merge each.
     std::vector<float> before = base, after = base;
@@ -236,7 +236,7 @@ int main(int argc, char ** argv) {
         shapes = { { 320, 128 }, { 2304, 768 }, { 50257, 768 } };
     }
     ggml::potal::log::ensure_outputs(); // Gemmini debug/cycle JSONL, not stdout
-    std::printf("potal-residual-merge-bench DIM=%u activation=%s compensation=%s (host CPU times, not NPU cycles)\n",
+    std::printf("potal-residual-merge-bench NPU_D=%u activation=%s compensation=%s (host CPU times, not NPU cycles)\n",
                 (unsigned) POTAL_HW_DIM, options::activation_quant_name(), options::compensation_name);
     bool all = true;
     for (const auto & shape : shapes) {

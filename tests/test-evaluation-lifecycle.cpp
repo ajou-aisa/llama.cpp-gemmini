@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
         {"resource", "FRONTEND_QUEUE"}, {"transition", "ENQUEUE"},
         {"required_work_ids", nlohmann::json::array()},
         {"required_call_ids", nlohmann::json::array()},
-        {"source_location", "frontend/src/im2p_gemmini_frontend.cpp:submit_stripe_planned"}});
+        {"source_location", "ggml/src/ggml-potal/matmul/stripe.cpp:submit"}});
     const auto pipeline_events = pipeline.finish(true, 1);
     assert(pipeline_events.front().at("version") == 3);
     assert(pipeline_events.front().at("target_mode_scope") == "STRIPE_PIPELINE_ONLY");

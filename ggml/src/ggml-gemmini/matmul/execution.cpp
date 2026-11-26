@@ -1,17 +1,23 @@
-#include <gemmini/trace-context.hpp>
+#include "../residual/rmd/rmd-executor.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 #include "execution.hpp"
 #include "detail.hpp"
 #include "../ggml-gemmini-geometry.hpp"
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
+#include "../../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/performance.hpp"
 
-#include "../quants/act/quantize.hpp"
-#include "../quants/act/dispatch.hpp"
-#include "../residual/rmd/rmd-builder.hpp"
-#include "../residual/direct/direct-builder.hpp"
-#include "../residual/direct/direct-executor.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../../ggml-npu-common/residual/direct/direct-builder.hpp"
+#include "../../ggml-npu-common/residual/direct/direct-executor.hpp"
 
-#include <gemmini.h>
+#include "tiling.hpp"
+#include "reference.hpp"
+#include "../../ggml-npu-common/profiling/include/npu/layer.hpp"
+#ifndef GEMMINI_DISABLE_WS_REUSE
+#define GEMMINI_DISABLE_WS_REUSE 0
+#endif
 
 #include <algorithm>
 #include <array>
@@ -35,11 +41,11 @@ using detail::emit_rmd_stripe_metrics;
 
 namespace {
 
-GemminiGeometryResult resolve_geometry(ggml_gemmini_args_t & args) {
+NpuGeometryResult resolve_geometry(ggml_gemmini_args_t & args) {
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
         gemmini_set_tile_ws(&args);
     }
-    return make_gemmini_geometry(
+    return make_npu_geometry(
         {{args.I, args.J, args.K}, {args.tile_I, args.tile_J, args.tile_K}, DIM});
 }
 
@@ -124,15 +130,9 @@ bool residual_backend_available(RmdBackend backend) {
     (void)backend;
     return true;
 #else
-    constexpr bool im2p_build =
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-        true;
-#else
-        false;
-#endif
     return backend == RmdBackend::cpu_direct ||
-           (backend == RmdBackend::gemmini_ws_compact &&
-            rmd::compact_rmd_backend_available(false, im2p_build));
+           (backend == RmdBackend::npu_compact &&
+            rmd::compact_rmd_backend_available(false));
 #endif
 }
 
@@ -146,7 +146,7 @@ MatmulStatus validate_exsia_residual_route(const ggml_gemmini_args_t &   args,
     if (detail::normalize_route(args).activation != detail::ActivationRoute::exsia) {
         return {};
     }
-    using Format      = ggml_gemmini_args_t::im2p_weight_format_t;
+    using Format      = ggml_gemmini_args_t::weight_format_t;
     const auto format = args.weight_format;
     if (format == Format::q8_h2 || format == Format::q8_hp2) {
         return make_status(MatmulStatusCode::unsupported_route,
@@ -154,7 +154,7 @@ MatmulStatus validate_exsia_residual_route(const ggml_gemmini_args_t &   args,
                            MatMulCapability::unsupported);
     }
     const bool h0 = format == Format::q4_h0 || format == Format::q8_h0 || format == Format::q16_h0;
-    if (h0 && options.rmd_backend == RmdBackend::gemmini_ws_compact) {
+    if (h0 && options.rmd_backend == RmdBackend::npu_compact) {
         return make_status(MatmulStatusCode::unsupported_route,
                            "H0 ExSIA requires CPU-direct residual execution",
                            MatMulCapability::unsupported);
@@ -1517,7 +1517,7 @@ MatmulStripeJob capture_stripe(MatmulExecution &                   execution,
         status = invalid_contract("overlapping stripe");
     } else if ((execution.options_.rmd_backend == RmdBackend::cpu_direct &&
                 rmd_packet != nullptr) ||
-               (execution.options_.rmd_backend == RmdBackend::gemmini_ws_compact &&
+               (execution.options_.rmd_backend == RmdBackend::npu_compact &&
                 direct_residual != nullptr) ||
                (direct_residual != nullptr && rmd_packet != nullptr)) {
         status = invalid_contract("residual payload does not match selected backend");
@@ -2117,7 +2117,7 @@ MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args,
     options.job_capacity      = 1;
     options.rmd_backend       = args.residual_route == residual::ResidualRoute::cpu_direct
                                     ? RmdBackend::cpu_direct
-                                    : RmdBackend::gemmini_ws_compact;
+                                    : RmdBackend::npu_compact;
     MatmulExecution execution = prepare_execution(args, options);
     if (!execution.status()) {
         return execution.status();
@@ -2151,4 +2151,275 @@ MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args,
     return finish_execution(execution);
 }
 
+} // namespace ggml::gemmini
+
+// Derived from Gemmini SDK develop fcfcf5ce; see matmul/README.md and LICENSE.gemmini*.
+namespace ggml::gemmini {
+void require_command(const char *what, gemmini_status_t status) {
+    if (status == GEMMINI_OK) return;
+    std::fprintf(stderr, "gemmini: %s failed: %s\n", what, gemmini_status_name(status));
+    std::abort();
+}
+namespace {
+uint32_t float_bits(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+tiling::Matmul make_matmul(size_t dim_I, size_t dim_J, size_t dim_K, const elem_t * A, const elem_t * B,
+                                  const void * D, void * C, size_t stride_A, size_t stride_B, size_t stride_D,
+                                  size_t stride_C, scale_t A_scale_factor, scale_t B_scale_factor,
+                                  scale_acc_t D_scale_factor, int act, acc_scale_t scale, bool repeating_bias,
+                                  bool transpose_A, bool transpose_B, bool full_C, bool low_D) {
+    tiling::Matmul mm;
+    mm.dim_i = dim_I;
+    mm.dim_j = dim_J;
+    mm.dim_k = dim_K;
+    mm.a = (uint64_t) (uintptr_t) A;
+    mm.b = (uint64_t) (uintptr_t) B;
+    mm.d = (uint64_t) (uintptr_t) D;
+    mm.c = (uint64_t) (uintptr_t) C;
+    mm.stride_a = stride_A;
+    mm.stride_b = stride_B;
+    mm.stride_d = stride_D;
+    mm.stride_c = stride_C;
+    // tiled_matmul_outer passed every factor through scale_t (D included).
+    mm.a_scale_bits = float_bits(A_scale_factor);
+    mm.b_scale_bits = float_bits(B_scale_factor);
+    mm.d_scale_bits = float_bits((scale_t) D_scale_factor);
+    mm.act = act;
+    mm.acc_scale_bits = float_bits((acc_scale_t) scale);
+    mm.config_ex_acc_scale_bits = float_bits((acc_scale_t) ACC_SCALE_IDENTITY);
+    mm.repeating_bias = repeating_bias;
+    mm.a_transpose = transpose_A;
+    mm.b_transpose = transpose_B;
+    mm.full_c = full_C;
+    mm.low_d = low_D;
+    mm.disable_ws_reuse = GEMMINI_DISABLE_WS_REUSE != 0;
+    return mm;
+}
+struct WsObserverState {
+    const tiling::Matmul * mm;
+    const tiling::Tiles *  tiles;
+    const gemmini_transport_t *transport;
+    bool                   a_reuse = false, b_reuse = false;
+#if GEMMINI_WS_LOOP_CYCLE && LOG_CYCLE && defined(__riscv)
+    std::optional<ggml::npu::log::HardwareCounterLease> counter_lease;
+    uint64_t                                                start = 0;
+    size_t                                                  i0_count = 0, j0_count = 0, k0_count = 0;
+#endif
+};
+
+void ws_before_loops(void * context, size_t i0_count, size_t j0_count, size_t k0_count, bool a_reuse,
+                            bool b_reuse) {
+    auto & s = *static_cast<WsObserverState *>(context);
+    s.a_reuse = a_reuse;
+    s.b_reuse = b_reuse;
+#if GEMMINI_WS_DEBUG
+    const tiling::Matmul & mm = *s.mm;
+    const size_t d = DIM;
+    gemmini_log_debug(
+        "[ws.outer] dim=(%zu,%zu,%zu) tile=(%zu,%zu,%zu) iter=(%zu,%zu,%zu) pad=(%zu,%zu,%zu) "
+        "stride=(%zu,%zu,%zu,%zu) reuse=(A:%d,B:%d) flags=(aT:%d,bT:%d,fullC:%d,lowD:%d,noBias:%d,repeatBias:%d,act:%d)",
+        mm.dim_i, mm.dim_j, mm.dim_k, s.tiles->i, s.tiles->j, s.tiles->k, i0_count, j0_count, k0_count,
+        (mm.dim_i / d + (mm.dim_i % d != 0)) * d - mm.dim_i, (mm.dim_j / d + (mm.dim_j % d != 0)) * d - mm.dim_j,
+        (mm.dim_k / d + (mm.dim_k % d != 0)) * d - mm.dim_k, mm.stride_a, mm.stride_b, mm.stride_d, mm.stride_c,
+        a_reuse ? 1 : 0, b_reuse ? 1 : 0, mm.a_transpose ? 1 : 0, mm.b_transpose ? 1 : 0, mm.full_c ? 1 : 0,
+        mm.low_d ? 1 : 0, mm.d == 0 ? 1 : 0, mm.repeating_bias ? 1 : 0, mm.act);
+#endif
+#if GEMMINI_WS_LOOP_CYCLE && LOG_CYCLE && defined(__riscv)
+    s.i0_count = i0_count;
+    s.j0_count = j0_count;
+    s.k0_count = k0_count;
+    s.counter_lease.emplace();
+    require_command("counter configure", gemmini_counter_configure(s.transport, 0, GEMMINI_EVENT_LOAD_ACTIVE_CYCLE));
+    require_command("counter configure", gemmini_counter_configure(s.transport, 1, GEMMINI_EVENT_EXE_ACTIVE_CYCLE));
+    require_command("counter configure", gemmini_counter_configure(s.transport, 2, GEMMINI_EVENT_STORE_ACTIVE_CYCLE));
+    require_command("counter configure", gemmini_counter_configure(s.transport, 3, GEMMINI_EVENT_LOOP_MATMUL_ACTIVE_CYCLES));
+    require_command("counter snapshot reset", gemmini_counter_snapshot_reset(s.transport));
+    s.start = ggml::npu::cycle::read();
+#endif
+    (void) i0_count;
+    (void) j0_count;
+    (void) k0_count;
+}
+void ws_before_inner(void * context, size_t index, size_t i0, size_t j0, size_t k0, uint64_t pre,
+                            const gemmini_loop_ws_desc_t & loop) {
+#if GEMMINI_WS_DEBUG
+    auto & s = *static_cast<WsObserverState *>(context);
+    gemmini_log_debug(
+        "[ws.inner.begin] idx=%zu i0=%zu j0=%zu k0=%zu IJK=(%zu,%zu,%zu) pad=(%zu,%zu,%zu) "
+        "ptr=(A:%p,B:%p,pre:%p,out:%p) spad=(%d,%d) reuse=(A:%d,B:%d)",
+        index, i0, j0, k0, (size_t) loop.i, (size_t) loop.j, (size_t) loop.k, (size_t) loop.pad_i,
+        (size_t) loop.pad_j, (size_t) loop.pad_k, (const void *) (uintptr_t) loop.a, (const void *) (uintptr_t) loop.b,
+        (const void *) (uintptr_t) pre, (void *) (uintptr_t) loop.c, (int) loop.a_spad_id, (int) loop.b_spad_id,
+        s.a_reuse ? 1 : 0, s.b_reuse ? 1 : 0);
+#else
+    (void) context; (void) index; (void) i0; (void) j0; (void) k0; (void) pre; (void) loop;
+#endif
+}
+void ws_after_inner(void * context, size_t index, size_t i0, size_t j0, size_t k0) {
+    (void) context;
+#if GEMMINI_WS_DEBUG
+    gemmini_log_debug("[ws.inner.end] idx=%zu i0=%zu j0=%zu k0=%zu", index, i0, j0, k0);
+#else
+    (void) index; (void) i0; (void) j0; (void) k0;
+#endif
+}
+void ws_after_fence(void * context) {
+#if GEMMINI_WS_LOOP_CYCLE && LOG_CYCLE && defined(__riscv)
+    auto & s = *static_cast<WsObserverState *>(context);
+    const uint64_t ws_loop_end = ggml::npu::cycle::read();
+    require_command("counter snapshot", gemmini_counter_snapshot_take(s.transport));
+    uint64_t load_occupancy_cycles = 0;
+    require_command("counter read", gemmini_counter_read(s.transport, 0, &load_occupancy_cycles));
+    uint64_t execute_occupancy_cycles = 0;
+    require_command("counter read", gemmini_counter_read(s.transport, 1, &execute_occupancy_cycles));
+    uint64_t store_occupancy_cycles = 0;
+    require_command("counter read", gemmini_counter_read(s.transport, 2, &store_occupancy_cycles));
+    uint64_t loop_occupancy_cycles = 0;
+    require_command("counter read", gemmini_counter_read(s.transport, 3, &loop_occupancy_cycles));
+    gemmini_log_ws_cycle(
+        ws_loop_end - s.start,
+        static_cast<uint32_t>(load_occupancy_cycles), static_cast<uint32_t>(execute_occupancy_cycles),
+        static_cast<uint32_t>(store_occupancy_cycles), static_cast<uint32_t>(loop_occupancy_cycles),
+        s.mm->dim_i, s.mm->dim_j, s.mm->dim_k,
+        s.tiles->i, s.tiles->j, s.tiles->k,
+        s.i0_count, s.j0_count, s.k0_count,
+        s.a_reuse ? 1 : 0, s.b_reuse ? 1 : 0);
+#else
+    (void) context;
+#endif
+}
+}
+void tiled_matmul(const gemmini_transport_t &transport, size_t dim_I, size_t dim_J, size_t dim_K,
+        const elem_t* A, const elem_t* B,
+        const void * D, void* C,
+        size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+        scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+        int act, acc_scale_t scale, acc_scale_t bert_scale,
+        bool repeating_bias,
+        size_t tile_I, size_t tile_J, size_t tile_K,
+        bool transpose_A, bool transpose_B,
+        bool full_C, bool low_D,
+        uint8_t weightA,
+        enum tiled_matmul_type_t tiled_matmul_type) {
+  (void) weightA;
+  if (tiled_matmul_type == WS) {
+    const gemmini_hw_config_t & cfg = *gemmini_hw_config_build();
+    const ggml::gemmini::tiling::Matmul mm = make_matmul(
+        dim_I, dim_J, dim_K, A, B, D, C, stride_A, stride_B, stride_D, stride_C, A_scale_factor, B_scale_factor,
+        D_scale_factor, act, scale, repeating_bias, transpose_A, transpose_B, full_C, low_D);
+    const ggml::gemmini::tiling::Tiles tiles{ tile_I, tile_J, tile_K };
+    const char * message = nullptr;
+    if (ggml::gemmini::tiling::check_ws(cfg, mm, tiles, &message) != GEMMINI_OK) {
+      printf("%s", message);
+      exit(1);
+    }
+    if ((act == GEMMINI_ACT_LAYERNORM || act == GEMMINI_ACT_SOFTMAX) && tile_J * DIM < dim_J) {
+      printf("When doing layernorm or softmax, the full J dimension of the matrix must fit in the accumulator\n");
+    }
+    (void) bert_scale;
+    WsObserverState state{ &mm, &tiles, &transport };
+    const ggml::gemmini::tiling::Observer observer{ &state, ws_before_loops, ws_before_inner,
+                                                    ws_after_inner, ws_after_fence };
+    require_command("tiled_matmul (WS)", ggml::gemmini::tiling::run_ws(&transport, cfg, mm, tiles, &observer));
+  } else if (tiled_matmul_type == CPU) {
+    if (full_C || low_D) {
+      printf("Not implemented: CPU matmul, full_C=%d, low_D=%d\n", full_C, low_D);
+    }
+    (void) tile_I; (void) tile_J; (void) tile_K;
+    matmul_cpu(transpose_A, transpose_B, dim_I, dim_J, dim_K,
+            A, B, (const acc_t*) D, (elem_t*)C,
+            stride_A, stride_B, stride_D, stride_C,
+            A_scale_factor, B_scale_factor, D_scale_factor,
+            act, scale, bert_scale, repeating_bias);
+  } else {
+    // OUTPUT_STATIONARY: rejected at configure (cmake/ggml-gemmini-options.cmake); not ported.
+    printf("Not implemented: OS matmul in the internal Gemmini tiler\n");
+    exit(1);
+  }
+}
+void tiled_matmul_auto(const gemmini_transport_t &transport, size_t dim_I, size_t dim_J, size_t dim_K,
+        const elem_t* A, const elem_t* B,
+        const void * D, void * C,
+        size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+        scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+        int act, acc_scale_t scale, acc_scale_t bert_scale,
+        bool repeating_bias,
+        bool transpose_A, bool transpose_B,
+        bool full_C, bool low_D,
+        uint8_t weightA,
+        enum tiled_matmul_type_t tiled_matmul_type) {
+    const bool double_buffered = tiled_matmul_type == WS;
+    const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 :
+      BANK_NUM * BANK_ROWS;
+    const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
+    (void) max_spad_rows; (void) max_acc_rows;
+
+    const ggml::gemmini::tiling::Tiles tiles = ggml::gemmini::tiling::select_tiles(
+        *gemmini_hw_config_build(), dim_I, dim_J, dim_K, act, double_buffered);
+    const size_t tile_I = tiles.i, tile_J = tiles.j, tile_K = tiles.k;
+
+#ifdef PRINT_TILE
+#if PRINT_TILE
+    const int spad_rows = tiling::total_spad_rows(*gemmini_hw_config_build(), tile_I, tile_J, tile_K);
+    const int acc_rows = tiling::total_acc_rows(*gemmini_hw_config_build(), tile_I, tile_J);
+
+    printf("tile_I: %d\n", tile_I);
+    printf("tile_J: %d\n", tile_J);
+    printf("tile_K: %d\n\n", tile_K);
+
+    printf("spad_rows: %d\n", spad_rows);
+    printf("acc_rows: %d\n\n", acc_rows);
+
+    printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
+    printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
+
+    exit(EXIT_SUCCESS);
+#endif
+#endif
+
+    tiled_matmul(transport, dim_I, dim_J, dim_K,
+        A, B, D, C,
+        stride_A, stride_B, stride_D, stride_C,
+        A_scale_factor, B_scale_factor, D_scale_factor,
+        act, scale, bert_scale, repeating_bias,
+        tile_I, tile_J, tile_K,
+        transpose_A, transpose_B,
+        full_C, low_D,
+        weightA,
+        tiled_matmul_type);
+
+}
+void gemmini_set_tile_ws(struct ggml_gemmini_args_t *args){
+    if (args == NULL)
+      return;
+
+    const char *layer = args->matmul_layer.c_str();
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    if (test_observe_semantic_layer(TestSemanticLayerSite::physical_set_tile_ws, layer))
+      return;
+#endif
+
+    // tile size 계산
+    uint64_t start = ggml::npu::cycle::read();
+
+    const size_t dim_I = args->I;
+    const size_t dim_J = args->J;
+    const size_t dim_K = args->K;
+    const int act = args->act;
+
+    const ggml::gemmini::tiling::Tiles tiles =
+        ggml::gemmini::tiling::select_ws_tiles(*gemmini_hw_config_build(), dim_I, dim_J, dim_K, act);
+    const size_t tile_I = tiles.i, tile_J = tiles.j, tile_K = tiles.k;
+
+    args->tile_I = tile_I;
+    args->tile_J = tile_J;
+    args->tile_K = tile_K;
+
+    // tile size 디버깅
+    gemmini_log_debug_layer(layer, "[set_tile_ws] dim=(%zu,%zu,%zu) tiles=(%zu,%zu,%zu)",
+                   dim_I, dim_J, dim_K, tile_I, tile_J, tile_K);
+  }
 } // namespace ggml::gemmini

@@ -161,6 +161,18 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+# NPU hardware parameters (GGML_NPU, NPU_*): validated and generated before
+# any NPU backend is configured; see cmake/npu-config.cmake.
+include(cmake/npu-config.cmake)
+if (GGML_NPU STREQUAL "GEMMINI")
+    # The API tests are added by ggml before the ordinary llama test directory.
+    enable_testing()
+    if (NPU_API_ONLY)
+        add_subdirectory(ggml/src/ggml-gemmini/api)
+        return()
+    endif()
+endif()
+
 # PoTal (see ggml/src/ggml-potal/README.md):
 #   POTAL_API_ONLY=ON configures only the standalone RoCC API in
 #   ggml/src/ggml-potal (no ggml/llama, no Gemmini software tree);
@@ -196,16 +208,12 @@ set(_GGML_GEMMINI_TOP_BINARY_DIR "${CMAKE_BINARY_DIR}")
 include(cmake/ggml-gemmini-options.cmake)
 if (GGML_POTAL)
     # The PoTal backend uses only POTAL_HW_PARAMS: no Gemmini headers and no
-    # IM2P.sim. The config module needs
+    # an external SDK. The config module needs
     # just the generated-config directory the geometry module would create.
-    if (CYCLE_SIM OR GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
-        message(FATAL_ERROR "GGML_POTAL=ON does not support CYCLE_SIM=1 or GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
-    endif()
     set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${_GGML_GEMMINI_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
 else()
     include(cmake/ggml-gemmini-geometry.cmake)
-    include(cmake/ggml-gemmini-im2p.cmake)
 endif()
 include(cmake/ggml-gemmini-config.cmake)
 

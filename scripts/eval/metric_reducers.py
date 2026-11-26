@@ -60,7 +60,7 @@ def activation_summary(path: Path) -> Record:
             ("CONFIRMED_BY_USER", "signed-row-original-bk32-population-2sigma-v1")},
             "unbound/unsupported activation reference authority")
     reference_complete = True
-    for row in metric_rows(path, "im2p-activation-quant-metrics"):
+    for row in metric_rows(path, "gemmini-activation-quant-metrics"):
         require(row.get("kind") == "COUNTS", "unexpected ACT record")
         key = invocation(row)
         require(key not in seen, "duplicate ACT chunk/invocation")
@@ -147,7 +147,7 @@ def residual_summary(path: Path, accept_proposed_weighting: bool = False) -> Rec
     mains: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     work_parents: set[tuple[int, int, int]] = set()
     dense_macs, expanded_macs, compact_macs, run_count = 0, 0, 0, 0
-    for row in metric_rows(path, "im2p-residual-path-metrics"):
+    for row in metric_rows(path, "gemmini-residual-path-metrics"):
         key = (*invocation(row), integer(row, "stripe_id"))
         m, n, k = integer(row, "m", 1), integer(row, "n", 1), integer(row, "k", 1)
         kind = text(row, "kind")

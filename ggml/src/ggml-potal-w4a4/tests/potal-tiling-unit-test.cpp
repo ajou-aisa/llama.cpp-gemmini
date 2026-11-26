@@ -29,7 +29,7 @@
 #include "ggml-potal-buffer.hpp"
 #include "ggml-potal.h"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/tiling.hpp"
 #include "matmul/weight_cache.hpp"
 #include "ops.hpp"
@@ -38,14 +38,14 @@
 #include "support/potal-emulator.hpp"
 
 // Unmodified Gemmini quantizers, metadata and residual code (shared sources).
-#include "quants/act/block/block.hpp"
-#include "quants/act/dispatch.hpp"
-#include "quants/act/exsia/exsia.hpp"
-#include "quants/act/quantize.hpp"
-#include "quants/act/stripe/stripe.hpp"
-#include "quants/act/tensor/tensor.hpp"
-#include "quants/act/token/token.hpp"
-#include "quants/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/activation/block/block.hpp"
+#include "../../ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/activation/stripe/stripe.hpp"
+#include "../../ggml-npu-common/quantization/activation/tensor/tensor.hpp"
+#include "../../ggml-npu-common/quantization/activation/token/token.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
 
 #include "ggml-quants.h" // block_q8_hp1 (ggml-common.h), Q8_HP1 reference quant/dequant
 
@@ -66,10 +66,10 @@
 
 using namespace ggml::potal;
 namespace hp1 = ggml::potal::quants::weight::hp1;
-namespace gq  = ggml::gemmini::quants;
+namespace gq  = ggml::npu::quants;
 
-// DIM is the <gemmini_params.h> macro, i.e. the selected PoTal parameter header.
-static_assert(DIM == POTAL_HW_DIM, "gemmini_params.h and potal_hw_params.h disagree on DIM");
+// NPU_D is the <gemmini_params.h> macro, i.e. the selected PoTal parameter header.
+static_assert(NPU_D == POTAL_HW_DIM, "gemmini_params.h and potal_hw_params.h disagree on NPU_D");
 
 namespace {
 
@@ -82,37 +82,37 @@ void check(const std::string & name, bool ok) {
 
 // ---- A: gemmini.h tiled_matmul_auto tile choice (WS), verbatim policy ------
 
-size_t gm_spad(size_t I, size_t J, size_t K) { return (I * K + K * J) * DIM; }
-size_t gm_acc(size_t I, size_t J) { return (I * J) * DIM; }
+size_t gm_spad(size_t I, size_t J, size_t K) { return (I * K + K * J) * NPU_D; }
+size_t gm_acc(size_t I, size_t J) { return (I * J) * NPU_D; }
 
 void gemmini_reference_tiles(size_t dim_I, size_t dim_J, size_t dim_K, size_t & tile_I, size_t & tile_J,
                              size_t & tile_K) {
     const size_t db_partition_rows    = ((size_t) POTAL_HW_BANK_NUM * POTAL_HW_BANK_ROWS / 2) / 2;
-    const size_t db_mats_in_partition = db_partition_rows / DIM;
-    const size_t db_mats_in_acc       = ((size_t) POTAL_HW_ACC_ROWS / 2) / DIM;
+    const size_t db_mats_in_partition = db_partition_rows / NPU_D;
+    const size_t db_mats_in_acc       = ((size_t) POTAL_HW_ACC_ROWS / 2) / NPU_D;
     const size_t db_max_tile_i_j      = (size_t) std::sqrt((double) db_mats_in_acc);
     const size_t db_max_tile_k        = db_mats_in_partition / db_max_tile_i_j;
-    const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
-    const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
-    const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
+    const size_t dim_I_padded = (dim_I / NPU_D + (dim_I % NPU_D != 0)) * NPU_D;
+    const size_t dim_J_padded = (dim_J / NPU_D + (dim_J % NPU_D != 0)) * NPU_D;
+    const size_t dim_K_padded = (dim_K / NPU_D + (dim_K % NPU_D != 0)) * NPU_D;
     const size_t max_spad_rows = (size_t) POTAL_HW_BANK_NUM * POTAL_HW_BANK_ROWS / 2;
     const size_t max_acc_rows  = (size_t) POTAL_HW_ACC_ROWS / 2;
-    tile_I = dim_I_padded / DIM < db_max_tile_i_j ? dim_I_padded / DIM : db_max_tile_i_j;
-    tile_J = dim_J_padded / DIM < db_max_tile_i_j ? dim_J_padded / DIM : db_max_tile_i_j;
-    tile_K = dim_K_padded / DIM < db_max_tile_k ? dim_K_padded / DIM : db_max_tile_k;
+    tile_I = dim_I_padded / NPU_D < db_max_tile_i_j ? dim_I_padded / NPU_D : db_max_tile_i_j;
+    tile_J = dim_J_padded / NPU_D < db_max_tile_i_j ? dim_J_padded / NPU_D : db_max_tile_i_j;
+    tile_K = dim_K_padded / NPU_D < db_max_tile_k ? dim_K_padded / NPU_D : db_max_tile_k;
     while (true) {
         bool increased = false;
         if (gm_spad(tile_I, tile_J + 1, tile_K) <= max_spad_rows && gm_acc(tile_I, tile_J + 1) <= max_acc_rows &&
-            (tile_J + 1) * DIM <= dim_J_padded) {
+            (tile_J + 1) * NPU_D <= dim_J_padded) {
             tile_J++;
             increased = true;
         }
         if (gm_spad(tile_I + 1, tile_J, tile_K) <= max_spad_rows && gm_acc(tile_I + 1, tile_J) <= max_acc_rows &&
-            (tile_I + 1) * DIM <= dim_I_padded) {
+            (tile_I + 1) * NPU_D <= dim_I_padded) {
             tile_I++;
             increased = true;
         }
-        if (gm_spad(tile_I, tile_J, tile_K + 1) <= max_spad_rows && (tile_K + 1) * DIM <= dim_K_padded) {
+        if (gm_spad(tile_I, tile_J, tile_K + 1) <= max_spad_rows && (tile_K + 1) * NPU_D <= dim_K_padded) {
             tile_K++;
             increased = true;
         }
@@ -135,7 +135,7 @@ void test_tile_select() {
     };
     for (const auto & sh : shapes) {
         for (uint32_t ppb : { 1u, 2u }) {
-            if ((sh[2] + DIM - 1) / DIM % ppb != 0) {
+            if ((sh[2] + NPU_D - 1) / NPU_D % ppb != 0) {
                 continue;
             }
             char name[160];
@@ -160,7 +160,7 @@ void test_tile_select() {
         }
     }
     potal_tile_plan plan;
-    check("A K not whole scale blocks rejected", potal_tile_select(4, DIM, 3 * DIM, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
+    check("A K not whole scale blocks rejected", potal_tile_select(4, NPU_D, 3 * NPU_D, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
     check("A zero dimension rejected", potal_tile_select(0, 16, 32, 2, &plan) == POTAL_ERR_INVALID_ARGUMENT);
 }
 
@@ -212,8 +212,8 @@ void test_tiled_execution() {
         int    carriers;
     };
     const shape shapes[] = {
-        { DIM, DIM, 32, 0 }, // the validated single GEMM on either HP1 geometry
-        { DIM, DIM, 96, 1 }, // beyond the bounded two-DIM legacy API: LOOP_WS
+        { NPU_D, NPU_D, 32, 0 }, // the validated single GEMM on either HP1 geometry
+        { NPU_D, NPU_D, 96, 1 }, // beyond the bounded two-NPU_D legacy API: LOOP_WS
         { 5, 40, 96, 1 },    // padding in I and J
         { 37, 100, 640, 0 }, // multi-I/J, padded
         { 3, 160, 4096, 1 }, // K chunks (accumulate, C NULL)
@@ -255,12 +255,12 @@ void test_tiled_execution() {
         check(name, session.report.invocations == plan.I0 * plan.J0 * plan.K0 &&
                         session.report.fences == session.report.invocations && emu.scales.empty() &&
                         session.report.scale_writes == session.report.scale_releases && !session.report.fatal);
-        if (s.m == DIM && s.n == DIM && s.k == 32) {
+        if (s.m == NPU_D && s.n == NPU_D && s.k == 32) {
             check("B validated shape issued through potal_gemm_ws_issue",
                   emu.gemms == 1 && session.report.validated_gemms == 1);
         }
-        if (s.m == DIM && s.n == DIM && s.k == 96) {
-            check("B K beyond two DIM uses LOOP_WS, not the bounded single GEMM",
+        if (s.m == NPU_D && s.n == NPU_D && s.k == 96) {
+            check("B K beyond two NPU_D uses LOOP_WS, not the bounded single GEMM",
                   emu.gemms == 0 && session.report.validated_gemms == 0 && emu.loops == 1);
         }
         if (s.k == 4096) {
@@ -340,9 +340,9 @@ std::vector<block_q8_hp1> quantize_rows(const std::vector<float> & w, size_t N, 
     return blocks;
 }
 
-ggml_gemmini_args_t hp1_args(const std::vector<block_q8_hp1> & blocks, size_t N, size_t K) {
-    ggml_gemmini_args_t args;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+npu_matmul_args hp1_args(const std::vector<block_q8_hp1> & blocks, size_t N, size_t K) {
+    npu_matmul_args args;
+    args.weight_format         = npu_matmul_args::weight_format_t::q8_hp1;
     args.block_size_k          = QK8_HP;
     args.J                     = N;
     args.K                     = K;
@@ -442,7 +442,7 @@ void test_hp1() {
     expect("zero channel scale with a non-zero block", hp1::status::channel_scale, RS::Success,
            [](auto & b) { b[5 * 4 + 1].m = 0; });
     hp1::stats        ignored;
-    ggml_gemmini_args_t short_k = hp1_args(blocks, N, K);
+    npu_matmul_args short_k = hp1_args(blocks, N, K);
     short_k.K                   = 100;
     const hp1::status   short_s = hp1::unpack(short_k, B.data(), ldb, carriers.data(), cs, scale.data(), &ignored);
     check("C HP1 rejects K not a multiple of 32 (storage contract)",
@@ -457,7 +457,7 @@ void test_hp1() {
 // ---- shared fixtures for D, E, G, H ------------------------------------------
 
 namespace act = gq::act;
-using ResidualRoute = ggml::gemmini::residual::ResidualRoute;
+using ResidualRoute = ggml::npu::residual::ResidualRoute;
 
 enum class algo { tensor, token, block, stripe, exsia };
 
@@ -503,7 +503,7 @@ struct mm_case {
     ggml_tensor *    y = nullptr;
     hp1_shape        s = {};
     hp1_operands     o;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1::stats       ws;
     bool             ok = false;
 
@@ -527,7 +527,7 @@ struct mm_case {
         std::memcpy(x->data, xf.data(), xf.size() * sizeof(float));
         potal_tile_plan plan;
         ok = check_mul_mat_hp1(y, true, &s) == GGML_POTAL_REJECT_NONE &&
-             potal_tile_select((size_t) M, (size_t) N, (size_t) K, hp1::block_k / DIM, &plan) == POTAL_OK &&
+             potal_tile_select((size_t) M, (size_t) N, (size_t) K, hp1::block_k / NPU_D, &plan) == POTAL_OK &&
              o.allocate(s) && init_args(w, y, s, "gpt2", "test", route, plan, args) &&
              unpack_weights(args, o, &ws) == hp1::status::ok;
     }
@@ -554,7 +554,7 @@ std::vector<float> random_activations(int64_t M, int64_t K, uint32_t seed, float
 }
 
 // The unmodified per-algorithm quantizer, exactly as quants/act/dispatch.cpp calls it.
-bool quantize_with(algo a, const ggml_tensor * x, ggml_gemmini_args_t & args, hp1_operands & o) {
+bool quantize_with(algo a, const ggml_tensor * x, npu_matmul_args & args, hp1_operands & o) {
     gq::reset_activation_quant_state(args);
     bool ok = false;
     switch (a) {
@@ -580,7 +580,7 @@ bool quantize_with(algo a, const ggml_tensor * x, ggml_gemmini_args_t & args, hp
 }
 
 // The algorithm's own dequantization (residuals included when it captured any).
-bool dequantize_with(algo a, const ggml_gemmini_args_t & args, std::vector<float> & out) {
+bool dequantize_with(algo a, const npu_matmul_args & args, std::vector<float> & out) {
     out.assign(args.I * args.K, 0.0f);
     switch (a) {
         case algo::tensor: return act::tensor::dequantize_activation(out.data(), args.K, 1, args.I, args.K, args);
@@ -594,7 +594,7 @@ bool dequantize_with(algo a, const ggml_gemmini_args_t & args, std::vector<float
 
 // Activation scale of element (m, k) read directly from the metadata the
 // quantizer stored (independent of ActivationMetadataView and the route code).
-bool raw_scale(const ggml_gemmini_args_t & args, size_t m, size_t k, double & scale) {
+bool raw_scale(const npu_matmul_args & args, size_t m, size_t k, double & scale) {
     const auto & st  = args.act_quant.storage();
     const size_t rps = args.activation_rows_per_stripe;
     if (const auto * t = std::get_if<act::tensor::Meta>(&st)) {
@@ -622,7 +622,7 @@ bool raw_scale(const ggml_gemmini_args_t & args, size_t m, size_t k, double & sc
 // C_g; constant-along-K routes use the whole-K golden instead (that is what the
 // ACC accumulates).
 bool route_golden(const route_plan & route, const mm_case & c, std::vector<float> & want) {
-    const ggml_gemmini_args_t & a = c.args;
+    const npu_matmul_args & a = c.args;
     const hp1_operands &        o = c.o;
     want.assign(a.I * a.J, 0.0f);
     std::vector<int32_t> g(o.m_pad * o.ldc, 0);
@@ -712,7 +712,7 @@ void test_configured_dispatcher() {
                                                                                          cfg == algo::stripe ? 2 :
                                                                                          cfg == algo::exsia  ? 3 : 4));
     route_plan none;
-    ggml_gemmini_args_t empty;
+    npu_matmul_args empty;
     check("D no metadata -> no route", !select_route(empty, none));
 
     if constexpr (options::activation_quant == options::ActivationQuantAlgo::TENSOR && !options::compensation) {
@@ -913,7 +913,7 @@ void test_ggml_contract() {
     ggml_tensor * tagged = mm(GGML_TYPE_Q8_HP1, GGML_TYPE_F32, 64, 16, 16);
     tagged->op_params[1] = 1;
     check("F tagged MUL_MAT rejected (op_params)", check_op(tagged) == GGML_POTAL_REJECT_OP_PARAMS);
-    check("F I8 x I8 DIM x DIM x K32 still accepted", check_op(mm(GGML_TYPE_I8, GGML_TYPE_I8, 32, DIM, DIM)) ==
+    check("F I8 x I8 NPU_D x NPU_D x K32 still accepted", check_op(mm(GGML_TYPE_I8, GGML_TYPE_I8, 32, NPU_D, NPU_D)) ==
                                                    GGML_POTAL_REJECT_NONE);
 
     // The CPU backend refuses Q8_HP1 MUL_MAT: a PoTal reject can never become
@@ -1026,7 +1026,7 @@ struct mm_args {
     ggml_tensor *       x = nullptr;
     ggml_tensor *       y = nullptr;
     hp1_shape           s = {};
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     bool                ok = false;
 
     mm_args(ggml_tensor * src0, int64_t M, uint32_t seed) {
@@ -1039,16 +1039,16 @@ struct mm_args {
         y = ggml_mul_mat(ctx.get(), src0, x);
         potal_tile_plan plan;
         ok = check_mul_mat_hp1(y, true, &s) == GGML_POTAL_REJECT_NONE &&
-             potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k, hp1::block_k / DIM, &plan) == POTAL_OK &&
+             potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k, hp1::block_k / NPU_D, &plan) == POTAL_OK &&
              init_args(src0, y, s, "gpt2", "test", ResidualRoute::cpu_direct, plan, args);
     }
 };
 
 // The prepared operands against the Gemmini reader's per-element accessors
 // (the pre-cache unpacking), padding included.
-bool same_as_reader(const ggml_gemmini_args_t & args, const hp1_weight & w) {
-    namespace wroute  = ggml::gemmini::quants::wroute;
-    namespace wreader = ggml::gemmini::quants::wreader;
+bool same_as_reader(const npu_matmul_args & args, const hp1_weight & w) {
+    namespace wroute  = ggml::npu::quants::wroute;
+    namespace wreader = ggml::npu::quants::wreader;
     const auto plan   = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
     if (!plan.valid || w.n != args.J || w.k != args.K) {
         return false;
@@ -1106,7 +1106,7 @@ bool bitwise_equal(const std::vector<float> & a, const std::vector<float> & b) {
 
 void test_weight_cache() {
     ggml_backend_ptr cpu(ggml_backend_cpu_init());
-    const int64_t    N = 40, K = 192; // N not a multiple of DIM: padded columns
+    const int64_t    N = 40, K = 192; // N not a multiple of NPU_D: padded columns
     weight_set       ws(cpu.get(), N, K, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     weight_cache     cache(size_t(64) << 20);
     const hp1_weight * first = nullptr;
@@ -1266,7 +1266,7 @@ void test_weight_cache() {
     // effect; its recoverable refusal safely retains the cached weight.
     {
         ggml_backend_ptr potal(ggml_backend_potal_init());
-        const auto selected = ggml::gemmini::resolve_matmul_options();
+        const auto selected = ggml::npu::resolve_matmul_options();
         bool invalid_paired = false;
         const bool paired = options::paired_auto_requested(&invalid_paired);
         const bool retain = selected.ok() && !invalid_paired &&
@@ -1365,7 +1365,7 @@ void test_weight_cache() {
 } // namespace
 
 int main() {
-    std::printf("POTAL_TILING_UNIT_TEST DIM=%u activation_quant=%s compensation=%s\n", (unsigned) POTAL_HW_DIM,
+    std::printf("POTAL_TILING_UNIT_TEST NPU_D=%u activation_quant=%s compensation=%s\n", (unsigned) POTAL_HW_DIM,
                 options::activation_quant_name(), options::compensation_name);
     test_tile_select();
     test_tiled_execution();

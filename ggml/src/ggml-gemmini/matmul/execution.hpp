@@ -1,7 +1,8 @@
 #pragma once
 
 #include "dense.hpp"
-#include "options.hpp"
+#include "gemmini.h"
+#include "../../ggml-npu-common/matmul/options.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -306,4 +307,32 @@ inline MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptionOverrid
     return resolution.ok() ? matmul(args, resolution.options) : resolution_status(resolution.error);
 }
 
+} // namespace ggml::gemmini
+
+namespace ggml::gemmini {
+void require_command(const char *what, gemmini_status_t status);
+void tiled_matmul(const gemmini_transport_t &transport, size_t dim_I, size_t dim_J, size_t dim_K,
+        const elem_t* A, const elem_t* B,
+        const void * D, void* C,
+        size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+        scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+        int act, acc_scale_t scale, acc_scale_t bert_scale,
+        bool repeating_bias,
+        size_t tile_I, size_t tile_J, size_t tile_K,
+        bool transpose_A, bool transpose_B,
+        bool full_C, bool low_D,
+        uint8_t weightA,
+        enum tiled_matmul_type_t tiled_matmul_type);
+void tiled_matmul_auto(const gemmini_transport_t &transport, size_t dim_I, size_t dim_J, size_t dim_K,
+        const elem_t* A, const elem_t* B,
+        const void * D, void * C,
+        size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+        scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+        int act, acc_scale_t scale, acc_scale_t bert_scale,
+        bool repeating_bias,
+        bool transpose_A, bool transpose_B,
+        bool full_C, bool low_D,
+        uint8_t weightA,
+        enum tiled_matmul_type_t tiled_matmul_type);
+void gemmini_set_tile_ws(struct ggml_gemmini_args_t *args);
 } // namespace ggml::gemmini

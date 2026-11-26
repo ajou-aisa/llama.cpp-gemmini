@@ -63,13 +63,11 @@ def collect_runs(args: argparse.Namespace) -> None:
     cuda_no_kv_offload = bool(getattr(args, "cuda_no_kv_offload", False))
     require(not cuda_no_kv_offload or role == "cuda",
             "--cuda-no-kv-offload is valid only with --role cuda")
-    require(role not in ("fullcpu", "fullcpu-cost-only") or (info.get("cpu_only") is True and integer(info, "cycle_sim") == 0),
-            "FullCPU requires CPU-only CYCLE_SIM=0 artifact")
-    require(role != "potal" or (integer(info, "cycle_sim") == 1 and info.get("backend") == "IM2P_SIM" and
-                               info.get("hp1") is True), "PoTal requires CPU-functional CYCLE_SIM=1 HP1 artifact")
+    require(role not in ("fullcpu", "fullcpu-cost-only") or (info.get("cpu_only") is True),
+            "FullCPU requires CPU-only artifact")
     require(role == "cuda" or integer(info, "log_cycle") == 1, "FullCPU/PoTal sources require existing CPU cycle log")
     require(role != "cuda" or (info.get("cuda_evaluation_supported") is True and integer(info, "cuda") == 1
-                              and integer(info, "cycle_sim") == 0), "CUDA native runner capability unavailable")
+                             ), "CUDA native runner capability unavailable")
     require(role != "cuda" or (integer(info, "log_cycle") == 0 and integer(info, "ggml_cpu_cycle_log") == 0),
             "direct CUDA application timing requires instrumentation-OFF artifact")
     require((role == "fullcpu-cost-only") == (args.paired_potal is not None),
@@ -82,15 +80,6 @@ def collect_runs(args: argparse.Namespace) -> None:
                            "build_info": info, "host": host, "settings": settings}
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    native_build = None
-    if role != "cuda":
-        require(args.im2p is not None, "FullCPU/PoTal collection requires --im2p for official native provenance")
-        sys.path.insert(0, str(args.im2p.resolve(strict=True)))
-        from sim.cycle.collection_native import prepare_native_build
-        native_build = prepare_native_build(binary.parent.parent, output)
-        require(compiled_info(binary) == info, "native rebuild changed requested role/metric configuration")
-        before = artifact_snapshot(binary)
-        identities["artifacts"] = before
     write_json(output / "request.json", identities)
     results: list[Record] = []
     comparison_fields = {"model": identities["model_sha256"],
@@ -119,10 +108,6 @@ def collect_runs(args: argparse.Namespace) -> None:
             command.extend(("--gpu-layers", "-1"))
             if cuda_no_kv_offload:
                 command.append("--no-kv-offload")
-        native_collection = None
-        if native_build is not None:
-            from sim.cycle.collection_native import start_native_collection
-            native_collection = start_native_collection(native_build, destination, tuple(command))
         host_before = host_facts()
         require(host_before["host_id"] == host["host_id"], "host identity changed before measurement")
         write_json(destination / "host-before.json", host_before)
@@ -132,11 +117,10 @@ def collect_runs(args: argparse.Namespace) -> None:
             host_after = host_facts()
             write_json(destination / "host-after.json", host_after)
         require(host_after["host_id"] == host["host_id"], "host identity changed during measurement")
-        provenance = None
         require(before == artifact_snapshot(binary), "native artifacts changed between actual repetitions")
         application = list(records(destination / "native/application.jsonl"))
         require(len(application) == 1, "one mapped prompt required per repetition")
-        require(application[0].get("source_role") == {"fullcpu": "full_cpu", "fullcpu-cost-only": "full_cpu", "potal": "potal_collection", "cuda": "cuda"}[role],
+        require(application[0].get("source_role") == {"fullcpu": "full_cpu", "fullcpu-cost-only": "full_cpu", "cuda": "cuda"}[role],
                 "native application source role mismatch")
         if role == "fullcpu-cost-only":
             from paired_inputs import forced_result
@@ -164,9 +148,6 @@ def collect_runs(args: argparse.Namespace) -> None:
                 integer(record(chunks[0]), "token_offset") == repetition * 256,
                 "native prompt/chunk mapping mismatch")
         require(len(prompt) == 256, "E2E prompt must contain exactly 256 native token IDs")
-        if native_collection is not None:
-            from sim.cycle.collection_native import finish_native_collection
-            provenance = finish_native_collection(native_collection)
         result: Record = {"schema": "potal-e2e-run", "version": 1, "repetition": repetition,
             "measurement_id": str(uuid.uuid4()), "role": role, "host_id": host["host_id"],
             "chunk_id": repetition,
@@ -176,7 +157,6 @@ def collect_runs(args: argparse.Namespace) -> None:
             "generated_tokens_sha256": measured["generated_tokens_sha256"],
             "application_sha256": sha256(destination / "native/application.jsonl"),
             "application_services": sampling,
-            "collection_provenance": None if provenance is None else {"path": str(provenance), "sha256": sha256(provenance)},
             "host_observations": {"before_sha256": sha256(destination / "host-before.json"),
                                   "after_sha256": sha256(destination / "host-after.json")},
             "workload_sha256": sha256(destination / "native/workload.json"),

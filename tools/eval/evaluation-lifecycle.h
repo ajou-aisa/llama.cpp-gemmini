@@ -1,9 +1,6 @@
 #pragma once
 
 #include "../../common/json.hpp"
-#if CYCLE_SIM
-#include <gemmini/cycle_sim_log.hpp>
-#endif
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -127,52 +124,6 @@ public:
         ++owner_count_;
         emit("PIPELINE_OWNER", std::move(fields));
     }
-#if CYCLE_SIM
-    void pipeline_session(ggml::gemmini::cycle_sim::Session &target) {
-        require(pipeline_, "pipeline session in non-pipeline lifecycle");
-        for (const auto &parent : target.producer_parents()) {
-            const auto &g = parent.geometry;
-            nlohmann::json residual_bindings = nlohmann::json::array();
-            for (const auto &binding : parent.residual_bindings)
-                residual_bindings.push_back({{"work_id", binding.work_id},
-                    {"call_id", binding.call_id}, {"child_parent_id", binding.child_parent_id},
-                    {"dense_work_id", binding.dense_work_id},
-                    {"dense_parent_id", binding.dense_parent_id},
-                    {"stripe_id", binding.stripe_id}, {"row_begin", binding.row_begin},
-                    {"row_end", binding.row_end}, {"source_row_begin", binding.source_row_begin},
-                    {"source_row_count", binding.source_row_count}});
-            pipeline_parent({{"phase_id", parent.phase_id},
-                {"operation_id", parent.operation_id}, {"parent_id", parent.parent_id},
-                {"required_work_ids", parent.work_ids}, {"fence_call_id", parent.fence_call_id},
-                {"fence_required_work_ids", parent.fence_required_work_ids},
-                {"residual_bindings", std::move(residual_bindings)},
-                {"production_geometry_version", g.version},
-                {"scope", "STREAM"}, {"activation_bits", g.activation_bits},
-                {"weight_bits", g.weight_bits}, {"dim", g.dim}, {"parent_m", g.m},
-                {"n", g.n}, {"k", g.k}, {"tile_i_count", g.tile_i_count},
-                {"tile_j_count", g.tile_j_count}, {"tile_k_count", g.tile_k_count}});
-        }
-        for (const auto &record : target.producer_events()) {
-            require(record.parent_id && record.work_id, "pipeline producer identity incomplete");
-            const auto [resource, transition] = producer_label(record.event.kind);
-            pipeline_owner({{"producer_sequence", record.sequence},
-                {"phase_id", record.phase_id}, {"operation_id", record.operation_id},
-                {"parent_id", *record.parent_id}, {"work_id", *record.work_id},
-                {"producer_run_id", record.event.run_id}, {"stripe_id", record.event.stripe_id},
-                {"workspace_slot", *record.event.workspace_slot}, {"target_npu_slot", nullptr},
-                {"row_begin", record.event.row_begin}, {"row_end", record.event.row_end},
-                {"resource", resource}, {"transition", transition},
-                {"rmd_packet", record.event.rmd_packet}, {"direct_residual", record.event.direct_residual},
-                {"required_work_ids", record.required_work_ids},
-                {"required_call_ids", record.required_call_ids},
-                {"observed_call_id", record.event.call_id
-                    ? nlohmann::json(*record.event.call_id) : nlohmann::json()},
-                {"source_owner", record.event.source_location.rfind("frontend/", 0) == 0
-                    ? "IM2P.sim" : "llama.cpp-gemmini"},
-                {"source_location", record.event.source_location}});
-        }
-    }
-#endif
     const std::vector<nlohmann::json> & finish(bool success, uint64_t graphs) {
         require(!active_ && !finished_ && graphs == graphs_, "finish while dispatch incomplete");
         require(!success || (tokens_ == expected_ && phase_count_ == tokens_ &&
@@ -187,27 +138,6 @@ public:
         return events_;
     }
 private:
-#if CYCLE_SIM
-    static std::pair<const char *, const char *> producer_label(
-            ggml::gemmini::cycle_sim::ProducerEventKind kind) {
-        using Kind = ggml::gemmini::cycle_sim::ProducerEventKind;
-        switch (kind) {
-        case Kind::ExsiaWorkspaceAcquire: return {"EXSIA_WORKSPACE", "ACQUIRE"};
-        case Kind::ActivationRowsCommit: return {"ACTIVATION_ROWS", "COMMIT"};
-        case Kind::ResidualPacketSeal: return {"RESIDUAL_PAYLOAD", "SEAL"};
-        case Kind::FrontendCapacityAcquire: return {"FRONTEND_OUTSTANDING", "ACQUIRE"};
-        case Kind::FrontendQueueEnqueue: return {"FRONTEND_QUEUE", "ENQUEUE"};
-        case Kind::FrontendQueueDequeue: return {"FRONTEND_QUEUE", "DEQUEUE"};
-        case Kind::StreamWorkAccepted: return {"CPU_FUNCTIONAL_STREAM", "ACCEPTED"};
-        case Kind::StreamWorkCompleted: return {"CPU_FUNCTIONAL_STREAM", "COMPLETED"};
-        case Kind::ResidualHostMergeCompleted: return {"RESIDUAL_MERGE_CALL", "COMPLETE"};
-        case Kind::ResidualCallbackCompleted: return {"RESIDUAL_CALLBACK", "COMPLETE"};
-        case Kind::FrontendCapacityRelease: return {"FRONTEND_OUTSTANDING", "RELEASE"};
-        case Kind::ExsiaWorkspaceRelease: return {"EXSIA_WORKSPACE", "RELEASE"};
-        }
-        throw std::runtime_error("unknown producer event");
-    }
-#endif
     void require_token(uint64_t index) const {
         require(!active_ && !finished_ && index == tokens_ && phase_count_ == tokens_ + 1 &&
             graphs_ > phase_graph_begin_, "token completion outside completed phase");

@@ -46,8 +46,7 @@ class CsvRow(TypedDict):
 
 
 COLUMNS: Final = tuple(CsvRow.__annotations__)
-NPU_TYPES: Final = frozenset({"IM2P_EXECUTION_TELEMETRY", "IM2P_STRIPE_TELEMETRY",
-    "IM2P_RMD_EXECUTION_TELEMETRY", "IM2P_RMD_STRIPE_TELEMETRY", "WS_LOOP_TELEMETRY"})
+NPU_TYPES: Final = frozenset({"WS_LOOP_TELEMETRY"})
 WORKLOAD_TYPES: Final = frozenset({"EXSIA_WORKLOAD", "RMD_STRIPE_TELEMETRY",
     "RMD_BACKEND_TELEMETRY", "QUANTIZATION_STRIPE_TELEMETRY", "MATMUL_CONFIGURATION", "INFERENCE_CONFIGURATION"})
 META: Final = frozenset({"schema", "version", "record_type", "execution_id", "inference_context",

@@ -1,5 +1,5 @@
-#include <gemmini/semantic.hpp>
-#include <gemmini/cpu_log_context.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/semantic.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cpu_log_context.hpp"
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
@@ -7,7 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 
-namespace semantic = ggml::gemmini::semantic;
+namespace semantic = ggml::npu::semantic;
 template<class Action> void rejected(Action action) {
     bool failed = false;
     try { action(); } catch (const std::runtime_error &) { failed = true; }
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
         {
             semantic::ScopedNode scope(&second, 3);
             assert(semantic::current_context()->identity.node_ordinal == 1);
-            assert(ggml::gemmini::log::current_cpu_correlation().worker_count == 3);
+            assert(ggml::npu::log::current_cpu_correlation().worker_count == 3);
         }
         assert(!semantic::current_context());
         session->execution(&first, run ? "CPU-split-a" : "CPU-combined", "ORDINARY_CPU", true);

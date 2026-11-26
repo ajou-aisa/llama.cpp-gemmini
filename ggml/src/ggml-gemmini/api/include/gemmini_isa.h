@@ -1,0 +1,132 @@
+/*
+ * Gemmini RoCC ISA constants.
+ *
+ * Values follow the Gemmini RTL used by the lab (gemmini-aisa
+ * aisa-customizations, GemminiISA.scala / LocalAddr.scala / CounterFile.scala)
+ * and the field layout of the SDK macros the backend issued before Phase 1
+ * (gemmini.h, RISC-V-DynDNN-gemmini-include develop fcfcf5ce). See
+ * docs/socmulator/isa-contract.md for the per-command contract.
+ *
+ * Only commands the llama.cpp backend issues are exposed. LOOP_CONV_WS and its
+ * configs exist in the RTL but have no encoder here.
+ */
+#ifndef GEMMINI_ISA_H
+#define GEMMINI_ISA_H
+
+/* RoCC custom-3 major opcode (0x7b); the SDK's XCUSTOM_ACC. */
+#define GEMMINI_XCUSTOM 3
+#define GEMMINI_OPCODE  0x7bu
+
+/* funct7 values (GemminiISA.scala). */
+#define GEMMINI_FUNCT_CONFIG                   0
+#define GEMMINI_FUNCT_MVIN2                    1
+#define GEMMINI_FUNCT_MVIN                     2
+#define GEMMINI_FUNCT_MVOUT                    3
+#define GEMMINI_FUNCT_COMPUTE_PRELOADED        4
+#define GEMMINI_FUNCT_COMPUTE_ACCUMULATE       5
+#define GEMMINI_FUNCT_PRELOAD                  6
+#define GEMMINI_FUNCT_FLUSH                    7
+#define GEMMINI_FUNCT_LOOP_WS                  8
+#define GEMMINI_FUNCT_LOOP_WS_CONFIG_BOUNDS    9
+#define GEMMINI_FUNCT_LOOP_WS_CONFIG_ADDRS_AB  10
+#define GEMMINI_FUNCT_LOOP_WS_CONFIG_ADDRS_DC  11
+#define GEMMINI_FUNCT_LOOP_WS_CONFIG_STRIDES_AB 12
+#define GEMMINI_FUNCT_LOOP_WS_CONFIG_STRIDES_DC 13
+#define GEMMINI_FUNCT_MVIN3                    14
+#define GEMMINI_FUNCT_COUNTER                  126
+
+/* CONFIG rs1[1:0] sub-command. */
+#define GEMMINI_CONFIG_EX   0
+#define GEMMINI_CONFIG_LD   1
+#define GEMMINI_CONFIG_ST   2
+#define GEMMINI_CONFIG_NORM 3
+
+#define GEMMINI_DATAFLOW_OS 0
+#define GEMMINI_DATAFLOW_WS 1
+
+#define GEMMINI_ACT_NONE      0
+#define GEMMINI_ACT_RELU      1
+#define GEMMINI_ACT_LAYERNORM 2
+#define GEMMINI_ACT_IGELU     3
+#define GEMMINI_ACT_SOFTMAX   4
+
+/* rs operand packing: {rows[63:48], cols[47:32], local address[31:0]}. */
+#define GEMMINI_ADDR_LEN       32
+#define GEMMINI_COLS_SHIFT     GEMMINI_ADDR_LEN
+#define GEMMINI_ROWS_SHIFT     (GEMMINI_ADDR_LEN + 16)
+#define GEMMINI_ROWS_COLS_MAX  0xffffu
+
+/* Local address (LocalAddr.scala). */
+#define GEMMINI_LOCAL_ACC          0x80000000u /* bit 31: accumulator */
+#define GEMMINI_LOCAL_ACCUMULATE   0x40000000u /* bit 30: add into ACC */
+#define GEMMINI_LOCAL_READ_FULL    0x20000000u /* bit 29: full-width ACC read */
+#define GEMMINI_LOCAL_GARBAGE      0xffffffffu /* no operand */
+
+/* COUNTER rs1 layout (CounterFile.scala). */
+#define GEMMINI_COUNTER_RESET           0x1u
+#define GEMMINI_COUNTER_SNAPSHOT_RESET  0x2u
+#define GEMMINI_COUNTER_SNAPSHOT_TAKE   0x4u
+#define GEMMINI_COUNTER_CONFIGURE       0x8u
+#define GEMMINI_COUNTER_INDEX_SHIFT     4
+#define GEMMINI_COUNTER_INDEX_MASK      0x7u
+#define GEMMINI_COUNTER_EVENT_SHIFT     12
+#define GEMMINI_COUNTER_EVENT_MASK      0x3fu
+#define GEMMINI_COUNTER_EXTERNAL_BIT    31
+#define GEMMINI_COUNTER_SLOTS           8u
+
+/* Counter events (gemmini_counter.h; CounterFile.scala CounterEvent). */
+#define GEMMINI_COUNTER_INCREMENTAL_EVENTS 44
+#define GEMMINI_EVENT_DISABLE                    0
+#define GEMMINI_EVENT_MAIN_LD_CYCLES             1
+#define GEMMINI_EVENT_MAIN_ST_CYCLES             2
+#define GEMMINI_EVENT_MAIN_EX_CYCLES             3
+#define GEMMINI_EVENT_MAIN_LD_ST_CYCLES          4
+#define GEMMINI_EVENT_MAIN_LD_EX_CYCLES          5
+#define GEMMINI_EVENT_MAIN_ST_EX_CYCLES          6
+#define GEMMINI_EVENT_MAIN_LD_ST_EX_CYCLES       7
+#define GEMMINI_EVENT_LOAD_DMA_WAIT_CYCLE        8
+#define GEMMINI_EVENT_LOAD_ACTIVE_CYCLE          9
+#define GEMMINI_EVENT_LOAD_SCRATCHPAD_WAIT_CYCLE 10
+#define GEMMINI_EVENT_STORE_DMA_WAIT_CYCLE       11
+#define GEMMINI_EVENT_STORE_ACTIVE_CYCLE         12
+#define GEMMINI_EVENT_STORE_POOLING_CYCLE        13
+#define GEMMINI_EVENT_STORE_SCRATCHPAD_WAIT_CYCLE 14
+#define GEMMINI_EVENT_DMA_TLB_MISS_CYCLE         15
+#define GEMMINI_EVENT_DMA_TLB_HIT_REQ            16
+#define GEMMINI_EVENT_DMA_TLB_TOTAL_REQ          17
+#define GEMMINI_EVENT_RDMA_ACTIVE_CYCLE          18
+#define GEMMINI_EVENT_RDMA_TLB_WAIT_CYCLES       19
+#define GEMMINI_EVENT_RDMA_TL_WAIT_CYCLES        20
+#define GEMMINI_EVENT_WDMA_ACTIVE_CYCLE          21
+#define GEMMINI_EVENT_WDMA_TLB_WAIT_CYCLES       22
+#define GEMMINI_EVENT_WDMA_TL_WAIT_CYCLES        23
+#define GEMMINI_EVENT_EXE_ACTIVE_CYCLE           24
+#define GEMMINI_EVENT_EXE_FLUSH_CYCLE            25
+#define GEMMINI_EVENT_EXE_CONTROL_Q_BLOCK_CYCLE  26
+#define GEMMINI_EVENT_EXE_PRELOAD_HAZ_CYCLE      27
+#define GEMMINI_EVENT_EXE_OVERLAP_HAZ_CYCLE      28
+#define GEMMINI_EVENT_SCRATCHPAD_A_WAIT_CYCLE    29
+#define GEMMINI_EVENT_SCRATCHPAD_B_WAIT_CYCLE    30
+#define GEMMINI_EVENT_SCRATCHPAD_D_WAIT_CYCLE    31
+#define GEMMINI_EVENT_ACC_A_WAIT_CYCLE           32
+#define GEMMINI_EVENT_ACC_B_WAIT_CYCLE           33
+#define GEMMINI_EVENT_ACC_D_WAIT_CYCLE           34
+#define GEMMINI_EVENT_A_GARBAGE_CYCLES           35
+#define GEMMINI_EVENT_B_GARBAGE_CYCLES           36
+#define GEMMINI_EVENT_D_GARBAGE_CYCLES           37
+#define GEMMINI_EVENT_IM2COL_MEM_CYCLES          38
+#define GEMMINI_EVENT_IM2COL_ACTIVE_CYCLES       39
+#define GEMMINI_EVENT_IM2COL_TRANSPOSER_WAIT_CYCLE 40
+#define GEMMINI_EVENT_RESERVATION_STATION_FULL_CYCLES   41
+#define GEMMINI_EVENT_RESERVATION_STATION_ACTIVE_CYCLES 42
+#define GEMMINI_EVENT_LOOP_MATMUL_ACTIVE_CYCLES  43
+#define GEMMINI_EVENT_TRANSPOSE_PRELOAD_UNROLLER_ACTIVE_CYCLES 44
+#define GEMMINI_EVENT_RESERVATION_STATION_LD_COUNT (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 1)
+#define GEMMINI_EVENT_RESERVATION_STATION_ST_COUNT (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 2)
+#define GEMMINI_EVENT_RESERVATION_STATION_EX_COUNT (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 3)
+#define GEMMINI_EVENT_RDMA_BYTES_REC             (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 4)
+#define GEMMINI_EVENT_WDMA_BYTES_SENT            (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 5)
+#define GEMMINI_EVENT_RDMA_TOTAL_LATENCY         (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 6)
+#define GEMMINI_EVENT_WDMA_TOTAL_LATENCY         (GEMMINI_COUNTER_INCREMENTAL_EVENTS + 7)
+
+#endif /* GEMMINI_ISA_H */

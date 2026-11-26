@@ -1,5 +1,5 @@
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-bitmap-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 struct Event { size_t row, k; int32_t value; };
 struct Input { std::string name; size_t rows, k; std::vector<Event> events; };
 void require(bool condition, const std::string &message) {

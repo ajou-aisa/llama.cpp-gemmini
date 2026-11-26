@@ -5,8 +5,8 @@
 #include "ggml.h"
 #include "matmul/dense.hpp"
 #include "matmul/paired-auto.hpp"
-#include "quants/act/exsia/types.hpp"
-#include "residual/rmd/rmd-builder.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -26,7 +26,7 @@
 
 using namespace ggml::potal;
 namespace gold = w4a4_golden;
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 
 namespace {
 
@@ -65,9 +65,9 @@ struct fixture {
                     std::ldexp(float(int((3 * n + 5 * k) % 15) - 7), int(k / 32 % 4) - 4);
         ggml_quantize_chunk(GGML_TYPE_MXINT4, values.data(), w->data, 0, N, K, nullptr);
         require(potal_frozen_plan(M, N, K, 1, 2, 4, 1, &main) == POTAL_OK, "frozen Main");
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         require(init_args(w, y, {M, N, K}, "qwen2", "index-payload",
-                    ggml::gemmini::residual::ResidualRoute::ws_packet, main, args) &&
+                    ggml::npu::residual::ResidualRoute::ws_packet, main, args) &&
                 weight.allocate(N, K) && prepare_weight(args, weight) == quants::weight::hp1::status::ok,
                 "real MXINT4 preparation");
         std::string why;
@@ -280,7 +280,7 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
     rmd::BlockScaledInt64Correction correction;
     require(residual::reconstruct_rows(*f.packet, f.decoded.rows, cr.get(), LD, N, correction) ==
                 rmd::RmdStatus::success && correction.values == f.correction_golden, "INT64 reconstruction");
-    ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot metadata;
+    ggml::npu::quants::act::exsia::StripeMetadataSnapshot metadata;
     metadata.theta = -3;
     std::vector<float> out(M * N, 123.0f);
     size_t nonzero = 0;

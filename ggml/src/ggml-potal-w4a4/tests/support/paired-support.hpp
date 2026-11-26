@@ -7,7 +7,7 @@
 //                    layout), and Main A8 codes M x K
 //   packets          sealed RMD packets per stripe (RmdStripeBuilder)
 //   A  golden        independent of every production lowering: Main by
-//                    DIM K passes with the emulator's SCU/Sat32 (RTL test
+//                    NPU_D K passes with the emulator's SCU/Sat32 (RTL test
 //                    double), Residual / INT64 / legacy merge by
 //                    support/stripe-golden.hpp, INT64 merge by its formula
 //   B  serialized    the existing path: potal_tiled_matmul_auto (Main) and
@@ -27,8 +27,8 @@
 #include "support/potal-emulator.hpp"
 #include "support/stripe-golden.hpp"
 
-#include "quants/act/exsia/exsia-event.hpp"
-#include "residual/rmd/rmd-builder.hpp"
+#include "../../../ggml-npu-common/quantization/activation/exsia/exsia-event.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -123,9 +123,9 @@ struct paired_fixture {
         }
         gp::hp1_shape           s = { (int64_t) M, (int64_t) N, (int64_t) K };
         gp::potal_tile_plan     plan;
-        ggml_gemmini_args_t     args;
+        npu_matmul_args     args;
         ok = a != nullptr && gp::potal_tile_select(M, N, K, 32 / PD, &plan) == POTAL_OK &&
-             gp::init_args(w, y, s, "gpt2", "paired-test", ggml::gemmini::residual::ResidualRoute::ws_packet, plan,
+             gp::init_args(w, y, s, "gpt2", "paired-test", ggml::npu::residual::ResidualRoute::ws_packet, plan,
                            args) &&
              weight.allocate((int64_t) N, (int64_t) K) &&
              gp::prepare_weight(args, weight) == gp::quants::weight::hp1::status::ok;
@@ -369,7 +369,7 @@ inline serialized_result serialized_of(const paired_fixture & f, size_t stripe_r
             gp::reconstruct_row(r.main_c.data() + m * f.N, f.N, act, f.weight.scale, r.legacy.data() + m * f.N, 1);
         }
         if (in.packets[s] != nullptr) {
-            ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot snap;
+            ggml::npu::quants::act::exsia::StripeMetadataSnapshot snap;
             snap.theta = in.theta[s];
             grmd::BlockScaledInt64Correction corr;
             corr.values = r.correction[s];

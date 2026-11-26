@@ -3,7 +3,7 @@
 
 namespace ggml::potal {
 potal_status e4c1_tile_select(size_t, size_t, size_t, uint32_t, potal_tile_plan *);
-pipeline_report e4c1_run_pipeline(const ggml_tensor *, ggml_gemmini_args_t &, const hp1_weight &,
+pipeline_report e4c1_run_pipeline(const ggml_tensor *, npu_matmul_args &, const hp1_weight &,
                                  const potal_tile_plan &, const pipeline_config &, stripe_owner &);
 }
 

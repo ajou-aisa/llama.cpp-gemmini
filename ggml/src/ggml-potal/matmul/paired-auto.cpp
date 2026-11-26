@@ -10,7 +10,7 @@
 #include "planning-profile.hpp"
 #endif
 
-#include "quants/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -3107,7 +3107,7 @@ struct executor {
         }
         ++window_fences;
 
-        namespace hp1ref = ggml::gemmini::quants::hp1;
+        namespace hp1ref = ggml::npu::quants::hp1;
         const residual::decoded_packet & d = *req.residual;
         const potal_paired_k_panel & pan = report.tile.panels[op.panel];
         const potal_paired_index_window & win = pan.windows[op.window];

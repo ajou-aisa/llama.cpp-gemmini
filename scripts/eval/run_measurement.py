@@ -4,21 +4,7 @@
 # dependencies = []
 # ///
 # How to run: python3 scripts/eval/run_measurement.py describe
-"""Canonical entry point of the PoTal measurement interface: performance, timeline, metric.
-
-  run_measurement.py performance [options]                 TTFT/TPOT, CPU-NPU timing (+ --timeline compact)
-  run_measurement.py timeline --from-run RUN [options]     export view of a completed run's stored schedule
-  run_measurement.py metric activation|residual|scu [...]  activation / residual / SCU metrics
-  run_measurement.py metric all [...]                      the three metrics over models x precisions x DIMs,
-                                                           aggregated (orchestration, not a fourth metric)
-
-  run_measurement.py identity RUN [RUN ...]                shared model/configuration identity of finished runs
-  run_measurement.py describe [--json | --markdown SECTION | --update-readme]
-
-This file only selects the delegate script and a default output directory; every option after the domain is passed
-through unchanged (`run_measurement.py performance --help` shows the delegate's options). All logic stays in
-run_cycle_evaluation.py (performance, timeline), campaign.py (metric) and metric_sweep.py (metric all).
-"""
+"""Metric measurement entry point: metric activation|residual|scu|all, identity, describe."""
 from __future__ import annotations
 
 import json
@@ -66,13 +52,6 @@ def present(arguments: list[str], name: str) -> bool:
 
 def default_output(command: tuple[str, ...], arguments: list[str], stamp: str) -> Path:
     precision, dim = option(arguments, "--precision", "a8w8"), option(arguments, "--dim", "32")
-    if command == ("performance",):
-        model = Path(option(arguments, "--model", "model") or "model").stem
-        suffix = "-smoke" if present(arguments, "--smoke") else ""
-        return Path("runs/performance") / f"{stamp}-{model}-{precision}-d{dim}-hp1{suffix}"
-    if command == ("timeline",):
-        source = Path(option(arguments, "--from-run", "run") or "run").name
-        return Path("runs/timeline") / f"{stamp}-{source}"
     if command == ("metric", METRIC_ALL):
         return Path("runs/metrics") / f"sweep-{stamp}"
     model = option(arguments, "--model", "model")
@@ -82,20 +61,17 @@ def default_output(command: tuple[str, ...], arguments: list[str], stamp: str) -
 def delegate(argv: list[str], stamp: str | None = None) -> tuple[Path, list[str]]:
     """(delegate script, its argument list) for `run_measurement.py ARGV`; no logic beyond the selection."""
     if not argv or argv[0] not in DOMAINS:
-        raise UsageError("choose a domain: performance, timeline, metric activation|residual|scu|all "
+        raise UsageError("choose a domain: metric activation|residual|scu|all "
                          "(or identity, describe)")
     if argv[0] == "metric":
         if len(argv) < 2 or argv[1] not in (*METRIC_KINDS, METRIC_ALL):
-            raise UsageError("metric requires one of: " + ", ".join((*METRIC_KINDS, METRIC_ALL)) +
-                             " (the legacy cycle replay adapter is `campaign.py cycle`)")
+            raise UsageError("metric requires one of: " + ", ".join((*METRIC_KINDS, METRIC_ALL)))
         command, rest = (argv[0], argv[1]), argv[2:]
     else:
         command, rest = (argv[0],), argv[1:]
     chosen = [name for name in MODE_OPTIONS if present(rest, name)]
     if chosen:
         raise UsageError(f"{' '.join(command)} selects the mode; remove {', '.join(chosen)}")
-    if command == ("timeline",) and not present(rest, "--from-run") and not present(rest, "--help") and "-h" not in rest:
-        raise UsageError("timeline requires --from-run COMPLETED_PERFORMANCE_RUN")
     script, *fixed = (SWEEP,) if command == ("metric", METRIC_ALL) else measurement(command)[1].delegate
     arguments = [*fixed, *rest]
     # Help and dry runs write nothing; a resumed sweep writes into its recorded directory.

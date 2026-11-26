@@ -63,8 +63,8 @@ struct weight_lookup {
     const hp1_weight *          weight  = nullptr;    // valid while the entry (or `transient`) lives
     std::unique_ptr<hp1_weight> transient;            // owner of a bypass/uncached weight
     quants::weight::hp1::status status  = quants::weight::hp1::status::ok;
-    ggml::gemmini::quants::wreader::WeightReaderStatus reader =
-        ggml::gemmini::quants::wreader::WeightReaderStatus::Success;
+    ggml::npu::quants::wreader::WeightReaderStatus reader =
+        ggml::npu::quants::wreader::WeightReaderStatus::Success;
     bool   alloc_failed = false;
     double alloc_s      = 0; // zeroed buffer allocation (not hit)
     double prepare_s    = 0; // prepare_weight(): validation + unpacking (not hit)
@@ -76,7 +76,7 @@ class weight_cache {
     explicit weight_cache(size_t budget_bytes); // 0 disables caching
 
     // The prepared operands of src0 (args: init_args of this MUL_MAT).
-    weight_lookup get(const ggml_tensor * src0, const ggml_gemmini_args_t & args);
+    weight_lookup get(const ggml_tensor * src0, const npu_matmul_args & args);
 
     // Initialization only, before this backend's first graph_compute. No inference
     // counters or transient success. Only an unset environment budget may grow;

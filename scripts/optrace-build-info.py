@@ -10,21 +10,26 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 SOURCE_SUFFIXES = {'.c','.cpp','.cc','.cxx','.h','.hpp','.inc','.rs','.scala',
                    '.sbt','.py','.cmake','.sh','.toml','.json','.bsv','.v','.sv'}
 ROOT_FILES = {'CMakeLists.txt','Makefile','Cargo.lock','Cargo.toml','build.sbt'}
 PREFIXES = {
     'llama.cpp-gemmini': ('src/','common/','ggml/','tools/main/','cmake/','scripts/'),
-    'IM2P.sim': ('src/','sim/','frontend/','config/','scripts/','fpga/gemmini_hp1/host/'),
-    'headers': ('include/','quants/'),
+    'headers': ('api/','legacy/','matmul/','quants/','residual/'),
 }
 EXCLUDED_PARTS = {'node_modules','__pycache__','target','models','.cache','.venv','.git'}
 
 def identity(root: Path, name: str) -> tuple[str,str,dict[str,str]]:
-    head = subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()
-    paths = subprocess.check_output(['git','-C',str(root),'ls-files','-co','--exclude-standard','-z'])
+    commit = subprocess.run(['git','-C',str(root),'rev-parse','HEAD'], capture_output=True, text=True, check=False)
+    head = commit.stdout.strip() if commit.returncode == 0 else ''
+    listed = subprocess.run(['git','-C',str(root),'ls-files','-co','--exclude-standard','-z'], capture_output=True, check=False)
+    if listed.returncode == 0:
+        paths = listed.stdout
+    else:
+        candidates = [p for prefix in PREFIXES[name] for p in (root / prefix).rglob('*')]
+        candidates.extend(p for p in root.iterdir() if p.is_file())
+        paths = b'\0'.join(str(p.relative_to(root)).encode() for p in candidates if p.is_file())
     hashes: dict[str,str] = {}
     for raw in sorted(set(paths.split(b'\0'))):
         if not raw:
@@ -58,46 +63,49 @@ def write_changed(path: Path, content: str) -> None:
 
 
 def main() -> None:
-    parser=argparse.ArgumentParser(description=__doc__)
-    for name in ('llama','sim','headers','out'):
-        parser.add_argument('--'+name,type=Path,required=True)
-    parser.add_argument('--runtime-manifest', type=Path, required=True)
-    parser.add_argument('--bits',type=int,choices=(4,8),required=True)
-    parser.add_argument('--dim',type=int,choices=(16,32,64),required=True)
-    parser.add_argument('--mode',choices=('FULL','STRIPE_PIPELINE'),required=True)
-    parser.add_argument('--rmd',choices=('ON','OFF'),required=True)
-    parser.add_argument('--rmd-backend',choices=('CPU','WS'),required=True)
-    a=parser.parse_args()
-    sys.path.insert(0, str(a.sim.resolve()))
-    from scripts.gemmini_replay_contract import runtime_binding
-    hardware, runtime = runtime_binding(a.runtime_manifest.resolve(), f'a{a.bits}w{a.bits}-d{a.dim}-hp1')
-    commits={};digests={};inputs={}
-    roots = {'llama.cpp-gemmini': a.llama.resolve(), 'IM2P.sim': a.sim.resolve(),
-             'headers': a.headers.resolve()}
-    for name,root in roots.items():
-        commits[name],digests[name],inputs[name]=identity(root,name)
-    values={'source_commits':commits,'source_worktree_sha256':digests,
-            'source_roots': {name: str(root) for name, root in roots.items()},
-            'profile':f'a{a.bits}w{a.bits}-d{a.dim}-hp1',
-            'mode':a.mode,'rmd':a.rmd,'rmd_backend':a.rmd_backend,
-            'hardware_contract': hardware, 'runtime_artifact': runtime,
-            'input_files_sha256':inputs}
-    lines=['#pragma once', '#include <gemmini/optrace.hpp>',
-           'namespace ggml::gemmini::optrace {',
-           'inline void fill_compiled_optrace_info(RunInfo &r) {',
-           f'  r.activation_bits = r.weight_bits = {a.bits}; r.dim = {a.dim};',
-           f'  r.profile = {json.dumps(values["profile"])};',
-           f'  r.hardware_contract_sha256 = {json.dumps(hardware["sha256"])};',
-           f'  r.runtime_manifest_sha256 = {json.dumps(runtime["manifest_sha256"])};',
-           '  r.backend = "IM2P_SIM/GEMMINI_HP1";',
-           f'  r.mode = "{a.mode};RMD={a.rmd};RMD_BACKEND={a.rmd_backend}";',
-           f'  r.residual_enabled = {"true" if a.rmd=="ON" and a.rmd_backend=="WS" else "false"};']
-    for field,entries in (('source_commits',commits),('source_worktree_sha256',digests)):
-        for key,value in sorted(entries.items()):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('llama', 'headers', 'out', 'cache'):
+        parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--backend', required=True)
+    parser.add_argument('--bits', type=int, required=True)
+    parser.add_argument('--dim', type=int, required=True)
+    parser.add_argument('--mode', choices=('FULL', 'STRIPE_PIPELINE'), required=True)
+    parser.add_argument('--rmd', choices=('ON', 'OFF'), required=True)
+    a = parser.parse_args()
+    commits, digests, sources = {}, {}, {}
+    for name, root in (('llama.cpp-gemmini', a.llama), ('headers', a.headers)):
+        head, digest, hashes = identity(root.resolve(), name)
+        commits[name], digests[name], sources[name] = head, digest, hashes
+    configuration = {}
+    for line in a.cache.read_text().splitlines():
+        if not line or line.startswith(('#', '//')) or '=' not in line or ':' not in line.split('=', 1)[0]:
+            continue
+        key, value = line.split('=', 1)
+        key = key.split(':', 1)[0]
+        if key.startswith(('GGML_', 'NPU_', 'LOG_', 'CYCLE_DETAIL')):
+            configuration[key] = value
+    encoded = json.dumps(configuration, sort_keys=True, separators=(',', ':')).encode()
+    hardware = {key: value for key, value in configuration.items() if key.startswith('NPU_')}
+    values = dict(profile=f'a{a.bits}w{a.bits}-d{a.dim}-hp1', activation_bits=a.bits,
+                  weight_bits=a.bits, dim=a.dim, backend=a.backend, mode=a.mode,
+                  residual_enabled=a.rmd == 'ON', source_commits=commits,
+                  source_worktree_sha256=digests,
+                  hardware_contract_sha256=hashlib.sha256(json.dumps(hardware, sort_keys=True).encode()).hexdigest(),
+                  runtime_manifest_sha256=hashlib.sha256(encoded).hexdigest())
+    lines = ['#pragma once', '#include <npu/optrace.hpp>',
+             'namespace ggml::npu::optrace {',
+             'inline void fill_compiled_optrace_info(RunInfo &r) {']
+    for key, value in values.items():
+        if not isinstance(value, dict):
+            lines.append(f'  r.{key} = {json.dumps(value)};')
+    for field, entries in (('source_commits', commits), ('source_worktree_sha256', digests)):
+        for key, value in sorted(entries.items()):
             lines.append(f'  r.{field}[{json.dumps(key)}] = {json.dumps(value)};')
-    lines.extend(['}', '} // namespace ggml::gemmini::optrace',''])
-    write_changed(a.out/'source-identities.json',json.dumps(values,indent=2,sort_keys=True)+'\n')
-    write_changed(a.out/'optrace-build-config.hpp','\n'.join(lines))
+    lines.extend(['}', '} // namespace ggml::npu::optrace', ''])
+    manifest = {**values, 'configuration': configuration, 'source_files': sources,
+                'identity_kind': 'native-build-configuration; empty commit means VCS unavailable'}
+    write_changed(a.out / 'source-identities.json', json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    write_changed(a.out / 'optrace-build-config.hpp', '\n'.join(lines))
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()

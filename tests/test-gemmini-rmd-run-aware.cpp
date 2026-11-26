@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-run-aware.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 
@@ -76,15 +76,15 @@ int main() {
     }
 
 #if GGML_GEMMINI_WEIGHT_BITS == 4
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.weight_format = ggml_gemmini_args_t::weight_format_t::q4_hp1;
     args.q4_hp1_blocks = source.data();
 #elif GGML_GEMMINI_WEIGHT_BITS == 8
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks = source.data();
     args.q8_hp1_block_count = source.size();
     args.q8_hp1_blocks_per_row = kBlocksPerRow;
 #else
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    args.weight_format = ggml_gemmini_args_t::weight_format_t::q16_hp1;
     args.q16_hp1_blocks = source.data();
 #endif
     args.native_block_count = source.size();
