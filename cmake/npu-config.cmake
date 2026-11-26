@@ -148,8 +148,14 @@ endif()
 npu_require_one_of(_npu_arch NONE GEMMINI POTAL)
 set(GGML_NPU "${_npu_arch}")
 
+if(GGML_NPU STREQUAL "GEMMINI" AND NPU_PRECISION STREQUAL "FP32")
+    if(NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h" OR
+       NOT EXISTS "${GEMMINI_SW_PATH}/gemmini_params.h")
+        message(FATAL_ERROR "FP32 baseline requires -DGEMMINI_SW_PATH=<FP32 DIM8 SDK overlay> with gemmini.h and gemmini_params.h; presets use GEMMINI_FP32_SDK. No overlay is supplied by this repository.")
+    endif()
+endif()
 if(DEFINED GEMMINI_SW_PATH AND NOT GEMMINI_SW_PATH STREQUAL "" AND
-   NOT GGML_GEMMINI_FP32)
+   NOT GGML_GEMMINI_FP32 AND NOT (GGML_NPU STREQUAL "GEMMINI" AND NPU_PRECISION STREQUAL "FP32"))
     message(FATAL_ERROR "NPU: GEMMINI_SW_PATH is no longer used: the Gemmini API is internal "
                         "(ggml/src/ggml-gemmini/api). Remove it and pass NPU_* or a CMake preset; "
                         "only the FP32 overlay still reads an external SDK.")
@@ -254,6 +260,10 @@ if(GGML_NPU STREQUAL "GEMMINI")
         # PB always lowers K blocks through the WS tiler. REFERENCE selects
         # its command-functional transport, not the generic CPU kernel.
         npu_derive_legacy(GGML_GEMMINI_OPTION WS STRING)
+    elseif(NPU_PRECISION STREQUAL "FP32")
+        # FP32 REFERENCE decodes the overlay's WS commands in its own model.
+        npu_derive_legacy(GGML_GEMMINI_PB OFF BOOL)
+        npu_derive_legacy(GGML_GEMMINI_OPTION WS STRING)
     elseif(NPU_TRANSPORT STREQUAL "REFERENCE")
         npu_derive_legacy(GGML_GEMMINI_PB OFF BOOL)
         npu_derive_legacy(GGML_GEMMINI_OPTION CPU STRING)
@@ -269,10 +279,10 @@ endif()
 if(GGML_NPU STREQUAL "GEMMINI")
     npu_require_one_of(NPU_PRECISION INT8 INT16 FP32)
     if(NPU_PRECISION STREQUAL "FP32")
-        # Legacy FP32 DIM8 experiment: its own SDK overlay (GEMMINI_SW_PATH)
+        # Independent FP32 DIM8 baseline: its own SDK overlay (GEMMINI_SW_PATH)
         # defines the hardware; no header is generated here.
         if(NOT NPU_D EQUAL 8)
-            message(FATAL_ERROR "NPU: Gemmini FP32 is the DIM8 experiment lane; NPU_D must be 8")
+            message(FATAL_ERROR "NPU: Gemmini FP32 is the DIM8 comparison baseline; NPU_D must be 8")
         endif()
         npu_derive_legacy(GGML_GEMMINI_FP32 ON BOOL)
     elseif(GGML_GEMMINI_FP32)

@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-source /home/alveo/miniforge3/etc/profile.d/conda.sh
-cd /home/alveo/firesim/target-design/chipyard
-source env.sh
-conda activate /home/alveo/firesim/.conda-env
 set -euo pipefail
-L=/home/alveo/firesim/target-design/chipyard/generators/potal/software/workspace/llama.cpp-potal
-O=/media/alveo/LaCie/fp32-5c-d8/sw
+L=$(cd "$(dirname "$0")/../../../../.." && pwd)
+O=${FP32_OUTPUT_DIR:?Set FP32_OUTPUT_DIR to the evaluation output directory}
 mkdir -p "$O/options"
 base=(-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
       -DLLAMA_CURL=OFF -DGGML_OPENMP=OFF -DGGML_GEMMINI_ENABLE_OPENMP=OFF)

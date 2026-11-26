@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from array import array
 from math import isfinite, sqrt
+from os import environ
 from pathlib import Path
 from typing import Final
 
-OUTPUT: Final = Path("/media/alveo/LaCie/fp32-5c-d8/sw")
+OUTPUT: Final = Path(environ["FP32_OUTPUT_DIR"])
 VOCAB: Final = 151936
 
 

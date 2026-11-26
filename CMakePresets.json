@@ -76,6 +76,22 @@
             "NPU_INDEX_ENTRIES": "64", "NPU_SCALE_ENTRIES": "256", "NPU_DMA_MAX_BYTES": "64"
         }
     },
+    {
+        "name": "npu-gemmini-fp32-d8", "hidden": true,
+        "description": "Independent FP32 comparison baseline; requires an explicit DIM8 SDK overlay and its memory geometry",
+        "cacheVariables": {
+            "GGML_NPU": "GEMMINI", "NPU_PRECISION": "FP32", "NPU_D": "8",
+            "GGML_GEMMINI_FP32": "ON", "GEMMINI_SW_PATH": "$env{GEMMINI_FP32_SDK}",
+            "NPU_SPAD_BANKS": "$env{FP32_SPAD_BANKS}", "NPU_SPAD_BANK_ROWS": "$env{FP32_SPAD_BANK_ROWS}",
+            "NPU_ACC_BANKS": "$env{FP32_ACC_BANKS}", "NPU_ACC_ROWS": "$env{FP32_ACC_ROWS}",
+            "NPU_DMA_MAX_BYTES": "64", "GGML_GEMMINI_PB": "OFF",
+            "GGML_GEMMINI_COMPUTE_TYPE": "FLOAT", "GGML_GEMMINI_OPTION": "WS",
+            "GGML_GEMMINI_ENABLE_RMD": "OFF", "GGML_GEMMINI_ENABLE_A4NKS_ATTENTION": "OFF",
+            "GGML_OPENMP": "OFF", "GGML_GEMMINI_ENABLE_OPENMP": "OFF"
+        }
+    },
+    { "name": "gemmini-fp32-d8-reference", "inherits": [ "base", "release", "npu-gemmini-fp32-d8", "npu-reference" ] },
+    { "name": "gemmini-fp32-d8-rocc", "inherits": [ "base", "release", "npu-gemmini-fp32-d8", "npu-rocc" ] },
     { "name": "npu-reference", "hidden": true, "cacheVariables": { "NPU_TRANSPORT": "REFERENCE", "LLAMA_BUILD_TESTS": "ON" } },
     {
         "name": "npu-rocc", "hidden": true,
