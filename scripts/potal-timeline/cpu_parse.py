@@ -66,8 +66,11 @@ def load(path: Path) -> list[Sample]:
 
 
 def delta(begin: Sample, end: Sample) -> tuple[int | float | str, ...]:
+    if (begin.mono_ns == 0) != (end.mono_ns == 0):
+        raise TraceError(f"mixed monotonic boundary availability: {begin.key}")
     if end.mono_ns < begin.mono_ns:
         raise TraceError(f"wall counter regression: {begin.key}")
+    wall: int | str = end.mono_ns - begin.mono_ns if begin.mono_ns != 0 else ""
     thread: int | str = ""
     process: int | str = ""
     if begin.thread_valid and end.thread_valid:
@@ -91,7 +94,7 @@ def delta(begin: Sample, end: Sample) -> tuple[int | float | str, ...]:
                 cycles = end.cycles - begin.cycles
                 instructions = end.instructions - begin.instructions
                 ipc = instructions / cycles if cycles else ""
-    return (*begin.key, end.mono_ns - begin.mono_ns, thread, process, cycles, instructions,
+    return (*begin.key, wall, thread, process, cycles, instructions,
             ipc, status, begin.source)
 
 

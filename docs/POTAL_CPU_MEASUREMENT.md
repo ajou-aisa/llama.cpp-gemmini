@@ -25,8 +25,11 @@ export GEMMINI_LOG_DIR=/absolute/output
 
 Create the output directory first. Preserve the normal five-role CPU mapping.
 The runtime does not change affinity on behalf of the application. `coarse`
-avoids detailed RoCC issue-window tracing; CPU clock sampling also excludes
-accelerator command spans. Increase `POTAL_TIMELINE_EVENTS`,
+avoids detailed RoCC issue-window tracing. Existing BEGIN/END events in
+stages 26-49, except reconstruction/merge stages 42/43, use CSR-only
+cycle/instruction samples: no OS clock or scheduling calls are added there.
+These sidecar rows have `mono_ns=0` and invalid thread/process clocks; the
+parser leaves their wall/CPU-time columns blank, not zero. Increase `POTAL_TIMELINE_EVENTS`,
 `POTAL_TIMELINE_ISSUER_EVENTS` and `POTAL_TIMELINE_ANCHORS` if the trace reports
 overflow. The sidecar reserves additional memory per event slot.
 
@@ -100,10 +103,26 @@ without changing execution.
 On RV64, enable the sidecar only when the target OS permits user-mode
 `rdcycle` and `rdinstret`. Counters are read only for workers whose registration
 verified single-CPU affinity. Endpoint CPU IDs must match the assigned CPU.
+When CPU sampling is enabled, caller registration discovers an existing
+single-CPU affinity instead of treating every caller as unpinned. It does
+not set affinity; a caller allowed on multiple CPUs still has unavailable
+hart counters. CSR-only samples use the CPU verified at registration.
 Do not change a worker's affinity during a run. These are **raw hart counters**,
 not per-thread PMU counters: interrupts and context switches can contribute,
 and Rocket WFI behavior makes them unsuitable as an elapsed-time clock.
 Keep CLOCK_MONOTONIC and thread CPU time alongside them.
+Use enclosing clocked spans and the main timeline for command-window time
+placement. CSR-only rows do not measure accelerator-internal MAC, DMA or
+busy/idle cycles, and the coarse profile still omits detailed command events.
+
+Both `ggml-potal` and the `GGML_POTAL_W4A4` fork use the same CPU sample
+helper, shutdown serializers and CPU regression checks. Run each backend's
+`potal-timeline-test`: the CPU case verifies caller pin discovery and
+BEGIN/END sidecar rows for stages 26, 28, 29, 33, 39 and 44, in addition
+to the existing clocked attention reconstruction stages. Binary/CSV parity
+alone does not establish counter coverage. Host tests check placement, row
+coverage and missing-clock handling; they do not validate RV64 CSR values
+or instrumentation overhead on FPGA.
 
 On ARM/x86 the sidecar reports CPU clocks but marks cycle/instruction counters
 unavailable. It never substitutes nanoseconds or the ARM generic timer for CPU

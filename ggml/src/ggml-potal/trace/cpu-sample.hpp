@@ -40,9 +40,23 @@ inline uint64_t clock_ns(clockid_t clock, bool & valid) noexcept {
     return valid ? uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec) : 0;
 }
 
-inline cpu_sample sample_cpu(int pinned_cpu, bool model_boundary) noexcept {
+// Command windows must not call the OS. Placement was verified at registration;
+// the caller must keep that affinity unchanged for the lifetime of the ring.
+inline cpu_sample sample_cpu_counters(int pinned_cpu) noexcept {
     cpu_sample out;
+    out.cpu = pinned_cpu;
+#if defined(__riscv) && __riscv_xlen == 64
+    if (pinned_cpu >= 0) {
+        __asm__ volatile("rdcycle %0\n\trdinstret %1" : "=r"(out.cycles), "=r"(out.instructions) : : "memory");
+        out.counters_valid = true;
+    }
+#endif
+    return out;
+}
+
+inline cpu_sample sample_cpu(int pinned_cpu, bool model_boundary) noexcept {
     const int before = sched_getcpu();
+    cpu_sample out;
     out.thread_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID, out.thread_valid);
     if (model_boundary) {
         rusage usage{};
@@ -54,13 +68,10 @@ inline cpu_sample sample_cpu(int pinned_cpu, bool model_boundary) noexcept {
     }
     bool mono_valid;
     out.mono_ns = clock_ns(CLOCK_MONOTONIC, mono_valid);
-#if defined(__riscv) && __riscv_xlen == 64
-    // Only opt-in, verified single-CPU threads read CSRs. The OS must grant U-mode access.
-    if (pinned_cpu >= 0 && before == pinned_cpu) {
-        __asm__ volatile("rdcycle %0\n\trdinstret %1" : "=r"(out.cycles), "=r"(out.instructions) : : "memory");
-        out.counters_valid = true;
-    }
-#endif
+    const auto counters = sample_cpu_counters(before == pinned_cpu ? pinned_cpu : -1);
+    out.cycles = counters.cycles;
+    out.instructions = counters.instructions;
+    out.counters_valid = counters.counters_valid;
     out.cpu = sched_getcpu();
     out.counters_valid = out.counters_valid && mono_valid && out.cpu == before && out.cpu == pinned_cpu;
     return out;

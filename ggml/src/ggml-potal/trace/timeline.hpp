@@ -319,13 +319,16 @@ inline void record_mono(stage st, event ev, uint8_t status, uint32_t run_id, uin
         e.reserved = 0;
     }
     // Never insert clock syscalls inside accelerator command windows.
-    if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end) &&
-        !(static_cast<uint16_t>(st) >= 26 && static_cast<uint16_t>(st) <= 49 &&
-          st != stage::final_reconstruct_int64 && st != stage::final_dequant_merge)) {
+    if (r->cpu_samples != nullptr && (ev == event::begin || ev == event::end)) {
         auto & sample = r->cpu_samples[h];
-        sample = sample_cpu(r->pinned_cpu, st == stage::model_inference ||
-                            st == stage::model_prefill || st == stage::model_decode);
-        e.reserved = sample.mono_ns;
+        if (static_cast<uint16_t>(st) >= 26 && static_cast<uint16_t>(st) <= 49 &&
+            st != stage::final_reconstruct_int64 && st != stage::final_dequant_merge) {
+            sample = sample_cpu_counters(r->pinned_cpu);
+        } else {
+            sample = sample_cpu(r->pinned_cpu, st == stage::model_inference ||
+                                st == stage::model_prefill || st == stage::model_decode);
+            e.reserved = sample.mono_ns;
+        }
     }
     r->head.store(h + 1, std::memory_order_relaxed);
 }

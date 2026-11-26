@@ -78,11 +78,14 @@ def transcode(stream: BinaryIO, output: TextIO, cpu: TextIO | None) -> int:
         previous = start - 1
         for parts in CPU.iter_unpack(exact(stream, sampled * CPU.size)):
             sample = Sample(*parts)
-            if not previous < sample.seq < start + count or sample.seq < start or sample.flags & ~7 or sample.reserved or not sample.mono:
+            if not previous < sample.seq < start + count or sample.seq < start or sample.flags & ~7 or sample.reserved:
                 raise FormatError("invalid CPU sample identity or flags")
+            event = events[sample.seq - start]
+            if not sample.mono and (sample.flags & 3 or event.kind not in (1, 2)):
+                raise FormatError("zero-mono CPU sample must be a boundary without valid CPU clocks")
             if cpu is None:
                 raise FormatError("unexpected CPU payload")
-            cpu.write(sample.csv(events[sample.seq - start], config["counter_source"]))
+            cpu.write(sample.csv(event, config["counter_source"]))
             previous = sample.seq
         if exact(stream, 1) != b"\n":
             raise FormatError("missing block terminator")

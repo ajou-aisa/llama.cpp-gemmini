@@ -142,8 +142,9 @@ bool flush() noexcept {
             const auto & ring = s.threads[i]->ring;
             for (uint32_t j = 0; j < ring.head.load(std::memory_order_relaxed); ++j) {
                 const auto & sample = ring.cpu_samples[j];
-                if (sample.mono_ns == 0) continue;
                 const auto & e = ring.events[j];
+                if (e.event_type != static_cast<uint8_t>(event::begin) &&
+                    e.event_type != static_cast<uint8_t>(event::end)) continue;
                 std::fprintf(cpu, "%u,%u,%u,%u,%u,%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%" PRIu64 ",%" PRIu64 ",%d,%d,%d,%s\n",
                     i, j, e.stage, e.event_type, e.run_id, e.layer_id, e.stripe_id, e.tile_id,
                     sample.mono_ns, sample.thread_ns, sample.process_ns, sample.cpu, sample.cycles,

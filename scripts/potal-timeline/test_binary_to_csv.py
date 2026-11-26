@@ -15,10 +15,52 @@ from typing import BinaryIO, Final, TextIO
 import pytest
 
 import binary_to_csv
-from binary_format import FormatError
+from binary_format import CPU, CPU_HEADER, EVENT, FormatError
 from binary_to_csv import convert, transcode
 
 ROOT: Final = Path(__file__).resolve().parents[2]
+
+
+def binary_cpu_trace(*, mono: int = 0, flags: int = 4,
+                     source: str = "riscv_hart_csr", kind: int = 1) -> bytes:
+    return (b"# potal_timeline_binary v1\n"
+            + f"#BINARY,endian=little,event_bytes=64,cpu_bytes=56,cpu=1,counter_source={source}\n".encode()
+            + b"# potal_timeline v1\n"
+            + b"T,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0\n"
+            + b"#EVENT,t_local\n#BLOCK,slot=0,events=1,samples=1\n"
+            + EVENT.pack(100, 0, 0, 15, kind, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0)
+            + CPU.pack(mono, 0, 0, 40, 80, 0, 3, flags, 0)
+            + b"\n#END,events=1\n")
+
+
+@pytest.mark.parametrize("kind", [1, 2])
+@pytest.mark.parametrize("flags,source", [(0, "unavailable"), (0, "riscv_hart_csr"), (4, "riscv_hart_csr")])
+def test_preserves_zero_mono_csr_boundaries(kind: int, flags: int, source: str) -> None:
+    output, cpu = io.StringIO(), io.StringIO()
+    assert transcode(io.BytesIO(binary_cpu_trace(kind=kind, flags=flags, source=source)), output, cpu) == 1
+    assert cpu.getvalue() == (CPU_HEADER
+                             + f"0,0,15,{kind},1,2,3,4,0,0,0,3,40,80,0,0,{flags >> 2},{source}\n")
+    assert output.getvalue().endswith("#END,events=1\n")
+
+
+@pytest.mark.parametrize("flags,source,kind", [
+    (1, "riscv_hart_csr", 1),
+    (2, "riscv_hart_csr", 2),
+    (7, "riscv_hart_csr", 1),
+    (8, "unavailable", 1),
+    (4, "riscv_hart_csr", 3),
+])
+def test_rejects_zero_mono_samples_outside_csr_boundaries(flags: int, source: str, kind: int) -> None:
+    with pytest.raises(FormatError):
+        transcode(io.BytesIO(binary_cpu_trace(flags=flags, source=source, kind=kind)),
+                  io.StringIO(), io.StringIO())
+
+
+def test_preserves_regular_cpu_sample_with_valid_clocks() -> None:
+    output, cpu = io.StringIO(), io.StringIO()
+    assert transcode(io.BytesIO(binary_cpu_trace(mono=100, flags=7)), output, cpu) == 1
+    assert cpu.getvalue() == (CPU_HEADER
+                             + "0,0,15,1,1,2,3,4,100,0,0,3,40,80,1,1,1,riscv_hart_csr\n")
 
 
 @pytest.fixture(scope="module", params=["ggml-potal", "ggml-potal-w4a4"])

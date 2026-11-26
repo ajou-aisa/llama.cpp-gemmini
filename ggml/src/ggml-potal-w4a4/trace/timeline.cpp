@@ -467,6 +467,12 @@ uint16_t register_thread(role r, int hart_id, int cpu_id) noexcept {
     if (t_info != nullptr) {
         return t_info->ring.slot;
     }
+    // All caller entry points pass -1. Discover an existing single-CPU pin
+    // without changing affinity, so the opt-in CPU sidecar can read its CSRs.
+    if (detail::g_cpu && r == role::caller && cpu_id < 0) {
+        const int actual = sched_getcpu();
+        if (pinned_to_cpu(actual)) cpu_id = actual;
+    }
     state & s = st();
     if (s.reuse) {
         // An exited thread of the same role and placement hands its slot over: the ring,

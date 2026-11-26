@@ -20,6 +20,28 @@ def test_hart_counters_have_their_own_units() -> None:
     assert row[6:13] == (100, 50, "", 40, 80, 2.0, "valid_hart_counts")
 
 
+@pytest.mark.parametrize("counters_valid", [True, False])
+def test_csr_only_spans_leave_wall_and_cpu_times_missing(counters_valid: bool) -> None:
+    samples = [replace(sample(event), mono_ns=0, thread_valid=False, process_valid=False,
+                       counters_valid=counters_valid) for event in (1, 2)]
+    row = paired(samples)[0]
+    assert row[6:9] == ("", "", "")
+    assert row[9:13] == ((40, 80, 2.0, "valid_hart_counts") if counters_valid else
+                        ("", "", "", "unavailable_or_unpinned"))
+    assert row[13] == "riscv_hart_csr"
+
+
+@pytest.mark.parametrize("begin_mono,end_mono", [(0, 200), (100, 0)])
+def test_mixed_monotonic_boundaries_are_rejected(begin_mono: int, end_mono: int) -> None:
+    with pytest.raises(TraceError, match="mixed monotonic"):
+        paired([replace(sample(1), mono_ns=begin_mono),
+                replace(sample(2), mono_ns=end_mono)])
+
+
+def test_equal_nonzero_monotonic_boundaries_retain_zero_wall_time() -> None:
+    assert paired([sample(1), replace(sample(2), mono_ns=100)])[0][6] == 0
+
+
 @pytest.mark.parametrize("end", [replace(sample(2), cpu=4), replace(sample(2), counters_valid=False),
                                 replace(sample(2), cycles=1), replace(sample(2), source="unavailable")])
 def test_untrusted_counters_are_missing_not_zero(end: Sample) -> None:
