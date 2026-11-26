@@ -1,9 +1,9 @@
 #include "attention-stationary.hpp"
-#include "ggml-gemmini-matmul-config.hpp"
-#include "../quants/act/exsia/local.hpp"
-#include "../quants/common/hp1_scu.hpp"
-#include "../quants/common/math.hpp"
-#include "../residual/rmd/rmd-types.hpp"
+#include "npu-matmul-config.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/local.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <algorithm>
 #include <cfenv>

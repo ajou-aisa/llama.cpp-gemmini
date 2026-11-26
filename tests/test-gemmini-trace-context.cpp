@@ -1,8 +1,8 @@
-#include <gemmini/trace-context.hpp>
-#include <gemmini/host-timing.hpp>
-#include <gemmini/log.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/trace-context.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/host-timing.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
 #include "../common/json.hpp"
-#include "../ggml/src/ggml-gemmini-utils/src/trace-metadata.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/src/trace-metadata.hpp"
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-using namespace ggml::gemmini;
+using namespace ggml::npu;
 using Json = nlohmann::json;
 namespace {
 bool check(bool condition, const char * message) {
@@ -224,20 +224,20 @@ bool test_uniform_device_metadata() {
         context,
         61));
     const auto   npu = Json::parse(trace::append_metadata(
-        R"({"schema":"gemmini.cycle","version":2,"record_type":"NPU_OPERATOR_SEGMENT","op":"rmd.matmul.execute","backend":"im2p_sim","clock_domain":"independent_rmd_simulator","cycles":0,"valid":true})",
+        R"({"schema":"gemmini.cycle","version":2,"record_type":"NPU_OPERATOR_SEGMENT","op":"rmd.matmul.execute","backend":"gemmini_ws","clock_domain":"gemmini_hw_counter","cycles":0,"valid":true})",
         context,
         62));
     const auto & a   = cpu["operator_context"];
     const auto & b   = npu["operator_context"];
 #if EXPECT_CYCLE_DETAIL
     if (!check(a["operator_kind"] == b["operator_kind"] && a["role"] == b["role"] &&
-                   a["device"] == "cpu" && b["device"] == "npu" && b["backend"] == "im2p_sim" &&
+                   a["device"] == "cpu" && b["device"] == "npu" && b["backend"] == "gemmini_ws" &&
                    npu["cycles"] == 0 && npu["valid"] == true,
                "detail metadata carries uniform device attribution"))
         return false;
 #else
     if (!check(a["operator_kind"] == b["operator_kind"] && a["role"] == b["role"] &&
-                   !a.contains("device") && !b.contains("device") && npu["backend"] == "im2p_sim" &&
+                   !a.contains("device") && !b.contains("device") && npu["backend"] == "gemmini_ws" &&
                    npu["cycles"] == 0 && npu["valid"] == true,
                "compact metadata avoids duplicating device/backend fields"))
         return false;

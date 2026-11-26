@@ -1,17 +1,20 @@
+#include "../ggml-gemmini-geometry.hpp"
 #include "attention.hpp"
+#if defined(GGML_GEMMINI_PB)
+#include "../pb/pb-attention.hpp"
+#endif
 #include "../potal-sensitivity.hpp"
 
-#include "ggml-gemmini-matmul-config.hpp"
+#include "npu-matmul-config.hpp"
 #include "../ggml-gemmini-geometry.hpp"
-#include "../quants/act/exsia/local.hpp"
-#include "../quants/act/exsia/exsia_shift.hpp"
-#include "../quants/common/hp1_scu.hpp"
-#include "../quants/common/math.hpp"
-#include "../residual/rmd/rmd-bitmap-builder.hpp"
-#include "../residual/rmd/rmd-im2p-executor.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/local.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia_shift.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-bitmap-builder.hpp"
 #include "../residual/rmd/rmd-run-aware.hpp"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 #endif
 
 #include <algorithm>
@@ -27,6 +30,29 @@
 #include <stdexcept>
 
 namespace ggml::gemmini {
+#if defined(GGML_GEMMINI_PB)
+namespace {
+uint64_t pb_completed_qk = 0, pb_completed_pv = 0;
+}
+bool attention_supported(const ggml_tensor * op) {
+    return pb::attention_supported(op);
+}
+uint64_t attention_completed_nodes(ggml_gemmini_attention_role role) {
+    return role == GGML_GEMMINI_ATTENTION_QK ? pb_completed_qk : pb_completed_pv;
+}
+int attention_anchor() { return 0; }
+const char * attention_execution_backend() { return "gemmini_pb"; }
+rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, AttentionCache *) {
+    const auto status = pb::execute_attention(op);
+    if (status != pb::Status::success)
+        return status == pb::Status::allocation_failure ? rmd::RmdStatus::allocation_failure :
+                                                        rmd::RmdStatus::invalid_arguments;
+    const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
+    ++(qk ? metrics.qk_nodes : metrics.pv_nodes);
+    ++(qk ? pb_completed_qk : pb_completed_pv);
+    return rmd::RmdStatus::success;
+}
+#else
 #if GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
 namespace {
 using rmd::RmdStatus;
@@ -209,7 +235,7 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
     auto & scratch = workspace ? *workspace : *local_workspace;
     scratch.selected.assign((rows*kp+63)/64, UINT64_MAX);
     auto & builder = scratch.builder;
-    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp);
+    builder.reset(begin, begin, rows, k, n, pe_bits, scratch.selected, kp, workspace != nullptr);
     require(builder.status() == RmdStatus::success, builder.status());
     for (size_t i = 0; i < rows; ++i) {
         for (size_t c = 0; c < k; ++c) {
@@ -299,24 +325,9 @@ std::vector<QkRegion> qk_regions(const QkMask & mask, size_t begin, size_t rows,
 }
 
 struct ScuGemm {
-    rmd::detail::Im2pProviderStatsAggregate aggregate;
     const char * layer;
-#if GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
-    std::unique_ptr<im2p_sim_t, decltype(&im2p_sim_destroy)> sim{nullptr, im2p_sim_destroy};
-#endif
     explicit ScuGemm(const char * name) : layer(name) {
-#if GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
-        require(im2p_sim_implementation() && std::strcmp(im2p_sim_implementation(), "gemmini-hp1-integrated-v1") == 0 &&
-                im2p_sim_abi_version() == IM2P_ABI_VERSION && im2p_sim_dim() == 32 &&
-                im2p_sim_activation_bits() == pe_bits && im2p_sim_weight_bits() == pe_bits &&
-                im2p_sim_activation_storage_bytes() == 1 && im2p_sim_weight_storage_bytes() == 1 &&
-                im2p_compiled_accumulator_rows() == 512,
-                RmdStatus::unsupported_route);
-        sim.reset(im2p_sim_create());
-        require(bool(sim), RmdStatus::execution_failed);
-#endif
     }
-#if !GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
     static void software(const int8_t * a, size_t rows, size_t stride, const int32_t * w,
                          size_t n, size_t k, size_t stationary_stride, const uint32_t * carriers,
                          std::vector<int64_t> & out, const std::vector<rmd::RunAwareRun> * runs = nullptr) {
@@ -343,7 +354,6 @@ struct ScuGemm {
                 out[i*n+j] = acc;
             }
     }
-#endif
     static void cuda_dot(const int8_t * a, size_t rows, size_t stride, const Stationary & w,
                          size_t pass, const QkRegion & region, std::vector<int64_t> & out,
                          const std::vector<rmd::RunAwareRun> * runs = nullptr) {
@@ -379,30 +389,6 @@ struct ScuGemm {
     }
     void run(const StreamStripe & st, const Stationary & w, size_t pass,
              const QkRegion & region, size_t begin, std::vector<int64_t> & out) {
-#if GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
-        rmd::detail::Im2pCompactDot dot;
-        dot.operand_bits = pe_bits;
-        dot.activations = st.main.data()+region.row*st.kp;
-        dot.rows = region.rows;
-        dot.activation_row_stride_bytes = st.kp;
-        dot.weights = w.codes[pass].data()+region.column;
-        dot.columns = region.columns;
-        dot.weight_row_stride = w.packed_columns();
-        dot.k = w.k;
-        dot.scu_carriers = w.carriers.data()+region.column;
-        dot.scu_row_stride = w.packed_columns();
-        dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
-        dot.trace_role = GEMMINI_TRACE_ROLE_DENSE;
-        dot.timing_identity.interval.layer = layer;
-        dot.timing_identity.identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
-        dot.timing_identity.stripe_id = begin;
-        dot.stripe_id = begin;
-        dot.source_row_begin = begin+region.row;
-        dot.source_row_count = region.rows;
-        dot.column_offset = region.column;
-        const auto status = rmd::detail::execute_im2p_compact_dot(sim.get(), dot, out, aggregate);
-        require(status == RmdStatus::success, status);
-#else
         (void)begin;
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (ggml_cuda_potal_attention_enabled()) {
@@ -412,26 +398,9 @@ struct ScuGemm {
 #endif
         software(st.main.data()+region.row*st.kp, region.rows, st.kp, w.codes[pass].data()+region.column,
                  region.columns, w.k, w.packed_columns(), w.carriers.data()+region.column, out);
-#endif
     }
     void run(const rmd::RunAwareRequest & request, const Stationary & w, size_t pass,
              const QkRegion & region, std::vector<int64_t> & out) {
-#if GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION
-        rmd::detail::Im2pRunAwareWork work;
-        work.request = &request;
-        work.original_weights = &w.codes[pass];
-        work.original_carriers = &w.carriers;
-        work.original_stride = w.packed_columns();
-        work.row_begin = region.row;
-        work.row_count = region.rows;
-        work.column_begin = region.column;
-        work.column_count = region.columns;
-        work.timing_identity.interval.layer = layer;
-        work.timing_identity.identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
-        work.timing_identity.stripe_id = request.stripe_id;
-        const auto status = rmd::detail::execute_im2p_run_aware(sim.get(), work, out, aggregate);
-        require(status == RmdStatus::success, status);
-#else
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (ggml_cuda_potal_attention_enabled()) {
             cuda_dot(request.activations.data()+region.row*request.k, region.rows, request.k,
@@ -442,7 +411,6 @@ struct ScuGemm {
         software(request.activations.data()+region.row*request.k, region.rows, request.k,
                  w.codes[pass].data()+region.column, region.columns, request.k, w.packed_columns(),
                  w.carriers.data()+region.column, out, &request.runs);
-#endif
     }
 };
 
@@ -608,8 +576,6 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics, A
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }
             }
-        const auto stats_status = rmd::checked_accumulate_provider_stats(pending.provider, scu.aggregate.stats);
-        require(stats_status == RmdStatus::success, stats_status);
         ++(qk ? pending.qk_nodes : pending.pv_nodes);
         std::memcpy(op->data, staged.data(), staged.size()*sizeof(float));
         metrics = pending;
@@ -647,4 +613,5 @@ rmd::RmdStatus attention_execute(ggml_tensor *, AttentionMetrics &, AttentionCac
     return rmd::RmdStatus::unsupported_route;
 }
 #endif
+#endif // GGML_GEMMINI_PB
 } // namespace ggml::gemmini

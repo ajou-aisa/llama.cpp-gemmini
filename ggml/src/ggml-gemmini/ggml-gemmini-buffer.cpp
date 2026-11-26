@@ -3,10 +3,17 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#include "../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-hp1-scu.h"
 #endif
 #if defined(GGML_GEMMINI_CUDA_RTN) || defined(GGML_GEMMINI_CUDA_RTN_ATTENTION)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
+#endif
+
+#if defined(GGML_GEMMINI_PB)
+#include "pb/pb-exec.hpp"
+#endif
+#if defined(GGML_GEMMINI_FP32)
+#include "fp32/exec.hpp"
 #endif
 
 #include <atomic>
@@ -68,6 +75,12 @@ void gemmini_buffer_free(ggml_backend_buffer_t buffer) {
 
     // Host addresses may be reused while the backend remains alive.
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+#if defined(GGML_GEMMINI_PB)
+        ggml::gemmini::pb::reset_validated_weights();
+#endif
+#if defined(GGML_GEMMINI_FP32)
+        ggml::gemmini::fp32::reset_weights();
+#endif
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         ggml_cuda_hp1_scu_clear_weights();
 #endif
@@ -82,6 +95,10 @@ void gemmini_buffer_free(ggml_backend_buffer_t buffer) {
 void gemmini_buffer_memset_tensor(
     ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     std::memset(static_cast<char *>(tensor->data) + offset, value, size);
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
+#endif
     GGML_UNUSED(buffer);
 }
 
@@ -91,6 +108,14 @@ void gemmini_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                size_t                offset,
                                size_t                size) {
     std::memcpy(static_cast<char *>(tensor->data) + offset, data, size);
+#if defined(GGML_GEMMINI_PB)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::pb::reset_validated_weights();
+#endif
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
+#endif
     GGML_UNUSED(buffer);
 }
 
@@ -108,6 +133,10 @@ bool gemmini_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                ggml_tensor *         destination) {
     if (ggml_backend_buffer_is_host(source->buffer)) {
         std::memcpy(destination->data, source->data, ggml_nbytes(source));
+#if defined(GGML_GEMMINI_FP32)
+        if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+            ggml::gemmini::fp32::reset_weights();
+#endif
         return true;
     }
     GGML_UNUSED(buffer);
@@ -118,6 +147,14 @@ void gemmini_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     buffer_context * context = get_buffer_context(buffer);
     GGML_ASSERT(context != nullptr);
     std::memset(context->state->data, value, context->state->size);
+#if defined(GGML_GEMMINI_PB)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::pb::reset_validated_weights();
+#endif
+#if defined(GGML_GEMMINI_FP32)
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        ggml::gemmini::fp32::reset_weights();
+#endif
 }
 
 const ggml_backend_buffer_i gemmini_buffer_i = {

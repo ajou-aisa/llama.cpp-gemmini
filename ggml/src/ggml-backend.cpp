@@ -22,11 +22,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#if LOG_CYCLE || CYCLE_SIM
-#include <gemmini/semantic.hpp>
-#endif
-#if CYCLE_SIM
-#include <gemmini/cycle_sim_log.hpp>
+#if LOG_CYCLE
+#include "ggml-npu-common/profiling/include/npu/semantic.hpp"
 #endif
 
 #ifdef __APPLE__
@@ -337,8 +334,8 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 }
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-#if LOG_CYCLE || CYCLE_SIM
-    namespace semantic = ggml::gemmini::semantic;
+#if LOG_CYCLE
+    namespace semantic = ggml::npu::semantic;
     const auto semantic_session = semantic::active_session();
     const std::string backend_name = ggml_backend_name(backend);
     const bool cpu_execution = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ||
@@ -348,59 +345,14 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
         if (!semantic_session) return;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const auto *node = cgraph->nodes[i];
-            std::string kind = cpu_execution ? "ORDINARY_CPU" : "UNSUPPORTED";
-#if CYCLE_SIM
-            if (std::find(selected_npu_nodes.begin(), selected_npu_nodes.end(), node) != selected_npu_nodes.end())
-                kind = "TARGET_NPU";
-            else if (backend_name == "GEMMINI") kind = "ORDINARY_CPU";
-#endif
+            // POTAL computes its nodes on the accelerator (view nodes are excluded by the graph capture).
+            std::string kind = cpu_execution ? "ORDINARY_CPU" : backend_name == "POTAL" ? "TARGET_NPU" : "UNSUPPORTED";
             semantic_session->execution(node, backend_name, kind, status == GGML_STATUS_SUCCESS);
         }
     };
 #endif
-#if CYCLE_SIM
-    namespace sim = ggml::gemmini::cycle_sim;
-    const auto phase = sim::current_context();
-    if (phase) {
-        try {
-            std::vector<sim::Context> operations;
-            std::vector<const ggml_tensor *> operation_nodes;
-            for (int i = 0; i < cgraph->n_nodes; ++i) {
-                const auto *node = cgraph->nodes[i];
-                if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) continue;
-                sim::Operation operation;
-                operation.layer = node->name;
-                operation.operation = ggml_op_name(node->op);
-                operation.actual_backend = ggml_backend_name(backend);
-                operation.activation_type = ggml_type_name(node->src[1]->type);
-                operation.weight_type = ggml_type_name(node->src[0]->type);
-                operation.m = static_cast<uint64_t>(ggml_nrows(node->src[1]));
-                operation.n = static_cast<uint64_t>(node->src[0]->ne[1]);
-                operation.k = static_cast<uint64_t>(node->src[0]->ne[0]);
-                operation.target_eligible = phase.session->target_eligible(node);
-                operation.semantic_context = semantic::context_for(node);
-                operations.push_back(phase.session->register_operation(node, operation, phase));
-                operation_nodes.push_back(node);
-            }
-            const auto status = backend->iface.graph_compute(backend, cgraph);
-            for (size_t i = 0; i < operations.size(); ++i)
-                if (phase.session->finish_operation(operations[i], status == GGML_STATUS_SUCCESS))
-                    selected_npu_nodes.push_back(operation_nodes[i]);
-            phase.session->ensure_healthy();
-            record_executions(status);
-            return status;
-        } catch (const std::exception &error) {
-            phase.session->record_failure(error.what());
-#if LOG_CYCLE || CYCLE_SIM
-            if (semantic_session) semantic_session->fail(error.what());
-#endif
-            GGML_LOG_ERROR("%s: cycle-sim: %s\n", __func__, error.what());
-            return GGML_STATUS_FAILED;
-        }
-    }
-#endif
     const auto status = backend->iface.graph_compute(backend, cgraph);
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
     try { record_executions(status); }
     catch (const std::exception &error) {
         if (semantic_session) semantic_session->fail(error.what());
@@ -1629,6 +1581,31 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+
+    ggml_backend_prepare_node_t prepare[GGML_SCHED_MAX_BACKENDS] = {};
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            prepare[i] = reinterpret_cast<ggml_backend_prepare_node_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_prepare_node"));
+        }
+    }
+    for (int i = 0; i < measure_graph->n_nodes; ++i) {
+        ggml_tensor * node = measure_graph->nodes[i];
+        const int backend_id = tensor_backend_id(node);
+        if (backend_id == -1 || !prepare[backend_id]) {
+            continue;
+        }
+        ggml_backend_t backend = sched->backends[backend_id];
+        const ggml_status status = prepare[backend_id](backend, node);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("%s: %s preparation failed for %s (status %d)\n",
+                           __func__, ggml_backend_name(backend), node->name, int(status));
+            ggml_backend_sched_reset(sched);
+            return false;
+        }
     }
 
     ggml_backend_sched_reset(sched);

@@ -17,11 +17,11 @@ class ScaleDumpLog : public Log {
   public:
     using Log::Log;
 
-    DumpResult write_to(LogTarget               target,
+    DumpResult write_to(ggml::npu::log::LogTarget               target,
                         const DumpMeta &        meta,
                         const ScaleTableView &  view,
                         const GroupDumpConfig & cfg) {
-        std::lock_guard<std::mutex> lock(ggml::gemmini::log::detail::output_mutex());
+        std::lock_guard<std::mutex> lock(ggml::npu::log::detail::output_mutex());
         bool                        owns   = false;
         FILE *                      out    = select_output_unlocked(target.path, &owns);
         DumpResult                  result = write(out, meta, view, cfg);
@@ -57,7 +57,7 @@ ScaleDumpLog g_dump_scale;
 } // namespace
 #endif
 
-DumpResult dump_scale_groups(LogTarget               target,
+DumpResult dump_scale_groups(ggml::npu::log::LogTarget               target,
                              const DumpMeta &        meta,
                              const ScaleTableView &  view,
                              const GroupDumpConfig & cfg) {

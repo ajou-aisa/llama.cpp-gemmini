@@ -1,10 +1,11 @@
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #define GGML_GEMMINI_TESTING 1
 #define GGML_GEMMINI_TEST_OBSERVER 1
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/matmul/attention.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia_shift.hpp"
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -24,7 +25,8 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
-#include <gemmini/log.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
+#include "gemmini.h"
 
 namespace {
 
@@ -265,9 +267,28 @@ bool test_counter_hooks_connected() {
     std::vector<float> hardware_output(6, 0.0f);
     auto               hardware_args = make_args(activation, weights, hardware_output);
     hardware_args.tiled_matmul_type  = static_cast<tiled_matmul_type_t>(1);
+    // No accelerator here: record the WS commands instead of issuing them.
+    struct Recording {
+        std::vector<gemmini_record_t> records = std::vector<gemmini_record_t>(4096);
+        gemmini_recorder_t recorder;
+        Recording() { gemmini_recorder_init(&recorder, records.data(), records.size()); }
+    };
+    auto recording = std::make_shared<Recording>();
+    auto &recorder = recording->recorder;
+    auto &records = recording->records;
+    hardware_args.transport = std::shared_ptr<const gemmini_transport_t>(recording, &recorder.transport);
+    const std::weak_ptr<Recording> lifetime = recording;
+    recording.reset(); // Only invocation ownership keeps the callbacks and storage alive.
     test_reset_matmul_counters();
     const MatmulStatus       hardware_status = matmul(hardware_args, options);
     const MatmulTestCounters hardware        = test_matmul_counters();
+    bool recorded_loop_ws = false;
+    for (size_t i = 0; i < recorder.count; ++i) {
+        recorded_loop_ws |= records[i].kind == GEMMINI_RECORD_ISSUE && records[i].command.funct == GEMMINI_FUNCT_LOOP_WS;
+    }
+    const bool drained = recorder.count != 0 && records[recorder.count - 1].kind == GEMMINI_RECORD_DRAIN;
+    hardware_args.transport.reset();
+    const bool released = lifetime.expired();
 
     const bool residual_counter_ok =
 #if GGML_GEMMINI_ENABLE_RMD
@@ -282,7 +303,11 @@ bool test_counter_hooks_connected() {
                   "construction/allocation/dense/residual/fallback hooks observe real work") &&
            expect(hardware_status.ok() && hardware.dense_dispatches > 0 &&
                       hardware.hardware_dispatches > 0,
-                  "hardware hook observes real dispatch");
+                  "hardware hook observes real dispatch") &&
+           expect(recorded_loop_ws && drained,
+                  "hardware dispatch issues LOOP_WS and drains through the transport") &&
+           expect(released && !fallback_args.transport,
+                  "transport ownership ends with its invocation and never leaks into another invocation");
 }
 
 bool test_cpu_direct_lifecycle_parity() {
@@ -724,7 +749,7 @@ bool test_correction_domain_composition() {
     std::vector<float>  original   = {5, 5, 11, 9, 17, 13};
     auto                args       = make_args(activation, weights, original);
     args.I                         = 1;
-    args.K                         = rmd::kBlockSize;
+    args.K                         = ggml::gemmini::rmd::kBlockSize;
 
     block_q16_h1 h1[2]{};
     for (block_q16_h1 & block : h1) {
@@ -732,17 +757,17 @@ bool test_correction_domain_composition() {
         block.s_rf = 0.25f;
     }
     args.weight_i8_scale_active = false;
-    args.weight_format          = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+    args.weight_format          = ggml_gemmini_args_t::weight_format_t::q16_h1;
     args.q16_h1_blocks          = h1;
     args.native_block_count     = 2;
     args.native_blocks_per_row  = 1;
     args.native_weight_bytes    = sizeof(h1);
 
     std::vector<float>    full_destination = {1.0f, 1.0f};
-    const rmd::Correction h1_correction    = rmd::BlockScaledInt64Correction{{8, -8}};
+    const ggml::gemmini::rmd::Correction h1_correction    = ggml::gemmini::rmd::BlockScaledInt64Correction{{8, -8}};
     bool                  ok =
-        expect(rmd::merge_rmd_correction_to(args, full_destination.data(), 0, 1, h1_correction) ==
-                       rmd::RmdStatus::success &&
+        expect(ggml::gemmini::rmd::merge_rmd_correction_to(args, full_destination.data(), 0, 1, h1_correction) ==
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    full_destination == std::vector<float>({3.0f, -1.0f}),
                "FULL H1 correction applies column scale exactly once");
 
@@ -751,12 +776,12 @@ bool test_correction_domain_composition() {
     constexpr int64_t wide_negative =
         static_cast<int64_t>(std::numeric_limits<int32_t>::min()) - 4096;
     std::vector<float>    wide_output = {0.0f, 0.0f};
-    const rmd::Correction wide        = rmd::BlockScaledInt64Correction{{
+    const ggml::gemmini::rmd::Correction wide        = ggml::gemmini::rmd::BlockScaledInt64Correction{{
         wide_positive,
         wide_negative,
     }};
-    ok = expect(rmd::merge_rmd_correction_to(args, wide_output.data(), 0, 1, wide) ==
-                        rmd::RmdStatus::success &&
+    ok = expect(ggml::gemmini::rmd::merge_rmd_correction_to(args, wide_output.data(), 0, 1, wide) ==
+                        ggml::gemmini::rmd::RmdStatus::success &&
                     wide_output[0] ==
                         static_cast<float>(static_cast<double>(wide_positive) * 0.25) &&
                     wide_output[1] == static_cast<float>(static_cast<double>(wide_negative) * 0.25),
@@ -766,74 +791,74 @@ bool test_correction_domain_composition() {
     block_q8_0 h0[2]{};
     h0[0].d                                  = ggml_fp32_to_fp16(0.5f);
     h0[1].d                                  = ggml_fp32_to_fp16(4.0f);
-    args.weight_format                       = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    args.weight_format                       = ggml_gemmini_args_t::weight_format_t::q8_h0;
     args.B_blocks                            = h0;
     args.blocks_J                            = 2;
     args.blocks_K                            = 1;
     args.native_weight_bytes                 = sizeof(h0);
     std::vector<float>    stripe_destination = {1.0f, 1.0f};
-    const rmd::Correction h0_correction      = rmd::PreScaledFloat64Correction{{2.5, -4.0}};
+    const ggml::gemmini::rmd::Correction h0_correction      = ggml::gemmini::rmd::PreScaledFloat64Correction{{2.5, -4.0}};
     ok =
-        expect(rmd::merge_rmd_correction_to(args, stripe_destination.data(), 0, 1, h0_correction) ==
-                       rmd::RmdStatus::success &&
+        expect(ggml::gemmini::rmd::merge_rmd_correction_to(args, stripe_destination.data(), 0, 1, h0_correction) ==
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    stripe_destination == std::vector<float>({3.5f, -3.0f}),
                "STRIPE H0 applies pre-scaled values directly without column scale") &&
         ok;
 
-    auto remains_unchanged = [&](const rmd::Correction & correction,
-                                 rmd::RmdStatus          expected,
+    auto remains_unchanged = [&](const ggml::gemmini::rmd::Correction & correction,
+                                 ggml::gemmini::rmd::RmdStatus          expected,
                                  const char *            message) {
         std::vector<float>       destination = {17.0f, -23.0f};
         const std::vector<float> before      = destination;
-        return expect(rmd::merge_rmd_correction_to(args, destination.data(), 0, 1, correction) ==
+        return expect(ggml::gemmini::rmd::merge_rmd_correction_to(args, destination.data(), 0, 1, correction) ==
                               expected &&
                           same_output(destination, before),
                       message);
     };
     ok = remains_unchanged(h1_correction,
-                           rmd::RmdStatus::unsupported_route,
+                           ggml::gemmini::rmd::RmdStatus::unsupported_route,
                            "wrong integer domain for H0 is failure-atomic") &&
          ok;
-    ok = remains_unchanged(rmd::PreScaledFloat64Correction{{
+    ok = remains_unchanged(ggml::gemmini::rmd::PreScaledFloat64Correction{{
                                std::numeric_limits<double>::quiet_NaN(),
                                1.0,
                            }},
-                           rmd::RmdStatus::overflow,
+                           ggml::gemmini::rmd::RmdStatus::overflow,
                            "NaN H0 correction is failure-atomic") &&
          ok;
 
-    args.weight_format       = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+    args.weight_format       = ggml_gemmini_args_t::weight_format_t::q16_h1;
     args.q16_h1_blocks       = h1;
     args.native_weight_bytes = sizeof(h1);
     ok = remains_unchanged(h0_correction,
-                           rmd::RmdStatus::unsupported_route,
+                           ggml::gemmini::rmd::RmdStatus::unsupported_route,
                            "wrong floating domain for H1 is failure-atomic") &&
          ok;
-    rmd::RmdStripeBuilder builder;
-    builder.reset(9, 0, 1, rmd::kBlockSize, 2);
+    ggml::gemmini::rmd::RmdStripeBuilder builder;
+    builder.reset(9, 0, 1, ggml::gemmini::rmd::kBlockSize, 2);
     builder.add_residual(0, 0, 257);
-    const rmd::StripePacketHandle packet = builder.finish();
-    rmd::CompressedOutput         compressed;
+    const ggml::gemmini::rmd::StripePacketHandle packet = builder.finish();
+    ggml::gemmini::rmd::CompressedOutput         compressed;
     compressed.j_padded = packet->j_padded;
     compressed.values.assign(packet->total_output_values, std::numeric_limits<int64_t>::max());
-    rmd::Correction compose_sentinel = rmd::PreScaledFloat64Correction{{7.25, -3.5}};
-    const auto * compose_before = std::get_if<rmd::PreScaledFloat64Correction>(&compose_sentinel);
+    ggml::gemmini::rmd::Correction compose_sentinel = ggml::gemmini::rmd::PreScaledFloat64Correction{{7.25, -3.5}};
+    const auto * compose_before = std::get_if<ggml::gemmini::rmd::PreScaledFloat64Correction>(&compose_sentinel);
     const double * const compose_data = compose_before->values.data();
-    ok = expect(rmd::compose_rmd_output(*packet, compressed, compose_sentinel) ==
-                        rmd::RmdStatus::overflow &&
-                    std::get_if<rmd::PreScaledFloat64Correction>(&compose_sentinel) != nullptr &&
-                    std::get<rmd::PreScaledFloat64Correction>(compose_sentinel).values ==
+    ok = expect(ggml::gemmini::rmd::compose_rmd_output(*packet, compressed, compose_sentinel) ==
+                        ggml::gemmini::rmd::RmdStatus::overflow &&
+                    std::get_if<ggml::gemmini::rmd::PreScaledFloat64Correction>(&compose_sentinel) != nullptr &&
+                    std::get<ggml::gemmini::rmd::PreScaledFloat64Correction>(compose_sentinel).values ==
                         std::vector<double>({7.25, -3.5}) &&
-                    std::get<rmd::PreScaledFloat64Correction>(compose_sentinel).values.data() ==
+                    std::get<ggml::gemmini::rmd::PreScaledFloat64Correction>(compose_sentinel).values.data() ==
                         compose_data,
                 "checked radix add overflow leaves correction variant byte-identical") &&
          ok;
 
     std::vector<float>       compact_destination = {31.0f, -41.0f};
     const std::vector<float> compact_before      = compact_destination;
-    ok = expect(rmd::merge_rmd_correction_to(
+    ok = expect(ggml::gemmini::rmd::merge_rmd_correction_to(
                     args, compact_destination.data(), *packet, h0_correction) ==
-                        rmd::RmdStatus::unsupported_route &&
+                        ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                     same_output(compact_destination, compact_before),
                 "H0 pre-scaled correction never enters compact composition") &&
          ok;
@@ -1002,7 +1027,7 @@ bool test_ws_preflight_is_atomic_on_host() {
     const auto               route  = args.tiled_matmul_type;
     MatmulOptions            options{};
     options.mode        = MatmulInvocationMode::full;
-    options.rmd_backend = RmdBackend::gemmini_ws_compact;
+    options.rmd_backend = RmdBackend::npu_compact;
     test_reset_matmul_counters();
     const MatmulStatus       status   = matmul(args, options);
     const MatmulTestCounters counters = test_matmul_counters();
@@ -1031,7 +1056,7 @@ bool test_bad_routes() {
     std::vector<float>  output(6, 0.0f);
 
     auto malformed_args          = make_args(activation, weights, output);
-    malformed_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    malformed_args.weight_format = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     const auto    output_before  = output;
     MatmulOptions full_options{};
     full_options.mode                      = MatmulInvocationMode::full;
@@ -1040,7 +1065,7 @@ bool test_bad_routes() {
     const bool         malformed_is_atomic = same_output(output, output_before);
 
     auto unsupported_args          = make_args(activation, weights, output);
-    unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    unsupported_args.weight_format = ggml_gemmini_args_t::weight_format_t::q8_h0;
     const MatmulStatus unsupported = matmul(unsupported_args, full_options);
 
     MatmulOptions invalid_options{};
@@ -1099,7 +1124,7 @@ bool test_dense_no_output_is_failure() {
     auto                     args   = make_args(activation, weights, output);
     args.B                          = nullptr;
     args.weight_i8_scale_active     = false;
-    args.weight_format              = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    args.weight_format              = ggml_gemmini_args_t::weight_format_t::q8_h0;
 
     MatMul             facade(args);
     const MatMulResult result = facade.run_full();
@@ -1195,7 +1220,7 @@ bool test_native_q4_hp1_cpu_dense_output() {
     }
     weights[0].channel_scale   = 0.25f;
     weights[1].channel_scale   = 0.5f;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q4_hp1;
     args.q4_hp1_blocks         = weights.data();
     args.native_block_count    = weights.size();
     args.native_blocks_per_row = 1;
@@ -1288,7 +1313,7 @@ bool test_native_q4_repeating_bias() {
         weight.m             = 0;
         weight.channel_scale = 1.0f;
     }
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q4_hp1;
     args.q4_hp1_blocks         = weights.data();
     args.native_block_count    = weights.size();
     args.native_blocks_per_row = 1;
@@ -1395,7 +1420,7 @@ bool test_native_q4_multiblock_final_float_oracle() {
             }
         }
     }
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q4_hp1;
     args.q4_hp1_blocks         = weights.data();
     args.native_block_count    = weights.size();
     args.native_blocks_per_row = blocks_per_row;
@@ -1500,7 +1525,7 @@ bool test_native_q16_hp1_cpu_dense_output() {
     std::fill(std::begin(weight.qs), std::end(weight.qs), int16_t{1});
     weight.m                   = 0;
     weight.channel_scale       = 2.0f;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q16_hp1;
     args.q16_hp1_blocks        = &weight;
     args.native_block_count    = 1;
     args.native_blocks_per_row = 1;
@@ -1562,7 +1587,7 @@ bool test_q16_pipeline_metadata_and_ownership([[maybe_unused]] bool borrowed) {
     std::fill(std::begin(weight.qs), std::end(weight.qs), int16_t{1});
     weight.m                   = 0;
     weight.channel_scale       = 1.0f;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q16_hp1;
     args.q16_hp1_blocks        = &weight;
     args.native_block_count    = 1;
     args.native_blocks_per_row = 1;
@@ -1857,7 +1882,7 @@ static bool test_attention_mask() {
 }
 
 static bool test_attention() {
-    using ggml::gemmini::quants::act::exsia::detail::shift_q_i32;
+    using ggml::npu::quants::act::exsia::detail::shift_q_i32;
     if (!expect(shift_q_i32(INT32_MIN, -32) == -1 && shift_q_i32(INT32_MIN, -33) == 0 &&
                 shift_q_i32(INT32_MAX, -32) == 0 && shift_q_i32(-3, -1) == -2,
                 "wide right-shift boundaries")) return false;

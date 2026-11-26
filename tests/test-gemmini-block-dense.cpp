@@ -1,3 +1,4 @@
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 
 #include <algorithm>
@@ -10,7 +11,7 @@
 namespace {
 
 using namespace ggml::gemmini;
-using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+using Format = ggml_gemmini_args_t::weight_format_t;
 
 bool initialize_activation(ggml_gemmini_args_t & args) {
     if (!args.A.allocate(args.I, args.K, 8)) {

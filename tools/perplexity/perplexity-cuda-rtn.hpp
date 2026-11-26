@@ -1,6 +1,6 @@
 #pragma once
 #include "common.h"
-#include "../../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../../ggml/src/ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
 #include <cstdio>
 #include <stdexcept>
 

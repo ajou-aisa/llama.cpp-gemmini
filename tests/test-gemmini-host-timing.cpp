@@ -1,7 +1,7 @@
-#include <gemmini/host-timing.hpp>
-#include <gemmini/log.hpp>
-#include <gemmini/cycle_reader.hpp>
-#include <gemmini/performance.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/host-timing.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
 
 #include <cstdio>
 #include <ctime>
@@ -18,7 +18,7 @@ bool check(bool condition, const char * message) {
 }
 
 bool check_thread_cpu_timing() {
-    using namespace ggml::gemmini::cycle;
+    using namespace ggml::npu::cycle;
     const HostSample  start{100, 7, 20, true};
     const HostSample  end{200, 7, 50, true};
     const HostSample  cross_thread{200, 8, 50, true};
@@ -69,13 +69,13 @@ bool check_thread_cpu_timing() {
 }
 
 bool check_cycle_write_timing() {
-    using namespace ggml::gemmini::log;
+    using namespace ggml::npu::log;
     FILE * output = std::tmpfile();
     if (!check(output != nullptr, "create real logger output"))
         return false;
     CycleLog         logger(output);
     CycleWriteTiming outer, inner;
-    const auto       start = ggml::gemmini::cycle::read_host_sample();
+    const auto       start = ggml::npu::cycle::read_host_sample();
     {
         ScopedCycleWriteTiming scope(outer);
         logger.write_json("{\"probe\":1}");
@@ -87,7 +87,7 @@ bool check_cycle_write_timing() {
         other.join();
         logger.write_json("{\"probe\":4}");
     }
-    const auto end = ggml::gemmini::cycle::read_host_sample();
+    const auto end = ggml::npu::cycle::read_host_sample();
     logger.write_json("{\"probe\":5}");
     std::rewind(output);
     char              buffer[256]{};
@@ -175,7 +175,7 @@ bool check_cycle_write_timing() {
 }
 
 bool check_worker_cpu_totals() {
-    using namespace ggml::gemmini::cycle;
+    using namespace ggml::npu::cycle;
     gemmini_cpu_sample start{}, end{};
     start.tid = end.tid    = 7;
     start.thread_cpu_valid = end.thread_cpu_valid = 1;
@@ -279,7 +279,7 @@ void record_test_cpu(uint64_t     start_ns,
     total.thread_cpu_ns      = cpu_ns;
     total.cycles_valid_count = total.thread_cpu_valid_count = reason ? 0 : 1;
     total.cycles_reason = total.thread_cpu_reason = reason;
-    ggml::gemmini::performance::record_cpu(start, end, total);
+    ggml::npu::performance::record_cpu(start, end, total);
 }
 
 bool contains(const std::string & value, const char * expected) {
@@ -298,9 +298,9 @@ std::string read_output(FILE * output) {
     return contents;
 }
 
-ggml::gemmini::performance::Summary replay(const std::string & contents) {
+ggml::npu::performance::Summary replay(const std::string & contents) {
     std::istringstream input(contents);
-    return ggml::gemmini::performance::read_summary(input);
+    return ggml::npu::performance::read_summary(input);
 }
 
 struct Recording {
@@ -308,16 +308,16 @@ struct Recording {
 
     Recording() {
         if (output) {
-            ggml::gemmini::log::cycle.set_output(output);
-            ggml::gemmini::performance::reset();
+            ggml::npu::log::cycle.set_output(output);
+            ggml::npu::performance::reset();
         }
     }
     ~Recording() {
-        ggml::gemmini::log::cycle.set_output(stderr);
+        ggml::npu::log::cycle.set_output(stderr);
         if (output)
             std::fclose(output);
     }
-    ggml::gemmini::performance::Summary summary() {
+    ggml::npu::performance::Summary summary() {
         return replay(read_output(output));
     }
 };
@@ -331,7 +331,7 @@ struct Recording {
 }
 
 bool check_cpu_interval_record() {
-    using namespace ggml::gemmini;
+    using namespace ggml::npu;
     gemmini_cpu_sample start{}, end{};
     start.ns  = 100;
     end.ns    = 200;
@@ -554,7 +554,7 @@ bool check_cpu_interval_record() {
 }
 
 bool check_cpu_resource_summary_from_timing_add() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create CPU resource recording"))
         return false;
@@ -608,7 +608,7 @@ bool check_cpu_resource_summary_from_timing_add() {
 }
 
 bool check_inference_summary() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create inference recording"))
         return false;
@@ -661,8 +661,8 @@ bool check_inference_summary() {
 #endif
     record_test_cpu(250, 300, 7, 30, 300);
     record_cpu_wall(250, 300);
-    record_npu("im2p", "dense", "work", 1000, true, nullptr);
-    record_npu("im2p", "rmd", "work", 400, true, nullptr);
+    record_npu("gemmini", "dense", "work", 1000, true, nullptr);
+    record_npu("gemmini", "rmd", "work", 400, true, nullptr);
 #if EXPECT_LOG_CYCLE
     const auto active_decode = recording.summary();
     ok = check(!active_decode.available && active_decode.reason == "incomplete_recording",
@@ -748,7 +748,7 @@ bool check_inference_summary() {
     std::fclose(output);
     ok = check(contains(text, "prefill:") && contains(text, "decode:") &&
                    contains(text, "CPU cycles=1000") && contains(text, "worker CPU=") &&
-                   contains(text, "CPU work wall=") && contains(text, "NPU im2p/dense/work:") &&
+                   contains(text, "CPU work wall=") && contains(text, "NPU gemmini/dense/work:") &&
                    contains(text, "TTFT=") && contains(text, "TPOT="),
                "the real FILE output contains both phases, CPU resources, NPU domains and token "
                "latencies") &&
@@ -762,7 +762,7 @@ bool check_inference_summary() {
 }
 
 bool check_nested_cpu_integrity() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     bool ok = true;
     for (int scenario = 0; scenario < 4; ++scenario) {
         Recording recording;
@@ -826,7 +826,7 @@ bool check_nested_cpu_integrity() {
 }
 
 bool check_inference_summary_incomplete() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create incomplete-metric recording"))
         return false;
@@ -891,7 +891,7 @@ bool check_inference_summary_incomplete() {
 // Feed counters through the public sink without loading an NPU backend or
 // simulator. These are test inputs, not measured device performance.
 bool check_supplied_npu_final_output() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create supplied-counter recording"))
         return false;
@@ -960,7 +960,7 @@ bool check_supplied_npu_final_output() {
 }
 
 bool check_inference_summary_overflow() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create overflow recording"))
         return false;
@@ -990,7 +990,7 @@ bool check_inference_summary_overflow() {
 }
 
 bool check_long_recording() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create long recording"))
         return false;
@@ -1027,7 +1027,7 @@ bool check_long_recording() {
 }
 
 bool check_recording_integrity() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     Recording recording;
     if (!check(recording.output != nullptr, "create recording integrity fixture"))
         return false;
@@ -1185,7 +1185,7 @@ bool check_recording_integrity() {
 }
 
 bool check_operation_clock_order() {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     bool ok = true;
     for (int scenario = 0; scenario < 3; ++scenario) {
         Recording recording;
@@ -1233,7 +1233,7 @@ bool check_operation_clock_order() {
 } // namespace
 
 int main() {
-    using namespace ggml::gemmini::cycle;
+    using namespace ggml::npu::cycle;
     const uint64_t caller_tid = host_thread_id();
     uint64_t       worker_tid = 0;
     std::string    worker_json;

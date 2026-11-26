@@ -6,8 +6,6 @@ native events, restricted to one work's [accepted, resource_ready) window.
 """
 from __future__ import annotations
 
-import ctypes as C
-from pathlib import Path
 from typing import Final, TypeAlias
 
 import numpy as np
@@ -28,36 +26,6 @@ DEFINITIONS: Final = {
 }
 Int64Array: TypeAlias = npt.NDArray[np.int64]
 Events: TypeAlias = npt.NDArray[np.void]
-
-
-def event_dtype() -> np.dtype[np.void]:
-    from sim.cycle.cli import Event
-    from sim.cycle.sequence_binding_abi import SequenceEvent
-
-    base = SequenceEvent.event.offset
-    fields = {"generation": (SequenceEvent.generation.offset, "<u8"),
-              "work_ordinal": (SequenceEvent.work_ordinal.offset, "<u8"),
-              "id": (base + Event.id.offset, "<u8"), "cycle": (base + Event.cycle.offset, "<u8"),
-              "logical_work_id": (base + Event.logical_work_id.offset, "<u8"),
-              "dependency": (base + Event.dependency.offset, "<u8"),
-              "type": (base + Event.type.offset, "<u4")}
-    return np.dtype({"names": list(fields), "formats": [value[1] for value in fields.values()],
-                     "offsets": [value[0] for value in fields.values()], "itemsize": C.sizeof(SequenceEvent)})
-
-
-def event_codes(library: Path) -> dict[str, int]:
-    lib = C.CDLL(str(library))
-    lib.im2p_cycle_event_name.argtypes, lib.im2p_cycle_event_name.restype = [C.c_uint32], C.c_char_p
-    names: dict[str, int] = {}
-    for code in range(256):
-        raw: bytes | None = lib.im2p_cycle_event_name(code)
-        name = "invalid" if raw is None else raw.decode("utf-8")
-        if name == "invalid":
-            break
-        require(name not in names, "duplicate native event name: " + name)
-        names[name] = code
-    require(all(name in names for name in EVENTS), "native library lacks scale/load/store event names")
-    return {name: names[name] for name in EVENTS}
 
 
 def union_cycles(starts: Int64Array, ends: Int64Array) -> int:
@@ -95,10 +63,6 @@ class EventAccounting:
         self.codes, self.dtype = codes, dtype
         self._chunks: dict[str, list[Events]] = {key: [] for key in EVENTS}
         self.total_events = 0
-
-    @classmethod
-    def for_library(cls, library: Path) -> EventAccounting:
-        return cls(event_codes(library), event_dtype())
 
     def sink(self, data: memoryview, count: int) -> None:
         events = np.frombuffer(data, dtype=self.dtype, count=count)

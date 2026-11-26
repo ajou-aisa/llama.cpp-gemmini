@@ -1,15 +1,15 @@
-#include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
+#include "../ggml/src/ggml-npu-common/residual/residual-capture.hpp"
 
-#include <gemmini/cycle_reader.hpp>
-#include <gemmini/log.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
 
 #include <cstdio>
 #include <string>
 
 namespace {
 
-namespace cycle = ggml::gemmini::cycle;
-namespace residual = ggml::gemmini::residual;
+namespace cycle = ggml::npu::cycle;
+namespace residual = ggml::npu::residual;
 
 bool check(bool condition, const char * message) {
     if (!condition) std::fprintf(stderr, "FAIL: %s\n", message);
@@ -36,7 +36,7 @@ bool direct_finish_preserves_the_canonical_payload() {
 }
 
 bool packet_finish_preserves_the_canonical_payload() {
-    ggml::gemmini::rmd::RmdStripeBuilder legacy;
+    ggml::npu::rmd::RmdStripeBuilder legacy;
     legacy.reset(3, 7, 2, 64, 17);
     legacy.add_residual(1, 33, -129);
     legacy.add_residual(0, 2, 1);
@@ -86,7 +86,7 @@ bool bitmap_capture_routes_and_validates() {
                    capture.add_residual(0, 2, 1) && capture.add_residual(1, 33, -129),
                "ordered ExSIA input reaches the bitmap builder")) return false;
     const auto actual = capture.finish();
-    ggml::gemmini::rmd::RmdStripeBuilder legacy;
+    ggml::npu::rmd::RmdStripeBuilder legacy;
     legacy.reset(3, 7, 2, 64, 17);
     legacy.add_residual(0, 2, 1);
     legacy.add_residual(1, 33, -129);
@@ -118,7 +118,7 @@ bool bitmap_capture_routes_and_validates() {
 bool finish_records_preserve_context() {
     FILE *output = std::tmpfile();
     if (!check(output != nullptr, "capture log fixture opens")) return false;
-    ggml::gemmini::log::cycle.set_output(output);
+    ggml::npu::log::cycle.set_output(output);
     residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
     capture.set_context(0, "capture-test-layer");
     capture.reset(3, 7, 2, 64, 17);
@@ -128,7 +128,7 @@ bool finish_records_preserve_context() {
     capture.reset(4, 9, 2, 64, 17);
     const bool added_again = capture.add_residual(0, 2, 1);
     const auto next_payload = capture.finish();
-    ggml::gemmini::log::cycle.set_output(nullptr);
+    ggml::npu::log::cycle.set_output(nullptr);
     std::rewind(output);
     char line[4096];
     const bool first_read = std::fgets(line, sizeof(line), output) != nullptr;

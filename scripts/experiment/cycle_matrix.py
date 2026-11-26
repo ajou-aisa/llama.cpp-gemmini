@@ -249,7 +249,7 @@ def prepare_build(args: argparse.Namespace, base: dict, width: int, logs: Path) 
         "LOG_CYCLE": "1", "CYCLE_DETAIL": str(args.detail),
         "LLAMA_BUILD_COMMON": "ON", "LLAMA_BUILD_TOOLS": "ON",
         "LLAMA_BUILD_TESTS": "OFF", "LLAMA_BUILD_SERVER": "OFF", "LLAMA_BUILD_EXAMPLES": "OFF",
-        "LLAMA_CURL": "OFF", "GGML_METAL": "OFF", "GGML_CUDA": "OFF", "IM2P_SIM_IMPLEMENTATION": "",
+        "LLAMA_CURL": "OFF", "GGML_METAL": "OFF", "GGML_CUDA": "OFF",
         "CMAKE_C_COMPILER_LAUNCHER": "", "CMAKE_CXX_COMPILER_LAUNCHER": "",
     }
     options = {key: value for key, (kind, value) in base.items()

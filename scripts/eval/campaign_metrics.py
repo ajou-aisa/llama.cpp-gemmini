@@ -34,8 +34,8 @@ def outputs(kind: str, raw: Path, manifest: Manifest, output: Path,
     """Aggregate and per-layer summaries of one stream, or of chunk-disjoint `shards` reduced as one stream (`raw` is
     then the shard index whose bytes bind every shard stream; it is the summaries' input)."""
     reducer = {"activation": activation, "residual": residual, "scu": weight_alignment}[kind]
-    schemas = {"activation": "im2p-activation-quant-metrics", "residual": "im2p-residual-path-metrics",
-               "scu": "im2p-scale-alignment-metrics"}
+    schemas = {"activation": "gemmini-activation-quant-metrics", "residual": "gemmini-residual-path-metrics",
+               "scu": "gemmini-scale-alignment-metrics"}
 
     def stream_of(path: Path) -> Iterator[Record]:
         return weight_alignment.rows(path, manifest) if kind == "scu" else metric_rows(path, schemas[kind], manifest)

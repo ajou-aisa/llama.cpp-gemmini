@@ -59,19 +59,18 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "Default Gemmini OFF wrapper must configure without an SDK: ${output}\n${error}")
 endif()
 file(READ "${off_build}/CMakeCache.txt" off_cache)
-if(NOT off_cache MATCHES "GGML_GEMMINI:[^=]+=OFF" OR
-   NOT off_cache MATCHES "GEMMINI_SW_PATH:[^=]+=.*sdk-absent/llama/../RISC-V-DynDNN-gemmini-include")
-    message(FATAL_ERROR "OFF wrapper must retain its declared missing header path and backend selection")
+if(NOT off_cache MATCHES "GGML_GEMMINI:[^=]+=OFF" OR off_cache MATCHES "GEMMINI_SW_PATH:")
+    message(FATAL_ERROR "OFF wrapper must keep its backend selection and pass no Gemmini header path")
 endif()
 if(EXISTS "${run_root}/sdk-absent/RISC-V-DynDNN-gemmini-include" OR
-   EXISTS "${run_root}/sdk-absent/IM2P.sim" OR EXISTS "${run_root}/provision.log" OR
+   EXISTS "${run_root}/provision.log" OR
    NOT EXISTS "${run_root}/build-stub.log" OR NOT EXISTS "${off_build}/build.ninja" OR
    EXISTS "${off_build}/generated/gemmini_params.h")
     message(FATAL_ERROR "OFF SDK-absent configure must avoid provisioning and Gemmini headers")
 endif()
 message(STATUS "sdk-absent: actual configure succeeded with default Gemmini OFF; no SDK/provisioning")
 
-foreach(scenario IN ITEMS defaults environment typed-cli simulator)
+foreach(scenario IN ITEMS defaults environment typed-cli)
     set(environment)
     set(arguments)
     set(expected 0)
@@ -82,40 +81,30 @@ foreach(scenario IN ITEMS defaults environment typed-cli simulator)
     if(scenario STREQUAL "typed-cli")
         set(arguments -DLOG_DEBUG:STRING=0 -DLOG_CYCLE:STRING=0)
         set(expected 0)
-    elseif(scenario STREQUAL "simulator")
-        set(arguments -DGGML_GEMMINI=ON -DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM
-            -DGGML_GEMMINI_OPTION=WS -DIM2P_SIM_IMPLEMENTATION=LEGACY_BSV)
     endif()
     set(build_dir "${run_root}/${scenario}-build")
-    execute_process(
-        COMMAND env -i "PATH=${run_root}/bin:$ENV{PATH}"
-            "CONTRACT_LOG=${run_root}/commands.log" "BUILD_DIR=${build_dir}"
-            BUILD_JOBS=2 PYTHONDONTWRITEBYTECODE=1 ${environment}
-            bash "${TEST_SCRIPT}" --dry-run ${arguments}
-        WORKING_DIRECTORY "${run_root}"
+    execute_process(COMMAND env -i "PATH=${run_root}/configure-bin:$ENV{PATH}"
+        "REAL_CMAKE=${CMAKE_COMMAND}" "BUILD_STUB_LOG=${run_root}/build-stub.log"
+        "BUILD_DIR=${build_dir}" BUILD_JOBS=2 ${environment}
+        bash "${TEST_SCRIPT}" -DGGML_METAL=OFF -DGGML_OPENMP=OFF
+        -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF ${arguments}
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-    file(WRITE "${run_root}/${scenario}.log"
-        "exit=${result}\n${output}\n${error}")
     if(NOT result EQUAL 0)
-        message(FATAL_ERROR "${scenario} dry-run failed: ${output}\n${error}")
+        message(FATAL_ERROR "${scenario} configure failed: ${output}\n${error}")
     endif()
-    if(EXISTS "${run_root}/commands.log" OR EXISTS "${build_dir}")
-        message(FATAL_ERROR "${scenario} dry-run invoked provisioning/configure/build")
-    endif()
-    if(NOT output MATCHES "Dry run: no provisioning, configure, build, or device access")
-        message(FATAL_ERROR "${scenario} did not complete the dry-run path")
-    endif()
-    string(REGEX MATCH "\"effective\": *\\{[^}]*\\}" effective "${error}")
-    foreach(variable IN ITEMS LOG_DEBUG LOG_CYCLE GGML_CPU_CYCLE_LOG)
-        if(NOT effective MATCHES "\"${variable}\": *\"${expected}\"")
-            message(FATAL_ERROR
-                "${scenario} expected effective ${variable}=${expected}: ${error}")
+    file(STRINGS "${build_dir}/CMakeCache.txt" logs REGEX "^(LOG_DEBUG|LOG_CYCLE):")
+    foreach(variable IN ITEMS LOG_DEBUG LOG_CYCLE)
+        if(NOT "${logs}" MATCHES "${variable}:[^=]+=${expected}")
+            message(FATAL_ERROR "${scenario} expected ${variable}=${expected}: ${logs}")
         endif()
     endforeach()
-    if(scenario STREQUAL "simulator" AND
-       NOT effective MATCHES "\"GGML_GEMMINI_EXECUTION_BACKEND\": *\"IM2P_SIM\"")
-        message(FATAL_ERROR
-            "simulator dry-run did not exercise the provisioning backend: ${error}")
+    file(STRINGS "${build_dir}/CMakeCache.txt" cpu_log REGEX "^GGML_CPU_CYCLE_LOG:")
+    string(REGEX REPLACE "^[^=]*=" "" cpu_log "${cpu_log}")
+    if(expected)
+        if(NOT cpu_log)
+            message(FATAL_ERROR "${scenario} expected CPU cycle logging enabled")
+        endif()
+    elseif(cpu_log)
+        message(FATAL_ERROR "${scenario} expected CPU cycle logging disabled")
     endif()
-    message(STATUS "${scenario}: effective logs=${expected}, no provisioning/configure/build")
 endforeach()

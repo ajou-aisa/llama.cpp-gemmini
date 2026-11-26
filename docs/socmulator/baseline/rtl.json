@@ -1,0 +1,3179 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-11-25",
+  "audit_kind": "READ_ONLY_SOURCE_AUDIT",
+  "verification_status": "SOURCE_CONFIRMED_NOT_ELABORATED",
+  "status_definitions": {
+    "CONFIRMED": "Explicitly read in source or measured from file bytes",
+    "CONFIRMED_DERIVED": "Direct evaluation of cited configuration formulas; not an unsupported configuration extrapolation",
+    "UNVERIFIED": "Evidence insufficient or runtime validation not performed",
+    "NOT_APPLICABLE": "Parameter belongs to an extension absent from this configuration"
+  },
+  "path_roots": {
+    "reference": "/Users/zerogod/aisa-lab/DynDNN/reference",
+    "software": "/Users/zerogod/aisa-lab/DynDNN/SoCmulator/llama.cpp"
+  },
+  "repositories": [
+    {
+      "name": "chipyard-aisa-potal",
+      "url": "https://github.com/ajou-aisa/chipyard-aisa.git",
+      "branch": "potal",
+      "commit": "fab3d2620c0d8b688bd8c151ce9f3c775737175d",
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal",
+      "role": "PRIMARY_POTAL_RTL",
+      "verification_status": "CONFIRMED_METADATA",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/.git/HEAD",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/.git/config",
+          "line_start": 8,
+          "line_end": 12
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/.git/refs/heads/potal",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ],
+      "submodule_pins": [
+        {
+          "path": "generators/gemmini",
+          "url": "https://github.com/ajou-aisa/gemmini-aisa.git",
+          "commit": "185293e87cbbc2a336410f49a3fd73d01ed8d04e",
+          "verification_status": "CONFIRMED_INDEX_GITLINK",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/.git/index",
+              "format": "git-index-v2",
+              "entry_path": "generators/gemmini",
+              "mode": "160000"
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/.gitmodules",
+              "line_start": 1,
+              "line_end": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "chipyard-aisa-aisa-customizations",
+      "url": "https://github.com/ajou-aisa/chipyard-aisa.git",
+      "branch": "aisa-customizations",
+      "commit": "c41eb162926561503de3be23e8fa865a6065655f",
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations",
+      "role": "CHIPYARD_GEMMINI_INTEGRATION",
+      "verification_status": "CONFIRMED_METADATA",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations/.git/HEAD",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations/.git/config",
+          "line_start": 8,
+          "line_end": 12
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations/.git/refs/heads/aisa-customizations",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ],
+      "submodule_pins": [
+        {
+          "path": "generators/gemmini",
+          "url": "https://github.com/ajou-aisa/gemmini-aisa.git",
+          "commit": "185293e87cbbc2a336410f49a3fd73d01ed8d04e",
+          "verification_status": "CONFIRMED_INDEX_GITLINK",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations/.git/index",
+              "format": "git-index-v2",
+              "entry_path": "generators/gemmini",
+              "mode": "160000"
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-aisa-customizations/.gitmodules",
+              "line_start": 1,
+              "line_end": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "gemmini-aisa-aisa-customizations",
+      "url": "https://github.com/ajou-aisa/gemmini-aisa.git",
+      "branch": "aisa-customizations",
+      "commit": "185293e87cbbc2a336410f49a3fd73d01ed8d04e",
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations",
+      "role": "PRIMARY_GEMMINI_RTL",
+      "verification_status": "CONFIRMED_METADATA",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/.git/HEAD",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/.git/config",
+          "line_start": 8,
+          "line_end": 12
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/.git/refs/heads/aisa-customizations",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ],
+      "submodule_pins": [
+        {
+          "path": "software/workspace/llama.cpp",
+          "url": "https://github.com/ajou-aisa/llama.cpp-gemmini.git",
+          "branch": "exsia-pipeline",
+          "commit": "53b8a5bff6e10c595d26f84ed84b7e03773200fc",
+          "verification_status": "CONFIRMED_INDEX_GITLINK",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/.git/index",
+              "format": "git-index-v2",
+              "entry_path": "software/workspace/llama.cpp",
+              "mode": "160000"
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/.gitmodules",
+              "line_start": 1,
+              "line_end": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "gemmini-aisa-potal",
+      "url": "https://github.com/ajou-aisa/gemmini-aisa.git",
+      "branch": "potal",
+      "commit": "d23f189e3406647ca9730952d16c7d8515d0af01",
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal",
+      "role": "SECONDARY_NOT_POTAL_ISA_AUTHORITY",
+      "verification_status": "CONFIRMED_METADATA",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal/.git/HEAD",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal/.git/config",
+          "line_start": 8,
+          "line_end": 12
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal/.git/refs/heads/potal",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ],
+      "submodule_pins": [
+        {
+          "path": "software/workspace/llama.cpp",
+          "url": "https://github.com/ajou-aisa/llama.cpp-gemmini.git",
+          "branch": "exsia-pipeline",
+          "commit": "53b8a5bff6e10c595d26f84ed84b7e03773200fc",
+          "verification_status": "CONFIRMED_INDEX_GITLINK",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal/.git/index",
+              "format": "git-index-v2",
+              "entry_path": "software/workspace/llama.cpp",
+              "mode": "160000"
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-potal/.gitmodules",
+              "line_start": 1,
+              "line_end": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RISC-V-DynDNN-gemmini-include",
+      "url": "https://github.com/ajou-aisa/RISC-V-DynDNN-gemmini-include.git",
+      "branch": "develop",
+      "checkout_state": "detached HEAD at origin/develop",
+      "commit": "fcfcf5ce7c4670bd789365f11810177f97016f81",
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop",
+      "role": "SOFTWARE_SIDE_GEMMINI_SDK",
+      "verification_status": "CONFIRMED_METADATA_COMPILED_USE_USER_REPORTED",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/.git",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/RISC-V-DynDNN-gemmini-include/.git/worktrees/gemmini-include-develop/HEAD",
+          "line_start": 1,
+          "line_end": 1
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/RISC-V-DynDNN-gemmini-include/.git/packed-refs",
+          "line_start": 5,
+          "line_end": 5
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/RISC-V-DynDNN-gemmini-include/.git/config",
+          "line_start": 8,
+          "line_end": 10
+        }
+      ],
+      "submodule_pins": []
+    }
+  ],
+  "header_files": [
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_params.h",
+      "sha256": "3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924",
+      "bytes": 2714,
+      "role": "GEMMINI_RTL_REPOSITORY_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini.h",
+      "sha256": "9c872cdabb865dd3aee77937f090855b51120178fc181a66f0b1cb50bbf9fcf4",
+      "bytes": 204951,
+      "role": "GEMMINI_RTL_REPOSITORY_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini.h",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_counter.h",
+      "sha256": "5826242287784b9a383d45fdcb6791f8a1651d9d320a1a5f011585a9885b5669",
+      "bytes": 1995,
+      "role": "GEMMINI_RTL_REPOSITORY_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_counter.h",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/rocc-software/src/xcustom.h",
+      "sha256": "9582eb00cee774e4680fde6408a0d607bba85196a0a4fd803f7b7ddd801aad69",
+      "bytes": 6856,
+      "role": "GEMMINI_RTL_REPOSITORY_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/rocc-software/src/xcustom.h",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+      "sha256": "b4cd8b9efef9f3cd9b598ae3cc84af6478f83e628ed73d94a77fb1c452df1fc7",
+      "bytes": 2526,
+      "role": "POTAL_GENERATED_PARAMS",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+      "sha256": "3580b84f15ed8de9f9d311edea64eaa7c1f9bb308b1552a8f79453ec2c05ea33",
+      "bytes": 2507,
+      "role": "POTAL_GENERATED_PARAMS",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+      "sha256": "5c3b625cf21748322dab3ef32112f0edf43aee89e0c17e763c097ddda484a506",
+      "bytes": 2508,
+      "role": "POTAL_GENERATED_PARAMS",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+      "sha256": "4b29d84eff0bd4a01c6db0519c79904b808ba0f2dc9bc3727cb395ca9e30eaf0",
+      "bytes": 2596,
+      "role": "POTAL_GENERATED_PARAMS",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini.h",
+      "sha256": "a6d7207ddee555f0fbcd00b9952a12507b458ee43a899c7c1e60a131af53b15f",
+      "bytes": 208174,
+      "role": "COMPILED_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini.h",
+          "line_start": 1,
+          "line_end": 1
+        }
+      ]
+    },
+    {
+      "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+      "sha256": "d6db18f8edbfeb854780286d8c2afb81ae3b9103224522478a9047d5550272e5",
+      "bytes": 2686,
+      "role": "COMPILED_SDK_REFERENCE",
+      "verification_status": "CONFIRMED_SHA256_AND_BYTES",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+          "line_start": 7,
+          "line_end": 28
+        }
+      ]
+    }
+  ],
+  "configurations": [
+    {
+      "id": "gemmini_int8_d16_default",
+      "architecture": "Gemmini",
+      "verification_status": "CONFIRMED_SOURCE_AND_HEADER",
+      "parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+      "comparison_parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_params.h",
+      "parameters": {
+        "NPU_PRECISION": {
+          "value": 8,
+          "unit": "bits per signed logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_D": {
+          "value": 16,
+          "unit": "logical elements per square tile side",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 8,
+              "line_end": 8
+            }
+          ]
+        },
+        "NPU_SPAD_BANKS": {
+          "value": 4,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 10,
+              "line_end": 10
+            }
+          ]
+        },
+        "NPU_SPAD_BANK_ROWS": {
+          "value": 4096,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 11,
+              "line_end": 11
+            }
+          ]
+        },
+        "NPU_ACC_BANKS": {
+          "value": 2,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            }
+          ]
+        },
+        "NPU_ACC_ROWS": {
+          "value": 1024,
+          "unit": "TOTAL rows across all ACC banks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BANK_ROWS": {
+          "value": 512,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BITS": {
+          "value": 32,
+          "unit": "bits per signed ACC element",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 20,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_TYPE": {
+          "value": "int8_t",
+          "unit": "C logical scalar type",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_BYTES": {
+          "value": 1,
+          "unit": "bytes per C logical scalar container",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_TRANSPORT_BITS_PER_INPUT": {
+          "value": 8,
+          "unit": "packed transport bits per logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            }
+          ]
+        },
+        "NPU_SPAD_ROW_BYTES": {
+          "value": 16,
+          "unit": "bytes per SP row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            }
+          ]
+        },
+        "NPU_ACC_ROW_BYTES": {
+          "value": 64,
+          "unit": "bytes per full ACC row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 21,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+              "line_start": 99,
+              "line_end": 106
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 20,
+              "line_end": 20
+            }
+          ]
+        },
+        "NPU_DMA_BUS_BITS": {
+          "value": 128,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 65,
+              "line_end": 66
+            }
+          ]
+        },
+        "NPU_DMA_MAX_BYTES": {
+          "value": 64,
+          "unit": "bytes",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+              "line_start": 65,
+              "line_end": 66
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 13,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN": {
+          "value": 4,
+          "unit": "D-column blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 14,
+              "line_end": 14
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN_ACC": {
+          "value": 1,
+          "unit": "D-column ACC blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_LOCAL_ADDR_BITS": {
+          "value": 32,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 9,
+              "line_end": 9
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/LocalAddr.scala",
+              "line_start": 6,
+              "line_end": 44
+            }
+          ]
+        },
+        "NPU_INDEX_ENTRIES": {
+          "value": null,
+          "unit": "K-row entries per physical weight buffer/window",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiISA.scala",
+              "line_start": 6,
+              "line_end": 56
+            }
+          ]
+        },
+        "NPU_INDEX_PHYSICAL_TOTAL": {
+          "value": null,
+          "unit": "K-row entries across two Execute tables",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiISA.scala",
+              "line_start": 6,
+              "line_end": 56
+            }
+          ]
+        },
+        "NPU_SCALE_ENTRIES": {
+          "value": null,
+          "unit": "slots per output column",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiISA.scala",
+              "line_start": 6,
+              "line_end": 56
+            }
+          ]
+        },
+        "NPU_SCALE_PHYSICAL_TOTAL": {
+          "value": null,
+          "unit": "column-slot entries across all scale memories",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiISA.scala",
+              "line_start": 6,
+              "line_end": 56
+            }
+          ]
+        },
+        "NPU_SCALE_SLOT_BITS": {
+          "value": null,
+          "unit": "bits",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiISA.scala",
+              "line_start": 6,
+              "line_end": 56
+            }
+          ]
+        },
+        "NPU_PACKING_ABI": {
+          "value": null,
+          "unit": "ABI version",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "XCUSTOM_ACC": {
+          "value": 3,
+          "unit": "custom opcode selector",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        },
+        "CUSTOM_OPCODE": {
+          "value": 123,
+          "unit": "instruction opcode bits6:0",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalIndexRoCCAdapter.scala",
+              "line_start": 132,
+              "line_end": 133
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        }
+      },
+      "local_address": {
+        "verification_status": "CONFIRMED_DERIVED",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          }
+        ],
+        "word_bits": 32,
+        "accumulator_bit": 31,
+        "accumulate_bit": 30,
+        "read_full_width_bit": 29,
+        "norm_bits": [
+          28,
+          26
+        ],
+        "sp_address_bits": 14,
+        "sp_bank_bits": 2,
+        "sp_bank_row_bits": 12,
+        "acc_address_bits": 10,
+        "acc_bank_bits": 1,
+        "acc_bank_row_bits": 9,
+        "garbage_bit": 14,
+        "data_bits": [
+          13,
+          0
+        ],
+        "unused_padding_bits": [
+          25,
+          15
+        ]
+      },
+      "constraints": {
+        "verification_status": "CONFIRMED_SOURCE",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+            "line_start": 21,
+            "line_end": 66
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+            "line_start": 99,
+            "line_end": 106
+          }
+        ],
+        "square_tile": true,
+        "sp_bank_rows_power_of_two": true,
+        "rows_per_bank_multiple_of_D": true,
+        "acc_rows_is_total": true,
+        "paired_geometry": null
+      },
+      "runtime_verification_status": "UNVERIFIED",
+      "software_feature_advertisement": {
+        "sdk_acc_read_full_width_macro": false,
+        "rtl_repository_acc_read_full_width_macro": true,
+        "rtl_acc_read_full_width": true,
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+            "line_start": 76,
+            "line_end": 84
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_params.h",
+            "line_start": 76,
+            "line_end": 85
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+            "line_start": 62,
+            "line_end": 63
+          }
+        ]
+      }
+    },
+    {
+      "id": "potal_int8_d16",
+      "architecture": "PoTAL",
+      "verification_status": "CONFIRMED_SOURCE_AND_HEADER",
+      "parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+      "comparison_parameter_header": null,
+      "parameters": {
+        "NPU_PRECISION": {
+          "value": 8,
+          "unit": "bits per signed logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_D": {
+          "value": 16,
+          "unit": "logical elements per square tile side",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 8,
+              "line_end": 8
+            }
+          ]
+        },
+        "NPU_SPAD_BANKS": {
+          "value": 4,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 10,
+              "line_end": 10
+            }
+          ]
+        },
+        "NPU_SPAD_BANK_ROWS": {
+          "value": 4096,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 11,
+              "line_end": 11
+            }
+          ]
+        },
+        "NPU_ACC_BANKS": {
+          "value": 2,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_ACC_ROWS": {
+          "value": 1024,
+          "unit": "TOTAL rows across all ACC banks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BANK_ROWS": {
+          "value": 512,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BITS": {
+          "value": 32,
+          "unit": "bits per signed ACC element",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 20,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_TYPE": {
+          "value": "int8_t",
+          "unit": "C logical scalar type",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_BYTES": {
+          "value": 1,
+          "unit": "bytes per C logical scalar container",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_TRANSPORT_BITS_PER_INPUT": {
+          "value": 8,
+          "unit": "packed transport bits per logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            }
+          ]
+        },
+        "NPU_SPAD_ROW_BYTES": {
+          "value": 16,
+          "unit": "bytes per SP row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            }
+          ]
+        },
+        "NPU_ACC_ROW_BYTES": {
+          "value": 64,
+          "unit": "bytes per full ACC row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 23,
+              "line_end": 118
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 20,
+              "line_end": 20
+            }
+          ]
+        },
+        "NPU_DMA_BUS_BITS": {
+          "value": 128,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_DMA_MAX_BYTES": {
+          "value": 64,
+          "unit": "bytes",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 16,
+              "line_end": 16
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN": {
+          "value": 4,
+          "unit": "D-column blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 17,
+              "line_end": 17
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN_ACC": {
+          "value": 1,
+          "unit": "D-column ACC blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 18,
+              "line_end": 18
+            }
+          ]
+        },
+        "NPU_LOCAL_ADDR_BITS": {
+          "value": 32,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 9,
+              "line_end": 9
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+              "line_start": 6,
+              "line_end": 44
+            }
+          ]
+        },
+        "NPU_INDEX_ENTRIES": {
+          "value": 32,
+          "unit": "K-row entries per physical weight buffer/window",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 208,
+              "line_end": 218
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_INDEX_PHYSICAL_TOTAL": {
+          "value": 64,
+          "unit": "K-row entries across two Execute tables",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_SCALE_ENTRIES": {
+          "value": 256,
+          "unit": "slots per output column",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 110,
+              "line_end": 112
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 13,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_PHYSICAL_TOTAL": {
+          "value": 4096,
+          "unit": "column-slot entries across all scale memories",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 8,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_SLOT_BITS": {
+          "value": 8,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 14,
+              "line_end": 14
+            }
+          ]
+        },
+        "NPU_PACKING_ABI": {
+          "value": null,
+          "unit": "ABI version",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "XCUSTOM_ACC": {
+          "value": 3,
+          "unit": "custom opcode selector",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        },
+        "CUSTOM_OPCODE": {
+          "value": 123,
+          "unit": "instruction opcode bits6:0",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalIndexRoCCAdapter.scala",
+              "line_start": 132,
+              "line_end": 133
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        }
+      },
+      "local_address": {
+        "verification_status": "CONFIRMED_DERIVED",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          }
+        ],
+        "word_bits": 32,
+        "accumulator_bit": 31,
+        "accumulate_bit": 30,
+        "read_full_width_bit": 29,
+        "norm_bits": [
+          28,
+          26
+        ],
+        "sp_address_bits": 14,
+        "sp_bank_bits": 2,
+        "sp_bank_row_bits": 12,
+        "acc_address_bits": 10,
+        "acc_bank_bits": 1,
+        "acc_bank_row_bits": 9,
+        "garbage_bit": 14,
+        "data_bits": [
+          13,
+          0
+        ],
+        "unused_padding_bits": [
+          25,
+          15
+        ]
+      },
+      "constraints": {
+        "verification_status": "CONFIRMED_SOURCE",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+            "line_start": 23,
+            "line_end": 118
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+            "line_start": 110,
+            "line_end": 117
+          }
+        ],
+        "square_tile": true,
+        "sp_bank_rows_power_of_two": true,
+        "rows_per_bank_multiple_of_D": true,
+        "acc_rows_is_total": true,
+        "paired_geometry": {
+          "sp_banks": 4,
+          "acc_banks": 2
+        }
+      },
+      "runtime_verification_status": "UNVERIFIED",
+      "software_feature_advertisement": null
+    },
+    {
+      "id": "potal_int8_d32",
+      "architecture": "PoTAL",
+      "verification_status": "CONFIRMED_SOURCE_AND_HEADER",
+      "parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+      "comparison_parameter_header": null,
+      "parameters": {
+        "NPU_PRECISION": {
+          "value": 8,
+          "unit": "bits per signed logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_D": {
+          "value": 32,
+          "unit": "logical elements per square tile side",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 8,
+              "line_end": 8
+            }
+          ]
+        },
+        "NPU_SPAD_BANKS": {
+          "value": 4,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 10,
+              "line_end": 10
+            }
+          ]
+        },
+        "NPU_SPAD_BANK_ROWS": {
+          "value": 2048,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 11,
+              "line_end": 11
+            }
+          ]
+        },
+        "NPU_ACC_BANKS": {
+          "value": 2,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_ACC_ROWS": {
+          "value": 512,
+          "unit": "TOTAL rows across all ACC banks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BANK_ROWS": {
+          "value": 256,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BITS": {
+          "value": 32,
+          "unit": "bits per signed ACC element",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 20,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_TYPE": {
+          "value": "int8_t",
+          "unit": "C logical scalar type",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_BYTES": {
+          "value": 1,
+          "unit": "bytes per C logical scalar container",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_TRANSPORT_BITS_PER_INPUT": {
+          "value": 8,
+          "unit": "packed transport bits per logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            }
+          ]
+        },
+        "NPU_SPAD_ROW_BYTES": {
+          "value": 32,
+          "unit": "bytes per SP row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            }
+          ]
+        },
+        "NPU_ACC_ROW_BYTES": {
+          "value": 128,
+          "unit": "bytes per full ACC row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 20,
+              "line_end": 20
+            }
+          ]
+        },
+        "NPU_DMA_BUS_BITS": {
+          "value": 128,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_DMA_MAX_BYTES": {
+          "value": 64,
+          "unit": "bytes",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 16,
+              "line_end": 16
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN": {
+          "value": 2,
+          "unit": "D-column blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 17,
+              "line_end": 17
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN_ACC": {
+          "value": 1,
+          "unit": "D-column ACC blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 18,
+              "line_end": 18
+            }
+          ]
+        },
+        "NPU_LOCAL_ADDR_BITS": {
+          "value": 32,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 9,
+              "line_end": 9
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+              "line_start": 6,
+              "line_end": 44
+            }
+          ]
+        },
+        "NPU_INDEX_ENTRIES": {
+          "value": 64,
+          "unit": "K-row entries per physical weight buffer/window",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 208,
+              "line_end": 218
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_INDEX_PHYSICAL_TOTAL": {
+          "value": 128,
+          "unit": "K-row entries across two Execute tables",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_SCALE_ENTRIES": {
+          "value": 256,
+          "unit": "slots per output column",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 110,
+              "line_end": 112
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 13,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_PHYSICAL_TOTAL": {
+          "value": 8192,
+          "unit": "column-slot entries across all scale memories",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 8,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_SLOT_BITS": {
+          "value": 8,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 14,
+              "line_end": 14
+            }
+          ]
+        },
+        "NPU_PACKING_ABI": {
+          "value": null,
+          "unit": "ABI version",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "XCUSTOM_ACC": {
+          "value": 3,
+          "unit": "custom opcode selector",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        },
+        "CUSTOM_OPCODE": {
+          "value": 123,
+          "unit": "instruction opcode bits6:0",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalIndexRoCCAdapter.scala",
+              "line_start": 132,
+              "line_end": 133
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d32_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        }
+      },
+      "local_address": {
+        "verification_status": "CONFIRMED_DERIVED",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          }
+        ],
+        "word_bits": 32,
+        "accumulator_bit": 31,
+        "accumulate_bit": 30,
+        "read_full_width_bit": 29,
+        "norm_bits": [
+          28,
+          26
+        ],
+        "sp_address_bits": 13,
+        "sp_bank_bits": 2,
+        "sp_bank_row_bits": 11,
+        "acc_address_bits": 9,
+        "acc_bank_bits": 1,
+        "acc_bank_row_bits": 8,
+        "garbage_bit": 13,
+        "data_bits": [
+          12,
+          0
+        ],
+        "unused_padding_bits": [
+          25,
+          14
+        ]
+      },
+      "constraints": {
+        "verification_status": "CONFIRMED_SOURCE",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+            "line_start": 126,
+            "line_end": 143
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+            "line_start": 110,
+            "line_end": 117
+          }
+        ],
+        "square_tile": true,
+        "sp_bank_rows_power_of_two": true,
+        "rows_per_bank_multiple_of_D": true,
+        "acc_rows_is_total": true,
+        "paired_geometry": {
+          "sp_banks": 4,
+          "acc_banks": 2
+        }
+      },
+      "runtime_verification_status": "UNVERIFIED",
+      "software_feature_advertisement": null
+    },
+    {
+      "id": "potal_int8_d64",
+      "architecture": "PoTAL",
+      "verification_status": "CONFIRMED_SOURCE_AND_HEADER",
+      "parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+      "comparison_parameter_header": null,
+      "parameters": {
+        "NPU_PRECISION": {
+          "value": 8,
+          "unit": "bits per signed logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_D": {
+          "value": 64,
+          "unit": "logical elements per square tile side",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 8,
+              "line_end": 8
+            }
+          ]
+        },
+        "NPU_SPAD_BANKS": {
+          "value": 4,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 10,
+              "line_end": 10
+            }
+          ]
+        },
+        "NPU_SPAD_BANK_ROWS": {
+          "value": 1024,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 11,
+              "line_end": 11
+            }
+          ]
+        },
+        "NPU_ACC_BANKS": {
+          "value": 2,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_ACC_ROWS": {
+          "value": 256,
+          "unit": "TOTAL rows across all ACC banks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BANK_ROWS": {
+          "value": 128,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BITS": {
+          "value": 32,
+          "unit": "bits per signed ACC element",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 20,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_TYPE": {
+          "value": "int8_t",
+          "unit": "C logical scalar type",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_BYTES": {
+          "value": 1,
+          "unit": "bytes per C logical scalar container",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "NPU_TRANSPORT_BITS_PER_INPUT": {
+          "value": 8,
+          "unit": "packed transport bits per logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            }
+          ]
+        },
+        "NPU_SPAD_ROW_BYTES": {
+          "value": 64,
+          "unit": "bytes per SP row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            }
+          ]
+        },
+        "NPU_ACC_ROW_BYTES": {
+          "value": 256,
+          "unit": "bytes per full ACC row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 126,
+              "line_end": 143
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 110,
+              "line_end": 117
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 20,
+              "line_end": 20
+            }
+          ]
+        },
+        "NPU_DMA_BUS_BITS": {
+          "value": 128,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            }
+          ]
+        },
+        "NPU_DMA_MAX_BYTES": {
+          "value": 64,
+          "unit": "bytes",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 16,
+              "line_end": 16
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN": {
+          "value": 1,
+          "unit": "D-column blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 17,
+              "line_end": 17
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN_ACC": {
+          "value": 1,
+          "unit": "D-column ACC blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 18,
+              "line_end": 18
+            }
+          ]
+        },
+        "NPU_LOCAL_ADDR_BITS": {
+          "value": 32,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 9,
+              "line_end": 9
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+              "line_start": 6,
+              "line_end": 44
+            }
+          ]
+        },
+        "NPU_INDEX_ENTRIES": {
+          "value": 128,
+          "unit": "K-row entries per physical weight buffer/window",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+              "line_start": 208,
+              "line_end": 218
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_INDEX_PHYSICAL_TOTAL": {
+          "value": 256,
+          "unit": "K-row entries across two Execute tables",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_SCALE_ENTRIES": {
+          "value": 256,
+          "unit": "slots per output column",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+              "line_start": 110,
+              "line_end": 112
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 13,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_PHYSICAL_TOTAL": {
+          "value": 16384,
+          "unit": "column-slot entries across all scale memories",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 8,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_SLOT_BITS": {
+          "value": 8,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 14,
+              "line_end": 14
+            }
+          ]
+        },
+        "NPU_PACKING_ABI": {
+          "value": null,
+          "unit": "ABI version",
+          "verification_status": "NOT_APPLICABLE",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 17,
+              "line_end": 24
+            }
+          ]
+        },
+        "XCUSTOM_ACC": {
+          "value": 3,
+          "unit": "custom opcode selector",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        },
+        "CUSTOM_OPCODE": {
+          "value": 123,
+          "unit": "instruction opcode bits6:0",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalIndexRoCCAdapter.scala",
+              "line_start": 132,
+              "line_end": 133
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_d64_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        }
+      },
+      "local_address": {
+        "verification_status": "CONFIRMED_DERIVED",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          }
+        ],
+        "word_bits": 32,
+        "accumulator_bit": 31,
+        "accumulate_bit": 30,
+        "read_full_width_bit": 29,
+        "norm_bits": [
+          28,
+          26
+        ],
+        "sp_address_bits": 12,
+        "sp_bank_bits": 2,
+        "sp_bank_row_bits": 10,
+        "acc_address_bits": 8,
+        "acc_bank_bits": 1,
+        "acc_bank_row_bits": 7,
+        "garbage_bit": 12,
+        "data_bits": [
+          11,
+          0
+        ],
+        "unused_padding_bits": [
+          25,
+          13
+        ]
+      },
+      "constraints": {
+        "verification_status": "CONFIRMED_SOURCE",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+            "line_start": 126,
+            "line_end": 143
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/GemminiConfigs.scala",
+            "line_start": 110,
+            "line_end": 117
+          }
+        ],
+        "square_tile": true,
+        "sp_bank_rows_power_of_two": true,
+        "rows_per_bank_multiple_of_D": true,
+        "acc_rows_is_total": true,
+        "paired_geometry": {
+          "sp_banks": 4,
+          "acc_banks": 2
+        }
+      },
+      "runtime_verification_status": "UNVERIFIED",
+      "software_feature_advertisement": null
+    },
+    {
+      "id": "potal_int4_d32",
+      "architecture": "PoTAL",
+      "verification_status": "CONFIRMED_SOURCE_AND_HEADER",
+      "parameter_header": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+      "comparison_parameter_header": null,
+      "parameters": {
+        "NPU_PRECISION": {
+          "value": 4,
+          "unit": "bits per signed logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 17,
+              "line_end": 18
+            }
+          ]
+        },
+        "NPU_D": {
+          "value": 32,
+          "unit": "logical elements per square tile side",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 8,
+              "line_end": 8
+            }
+          ]
+        },
+        "NPU_SPAD_BANKS": {
+          "value": 4,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 10,
+              "line_end": 10
+            }
+          ]
+        },
+        "NPU_SPAD_BANK_ROWS": {
+          "value": 2048,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 11,
+              "line_end": 11
+            }
+          ]
+        },
+        "NPU_ACC_BANKS": {
+          "value": 2,
+          "unit": "banks",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 319,
+              "line_end": 319
+            }
+          ]
+        },
+        "NPU_ACC_ROWS": {
+          "value": 512,
+          "unit": "TOTAL rows across all ACC banks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BANK_ROWS": {
+          "value": 256,
+          "unit": "rows per bank",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 30,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 12,
+              "line_end": 12
+            }
+          ]
+        },
+        "NPU_ACC_BITS": {
+          "value": 32,
+          "unit": "bits per signed ACC element",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 18,
+              "line_end": 27
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_TYPE": {
+          "value": "int8_t",
+          "unit": "C logical scalar type",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 24,
+              "line_end": 27
+            }
+          ]
+        },
+        "NPU_INPUT_STORAGE_BYTES": {
+          "value": 1,
+          "unit": "bytes per C logical scalar container",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 24,
+              "line_end": 27
+            }
+          ]
+        },
+        "NPU_TRANSPORT_BITS_PER_INPUT": {
+          "value": 4,
+          "unit": "packed transport bits per logical input",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/SoCmulator/llama.cpp/ggml/src/ggml-potal-w4a4/include/potal-int4.h",
+              "line_start": 8,
+              "line_end": 26
+            }
+          ]
+        },
+        "NPU_SPAD_ROW_BYTES": {
+          "value": 16,
+          "unit": "bytes per SP row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 20,
+              "line_end": 20
+            }
+          ]
+        },
+        "NPU_ACC_ROW_BYTES": {
+          "value": 128,
+          "unit": "bytes per full ACC row",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 142,
+              "line_end": 147
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 111,
+              "line_end": 120
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 27,
+              "line_end": 27
+            }
+          ]
+        },
+        "NPU_DMA_BUS_BITS": {
+          "value": 128,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 320,
+              "line_end": 320
+            }
+          ]
+        },
+        "NPU_DMA_MAX_BYTES": {
+          "value": 64,
+          "unit": "bytes",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 70,
+              "line_end": 71
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 16,
+              "line_end": 16
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN": {
+          "value": 4,
+          "unit": "D-column blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 21,
+              "line_end": 21
+            }
+          ]
+        },
+        "NPU_MAX_BLOCK_LEN_ACC": {
+          "value": 1,
+          "unit": "D-column ACC blocks",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 22,
+              "line_end": 22
+            }
+          ]
+        },
+        "NPU_LOCAL_ADDR_BITS": {
+          "value": 32,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 9,
+              "line_end": 9
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/LocalAddr.scala",
+              "line_start": 6,
+              "line_end": 44
+            }
+          ]
+        },
+        "NPU_INDEX_ENTRIES": {
+          "value": 64,
+          "unit": "K-row entries per physical weight buffer/window",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+              "line_start": 211,
+              "line_end": 221
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_INDEX_PHYSICAL_TOTAL": {
+          "value": 128,
+          "unit": "K-row entries across two Execute tables",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/ExecuteController.scala",
+              "line_start": 73,
+              "line_end": 89
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 15,
+              "line_end": 15
+            }
+          ]
+        },
+        "NPU_SCALE_ENTRIES": {
+          "value": 256,
+          "unit": "slots per output column",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+              "line_start": 110,
+              "line_end": 112
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 13,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_PHYSICAL_TOTAL": {
+          "value": 8192,
+          "unit": "column-slot entries across all scale memories",
+          "verification_status": "CONFIRMED_DERIVED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalWriteback.scala",
+              "line_start": 135,
+              "line_end": 139
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 8,
+              "line_end": 13
+            }
+          ]
+        },
+        "NPU_SCALE_SLOT_BITS": {
+          "value": 8,
+          "unit": "bits",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 14,
+              "line_end": 14
+            }
+          ]
+        },
+        "NPU_PACKING_ABI": {
+          "value": 1,
+          "unit": "ABI version",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 19,
+              "line_end": 19
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/SoCmulator/llama.cpp/ggml/src/ggml-potal-w4a4/include/potal-int4.h",
+              "line_start": 8,
+              "line_end": 26
+            }
+          ]
+        },
+        "XCUSTOM_ACC": {
+          "value": 3,
+          "unit": "custom opcode selector",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        },
+        "CUSTOM_OPCODE": {
+          "value": 123,
+          "unit": "instruction opcode bits6:0",
+          "verification_status": "CONFIRMED",
+          "sources": [
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalIndexRoCCAdapter.scala",
+              "line_start": 132,
+              "line_end": 133
+            },
+            {
+              "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+              "line_start": 7,
+              "line_end": 7
+            }
+          ]
+        }
+      },
+      "local_address": {
+        "verification_status": "CONFIRMED_DERIVED",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          }
+        ],
+        "word_bits": 32,
+        "accumulator_bit": 31,
+        "accumulate_bit": 30,
+        "read_full_width_bit": 29,
+        "norm_bits": [
+          28,
+          26
+        ],
+        "sp_address_bits": 13,
+        "sp_bank_bits": 2,
+        "sp_bank_row_bits": 11,
+        "acc_address_bits": 9,
+        "acc_bank_bits": 1,
+        "acc_bank_row_bits": 8,
+        "garbage_bit": 13,
+        "data_bits": [
+          12,
+          0
+        ],
+        "unused_padding_bits": [
+          25,
+          14
+        ]
+      },
+      "constraints": {
+        "verification_status": "CONFIRMED_SOURCE",
+        "sources": [
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/LocalAddr.scala",
+            "line_start": 6,
+            "line_end": 44
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/PoTalConfigs.scala",
+            "line_start": 142,
+            "line_end": 147
+          },
+          {
+            "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+            "line_start": 111,
+            "line_end": 120
+          }
+        ],
+        "square_tile": true,
+        "sp_bank_rows_power_of_two": true,
+        "rows_per_bank_multiple_of_D": true,
+        "acc_rows_is_total": true,
+        "paired_geometry": {
+          "sp_banks": 4,
+          "acc_banks": 2
+        }
+      },
+      "runtime_verification_status": "UNVERIFIED",
+      "software_feature_advertisement": null
+    }
+  ],
+  "findings": [
+    {
+      "id": "gemmini_acc_banks",
+      "verification_status": "CONFIRMED",
+      "value": 2,
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/Configs.scala",
+          "line_start": 38,
+          "line_end": 42
+        }
+      ]
+    },
+    {
+      "id": "sdk_full_width_read_advertisement",
+      "verification_status": "CONFIRMED",
+      "description": "Actual SDK omits ACC_READ_FULL_WIDTH; RTL repository header defines it and RTL supports it.",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-include-develop/gemmini_params.h",
+          "line_start": 76,
+          "line_end": 84
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/software/gemmini-rocc-tests/include/gemmini_params.h",
+          "line_start": 76,
+          "line_end": 85
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+          "line_start": 62,
+          "line_end": 63
+        }
+      ]
+    },
+    {
+      "id": "index_queue",
+      "verification_status": "CONFIRMED_SOURCE_RUNTIME_UNVERIFIED",
+      "production_isa": false,
+      "wired": true,
+      "default_enabled": false,
+      "funct7": [
+        32,
+        33,
+        34,
+        35,
+        36
+      ],
+      "additional_guard_funct7": 37,
+      "enabled_configs": [
+        "FireSimFiveRocketSinglePoTalD32PairedStreamingIndexQueueConfig",
+        "FireSimFiveRocketSinglePoTalW4A4D32PairedStreamingIndexQueueConfig"
+      ],
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/Configs.scala",
+          "line_start": 27,
+          "line_end": 27
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/Controller.scala",
+          "line_start": 254,
+          "line_end": 260
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/Controller.scala",
+          "line_start": 348,
+          "line_end": 371
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/firechip/src/main/scala/TargetConfigs.scala",
+          "line_start": 440,
+          "line_end": 446
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/firechip/src/main/scala/W4A4TargetConfigs.scala",
+          "line_start": 31,
+          "line_end": 37
+        }
+      ]
+    },
+    {
+      "id": "sat32_shift",
+      "verification_status": "CONFIRMED",
+      "equation": "q=Sat32(new_partial << carrier); first contribution ACC=q, later ACC=Sat32(old_ACC+q). Zero carrier 0x80000000 produces q=0. Old_ACC is not shifted.",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalSCU.scala",
+          "line_start": 31,
+          "line_end": 60
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+          "line_start": 241,
+          "line_end": 255
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalWriteback.scala",
+          "line_start": 278,
+          "line_end": 302
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/AccumulatorMem.scala",
+          "line_start": 71,
+          "line_end": 84
+        }
+      ]
+    },
+    {
+      "id": "int4_packing",
+      "verification_status": "CONFIRMED",
+      "abi": 1,
+      "even_column_nibble": "low",
+      "odd_column_nibble": "high",
+      "signed_input_range": [
+        -8,
+        7
+      ],
+      "D": 32,
+      "sp_row_bytes": 16,
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/software/gemmini-rocc-tests/include/gemmini_potal_w4a4_d32_params.h",
+          "line_start": 17,
+          "line_end": 27
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/SoCmulator/llama.cpp/ggml/src/ggml-potal-w4a4/include/potal-int4.h",
+          "line_start": 8,
+          "line_end": 26
+        }
+      ]
+    },
+    {
+      "id": "hardcoded_max_bytes",
+      "verification_status": "CONFIRMED",
+      "description": "Header MAX_BYTES is emitted as literal 64, independently of dma_maxbytes. Audited configs also set dma_maxbytes=64.",
+      "sources": [
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/gemmini-aisa-aisa-customizations/src/main/scala/gemmini/GemminiConfigs.scala",
+          "line_start": 343,
+          "line_end": 344
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potalw4/GemminiConfigs.scala",
+          "line_start": 406,
+          "line_end": 407
+        },
+        {
+          "path": "/Users/zerogod/aisa-lab/DynDNN/reference/chipyard-aisa-potal/generators/potal/src/main/scala/potal/PoTalConfigs.scala",
+          "line_start": 70,
+          "line_end": 71
+        }
+      ]
+    }
+  ],
+  "unverified": [
+    "No elaboration, simulation, synthesis, hardware run, deployment or cache-coherence experiment was performed.",
+    "Use of supplied SDK in a particular compiled binary is user-reported; build configuration was inspected but no compile database or binary was verified.",
+    "Physical system DMA address width and exception recovery for malformed commands are not established as common constants."
+  ]
+}

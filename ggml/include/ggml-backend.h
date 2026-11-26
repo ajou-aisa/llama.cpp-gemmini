@@ -192,6 +192,11 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+    // Optional "ggml_backend_prepare_node": prepare an assigned node after scheduler
+    // reservation, without executing it. Activation/output data may be unallocated.
+    // Reservations can repeat, including during inference: the backend owns
+    // idempotence, initialization-only restrictions and prepared-data lifetimes.
+    typedef enum ggml_status             (*ggml_backend_prepare_node_t)(ggml_backend_t backend, const struct ggml_tensor * node);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

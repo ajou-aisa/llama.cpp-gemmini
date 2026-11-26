@@ -1,5 +1,5 @@
 #include <gemmini_params.h>
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-types.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <array>
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 namespace {
 
-using namespace ggml::gemmini::rmd;
+using namespace ggml::npu::rmd;
 
 struct GemmCase {
     size_t m;

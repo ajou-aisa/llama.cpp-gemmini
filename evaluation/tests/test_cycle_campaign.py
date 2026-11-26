@@ -6,11 +6,16 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "scripts/eval"), str(ROOT.parent / "IM2P.sim")]
-from cycle_accounting import EVENTS, EventAccounting, event_dtype, union_cycles
+sys.path[:0] = [str(ROOT / "scripts/eval")]
+from cycle_accounting import EVENTS, EventAccounting, union_cycles
 from eval_common import EvaluationError
 
 CODES = {key: index + 1 for index, key in enumerate(EVENTS)}
+
+
+def event_dtype() -> np.dtype[np.void]:
+    return np.dtype([(key, "<u8") for key in
+                     ("generation", "work_ordinal", "id", "cycle", "logical_work_id", "dependency", "type")])
 
 
 def buffer(rows: list[tuple[str, int, int, int]], work: int = 7) -> tuple[memoryview, int]:

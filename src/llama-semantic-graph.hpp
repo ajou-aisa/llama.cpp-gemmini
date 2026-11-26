@@ -1,10 +1,10 @@
 #pragma once
-#include <gemmini/semantic.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/semantic.hpp"
 #include "ggml-impl.h"
 #include <unordered_map>
 #include <stdexcept>
 
-namespace ggml::gemmini::semantic {
+namespace ggml::npu::semantic {
 inline void capture_graph(const ggml_cgraph *graph) {
     const auto session = active_session();
     if (!session) return;

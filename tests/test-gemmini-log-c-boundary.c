@@ -1,4 +1,4 @@
-#include <gemmini/log.h>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.h"
 
 int gemmini_log_c_boundary_call(int operation, const char * path);
 

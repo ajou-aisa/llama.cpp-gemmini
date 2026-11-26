@@ -63,7 +63,7 @@ def fixtures(root: Path, dim: int = 64) -> Manifest:
         "tokenizer_sha256": "1" * 64, "chunk_policy": "smoke-only; not a dataset campaign",
         "precision": "A8W8", "dim": dim, "BK": 32, "seed": 1234, "git_sha": "2" * 40})
     manifest = Manifest.load(root / "evaluation_manifest.json")
-    _emit(root / "activation.jsonl", manifest, "im2p-activation-quant-metrics",
+    _emit(root / "activation.jsonl", manifest, "gemmini-activation-quant-metrics",
           [_counts(32, 1, 2, 1, 0), _counts(64, 2, 1, 1, 1)],
           {"definition_status": "CONFIRMED_BY_USER", "reference_revision": activation.REFERENCE})
     main: Record = {"kind": "MAIN_STRIPE", "stripe_id": 0, "row_begin": 0, "row_count": 2,
@@ -84,7 +84,7 @@ def fixtures(root: Path, dim: int = 64) -> Manifest:
                        "row_map": [{"original_lane_id": 0, "source_row": 0},
                                    {"original_lane_id": 0, "source_row": 1},
                                    {"original_lane_id": 1, "source_row": 0}]}
-    _emit(root / "residual.jsonl", manifest, "im2p-residual-path-metrics", [main, radix, compact])
+    _emit(root / "residual.jsonl", manifest, "gemmini-residual-path-metrics", [main, radix, compact])
     scale: list[Record] = []
     for column, offset, count in ((0, 0, 16), (1, 3, 32), (2, 1, 16)):
         scale.append({"kind": "SCALE_ALIGNMENT", "column": column, "original_block": 0,
@@ -92,7 +92,7 @@ def fixtures(root: Path, dim: int = 64) -> Manifest:
                       "original_weight_scale": 0.25 * 2 ** offset, "aligned_pot_scale": 0.25,
                       "scu_shift_offset": offset, "updated_partial_sum_count": count if offset else 0,
                       "total_partial_sum_count": count, "zero_weight": False})
-    _emit(root / "scale.jsonl", manifest, "im2p-scale-alignment-metrics", scale,
+    _emit(root / "scale.jsonl", manifest, "gemmini-scale-alignment-metrics", scale,
           {"scale_domain": "hp1_block_pot_to_channel_anchor"})
     return manifest
 

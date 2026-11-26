@@ -38,7 +38,7 @@ def _fragments(row: Record, dim: int) -> int:
 
 
 def reduce(path: Path, manifest: Manifest) -> Record:
-    return summarize(metric_rows(path, "im2p-residual-path-metrics", manifest), path, manifest)
+    return summarize(metric_rows(path, "gemmini-residual-path-metrics", manifest), path, manifest)
 
 
 def summarize(rows: Iterator[Record], path: Path, manifest: Manifest) -> Record:

@@ -1,12 +1,12 @@
-#include "gemmini/cycle_reader.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
 #include <cstdio>
 
 int main() {
-    using namespace ggml::gemmini::cycle;
+    using namespace ggml::npu::cycle;
     reset_read_count_for_test();
     const auto counter = read();
     const auto timestamp = timestamp_ns();
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
     const bool enabled = true;
 #else
     const bool enabled = false;

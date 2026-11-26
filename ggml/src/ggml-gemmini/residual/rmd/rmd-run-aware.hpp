@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rmd-types.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +9,7 @@
 struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::rmd {
+using namespace ggml::npu::rmd;
 
 struct RunAwareRun {
     uint32_t              original_block_id       = 0;

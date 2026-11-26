@@ -1,5 +1,4 @@
-foreach(required IN ITEMS CPU_SOURCE CPU_CMAKE GEMMINI_SOURCE OPS_SOURCE
-                          IM2P_ROUTE_SOURCE IM2P_ROUTE_HEADER)
+foreach(required IN ITEMS CPU_SOURCE CPU_CMAKE GEMMINI_SOURCE OPS_SOURCE)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} is required")
     endif()
@@ -9,8 +8,6 @@ file(READ "${CPU_SOURCE}" cpu_source)
 file(READ "${CPU_CMAKE}" cpu_cmake)
 file(READ "${GEMMINI_SOURCE}" gemmini_entry)
 file(READ "${OPS_SOURCE}" ops_source)
-file(READ "${IM2P_ROUTE_SOURCE}" route_source)
-file(READ "${IM2P_ROUTE_HEADER}" route_header)
 
 function(require_cpu_count regex expected description)
     string(REGEX MATCHALL "${regex}" matches "${cpu_source}")
@@ -144,22 +141,22 @@ foreach(token IN LISTS forbidden_cpu_tokens)
     endif()
 endforeach()
 
-foreach(token IN ITEMS "ggml-gemmini-utils/src" "cycle_reader_internal.h")
+foreach(token IN ITEMS "ggml-npu-common/profiling/src" "cycle_reader_internal.h")
     string(FIND "${cpu_cmake}" "${token}" token_pos)
     if(NOT token_pos EQUAL -1)
         message(FATAL_ERROR "ggml-cpu retains forbidden private include path: ${token}")
     endif()
 endforeach()
 
-require_gemmini_count("ggml::gemmini::cycle::read\\(\\)" 0
+require_gemmini_count("ggml::npu::cycle::read\\(\\)" 0
     "Gemmini outer scopes have no unowned scalar cycle endpoints")
 require_gemmini_count("gemmini_cpu_sample start\\{\\}, end\\{\\}" 1
     "Gemmini shared native/host endpoint storage")
 require_gemmini_count(
-    "rmd_telemetry_invocation_start = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
+    "rmd_telemetry_invocation_start = ggml::npu::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation start boundary")
 require_gemmini_count(
-    "rmd_telemetry_invocation_end = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
+    "rmd_telemetry_invocation_end = ggml::npu::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation end boundary")
 require_gemmini_count(
     "quantize_start = gemmini_cpu_timing_read\\(\\)" 1
@@ -218,9 +215,9 @@ endif()
 set(required_gemmini_operations
     "args.transpose_B = (TRANSPOSE_B != 0)"
     "ggml::gemmini::gemmini_set_tile_ws(&args)"
-    "ggml::gemmini::quants::quantize_activation(src1, args)"
+    "ggml::npu::quants::quantize_activation(src1, args)"
     "pipeline_stripe_telemetry(layer, profile)"
-    "ggml::gemmini::evaluate_matmul_cpu_interval("
+    "ggml::npu::evaluate_matmul_cpu_interval("
     "rmd_telemetry_invocation_start, rmd_telemetry_invocation_end)")
 foreach(operation IN LISTS required_gemmini_operations)
     string(REGEX REPLACE "[ \t\r\n]" "" operation_compact "${operation}")
@@ -254,66 +251,7 @@ foreach(token IN LISTS forbidden_gemmini_tokens)
     endforeach()
 endforeach()
 
-if(gemmini_entry MATCHES "ggml::gemmini::cycle::read\\(\\)")
+if(gemmini_entry MATCHES "ggml::npu::cycle::read\\(\\)")
     message(FATAL_ERROR "Gemmini entry must not introduce unowned scalar cycle endpoints")
 endif()
-foreach(token IN ITEMS "read_matmul_cpu_sample(" "gemmini_cpu_timing_read("
-                       "emit_matmul_cpu_interval(" "log::cycle.write" ".fence("
-                       "start_full(" "start_pipeline(")
-    string(FIND "${route_source}" "${token}" token_pos)
-    if(NOT token_pos EQUAL -1)
-        message(FATAL_ERROR "Pure IM2P projection must not execute runtime/timer/emit calls: ${token}")
-    endif()
-endforeach()
-foreach(token IN ITEMS "im2p_gemmini_frontend.hpp" "im2p_geometry.h" "im2p_compact_runs.h")
-    string(FIND "${route_header}" "${token}" token_pos)
-    if(NOT token_pos EQUAL -1)
-        message(FATAL_ERROR "Pure IM2P public route contract must not include SDK implementation headers: ${token}")
-    endif()
-endforeach()
-
-# Adapter boundaries must exist at the real callsites, not only in a name table.
-get_filename_component(gemmini_source_dir "${GEMMINI_SOURCE}" DIRECTORY)
-file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p_source)
-foreach(operation IN ITEMS
-        im2p.host_input_preparation
-        im2p.stripe_input_capture
-        im2p.stripe_submit_host_call
-        im2p.frontend_start_host_call
-        im2p.fence_host_call
-        im2p.residual_metadata_preparation
-        im2p.residual_backend_host_call
-        im2p.residual_simulator_host_call
-        im2p.output_correction_apply
-        im2p.post_fence_validation
-        im2p.output_authorize_host_call
-        im2p.output_buffer_copy)
-    string(FIND "${im2p_source}" "\"${operation}\"" operation_pos)
-    if(operation_pos EQUAL -1)
-        message(FATAL_ERROR "Missing real IM2P host CPU boundary: ${operation}")
-    endif()
-endforeach()
-# The captured FULL and PIPELINE callbacks bind the actual event, while the
-# upstream baseline FULL path obtains the optional run from its own metadata.
-string(REGEX MATCHALL "direct_metrics[.]run_id[ ]*=[^;]*" direct_run_bindings "${im2p_source}")
-list(LENGTH direct_run_bindings direct_run_count)
-if(NOT direct_run_count EQUAL 3)
-    message(FATAL_ERROR "All three direct worker callsites must preserve run identity, including zero")
-endif()
-set(event_run_count 0)
-set(metadata_run_count 0)
-foreach(binding IN LISTS direct_run_bindings)
-    if(binding STREQUAL "direct_metrics.run_id = event.run_id")
-        math(EXPR event_run_count "${event_run_count} + 1")
-    elseif(binding STREQUAL "direct_metrics.run_id = metadata->run_id")
-        math(EXPR metadata_run_count "${metadata_run_count} + 1")
-    else()
-        message(FATAL_ERROR "Direct worker identity must come from its actual event or metadata: ${binding}")
-    endif()
-endforeach()
-if(NOT event_run_count EQUAL 2 OR NOT metadata_run_count EQUAL 1)
-    message(FATAL_ERROR "Expected two event bindings and one baseline metadata binding")
-endif()
-
-message(STATUS
-    "CPU operation coverage and IM2P host boundary contract passed")
+message(STATUS "CPU operation coverage and Gemmini host boundary contract passed")

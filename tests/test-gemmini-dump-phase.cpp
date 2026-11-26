@@ -4,8 +4,8 @@
 #include "ggml-gemmini.h"
 #include "dump/dump_tensor.hpp"
 #include "dump/scale/scale_dump_dispatch.hpp"
-#include <gemmini/performance.hpp>
-#include "../ggml/src/ggml-gemmini-utils/src/trace-metadata.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/src/trace-metadata.hpp"
 #include "json.hpp"
 #include <cmath>
 #include <cstdio>
@@ -17,8 +17,8 @@
 #include <unistd.h>
 #endif
 
-namespace perf = ggml::gemmini::performance;
-namespace log  = ggml::gemmini::log;
+namespace perf = ggml::npu::performance;
+namespace log  = ggml::npu::log;
 static void check(bool condition, const char * message) {
     if (!condition)
         throw std::runtime_error(message);

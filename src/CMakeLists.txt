@@ -36,15 +36,18 @@ add_library(llama
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
-target_compile_definitions(llama PRIVATE CYCLE_SIM=${CYCLE_SIM} LOG_CYCLE=${LOG_CYCLE})
-if(LOG_CYCLE OR CYCLE_SIM)
+target_compile_definitions(llama PRIVATE LOG_CYCLE=${LOG_CYCLE})
+if(LOG_CYCLE)
     target_include_directories(llama PRIVATE ../ggml/src)
-    target_link_libraries(llama PRIVATE ggml-gemmini-utils)
+    target_link_libraries(llama PRIVATE ggml-npu-profiling)
 endif()
 
 target_link_libraries(llama PUBLIC ggml)
 if(GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
     target_compile_definitions(llama PRIVATE GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=1)
+endif()
+if(GGML_POTAL)
+    target_compile_definitions(llama PRIVATE GGML_POTAL_ATTENTION=1)
 endif()
 
 if (BUILD_SHARED_LIBS)

@@ -10,7 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <cinttypes>
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
 #include "llama-semantic-graph.hpp"
 #endif
 
@@ -144,9 +144,11 @@ llama_context::llama_context(
                 if (prefer_gemmini && ((pass == 0) != is_gemmini)) {
                     continue;
                 }
+                // Gemmini and PoTal name their matmul layers from the model architecture.
+                const bool is_potal = std::strcmp(ggml_backend_dev_name(dev), "POTAL") == 0;
                 const char * backend_params = nullptr;
                 std::string gemmini_model_arch;
-                if (is_gemmini) {
+                if (is_gemmini || is_potal) {
                     gemmini_model_arch = model.arch_name();
                     backend_params = gemmini_model_arch.c_str();
                 }
@@ -760,8 +762,8 @@ int llama_context::encode(llama_batch & inp_batch) {
     auto * gf = graph_init();
     auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_ENCODER);
 
-#if LOG_CYCLE || CYCLE_SIM
-    ggml::gemmini::semantic::capture_graph(gf);
+#if LOG_CYCLE
+    ggml::npu::semantic::capture_graph(gf);
 #endif
 
     ggml_backend_sched_alloc_graph(sched.get(), gf);
@@ -982,8 +984,8 @@ int llama_context::decode(llama_batch & inp_batch) {
         auto * gf = graph_init();
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
 
-#if LOG_CYCLE || CYCLE_SIM
-        ggml::gemmini::semantic::capture_graph(gf);
+#if LOG_CYCLE
+        ggml::npu::semantic::capture_graph(gf);
 #endif
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);

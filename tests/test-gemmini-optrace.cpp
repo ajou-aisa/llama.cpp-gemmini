@@ -1,4 +1,4 @@
-#include <gemmini/optrace.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/optrace.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-namespace trace = ggml::gemmini::optrace;
+namespace trace = ggml::npu::optrace;
 
 static trace::RunInfo info(unsigned bits = 8, unsigned dim = 16) {
     trace::RunInfo r;
@@ -20,13 +20,13 @@ static trace::RunInfo info(unsigned bits = 8, unsigned dim = 16) {
         "-d" + std::to_string(dim) + "-hp1";
     r.activation_bits = r.weight_bits = bits;
     r.dim = dim;
-    r.backend = "IM2P_SIM/GEMMINI_HP1";
+    r.backend = "GEMMINI/REFERENCE";
     r.mode = "FULL";
     r.hardware_contract_sha256 = std::string(64, '3');
     r.runtime_manifest_sha256 = std::string(64, '4');
     r.prompt_tokens = 256;
     r.requested_generated_tokens = 5;
-    for (const char *name : {"IM2P.sim", "llama.cpp-gemmini", "headers"}) {
+    for (const char *name : {"llama.cpp-gemmini", "headers"}) {
         r.source_commits[name] = std::string(40, '1');
         r.source_worktree_sha256[name] = std::string(64, '2');
     }
@@ -61,18 +61,6 @@ int main(int argc, char **argv) {
     assert(!trace::Session::start(nullptr, info()));
     assert(!trace::Session::start("", info()));
     assert(!trace::current_context());
-#if CYCLE_SIM
-    const auto forbidden = root / "functional-cannot-claim-production.jsonl";
-    bool rejected = false;
-    try {
-        trace::Session::start(forbidden.c_str(), info());
-    } catch (const std::runtime_error & error) {
-        rejected = std::string(error.what()) ==
-            "optrace: CPU-functional collection cannot claim production RTL acceptance";
-    }
-    assert(rejected && !std::filesystem::exists(forbidden));
-    return 0;
-#endif
     for (unsigned bits : {4u, 8u}) for (unsigned dim : {16u, 32u, 64u}) {
         const auto tag = std::to_string(bits) + "-" + std::to_string(dim);
         for (unsigned repeat = 0; repeat != 2; ++repeat) {

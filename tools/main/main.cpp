@@ -1,3 +1,4 @@
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/optrace.hpp"
 #include "arg.h"
 #include "common.h"
 #include "console.h"
@@ -18,21 +19,17 @@
 #include <string>
 #include <vector>
 
-#include <gemmini/log.hpp>
-#include <gemmini/host-timing.hpp>
-#include <gemmini/optrace.hpp>
-#include <gemmini/performance.hpp>
-#if LOG_CYCLE || CYCLE_SIM
-#include <gemmini/semantic.hpp>
-#endif
-#if CYCLE_SIM
-#include <gemmini/cycle_sim_log.hpp>
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/host-timing.hpp"
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
+#if LOG_CYCLE
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/semantic.hpp"
 #endif
 
-namespace perf = ggml::gemmini::performance;
+namespace perf = ggml::npu::performance;
 
 static uint64_t performance_now_ns() {
-    return ggml::gemmini::cycle::timeline_now_ns();
+    return ggml::npu::cycle::timeline_now_ns();
 }
 
 #if LOG_CYCLE
@@ -69,7 +66,7 @@ static void log_inference_configuration(const common_params & params, llama_mode
     char description[256]{};
     llama_model_desc(model, description, sizeof(description));
     Json record = {{"schema", "gemmini.cycle"}, {"version", 2},
-        {"record_type", "INFERENCE_CONFIGURATION"}, {"execution_id", ggml::gemmini::cycle::host_execution_id()},
+        {"record_type", "INFERENCE_CONFIGURATION"}, {"execution_id", ggml::npu::cycle::host_execution_id()},
         {"timestamp_ns", timestamp_ns}, {"inference_context", nullptr},
         {"build_commit", LLAMA_COMMIT}, {"build_compiler", LLAMA_COMPILER},
         {"build_target", LLAMA_BUILD_TARGET}, {"model_path", params.model.path},
@@ -121,7 +118,7 @@ static void log_inference_configuration(const common_params & params, llama_mode
     record["host_policy_reason"] = (record["cpu_affinity_observed"].is_null() || policies.empty())
         ? Json("host_policy_partially_unavailable") : Json();
 #endif
-    ggml::gemmini::log::cycle.write_json(record.dump());
+    ggml::npu::log::cycle.write_json(record.dump());
     (void) gemmini_log_cycle_flush();
 }
 #endif
@@ -131,17 +128,17 @@ static void print_final_performance() {
     perf::finish_recording();
     perf::Summary summary;
 #if LOG_CYCLE
-    if (!ggml::gemmini::log::cycle.healthy()) {
+    if (!ggml::npu::log::cycle.healthy()) {
         summary.reason = "cycle_log_write_failed";
     } else {
-        const auto path = ggml::gemmini::log::cycle.output_path();
+        const auto path = ggml::npu::log::cycle.output_path();
         if (path.empty()) summary.reason = "cycle_log_not_readable_file";
         else summary = perf::read_summary(path);
     }
 #else
     summary.reason = "LOG_CYCLE_disabled";
 #endif
-    ggml::gemmini::log::cycle.write_json(summary.serialize());
+    ggml::npu::log::cycle.write_json(summary.serialize());
     (void) gemmini_log_cycle_flush();
     summary.print(stderr);
 }
@@ -256,14 +253,14 @@ static bool file_is_empty(const std::string & path) {
 #if LOG_DEBUG
 static bool set_gemmini_debug_log_output(const char * path) {
     if (std::strcmp(path, "stdout") == 0 || std::strcmp(path, "-") == 0) {
-        ggml::gemmini::log::debug.set_output(stdout);
+        ggml::npu::log::debug.set_output(stdout);
         return true;
     }
     if (std::strcmp(path, "stderr") == 0) {
-        ggml::gemmini::log::debug.set_output(stderr);
+        ggml::npu::log::debug.set_output(stderr);
         return true;
     }
-    return ggml::gemmini::log::debug.set_output_path(path, true);
+    return ggml::npu::log::debug.set_output_path(path, true);
 }
 #endif
 
@@ -295,14 +292,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+
+
+
     const char * optrace_path = std::getenv("GEMMINI_OPTRACE_PATH");
     const bool optrace_requested = optrace_path && *optrace_path;
-#if CYCLE_SIM
-    if (optrace_requested) {
-        fprintf(stderr, "error: CPU-functional cycle-sim cannot emit production RTL optrace\n");
-        return 1;
-    }
-#endif
     if (optrace_requested && (std::getenv("GEMMINI_MATMUL_MODE") ||
         std::getenv("GEMMINI_RMD_BACKEND") || std::getenv("GEMMINI_STRIPE_JOB_CAPACITY"))) {
         fprintf(stderr, "error: optrace v1 records compiled mode/config; use a matching build without Gemmini runtime mode overrides\n");
@@ -341,11 +335,11 @@ int main(int argc, char ** argv) {
     const char * cycle_log_path = params.gemmini_cycle_log.empty()
         ? GEMMINI_LOG_DEFAULT_CYCLE_PATH
         : params.gemmini_cycle_log.c_str();
-    const bool cycle_log_ready = ggml::gemmini::log::cycle.set_output_path(cycle_log_path, true);
+    const bool cycle_log_ready = ggml::npu::log::cycle.set_output_path(cycle_log_path, true);
     if (!params.gemmini_cycle_log.empty() && !cycle_log_ready) {
         return 1;
     }
-    ggml::gemmini::log::cycle.set_buffered(true);
+    ggml::npu::log::cycle.set_buffered(true);
 #else
     if (!params.gemmini_cycle_log.empty()) {
         fprintf(stderr, "error: --gemmini-cycle-log is unavailable because this build has LOG_CYCLE=0\n");
@@ -353,13 +347,6 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-#if CYCLE_SIM
-    if (params.interactive || params.interactive_first || params.embedding ||
-        params.n_predict <= 0 || params.grp_attn_n != 1 || !params.path_prompt_cache.empty()) {
-        fprintf(stderr, "error: CYCLE_SIM requires a fresh noninteractive decoder run with a positive token limit\n");
-        return 1;
-    }
-#endif
 
     common_init();
 
@@ -802,14 +789,15 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> embd;
 
-    namespace optrace = ggml::gemmini::optrace;
+    namespace optrace = ggml::npu::optrace;
     std::shared_ptr<optrace::Session> production_trace;
     optrace::Context prefill_context;
     uint64_t trace_decode_index = 0;
+
     // Track the actual driver origin, not the token count or GEMM shape.
     bool embd_from_generated = false;
-#if LOG_CYCLE || CYCLE_SIM
-    namespace semantic = ggml::gemmini::semantic;
+#if LOG_CYCLE
+    namespace semantic = ggml::npu::semantic;
     std::shared_ptr<semantic::Session> semantic_trace;
     bool semantic_prefill = false;
     uint64_t semantic_decode_index = 0;
@@ -834,10 +822,8 @@ int main(int argc, char ** argv) {
             ",\"seed\":" + std::to_string(params.sampling.seed) + ",\"numa\":" + std::to_string(params.numa) +
             ",\"build_target\":" + semantic::quote(LLAMA_BUILD_TARGET) + '}';
         const bool cpu_only_build = semantic::compiled_cpu_only_build();
-        const auto source = CYCLE_SIM ? semantic::Source::PotalCollection :
-            cpu_only_build ? semantic::Source::FullCpu : semantic::Source::Unspecified;
-        const std::string producer = std::string("{\"cycle_sim\":") + std::to_string(CYCLE_SIM) +
-            ",\"log_cycle\":" + std::to_string(LOG_CYCLE) + ",\"cpu_only_build\":" + (cpu_only_build ? "true" : "false") +
+        const auto source = cpu_only_build ? semantic::Source::FullCpu : semantic::Source::Unspecified;
+        const std::string producer = std::string("{\"log_cycle\":") + std::to_string(LOG_CYCLE) + ",\"cpu_only_build\":" + (cpu_only_build ? "true" : "false") +
             ",\"git_commit\":" + semantic::quote(LLAMA_COMMIT) +
             ",\"warmup_excluded\":true,\"reserve_measure_graphs_excluded\":true}";
         try {
@@ -848,33 +834,8 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
-#if CYCLE_SIM
-    namespace cycle_sim = ggml::gemmini::cycle_sim;
-    std::shared_ptr<cycle_sim::Session> functional_trace;
-    cycle_sim::Context functional_prefill;
-    uint64_t functional_decode_index = 0;
-    if (llama_model_has_encoder(model) ||
-        embd_inp.size() + static_cast<size_t>(params.n_predict) >= static_cast<size_t>(n_ctx)) {
-        LOG_ERR("cycle-sim: encoder or context-shifting execution is unsupported\n");
-        return 1;
-    }
-    try {
-        const auto identity = params.model_alias.empty()
-            ? std::filesystem::path(params.model.path).filename().string()
-            : params.model_alias;
-        functional_trace = cycle_sim::Session::start(
-            cycle_sim::compiled_run_info(identity, embd_inp.size(), params.n_predict));
-        functional_trace->set_policy_query({ggml_backend_dev_by_name("GEMMINI"),
-            [](void *device, const void *node) {
-                return device && ggml_backend_dev_supports_op(
-                    static_cast<ggml_backend_dev_t>(device),
-                    static_cast<const ggml_tensor *>(node));
-            }});
-    } catch (const std::exception &error) {
-        LOG_ERR("cycle-sim: %s\n", error.what());
-        return 1;
-    }
-#endif
+
+
     if (optrace_requested) {
         if (params.interactive || llama_model_has_encoder(model) ||
             embd_inp.size() + static_cast<size_t>(params.n_predict) >= static_cast<size_t>(n_ctx)) {
@@ -911,8 +872,21 @@ int main(int argc, char ** argv) {
 #endif
     perf::reset();
     perf::set_npu_frequency(npu_hz);
+    // Optional outer latency evidence without enabling per-node cycle logging.
+    // Buffer token boundaries and print only after inference has completed.
+    const char * latency_option = std::getenv("POTAL_REQUEST_LATENCY");
+    const bool request_latency = latency_option && std::strcmp(latency_option, "1") == 0;
+    if (request_latency && (params.interactive || params.interactive_first ||
+                            params.n_predict <= 0 || embd_inp.empty())) {
+        LOG_ERR("POTAL_REQUEST_LATENCY requires a noninteractive prompt and positive n_predict\n");
+        return 1;
+    }
+    struct latency_sample { uint64_t timestamp; llama_token token; };
+    std::vector<latency_sample> latency_samples;
+    if (request_latency) latency_samples.reserve(params.n_predict);
+    const uint64_t request_start_ns = embd_inp.empty() ? 0 : performance_now_ns();
     if (!embd_inp.empty()) {
-        perf::start_request(performance_now_ns());
+        perf::start_request(request_start_ns);
     }
     perf::Phase inference_phase = perf::Phase::prefill;
 
@@ -1046,7 +1020,7 @@ int main(int argc, char ** argv) {
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
                 try {
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
                     if (semantic_trace) {
                         if (embd_from_generated) {
                             semantic_trace->phase("decode", semantic_decode_index++, &embd[i], n_eval);
@@ -1056,6 +1030,7 @@ int main(int argc, char ** argv) {
                         }
                     }
 #endif
+
                     optrace::Context trace_context;
                     if (production_trace) {
                         if (embd_from_generated) {
@@ -1067,17 +1042,6 @@ int main(int argc, char ** argv) {
                         }
                     }
                     optrace::ScopedContext trace_scope(std::move(trace_context));
-#if CYCLE_SIM
-                    cycle_sim::Context functional_context;
-                    if (embd_from_generated) {
-                        functional_context = functional_trace->phase("decode", functional_decode_index++, n_eval);
-                    } else {
-                        if (!functional_prefill)
-                            functional_prefill = functional_trace->phase("prefill", std::nullopt, embd_inp.size());
-                        functional_context = functional_prefill;
-                    }
-                    cycle_sim::ScopedContext functional_scope(functional_context);
-#endif
                     InferenceOperation operation(inference_phase, "llama.decode");
                     const int status = llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval));
                     llama_synchronize(ctx);
@@ -1087,11 +1051,8 @@ int main(int argc, char ** argv) {
                         print_final_performance();
                         return 1;
                     }
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
                     if (semantic_trace) semantic_trace->ensure_healthy();
-#endif
-#if CYCLE_SIM
-                    functional_trace->ensure_healthy();
 #endif
                 } catch (const std::exception & error) {
                     LOG_ERR("optrace/evaluation: %s\n", error.what());
@@ -1131,6 +1092,7 @@ int main(int argc, char ** argv) {
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
             const uint64_t token_ready_ns = sampling.finish(true);
             perf::token_ready(token_ready_ns, id);
+            if (request_latency) latency_samples.push_back({token_ready_ns, id});
             inference_phase = perf::Phase::decode;
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
@@ -1398,7 +1360,19 @@ int main(int argc, char ** argv) {
         }
     }
 
-    perf::finish_request(performance_now_ns());
+    const uint64_t request_end_ns = performance_now_ns();
+    perf::finish_request(request_end_ns);
+    if (request_latency) {
+        std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"request_start\",\"timestamp_ns\":%llu,"
+            "\"clock\":\"steady_clock\",\"boundary\":\"tokenized_prompt_before_inference\"}\n",
+            (unsigned long long) request_start_ns);
+        for (size_t i = 0; i < latency_samples.size(); ++i)
+            std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"token_ready\",\"timestamp_ns\":%llu,"
+                "\"token_index\":%zu,\"token_id\":%d,\"boundary\":\"sampling_and_accept_complete\"}\n",
+                (unsigned long long) latency_samples[i].timestamp, i, int(latency_samples[i].token));
+        std::fprintf(stderr, "POTAL_REQUEST_EVENT {\"event\":\"request_end\",\"timestamp_ns\":%llu}\n",
+            (unsigned long long) request_end_ns);
+    }
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
@@ -1412,7 +1386,7 @@ int main(int argc, char ** argv) {
     common_sampler_free(smpl);
 
     bool execution_ok = true;
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
     if (semantic_trace) {
         try { semantic_trace->finish(execution_ok); }
         catch (const std::exception &error) {
@@ -1421,15 +1395,7 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
-#if CYCLE_SIM
-    try {
-        functional_trace->finish(execution_ok,
-            execution_ok ? "" : "backend execution failed");
-    } catch (const std::exception &error) {
-        LOG_ERR("cycle-sim: %s\n", error.what());
-        execution_ok = false;
-    }
-#endif
+
     if (production_trace) {
         try {
             production_trace->finish(execution_ok,

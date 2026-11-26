@@ -1,4 +1,5 @@
-#include <gemmini/trace-context.hpp>
+#include "../ggml-npu-common/profiling/include/npu/optrace.hpp"
+#include "../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 // ggml-gemmini.cpp
 
 #include <cstdio>
@@ -20,18 +21,17 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "ggml-gpu-cpu-exact.hpp"
+#include "../ggml-npu-common/evaluation/gemmini/graph.hpp"
 #endif
-#include "ggml-gemmini-config.hpp"
+#include "../ggml-npu-common/config/software.hpp"
 #include "ggml-gemmini-buffer.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-quants.h"
 
-#include <gemmini/log.hpp>
-#include <gemmini/optrace.hpp>
-#include <gemmini/performance.hpp>
-#if LOG_CYCLE || CYCLE_SIM
-#include <gemmini/semantic.hpp>
+#include "../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml-npu-common/profiling/include/npu/performance.hpp"
+#if LOG_CYCLE
+#include "../ggml-npu-common/profiling/include/npu/semantic.hpp"
 #endif
 #if LOG_CYCLE
 #include "../../../common/json.hpp"
@@ -39,13 +39,10 @@
 #include "dump/dump_tensor.hpp"
 
 #include <gemmini_params.h>
-#include <gemmini.h>
+#include "gemmini.h"
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-#include "ggml-gemmini-im2p.hpp"
-#endif
-#include "quants/act/quantize.hpp"
+#include "../ggml-npu-common/quantization/activation/quantize.hpp"
 // #include "quantization/ggml-gemmini-quantize.h"
 
 #if LOG_DUMP
@@ -68,14 +65,14 @@
 #include "ops.hpp"
 #include "potal-sensitivity.hpp"
 #if defined(GGML_GEMMINI_CUDA_RTN)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
 #endif
 
 // Cycle 측정 용
-extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
+
 
 void setup_gemmini_log_outputs_if_needed(void) {
-    const auto result = ggml::gemmini::log::setup_default_outputs();
+    const auto result = ggml::npu::log::setup_default_outputs();
     if (!result.cycle) {
         GGML_LOG_WARN("%s: failed to set default cycle log path '%s'\n",
                       __func__,
@@ -86,9 +83,6 @@ void setup_gemmini_log_outputs_if_needed(void) {
                       __func__,
                       GEMMINI_LOG_DEFAULT_DEBUG_PATH);
     }
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    ggml::gemmini::im2p_adapter::install_rtl_debug_sink();
-#endif
 }
 
 // backend interface
@@ -123,7 +117,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
                 std::max(graph_max_i, static_cast<size_t>(node->ne[1] > 0 ? node->ne[1] : 1));
         }
     }
-    ggml::gemmini::log::debug("graph",
+    ggml::npu::log::debug("graph",
                               "nodes=%d mul_mat=%zu max_i=%zu",
                               cgraph->n_nodes,
                               graph_mul_mat_count,
@@ -142,9 +136,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
 
     ggml::gemmini::log::DumpPhase phase   = ggml::gemmini::log::DumpPhase::unknown;
     uint64_t                      step_id = 0;
-    const auto                    context = ggml::gemmini::performance::capture_context();
+    const auto                    context = ggml::npu::performance::capture_context();
     if (context.request_id && context.operation_id) {
-        const bool decode = context.phase == ggml::gemmini::performance::Phase::decode;
+        const bool decode = context.phase == ggml::npu::performance::Phase::decode;
         phase =
             decode ? ggml::gemmini::log::DumpPhase::decode : ggml::gemmini::log::DumpPhase::prefill;
         step_id = decode ? context.decode_ordinal + 1 : 1;
@@ -157,10 +151,10 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
     const uint64_t graph_id = gemmini_trace_reserve_ids(static_cast<uint64_t>(cgraph->n_nodes) + 1);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
-#if LOG_CYCLE || CYCLE_SIM
-        ggml::gemmini::semantic::ScopedNode semantic_scope(node, 1);
+#if LOG_CYCLE
+        ggml::npu::semantic::ScopedNode semantic_scope(node, 1);
 #endif
-        ggml::gemmini::trace::ScopedContext operator_context(
+        ggml::npu::trace::ScopedContext operator_context(
             gemmini_trace_operator(graph_trace,
                                    graph_id,
                                    graph_id + 1 + static_cast<uint64_t>(i),
@@ -169,8 +163,8 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
                                    0,
                                    1,
                                    1));
-        ggml::gemmini::trace::CpuStage operator_dispatch(
-            node->name, "operator.host_dispatch", ggml::gemmini::trace::CpuStage::Scope::envelope);
+        ggml::npu::trace::CpuStage operator_dispatch(
+            node->name, "operator.host_dispatch", ggml::npu::trace::CpuStage::Scope::envelope);
 
         switch (node->op) {
         case GGML_OP_GET_ROWS:
@@ -212,10 +206,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
             ggml::gemmini::log::dump_set_node_idx(node_idx);
 #endif
-#if CYCLE_SIM
-            const auto cycle_sim_context = ggml::gemmini::cycle_sim::context_for(node);
-            ggml::gemmini::cycle_sim::ScopedContext cycle_sim_scope(cycle_sim_context);
-#endif
             if (ggml_gemmini_get_attention_role(node) != GGML_GEMMINI_ATTENTION_NONE) {
                 const auto status = ggml::gemmini::attention_execute(node, ctx->attention, &ctx->attention_cache);
                 if (status != ggml::gemmini::rmd::RmdStatus::success) {
@@ -233,17 +223,13 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
                         throw std::runtime_error("PoTal sensitivity attention replay failed");
                 } else ggml_backend_gemmini_mul_mat(ctx, node);
             });
-#if CYCLE_SIM
-            if (cycle_sim_context)
-                cycle_sim_context.session->ensure_healthy();
-#endif
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && defined(GGML_GEMMINI_TESTING)
-            if (ggml::gemmini::im2p_adapter::test_production_failed()) {
-                return GGML_STATUS_FAILED;
-            }
-#endif
             break;
         }
+#if defined(GGML_GEMMINI_PB)
+        case GGML_OP_FLASH_ATTN_EXT:
+            GGML_LOG_ERROR("Gemmini-PB: node '%s' is unsupported: flash attention bypasses QK and PV\n", node->name);
+            return GGML_STATUS_FAILED;
+#endif
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -303,11 +289,7 @@ static ggml_guid_t ggml_backend_gemmini_guid(void) {
 
 ggml_backend_t ggml_backend_gemmini_init(void) {
     ggml_backend_gemmini_context * ctx = new ggml_backend_gemmini_context;
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    ggml::gemmini::log::debug("backend", "compiled_backend=IM2P_SIM transport=Verilator");
-#else
-    ggml::gemmini::log::debug("backend", "compiled_backend=HARDWARE");
-#endif
+    ggml::npu::log::debug("backend", "compiled_backend=HARDWARE");
     ggml_backend_t backend = new ggml_backend{
         /* .guid      = */ ggml_backend_gemmini_guid(),
         /* .interface = */ gemmini_backend_i,

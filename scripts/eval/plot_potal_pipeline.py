@@ -115,31 +115,8 @@ def stage_name(r):
     if op == "frontend.input_snapshot":
         return "Input Snapshot"
 
-    if op == "im2p.stripe_input_capture":
-        return "Stripe Input Capture"
-
-    if op == "im2p.host_input_preparation":
-        return "Host Input Prep"
-
-    if op == "im2p.residual_metadata_preparation":
-        return "Residual Metadata"
-
-    if op == "im2p.residual_run_preparation":
-        return "Residual Run Prep"
-
-    if op == "im2p.residual_radix_recomposition":
-        return "Radix Recompose"
-
-    if op == "im2p.output_correction_apply":
-        return "Correction Apply"
-
-    if op == "im2p.output_reconstruction":
-        return "Output Reconstruction"
-
     if op in (
         "frontend.output_copy",
-        "im2p.output_buffer_copy",
-        "im2p.residual_output_publish",
     ):
         return "Output Copy/Publish"
 

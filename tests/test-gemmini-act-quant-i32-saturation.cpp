@@ -1,12 +1,12 @@
 #include "../ggml/include/ggml.h"
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/tensor/tensor.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/token/token.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/stripe/stripe.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/tensor/tensor.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/token/token.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/quantize.hpp"
 
 #include <cfloat>
 #include <cfenv>
@@ -16,7 +16,7 @@
 #include <new>
 #include <vector>
 
-namespace act = ggml::gemmini::quants::act;
+namespace act = ggml::npu::quants::act;
 
 namespace {
 
@@ -55,9 +55,9 @@ void operator delete[](void * memory, std::size_t) noexcept {
 static bool check_saturated_reconstruction(const char *                name,
                                            const ggml_gemmini_args_t & args,
                                            int32_t                     expected) {
-    namespace rmd             = ggml::gemmini::rmd;
-    const auto & packets      = ggml::gemmini::quants::activation_rmd_packets(args);
-    const auto & direct       = ggml::gemmini::quants::activation_direct_residuals(args);
+    namespace rmd             = ggml::npu::rmd;
+    const auto & packets      = ggml::npu::quants::activation_rmd_packets(args);
+    const auto & direct       = ggml::npu::quants::activation_direct_residuals(args);
     const bool   packet_route = args.residual_route == act::ResidualRoute::ws_packet;
     if (args.act_quant.kind() == act::MetaKind::none ||
         (packet_route ? packets.empty() || !direct.empty() : direct.empty() || !packets.empty())) {
@@ -97,8 +97,8 @@ static bool check_saturated_reconstruction(const char *                name,
     // room for a negative low limb); the other quantizers commit the saturated value. Either
     // way the committed activation plus the residual payload restores the endpoint exactly.
     const int32_t committed = args.A.get(0, outlier_k);
-    if (committed < ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN ||
-        committed > ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX ||
+    if (committed < ggml::npu::config::GGML_GEMMINI_ACTIVATION_QMIN ||
+        committed > ggml::npu::config::GGML_GEMMINI_ACTIVATION_QMAX ||
         static_cast<int64_t>(committed) + residual != expected) {
         std::fprintf(
             stderr,
@@ -215,7 +215,7 @@ static bool check_public_quantizer_zeroes_nonfinite() {
         args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
 
-        if (!ggml::gemmini::quants::quantize_activation(&tensor, args)) {
+        if (!ggml::npu::quants::quantize_activation(&tensor, args)) {
             std::fputs("FAIL: public activation quantizer rejected NaN/Inf instead of zeroing it\n",
                        stderr);
             return false;
@@ -249,7 +249,7 @@ static bool check_public_quantizer_saturates_and_commits() {
             args.residual_route    = route;
             const int32_t expected = outlier < 0 ? std::numeric_limits<int32_t>::min()
                                                  : std::numeric_limits<int32_t>::max();
-            if (!ggml::gemmini::quants::quantize_activation(&tensor, args) ||
+            if (!ggml::npu::quants::quantize_activation(&tensor, args) ||
                 !check_saturated_reconstruction("public quantizer", args, expected)) {
                 std::fputs(
                     "FAIL: public activation quantizer did not commit saturated INT32 activation\n",
@@ -262,7 +262,7 @@ static bool check_public_quantizer_saturates_and_commits() {
 }
 
 static bool check_exact_packet_slice_reuses_handle() {
-    ggml::gemmini::rmd::RmdStripeBuilder builder;
+    ggml::npu::rmd::RmdStripeBuilder builder;
     builder.reset(7, 16, 2, 32, 3);
     if (!builder.add_residual(0, 5, 257)) {
         std::fputs("FAIL: exact-slice fixture build failed\n", stderr);
@@ -273,9 +273,9 @@ static bool check_exact_packet_slice_reuses_handle() {
         std::fputs("FAIL: exact-slice fixture packet missing\n", stderr);
         return false;
     }
-    ggml::gemmini::rmd::RmdStatus status{};
-    const auto sliced = ggml::gemmini::rmd::slice_packets({packet}, 16, 18, 7, status);
-    if (status != ggml::gemmini::rmd::RmdStatus::success || sliced != packet) {
+    ggml::npu::rmd::RmdStatus status{};
+    const auto sliced = ggml::npu::rmd::slice_packets({packet}, 16, 18, 7, status);
+    if (status != ggml::npu::rmd::RmdStatus::success || sliced != packet) {
         std::fputs("FAIL: exact packet slice rebuilt instead of reusing its handle\n", stderr);
         return false;
     }
@@ -283,8 +283,8 @@ static bool check_exact_packet_slice_reuses_handle() {
 }
 
 static bool check_radix_compose_allows_final_int64_cancellation() {
-    const auto contract = ggml::gemmini::rmd::balanced_radix_contract(GGML_GEMMINI_ACTIVATION_BITS);
-    ggml::gemmini::rmd::RmdStripeBuilder builder;
+    const auto contract = ggml::npu::rmd::balanced_radix_contract(GGML_GEMMINI_ACTIVATION_BITS);
+    ggml::npu::rmd::RmdStripeBuilder builder;
     builder.reset(0, 0, 1, 32, 1);
     if (contract.radix == 0 ||
         !builder.add_residual(0, 0, static_cast<int32_t>(contract.radix + 1))) {
@@ -295,8 +295,8 @@ static bool check_radix_compose_allows_final_int64_cancellation() {
         return false;
     }
     const auto &                         block = packet->blocks.front();
-    ggml::gemmini::rmd::CompressedOutput output;
-    output.domain   = ggml::gemmini::rmd::CompressedOutput::Domain::block_scaled_int64;
+    ggml::npu::rmd::CompressedOutput output;
+    output.domain   = ggml::npu::rmd::CompressedOutput::Domain::block_scaled_int64;
     output.j_padded = packet->j_padded;
     output.values.assign(packet->total_output_values, 0);
     for (uint8_t position = 0; position < block.active_lane_count; ++position) {
@@ -313,11 +313,11 @@ static bool check_radix_compose_allows_final_int64_cancellation() {
             break;
         }
     }
-    ggml::gemmini::rmd::Correction correction = ggml::gemmini::rmd::BlockScaledInt64Correction{};
-    const auto    status   = ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction);
+    ggml::npu::rmd::Correction correction = ggml::npu::rmd::BlockScaledInt64Correction{};
+    const auto    status   = ggml::npu::rmd::compose_rmd_output(*packet, output, correction);
     const int64_t expected = std::numeric_limits<int64_t>::max() - contract.radix;
-    const auto * integer = std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction);
-    if (status != ggml::gemmini::rmd::RmdStatus::success || integer == nullptr ||
+    const auto * integer = std::get_if<ggml::npu::rmd::BlockScaledInt64Correction>(&correction);
+    if (status != ggml::npu::rmd::RmdStatus::success || integer == nullptr ||
         integer->values != std::vector<int64_t>{expected}) {
         std::fputs("FAIL: radix compose rejected an in-range final INT64 after lane cancellation\n",
                    stderr);
@@ -330,15 +330,15 @@ static bool check_radix_compose_allows_final_int64_cancellation() {
             output.values[offset] = 1;
         }
     }
-    correction             = ggml::gemmini::rmd::BlockScaledInt64Correction{{41, 42}};
+    correction             = ggml::npu::rmd::BlockScaledInt64Correction{{41, 42}};
     const auto   unchanged = correction;
     const auto * unchanged_integer =
-        std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&unchanged);
-    if (ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction) !=
-            ggml::gemmini::rmd::RmdStatus::overflow ||
+        std::get_if<ggml::npu::rmd::BlockScaledInt64Correction>(&unchanged);
+    if (ggml::npu::rmd::compose_rmd_output(*packet, output, correction) !=
+            ggml::npu::rmd::RmdStatus::overflow ||
         unchanged_integer == nullptr ||
-        std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction) == nullptr ||
-        std::get<ggml::gemmini::rmd::BlockScaledInt64Correction>(correction).values !=
+        std::get_if<ggml::npu::rmd::BlockScaledInt64Correction>(&correction) == nullptr ||
+        std::get<ggml::npu::rmd::BlockScaledInt64Correction>(correction).values !=
             unchanged_integer->values) {
         std::fputs("FAIL: radix compose overflow modified caller output\n", stderr);
         return false;
@@ -368,7 +368,7 @@ static bool check_backend_neutral_checked_merge() {
     args.I                     = rows;
     args.J                     = columns;
     args.K                     = 64;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q16_h1;
     args.q16_h1_blocks         = weights.data();
     args.native_block_count    = weights.size();
     args.native_blocks_per_row = 2;
@@ -379,7 +379,7 @@ static bool check_backend_neutral_checked_merge() {
     args.stride_f_out          = row_stride;
     args.col_stride_f_out      = col_stride;
 
-    ggml::gemmini::rmd::RmdStripeBuilder builder;
+    ggml::npu::rmd::RmdStripeBuilder builder;
     builder.reset(4, row_begin, row_end - row_begin, args.K, columns);
     if (!builder.add_residual(0, 0, 1) || !builder.add_residual(1, 32, 1)) {
         std::fputs("FAIL: checked-merge packet fixture build failed\n", stderr);
@@ -391,21 +391,21 @@ static bool check_backend_neutral_checked_merge() {
         return false;
     }
 
-    const ggml::gemmini::rmd::Correction correction =
-        ggml::gemmini::rmd::BlockScaledInt64Correction{{4, -3, 7, 5}};
+    const ggml::npu::rmd::Correction correction =
+        ggml::npu::rmd::BlockScaledInt64Correction{{4, -3, 7, 5}};
     const std::vector<float> sentinel(rows * row_stride, -123.0f);
     std::vector<float>       direct = sentinel;
     args.f_out                      = direct.data();
     const auto direct_status =
-        ggml::gemmini::rmd::merge_rmd_correction(args, row_begin, row_end, correction);
+        ggml::npu::rmd::merge_rmd_correction(args, row_begin, row_end, correction);
 
     std::vector<float> wrapped = sentinel;
     args.f_out                 = wrapped.data();
     size_t     nonzero_count   = 99;
     const auto wrapped_status =
-        ggml::gemmini::rmd::merge_rmd_correction(args, *packet, correction, &nonzero_count);
-    if (direct_status != ggml::gemmini::rmd::RmdStatus::success ||
-        wrapped_status != ggml::gemmini::rmd::RmdStatus::success || direct != wrapped ||
+        ggml::npu::rmd::merge_rmd_correction(args, *packet, correction, &nonzero_count);
+    if (direct_status != ggml::npu::rmd::RmdStatus::success ||
+        wrapped_status != ggml::npu::rmd::RmdStatus::success || direct != wrapped ||
         nonzero_count != 4) {
         std::fputs("FAIL: direct and packet checked merges differ\n", stderr);
         return false;
@@ -425,15 +425,15 @@ static bool check_backend_neutral_checked_merge() {
         }
     }
 
-    const ggml::gemmini::rmd::Correction sparse_correction =
-        ggml::gemmini::rmd::BlockScaledInt64Correction{{0, -3, 7, 0}};
+    const ggml::npu::rmd::Correction sparse_correction =
+        ggml::npu::rmd::BlockScaledInt64Correction{{0, -3, 7, 0}};
     for (auto & weight : weights)
         weight.s_rf = 0.0f;
     wrapped       = sentinel;
     nonzero_count = 99;
-    if (ggml::gemmini::rmd::merge_rmd_correction(
+    if (ggml::npu::rmd::merge_rmd_correction(
             args, *packet, sparse_correction, &nonzero_count) !=
-            ggml::gemmini::rmd::RmdStatus::success ||
+            ggml::npu::rmd::RmdStatus::success ||
         nonzero_count != 2 || wrapped != sentinel) {
         std::fputs("FAIL: nonzero count must use raw correction before zero column scale\n",
                    stderr);
@@ -442,7 +442,7 @@ static bool check_backend_neutral_checked_merge() {
     weights[0].s_rf = weights[1].s_rf = 0.5f;
     weights[2].s_rf = weights[3].s_rf = 2.0f;
 
-    ggml::gemmini::rmd::RmdStripeBuilder block_zero_builder;
+    ggml::npu::rmd::RmdStripeBuilder block_zero_builder;
     block_zero_builder.reset(5, row_begin, row_end - row_begin, args.K, columns);
     if (!block_zero_builder.add_residual(0, 0, 1)) {
         std::fputs("FAIL: packet scale-scope fixture build failed\n", stderr);
@@ -459,8 +459,8 @@ static bool check_backend_neutral_checked_merge() {
     weights[3].s_rf = 10.0f;
     wrapped         = sentinel;
     args.f_out      = wrapped.data();
-    if (ggml::gemmini::rmd::merge_rmd_correction(args, *block_zero_packet, correction) !=
-            ggml::gemmini::rmd::RmdStatus::success ||
+    if (ggml::npu::rmd::merge_rmd_correction(args, *block_zero_packet, correction) !=
+            ggml::npu::rmd::RmdStatus::success ||
         wrapped != direct) {
         std::fputs("FAIL: packet merge rejected mismatched s_rf in an untouched block\n", stderr);
         return false;
@@ -468,8 +468,8 @@ static bool check_backend_neutral_checked_merge() {
 
     wrapped    = sentinel;
     args.f_out = wrapped.data();
-    if (ggml::gemmini::rmd::merge_rmd_correction(args, *packet, correction) !=
-            ggml::gemmini::rmd::RmdStatus::unsupported_route ||
+    if (ggml::npu::rmd::merge_rmd_correction(args, *packet, correction) !=
+            ggml::npu::rmd::RmdStatus::unsupported_route ||
         wrapped != sentinel) {
         std::fputs("FAIL: packet merge accepted touched mismatched s_rf or modified output\n",
                    stderr);
@@ -478,8 +478,8 @@ static bool check_backend_neutral_checked_merge() {
 
     wrapped    = sentinel;
     args.f_out = wrapped.data();
-    if (ggml::gemmini::rmd::merge_rmd_correction(args, row_begin, row_end, correction) !=
-            ggml::gemmini::rmd::RmdStatus::unsupported_route ||
+    if (ggml::npu::rmd::merge_rmd_correction(args, row_begin, row_end, correction) !=
+            ggml::npu::rmd::RmdStatus::unsupported_route ||
         wrapped != sentinel) {
         std::fputs("FAIL: direct merge did not conservatively validate every Q16_H1 block\n",
                    stderr);
@@ -489,15 +489,15 @@ static bool check_backend_neutral_checked_merge() {
     weights[3].s_rf = 2.0f;
 
     auto fails_without_writing = [&](const char *                           name,
-                                     ggml::gemmini::rmd::RmdStatus          expected,
+                                     ggml::npu::rmd::RmdStatus          expected,
                                      size_t                                 begin,
                                      size_t                                 end,
-                                     const ggml::gemmini::rmd::Correction & values) {
+                                     const ggml::npu::rmd::Correction & values) {
         direct                   = sentinel;
         args.f_out               = direct.data();
         size_t     failure_count = 99;
         const auto status =
-            ggml::gemmini::rmd::merge_rmd_correction(args, begin, end, values, &failure_count);
+            ggml::npu::rmd::merge_rmd_correction(args, begin, end, values, &failure_count);
         if (status != expected || direct != sentinel || failure_count != 99) {
             std::fprintf(stderr, "FAIL: %s did not preserve sentinel output\n", name);
             return false;
@@ -507,7 +507,7 @@ static bool check_backend_neutral_checked_merge() {
 
     meta.scales[5] = std::numeric_limits<float>::quiet_NaN();
     if (!fails_without_writing("invalid activation scale",
-                               ggml::gemmini::rmd::RmdStatus::invalid_arguments,
+                               ggml::npu::rmd::RmdStatus::invalid_arguments,
                                row_begin,
                                row_end,
                                correction)) {
@@ -515,25 +515,25 @@ static bool check_backend_neutral_checked_merge() {
     }
     meta.scales[5] = 5.0f;
     if (!fails_without_writing("invalid global row range",
-                               ggml::gemmini::rmd::RmdStatus::invalid_arguments,
+                               ggml::npu::rmd::RmdStatus::invalid_arguments,
                                row_end,
                                row_begin,
                                correction) ||
         !fails_without_writing("row tail beyond args.I",
-                               ggml::gemmini::rmd::RmdStatus::invalid_arguments,
+                               ggml::npu::rmd::RmdStatus::invalid_arguments,
                                row_begin,
                                rows + 1,
                                correction) ||
         !fails_without_writing("invalid correction dimensions",
-                               ggml::gemmini::rmd::RmdStatus::invalid_arguments,
+                               ggml::npu::rmd::RmdStatus::invalid_arguments,
                                row_begin,
                                row_end,
-                               ggml::gemmini::rmd::BlockScaledInt64Correction{{1, 2, 3}})) {
+                               ggml::npu::rmd::BlockScaledInt64Correction{{1, 2, 3}})) {
         return false;
     }
     args.stride_f_out = std::numeric_limits<size_t>::max();
     if (!fails_without_writing("overflowing output dimensions",
-                               ggml::gemmini::rmd::RmdStatus::invalid_arguments,
+                               ggml::npu::rmd::RmdStatus::invalid_arguments,
                                row_begin,
                                row_end,
                                correction)) {
@@ -543,7 +543,7 @@ static bool check_backend_neutral_checked_merge() {
 
     weights[0].s_rf = weights[1].s_rf = std::numeric_limits<float>::quiet_NaN();
     if (!fails_without_writing("invalid column weight scale",
-                               ggml::gemmini::rmd::RmdStatus::unsupported_route,
+                               ggml::npu::rmd::RmdStatus::unsupported_route,
                                row_begin,
                                row_end,
                                correction)) {
@@ -551,8 +551,8 @@ static bool check_backend_neutral_checked_merge() {
     }
     weights[0].s_rf = weights[1].s_rf = 0.5f;
 
-    const ggml::gemmini::rmd::Correction overflowing =
-        ggml::gemmini::rmd::BlockScaledInt64Correction{{
+    const ggml::npu::rmd::Correction overflowing =
+        ggml::npu::rmd::BlockScaledInt64Correction{{
             0,
             1,
             std::numeric_limits<int64_t>::max(),
@@ -560,7 +560,7 @@ static bool check_backend_neutral_checked_merge() {
         }};
     weights[0].s_rf = weights[1].s_rf = std::numeric_limits<float>::max();
     if (!fails_without_writing("late floating merge overflow",
-                               ggml::gemmini::rmd::RmdStatus::overflow,
+                               ggml::npu::rmd::RmdStatus::overflow,
                                row_begin,
                                row_end,
                                overflowing)) {
@@ -572,9 +572,9 @@ static bool check_backend_neutral_checked_merge() {
     args.f_out           = direct.data();
     fail_next_allocation = true;
     const auto allocation_status =
-        ggml::gemmini::rmd::merge_rmd_correction(args, row_begin, row_end, correction);
+        ggml::npu::rmd::merge_rmd_correction(args, row_begin, row_end, correction);
     fail_next_allocation = false;
-    if (allocation_status != ggml::gemmini::rmd::RmdStatus::allocation_failure ||
+    if (allocation_status != ggml::npu::rmd::RmdStatus::allocation_failure ||
         direct != sentinel) {
         std::fputs("FAIL: merge allocation failure modified sentinel output\n", stderr);
         return false;

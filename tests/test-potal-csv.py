@@ -152,7 +152,7 @@ def main() -> None:
             assert row["coverage"] == "incomplete_no_record_count_contract"
             assert Path(row["source_file"]) == source and row["source_line"] == "4"
         npu = [row for row in tables["npu-stages"] if row["scope"] == "canonical_resource"]
-        assert any(row["value"] == "11" and row["backend"] == "im2p" and row["domain"] == "dense"
+        assert any(row["value"] == "11" and row["backend"] == "gemmini" and row["domain"] == "dense"
                    and row["metric"] == "work" for row in npu), npu
         raw = next(row for row in tables["npu-stages"] if row["metric"] == "load_occupancy_cycles")
         assert (raw["value"], raw["unit"], raw["valid"], raw["reason"], raw["scope"]) == (

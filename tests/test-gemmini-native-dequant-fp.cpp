@@ -4,10 +4,11 @@
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
-#include "../ggml/src/ggml-gemmini/ggml-gemmini-im2p.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/quantize.hpp"
 #include "../ggml/src/ggml-quants.h"
-#include <gemmini.h>
+#include "matmul/baseline.hpp"
+#include "matmul/execution.hpp"
+#include "reference/cpu.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -122,12 +123,12 @@ bool dequantize_activations(const ggml_tensor * activation, std::vector<float> &
     args.K = K;
     args.A.allocate(I, K, GGML_GEMMINI_ACTIVATION_BITS);
     args.sA = K;
-    if (!ggml::gemmini::quants::quantize_activation(activation, args)) {
+    if (!ggml::npu::quants::quantize_activation(activation, args)) {
         return false;
     }
 
     decoded.resize(I * K);
-    return ggml::gemmini::quants::dequantize_activation(decoded.data(), K, 1, I, K, args);
+    return ggml::npu::quants::dequantize_activation(decoded.data(), K, 1, I, K, args);
 }
 
 void free_case(ggml_backend_buffer_t buffer, ggml_context * ctx) {
@@ -169,40 +170,10 @@ bool run_valid_case(ggml_backend_t backend, ggml_type type) {
     ggml_backend_tensor_set(
         activation, activation_source.data(), 0, activation_source.size() * sizeof(float));
 
-#if defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1) && !CYCLE_SIM && GGML_GEMMINI_WEIGHT_BITS == 16
-    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
-                      ggml::gemmini::config::ComputeType::INT &&
-                  !ggml::gemmini::config::DEQUANT_FP_TEST && OPTION != CPU) {
-        if (type == PRIMARY_TYPE) {
-            using namespace ggml::gemmini::im2p_adapter;
-            const bool         unsupported = !ggml_backend_supports_op(backend, output);
-            std::vector<float> actual(I * J, 12345.0f);
-            ggml_backend_tensor_set(output, actual.data(), 0, actual.size() * sizeof(float));
-            ggml_cgraph * graph = ggml_new_graph(ctx);
-            ggml_build_forward_expand(graph, output);
-            test_reset();
-            const auto status   = ggml_backend_graph_compute(backend, graph);
-            const auto counters = test_counters();
-            ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
-            const bool rejected =
-                unsupported && status != GGML_STATUS_SUCCESS &&
-                counters.production_error == Error::unsupported_route && counters.full == 0 &&
-                counters.pipeline == 0 && counters.provider_dot_attempts == 0 &&
-                counters.commit == 0 &&
-                std::all_of(actual.begin(), actual.end(), [](float v) { return v == 12345.0f; });
-            std::printf("H1 GEMMINI_HP1 supports_op=false typed=unsupported_route dispatch=0 "
-                        "sentinel=unchanged: %s\n",
-                        rejected ? "PASS" : "FAIL");
-            test_reset();
-            free_case(buffer, ctx);
-            return rejected;
-        }
-    }
-#endif
 
-    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
-                      ggml::gemmini::config::ComputeType::INT &&
-                  !ggml::gemmini::config::DEQUANT_FP_TEST && OPTION != CPU) {
+    if constexpr (ggml::npu::config::CURRENT_COMPUTE_TYPE ==
+                      ggml::npu::config::ComputeType::INT &&
+                  !ggml::npu::config::DEQUANT_FP_TEST && OPTION != CPU) {
         if (type == GGML_TYPE_Q8_H2) {
             const bool rejected = !ggml_backend_supports_op(backend, output);
             std::printf("q8_h2 INT/WS: %s\n", rejected ? "REJECTED (PASS)" : "ACCEPTED (FAIL)");
@@ -367,18 +338,18 @@ int main(int argc, char ** argv) {
     }
 
     if (selection == "--native-full") {
-        const auto resolution = ggml::gemmini::resolve_matmul_options();
+        const auto resolution = ggml::npu::resolve_matmul_options();
         if (!resolution.ok() ||
-            resolution.options.mode != ggml::gemmini::MatmulInvocationMode::full) {
+            resolution.options.mode != ggml::npu::MatmulInvocationMode::full) {
             std::fputs("dequant test did not resolve FULL\n", stderr);
             return 1;
         }
     }
 
     if (selection == "--native-pipeline") {
-        const auto resolution = ggml::gemmini::resolve_matmul_options();
+        const auto resolution = ggml::npu::resolve_matmul_options();
         if (!resolution.ok() ||
-            resolution.options.mode != ggml::gemmini::MatmulInvocationMode::stripe_pipeline) {
+            resolution.options.mode != ggml::npu::MatmulInvocationMode::stripe_pipeline) {
             std::fputs("deferred dequant test did not resolve STRIPE_PIPELINE\n", stderr);
             return 1;
         }

@@ -20,9 +20,9 @@ endfunction()
 
 # Jetson profile intervals retain one native start/end sample; all other targets
 # retain the original scalar cycle::read path and scalar ordering behavior.
-require_count("${profile}" "interval\\.start_sample = ggml::gemmini::cycle::read_sample\\(\\)" 1
+require_count("${profile}" "interval\\.start_sample = ggml::npu::cycle::read_sample\\(\\)" 1
     "profile start performs one native sample read")
-require_count("${profile}" "interval\\.end_sample = ggml::gemmini::cycle::read_sample\\(\\)" 1
+require_count("${profile}" "interval\\.end_sample = ggml::npu::cycle::read_sample\\(\\)" 1
     "profile end performs one native sample read")
 require_count("${profile}" "interval\\.start = profile_now\\(\\)" 1
     "non-Jetson profile start retains baseline scalar reader path")
@@ -74,7 +74,7 @@ if(NOT profile_header MATCHES "std::array<ProfileInterval, EXSIA_LOCAL_WORKER_CO
 endif()
 if(NOT profile_header MATCHES "NativeCycleSample start_sample" OR
    NOT profile_header MATCHES "NativeCycleSample end_sample" OR
-   NOT profile_header MATCHES "array<ggml::gemmini::cycle::NativeCycleSample, 5>")
+   NOT profile_header MATCHES "array<ggml::npu::cycle::NativeCycleSample, 5>")
     message(FATAL_ERROR "worker intervals and P0-P3 endpoints must retain native provenance")
 endif()
 if(NOT profile MATCHES "checked_profile_interval[\n\r ]*\\([\n\r ]*const ProfileInterval &[ \t]*interval")
@@ -85,10 +85,10 @@ endif()
 # pair must remain adjacent to only the callback, carry real identity, and stay
 # independent from callback acceptance. Both supported callback callsites use it.
 require_count("${runtime}"
-    "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample\\(\\)"
+    "stripe_ready_handoff_start = ggml::npu::cycle::read_sample\\(\\)"
     1 "pipeline stripe-ready handoff performs one native start read")
 require_count("${runtime}"
-    "stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample\\(\\)"
+    "stripe_ready_handoff_end = ggml::npu::cycle::read_sample\\(\\)"
     1 "pipeline stripe-ready handoff performs one native end read")
 require_count("${runtime}" "exsia\\.stripe_ready_handoff" 1
     "pipeline stripe-ready handoff has one detail label")
@@ -109,9 +109,9 @@ require_count("${runtime}" "notify_stripe_ready\\([ \t\r\n]*slot,[ \t\r\n]*run_i
 require_count("${runtime}" "notify_stripe_ready\\([ \t\r\n]*slot,[ \t\r\n]*run_id,[ \t\r\n]*false" 0
     "supported callbacks do not disable the existing handoff pair")
 string(FIND "${runtime}" "if (theta == std::numeric_limits<int16_t>::min())" theta_guard)
-string(FIND "${runtime}" "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample()" handoff_start)
+string(FIND "${runtime}" "stripe_ready_handoff_start = ggml::npu::cycle::read_sample()" handoff_start)
 string(FIND "${runtime}" "const bool accepted = sink->on_ready(" handoff_callback)
-string(FIND "${runtime}" "stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample()" handoff_end)
+string(FIND "${runtime}" "stripe_ready_handoff_end = ggml::npu::cycle::read_sample()" handoff_end)
 string(FIND "${runtime}" "slot.release();" slot_release)
 if(theta_guard EQUAL -1 OR handoff_start EQUAL -1 OR handoff_callback EQUAL -1 OR
    handoff_end EQUAL -1 OR slot_release EQUAL -1 OR

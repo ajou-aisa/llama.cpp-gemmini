@@ -77,7 +77,7 @@ and requires the exact chunk policy string shown above with the requested split
 and max-chunks value. Existing unbound historical `--reduce` remains available for
 old ACT/RES evidence; new collection requires a manifest. Bound reduction is
 available with `--reduce INPUT --evaluation-manifest MANIFEST --output FRESH`.
-The existing full-inference collector uses the functional IM2P_SIM route; the
+The existing full-inference collector uses the internal Gemmini REFERENCE route; the
 standalone observer/reducer smoke requires no cycle library or timing call.
 
 ## Definitions
@@ -111,7 +111,7 @@ standalone observer/reducer smoke requires no cycle library or timing call.
   The producer can instead aggregate (`llama-eval-workload --scale-mode aggregate`): it validates every coordinate as
   above (duplicates per invocation included) and emits one `AGGREGATE` record per (chunk, layer, work type) with
   `delta_w_sum`, `max_delta_w`, `alignment_count`, `updated_partial_sum_count`, `total_partial_sum_count` and
-  `zero_weight_count` (schema `im2p-scale-alignment-aggregate`; `RUN_END` adds the total `alignment_count` and
+  `zero_weight_count` (schema `gemmini-scale-alignment-aggregate`; `RUN_END` adds the total `alignment_count` and
   `scale_invocation_count`). The reducer reads either stream and returns the same summary. Each invocation sums its
   own coordinates and joins its chunk's records once, at the next chunk boundary; an SCU alignment after that
   boundary, an invocation still incomplete there, or a sum overflowing 64 bits fails the run instead of being

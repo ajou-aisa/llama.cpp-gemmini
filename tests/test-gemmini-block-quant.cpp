@@ -1,9 +1,9 @@
 #include "../ggml/include/ggml.h"
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/quants/act/block/block.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/block/block.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/quantize.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,8 +12,8 @@
 #include <limits>
 #include <vector>
 
-namespace act = ggml::gemmini::quants::act;
-namespace block = ggml::gemmini::quants::act::block;
+namespace act = ggml::npu::quants::act;
+namespace block = ggml::npu::quants::act::block;
 
 namespace {
 
@@ -136,7 +136,7 @@ bool isolation_test() {
 }
 
 bool quant_case(size_t cols, act::ResidualRoute route) {
-    const int32_t qmax = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    const int32_t qmax = ggml::npu::config::GGML_GEMMINI_ACTIVATION_QMAX;
     std::vector<float> source(cols, 1.0f);
     for (size_t k = 32; k < cols; ++k) source[k] = -10.0f;
     if (cols >= 17) source[16] = 100.0f;
@@ -213,7 +213,7 @@ bool quant_case(size_t cols, act::ResidualRoute route) {
     }
 #if GGML_GEMMINI_ENABLE_RMD
     if (packet && !meta.rmd_packets.empty()) {
-        auto malformed = std::make_shared<ggml::gemmini::rmd::StripePacket>(
+        auto malformed = std::make_shared<ggml::npu::rmd::StripePacket>(
             *meta.rmd_packets.front());
         malformed->version = 0;
         meta.rmd_packets = {malformed};
@@ -227,7 +227,7 @@ bool quant_case(size_t cols, act::ResidualRoute route) {
 bool mxint_tests() {
     constexpr int bits = GGML_GEMMINI_ACTIVATION_BITS;
     if (bits != 4 && bits != 8) return true;
-    const int32_t limit = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    const int32_t limit = ggml::npu::config::GGML_GEMMINI_ACTIVATION_QMAX;
     const float step = std::ldexp(1.0f, -(bits - 2));
     std::vector<float> source(32, 0.0f);
     source[0] = 1.0f;
@@ -290,13 +290,13 @@ bool quant_tests() {
     args.K = 33;
     args.sA = 33;
     args.A.allocate(1, 33, GGML_GEMMINI_ACTIVATION_BITS);
-    if (!ggml::gemmini::quants::quantize_activation(&tensor, args)) return false;
+    if (!ggml::npu::quants::quantize_activation(&tensor, args)) return false;
     if (args.act_quant.kind() != act::MetaKind::block) {
         std::fputs("FAIL quant: public dispatch did not select BLOCK\n", stderr);
         return false;
     }
     tensor.type = GGML_TYPE_I32;
-    if (ggml::gemmini::quants::quantize_activation(&tensor, args) ||
+    if (ggml::npu::quants::quantize_activation(&tensor, args) ||
         args.act_quant.kind() != act::MetaKind::none) {
         std::fputs("FAIL quant: public failure did not reset metadata\n", stderr);
         return false;
@@ -307,7 +307,7 @@ bool quant_tests() {
             return false;
         }
     }
-    const int32_t qmax = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    const int32_t qmax = ggml::npu::config::GGML_GEMMINI_ACTIVATION_QMAX;
     const float first_scale =
 #if GGML_GEMMINI_ENABLE_RMD
         1.0f / static_cast<float>(qmax);

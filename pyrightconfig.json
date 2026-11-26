@@ -10,12 +10,12 @@
   "executionEnvironments": [
     {
       "root": "tests",
-      "extraPaths": ["scripts/eval", "../IM2P.sim"],
+      "extraPaths": ["scripts/eval"],
       "pythonVersion": "3.11",
     },
     {
       "root": "scripts/eval",
-      "extraPaths": ["scripts/eval", "../IM2P.sim"],
+      "extraPaths": ["scripts/eval"],
       "pythonVersion": "3.11",
     },
     {
@@ -32,6 +32,6 @@
       // uses match expressions in steps.py
       "root": "tools/server/tests",
       "pythonVersion": "3.10",
-    },
-  ],
+    }
+],
  }

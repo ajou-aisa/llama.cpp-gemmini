@@ -1,30 +1,32 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/types.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/stripe/types.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/tensor/tensor.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/token/token.hpp"
-#include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/stripe/stripe.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/stripe/types.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/token/types.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/tensor/tensor.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/token/token.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/common/weight_reader.hpp"
 
 #include <ggml.h>
-#include <gemmini/log.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
 #include "../common/json.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia-profile.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia-profile.hpp"
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
-#include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
-#include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
+#include "../ggml/src/ggml-npu-common/residual/direct/direct-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/direct/direct-executor.hpp"
 #if LOG_CYCLE && CYCLE_DETAIL
-#include "../ggml/src/ggml-gemmini/residual/direct/direct-stage-profile.hpp"
+#include "../ggml/src/ggml-npu-common/residual/direct/direct-stage-profile.hpp"
 #endif
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.hpp"
-#include <gemmini.h>
+#include "../ggml/src/ggml-npu-common/residual/rmd/rmd-reference.hpp"
+#include "matmul/baseline.hpp"
+#include "matmul/execution.hpp"
+#include "reference/cpu.hpp"
 #endif
 
 #include <cstdio>
@@ -346,13 +348,13 @@ bool test_non_outlier_clipping_policy() {
 #endif
 }
 
-const std::vector<rmd::OutputValue> * integer_values(const rmd::Correction & correction) {
-    const auto * typed = std::get_if<rmd::BlockScaledInt64Correction>(&correction);
+const std::vector<ggml::gemmini::rmd::OutputValue> * integer_values(const ggml::gemmini::rmd::Correction & correction) {
+    const auto * typed = std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction);
     return typed == nullptr ? nullptr : &typed->values;
 }
 
-bool integer_values_equal(const rmd::Correction &               correction,
-                          const std::vector<rmd::OutputValue> & expected) {
+bool integer_values_equal(const ggml::gemmini::rmd::Correction &               correction,
+                          const std::vector<ggml::gemmini::rmd::OutputValue> & expected) {
     const auto * values = integer_values(correction);
     return values != nullptr && *values == expected;
 }
@@ -431,6 +433,88 @@ bool test_outlier_limb_policy() {
 #else
     return true;
 #endif
+}
+
+bool test_folding_integer_boundaries() {
+#if GGML_GEMMINI_ENABLE_RMD
+    using namespace quants::act::exsia;
+    constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
+    constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
+    constexpr int32_t imax = std::numeric_limits<int32_t>::max();
+    constexpr int32_t imin = std::numeric_limits<int32_t>::min();
+    const std::pair<int32_t, int32_t> cases[] = {
+        {0, 0}, {1, 1}, {-1, -1}, {qmin, qmin}, {qmax, qmax},
+        {qmin - 1, qmax}, {qmax + 1, qmin},
+        {imin, 0}, {imin + 1, 1}, {imax - qmax - 1, qmax},
+        {imax - qmax, qmax}, {imax, qmax},
+    };
+    constexpr size_t columns = 64;
+    std::vector<int32_t> wide(columns, 0), validation_residual(columns, 0);
+    for (size_t i = 0; i < std::size(cases); ++i)
+        wide[i] = cases[i].first;
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = columns;
+    if (!args.A.allocate(1, columns, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+    ExSIAState state;
+    state.B_size = 32;
+    state.K_padded = columns;
+    state.blocks_per_row = 2;
+    StripeState stripe;
+    stripe.row_end = 1;
+    stripe.e1 = 0;
+    if (!stripe.outlier_mask.prepare(1, columns))
+        return false;
+    stripe.outlier_mask.words[0] = (uint64_t{1} << std::size(cases)) - 1;
+    Meta meta;
+    meta.rho = 0;
+    meta.theta.resize(1);
+    residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
+    StripeFolding folding;
+    if (!check(folding.run(meta, state, stripe, args, 0, wide, {0, 0},
+                           validation_residual, capture),
+               "folding accepts signed INT32 boundary values"))
+        return false;
+    const auto payload = capture.finish();
+    if (!check(payload.direct != nullptr, "folding publishes boundary residuals"))
+        return false;
+    std::vector<int64_t> restored(columns, 0);
+    for (const auto & event : payload.direct->events)
+        restored.at(event.original_k) += event.residual;
+    for (size_t i = 0; i < columns; ++i) {
+        const int32_t expected_low = i < std::size(cases) ? cases[i].second : 0;
+        if (!check(args.A.get(0, i) == expected_low,
+                   "folding preserves balanced low limbs and INT32 saturation fallback") ||
+            !check(restored[i] + args.A.get(0, i) == wide[i],
+                   "dense plus emitted residual exactly reconstructs INT32 input"))
+            return false;
+    }
+    for (int16_t delta : {1, 7, 15, 30, 31, 40}) {
+        stripe.e1 = delta;
+        stripe.e2 = 0;
+        if (!check(folding.run(meta, state, stripe, args, 0, wide, {delta, 0},
+                               validation_residual, capture),
+                   "folding accepts promoted blocks at left-shift boundaries"))
+            return false;
+        const auto shifted_payload = capture.finish();
+        std::fill(restored.begin(), restored.end(), 0);
+        if (shifted_payload.direct)
+            for (const auto & event : shifted_payload.direct->events)
+                restored.at(event.original_k) += event.residual;
+        for (size_t i = 0; i < columns; ++i) {
+            const int64_t scaled = i < state.B_size
+                ? int64_t(wide[i]) * (int64_t{1} << std::min<int>(delta, 31)) : wide[i];
+            const int64_t expected = std::clamp(scaled, int64_t(imin), int64_t(imax));
+            if (!check(restored[i] + args.A.get(0, i) == expected,
+                       "promoted dense plus residual matches saturated INT64 scaling"))
+                return false;
+        }
+    }
+#endif
+    return true;
 }
 
 bool test_activation_stripe_geometry_contract() {
@@ -715,7 +799,7 @@ bool test_exsia_packet_capture() {
         if (!packet)
             continue;
         ++packet_count;
-        if (!check(rmd::validate_packet(*packet) == rmd::RmdStatus::success,
+        if (!check(ggml::gemmini::rmd::validate_packet(*packet) == ggml::gemmini::rmd::RmdStatus::success,
                    "ExSIA publishes valid compact packet"))
             return false;
         for (const auto & block : packet->blocks)
@@ -821,70 +905,70 @@ bool test_rmd_cpu_ws_routes() {
     args.weight_i8_scale_active = true;
     args.weight_scale           = 1.0f;
 
-    rmd::RmdStripeBuilder builder;
+    ggml::gemmini::rmd::RmdStripeBuilder builder;
     builder.reset(0, 0, 1, 1, 1);
     if (!builder.add_residual(0, 0, 256)) {
         return check(false, "RMD route packet input accepted");
     }
-    const rmd::StripePacketHandle packet = builder.finish();
+    const ggml::gemmini::rmd::StripePacketHandle packet = builder.finish();
     if (!check(packet != nullptr, "RMD route packet built")) {
         return false;
     }
 
-    rmd::CompressedOutput    cpu_output;
-    rmd::RmdExecutionMetrics route_metrics{};
+    ggml::gemmini::rmd::CompressedOutput    cpu_output;
+    ggml::gemmini::rmd::RmdExecutionMetrics route_metrics{};
     args.tiled_matmul_type = OS;
-    const rmd::RmdStatus cpu =
-        rmd::execute_rmd_stripe_reference(args, *packet, cpu_output, &route_metrics);
-    std::vector<rmd::ReferenceResidual> route_events = {{0, 0, 256}};
-    std::vector<rmd::OutputValue>       route_direct;
-    rmd::Correction                     route_packet = rmd::BlockScaledInt64Correction{};
+    const ggml::gemmini::rmd::RmdStatus cpu =
+        ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, cpu_output, &route_metrics);
+    std::vector<ggml::gemmini::rmd::ReferenceResidual> route_events = {{0, 0, 256}};
+    std::vector<ggml::gemmini::rmd::OutputValue>       route_direct;
+    ggml::gemmini::rmd::Correction                     route_packet = ggml::gemmini::rmd::BlockScaledInt64Correction{};
     const auto                          route_direct_status =
-        rmd::reference_direct_correction(args, 1, route_events, route_direct);
-    const auto   route_packet_status = rmd::compose_rmd_output(*packet, cpu_output, route_packet);
+        ggml::gemmini::rmd::reference_direct_correction(args, 1, route_events, route_direct);
+    const auto   route_packet_status = ggml::gemmini::rmd::compose_rmd_output(*packet, cpu_output, route_packet);
     const auto * route_packet_values = integer_values(route_packet);
-    if (!check(cpu == rmd::RmdStatus::success && route_direct_status == rmd::RmdStatus::success &&
-                   route_packet_status == rmd::RmdStatus::success &&
+    if (!check(cpu == ggml::gemmini::rmd::RmdStatus::success && route_direct_status == ggml::gemmini::rmd::RmdStatus::success &&
+                   route_packet_status == ggml::gemmini::rmd::RmdStatus::success &&
                    route_packet_values != nullptr &&
-                   route_direct == std::vector<rmd::OutputValue>{1024} &&
+                   route_direct == std::vector<ggml::gemmini::rmd::OutputValue>{1024} &&
                    route_direct == *route_packet_values && !cpu_output.values.empty() &&
                    cpu_output.values.front() == 4,
                "RMD reference API ignores the runtime matmul route")) {
         return false;
     }
-    const rmd::StripePacket packet_before = *packet;
-    rmd::CompressedOutput   output;
+    const ggml::gemmini::rmd::StripePacket packet_before = *packet;
+    ggml::gemmini::rmd::CompressedOutput   output;
     output.j_padded                        = 7;
     output.values                          = {11, 22, 33};
-    const rmd::CompressedOutput  unchanged = output;
-    rmd::StripePacket            malformed = *packet;
-    const rmd::BlockDescriptor & first     = malformed.blocks.front();
+    const ggml::gemmini::rmd::CompressedOutput  unchanged = output;
+    ggml::gemmini::rmd::StripePacket            malformed = *packet;
+    const ggml::gemmini::rmd::BlockDescriptor & first     = malformed.blocks.front();
     malformed.stacked_activation.signed_int8[first.activation_offset + first.compact_k_count] = 1;
-    if (!check(rmd::execute_rmd_stripe_ws(args, malformed, output) ==
-                       rmd::RmdStatus::invalid_packet &&
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_ws(args, malformed, output) ==
+                       ggml::gemmini::rmd::RmdStatus::invalid_packet &&
                    output.j_padded == unchanged.j_padded && output.values == unchanged.values,
                "explicit RMD WS validates packets before host rejection")) {
         return false;
     }
-    rmd::RmdExecutionMetrics ws_metrics{};
-    const rmd::RmdStatus     ws = rmd::execute_rmd_stripe_ws(args, *packet, output, &ws_metrics);
+    ggml::gemmini::rmd::RmdExecutionMetrics ws_metrics{};
+    const ggml::gemmini::rmd::RmdStatus     ws = ggml::gemmini::rmd::execute_rmd_stripe_ws(args, *packet, output, &ws_metrics);
 #if defined(__riscv)
-    rmd::Correction route_ws        = rmd::BlockScaledInt64Correction{};
-    const auto      route_ws_status = rmd::compose_rmd_output(*packet, output, route_ws);
+    ggml::gemmini::rmd::Correction route_ws        = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    const auto      route_ws_status = ggml::gemmini::rmd::compose_rmd_output(*packet, output, route_ws);
     const auto *    route_ws_values = integer_values(route_ws);
     std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=%lld\n",
                 static_cast<long long>(route_direct.front()),
                 static_cast<long long>(route_packet_values->front()),
                 static_cast<long long>(route_ws_values == nullptr ? 0 : route_ws_values->front()));
-    const bool ws_result = ws == rmd::RmdStatus::success &&
-                           route_ws_status == rmd::RmdStatus::success &&
+    const bool ws_result = ws == ggml::gemmini::rmd::RmdStatus::success &&
+                           route_ws_status == ggml::gemmini::rmd::RmdStatus::success &&
                            route_ws_values != nullptr && *route_ws_values == *route_packet_values &&
                            *route_ws_values == route_direct;
 #else
     std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=unsupported\n",
                 static_cast<long long>(route_direct.front()),
                 static_cast<long long>(route_packet_values->front()));
-    const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
+    const bool ws_result = ws == ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                            output.j_padded == unchanged.j_padded &&
                            output.values == unchanged.values;
 #endif
@@ -914,20 +998,20 @@ bool test_rmd_cpu_ws_routes() {
     cancel_args.sB                       = 1;
     cancel_args.weight_i8_scale_active   = true;
     cancel_args.weight_scale             = 1.0f;
-    rmd::RmdStripeBuilder cancel_builder;
+    ggml::gemmini::rmd::RmdStripeBuilder cancel_builder;
     cancel_builder.reset(0, 0, 1, 4, 1);
     if (!cancel_builder.add_residual(0, 0, 1) || !cancel_builder.add_residual(0, 1, 1) ||
         !cancel_builder.add_residual(0, 2, 1) || !cancel_builder.add_residual(0, 3, -256)) {
         return check(false, "RMD cancellation packet input accepted");
     }
     const auto               cancel_packet = cancel_builder.finish();
-    rmd::CompressedOutput    cancel_output;
-    rmd::RmdExecutionMetrics cancel_metrics{};
-    const auto               cancel_status = rmd::execute_rmd_stripe_reference(
+    ggml::gemmini::rmd::CompressedOutput    cancel_output;
+    ggml::gemmini::rmd::RmdExecutionMetrics cancel_metrics{};
+    const auto               cancel_status = ggml::gemmini::rmd::execute_rmd_stripe_reference(
         cancel_args, *cancel_packet, cancel_output, &cancel_metrics);
-    rmd::Correction cancel_composed = rmd::BlockScaledInt64Correction{};
+    ggml::gemmini::rmd::Correction cancel_composed = ggml::gemmini::rmd::BlockScaledInt64Correction{};
     const auto      cancel_compose_status =
-        rmd::compose_rmd_output(*cancel_packet, cancel_output, cancel_composed);
+        ggml::gemmini::rmd::compose_rmd_output(*cancel_packet, cancel_output, cancel_composed);
     const auto * cancel_composed_values = integer_values(cancel_composed);
     std::printf(
         "RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld "
@@ -940,26 +1024,26 @@ bool test_rmd_cpu_ws_routes() {
         cancel_composed_values == nullptr || cancel_composed_values->empty()
             ? size_t{0}
             : size_t{cancel_composed_values->front() != 0});
-    std::vector<rmd::ReferenceResidual> cancel_events = {
+    std::vector<ggml::gemmini::rmd::ReferenceResidual> cancel_events = {
         {0, 0, 1}, {0, 1, 1}, {0, 2, 1}, {0, 3, -256}};
-    std::vector<rmd::OutputValue> cancel_direct;
+    std::vector<ggml::gemmini::rmd::OutputValue> cancel_direct;
     const auto                    cancel_direct_status =
-        rmd::reference_direct_correction(cancel_args, 1, cancel_events, cancel_direct);
-    if (!check(cancel_status == rmd::RmdStatus::success &&
-                   cancel_compose_status == rmd::RmdStatus::success &&
-                   cancel_direct_status == rmd::RmdStatus::success &&
-                   cancel_direct == std::vector<rmd::OutputValue>{0} &&
+        ggml::gemmini::rmd::reference_direct_correction(cancel_args, 1, cancel_events, cancel_direct);
+    if (!check(cancel_status == ggml::gemmini::rmd::RmdStatus::success &&
+                   cancel_compose_status == ggml::gemmini::rmd::RmdStatus::success &&
+                   cancel_direct_status == ggml::gemmini::rmd::RmdStatus::success &&
+                   cancel_direct == std::vector<ggml::gemmini::rmd::OutputValue>{0} &&
                    cancel_composed_values != nullptr && cancel_direct == *cancel_composed_values,
                "RMD cancellation reference correction"))
         return false;
 #if defined(__riscv)
-    rmd::CompressedOutput    ws_cancel_output;
-    rmd::RmdExecutionMetrics ws_cancel_metrics{};
-    const auto               ws_cancel_status = rmd::execute_rmd_stripe_ws(
+    ggml::gemmini::rmd::CompressedOutput    ws_cancel_output;
+    ggml::gemmini::rmd::RmdExecutionMetrics ws_cancel_metrics{};
+    const auto               ws_cancel_status = ggml::gemmini::rmd::execute_rmd_stripe_ws(
         cancel_args, *cancel_packet, ws_cancel_output, &ws_cancel_metrics);
-    rmd::Correction ws_cancel_composed = rmd::BlockScaledInt64Correction{};
+    ggml::gemmini::rmd::Correction ws_cancel_composed = ggml::gemmini::rmd::BlockScaledInt64Correction{};
     const auto      ws_cancel_compose_status =
-        rmd::compose_rmd_output(*cancel_packet, ws_cancel_output, ws_cancel_composed);
+        ggml::gemmini::rmd::compose_rmd_output(*cancel_packet, ws_cancel_output, ws_cancel_composed);
     const auto * ws_cancel_values = integer_values(ws_cancel_composed);
     std::printf("RMD_STAGE ws raw_lanes=256,-1 correction=%lld nonzero_count=%zu\n",
                 static_cast<long long>(ws_cancel_values == nullptr || ws_cancel_values->empty()
@@ -973,8 +1057,8 @@ bool test_rmd_cpu_ws_routes() {
         static_cast<long long>(cancel_direct.front()),
         static_cast<long long>(cancel_composed_values->front()),
         static_cast<long long>(ws_cancel_values == nullptr ? 0 : ws_cancel_values->front()));
-    if (!check(ws_cancel_status == rmd::RmdStatus::success &&
-                   ws_cancel_compose_status == rmd::RmdStatus::success &&
+    if (!check(ws_cancel_status == ggml::gemmini::rmd::RmdStatus::success &&
+                   ws_cancel_compose_status == ggml::gemmini::rmd::RmdStatus::success &&
                    ws_cancel_values != nullptr && *ws_cancel_values == *cancel_composed_values &&
                    *ws_cancel_values == cancel_direct && !ws_cancel_values->empty() &&
                    ws_cancel_values->front() == 0,
@@ -986,7 +1070,7 @@ bool test_rmd_cpu_ws_routes() {
                 static_cast<long long>(cancel_composed_values->front()));
 #endif
 #endif
-    const auto same_block = [](const rmd::BlockDescriptor & a, const rmd::BlockDescriptor & b) {
+    const auto same_block = [](const ggml::gemmini::rmd::BlockDescriptor & a, const ggml::gemmini::rmd::BlockDescriptor & b) {
         const bool metadata_equal =
             a.block_id == b.block_id && a.global_k_begin == b.global_k_begin &&
             a.compact_k_count == b.compact_k_count && a.padded_k_count == b.padded_k_count &&
@@ -1050,7 +1134,7 @@ bool test_q8_srmd_software_ws_routing() {
 
     DirectStripeBuilder direct_builder;
     direct_builder.reset(17, 0, rows, logical_k, columns);
-    rmd::RmdStripeBuilder packet_builder;
+    ggml::gemmini::rmd::RmdStripeBuilder packet_builder;
     packet_builder.reset(17, 0, rows, logical_k, columns);
     for (const ResidualEvent & event : events) {
         if (!direct_builder.add_residual(event.local_row, event.original_k, event.residual) ||
@@ -1072,7 +1156,7 @@ bool test_q8_srmd_software_ws_routing() {
         args.I                 = rows;
         args.J                 = columns;
         args.K                 = logical_k;
-        args.weight_format     = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+        args.weight_format     = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
         args.B                 = derived_weights.data();
         args.sB                = logical_k;
         args.transpose_B       = true;
@@ -1088,11 +1172,11 @@ bool test_q8_srmd_software_ws_routing() {
 
     ggml_gemmini_args_t cpu_args         = make_affine_args();
     cpu_args.residual_route              = residual::ResidualRoute::cpu_direct;
-    rmd::Correction        direct_output = rmd::BlockScaledInt64Correction{};
+    ggml::gemmini::rmd::Correction        direct_output = ggml::gemmini::rmd::BlockScaledInt64Correction{};
     DirectExecutionMetrics direct_metrics{};
     if (!check(residual::execute_direct_stripe(
                    cpu_args, *direct_payload, direct_output, &direct_metrics) ==
-                   rmd::RmdStatus::success,
+                   ggml::gemmini::rmd::RmdStatus::success,
                "CPU affine residual uses direct executor") ||
         !check(direct_metrics.event_count == events.size() && direct_metrics.call_count == 1,
                "CPU executes original INT32 residual events directly")) {
@@ -1105,15 +1189,15 @@ bool test_q8_srmd_software_ws_routing() {
     const auto & direct_correction = *direct_correction_ptr;
 
     auto verify_software_ws = [&](const char * route, ggml_gemmini_args_t args) {
-        rmd::CompressedOutput    compressed;
-        rmd::RmdExecutionMetrics metrics{};
-        const rmd::RmdStatus     status =
-            rmd::execute_rmd_stripe_ws(args, *packet, compressed, &metrics);
-        if (status != rmd::RmdStatus::success) {
+        ggml::gemmini::rmd::CompressedOutput    compressed;
+        ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
+        const ggml::gemmini::rmd::RmdStatus     status =
+            ggml::gemmini::rmd::execute_rmd_stripe_ws(args, *packet, compressed, &metrics);
+        if (status != ggml::gemmini::rmd::RmdStatus::success) {
             std::fprintf(stderr,
                          "FAIL: %s WS must select compact SRMD software executor; status=%s\n",
                          route,
-                         rmd::rmd_status_message(status));
+                         ggml::gemmini::rmd::rmd_status_message(status));
             return false;
         }
         if (!check(metrics.ws_call_count == 0,
@@ -1124,7 +1208,7 @@ bool test_q8_srmd_software_ws_routing() {
         }
 
         for (size_t block_index = 0; block_index < packet->blocks.size(); ++block_index) {
-            const rmd::BlockDescriptor & block       = packet->blocks[block_index];
+            const ggml::gemmini::rmd::BlockDescriptor & block       = packet->blocks[block_index];
             const int64_t                block_scale = block_index == 0 ? 3 : 7;
             for (size_t lane_position = 0; lane_position < block.active_lane_count;
                  ++lane_position) {
@@ -1133,9 +1217,9 @@ bool test_q8_srmd_software_ws_routing() {
                 for (const ResidualEvent & event : events) {
                     if (event.original_k / QK8_0 != block.block_id)
                         continue;
-                    rmd::NativeBalancedDigits digits{};
-                    if (rmd::decompose_balanced_radix(event.residual, 8, digits) !=
-                        rmd::RmdStatus::success)
+                    ggml::gemmini::rmd::NativeBalancedDigits digits{};
+                    if (ggml::gemmini::rmd::decompose_balanced_radix(event.residual, 8, digits) !=
+                        ggml::gemmini::rmd::RmdStatus::success)
                         return false;
                     const int8_t code = derived_weights[event.original_k];
                     raw_lane += static_cast<int64_t>(digits.digits[lane_id]) * code;
@@ -1150,9 +1234,9 @@ bool test_q8_srmd_software_ws_routing() {
             }
         }
 
-        rmd::Correction composed = rmd::BlockScaledInt64Correction{};
-        return check(rmd::compose_rmd_output(*packet, compressed, composed) ==
-                         rmd::RmdStatus::success,
+        ggml::gemmini::rmd::Correction composed = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+        return check(ggml::gemmini::rmd::compose_rmd_output(*packet, compressed, composed) ==
+                         ggml::gemmini::rmd::RmdStatus::success,
                      "Q8 software WS compressed output composes") &&
                check(integer_values_equal(composed, direct_correction),
                      "signed radix lanes and 128 carry boundaries match direct INT32 residuals");
@@ -1170,22 +1254,22 @@ bool test_q8_srmd_software_ws_routing() {
     tensor_args.weight_i8_scale_active            = true;
     tensor_args.weight_scale                      = 1.0f;
     tensor_args.tiled_matmul_type                 = WS;
-    rmd::RmdStripeBuilder tensor_builder;
+    ggml::gemmini::rmd::RmdStripeBuilder tensor_builder;
     tensor_builder.reset(0, 0, 1, 1, 1);
     tensor_builder.add_residual(0, 0, 128);
     const auto tensor_packet = tensor_builder.finish();
     if (!check(tensor_packet != nullptr, "i8_tensor hardware-route packet built")) {
         return false;
     }
-    rmd::CompressedOutput    tensor_output;
-    rmd::RmdExecutionMetrics tensor_metrics{};
-    const rmd::RmdStatus     tensor_status =
-        rmd::execute_rmd_stripe_ws(tensor_args, *tensor_packet, tensor_output, &tensor_metrics);
+    ggml::gemmini::rmd::CompressedOutput    tensor_output;
+    ggml::gemmini::rmd::RmdExecutionMetrics tensor_metrics{};
+    const ggml::gemmini::rmd::RmdStatus     tensor_status =
+        ggml::gemmini::rmd::execute_rmd_stripe_ws(tensor_args, *tensor_packet, tensor_output, &tensor_metrics);
 #if defined(__riscv)
-    return check(tensor_status == rmd::RmdStatus::success && tensor_metrics.ws_call_count != 0,
+    return check(tensor_status == ggml::gemmini::rmd::RmdStatus::success && tensor_metrics.ws_call_count != 0,
                  "i8_tensor WS residual route remains hardware tiled_matmul");
 #else
-    return check(tensor_status == rmd::RmdStatus::unsupported_route &&
+    return check(tensor_status == ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                      tensor_metrics.packet_call_count == 0 && tensor_metrics.ws_call_count == 0,
                  "i8_tensor WS residual route remains hardware-only on host");
 #endif
@@ -1218,7 +1302,7 @@ bool test_q8_hp1_srmd_reference_and_routing() {
 
     DirectStripeBuilder direct_builder;
     direct_builder.reset(23, 0, rows, logical_k, columns);
-    rmd::RmdStripeBuilder packet_builder;
+    ggml::gemmini::rmd::RmdStripeBuilder packet_builder;
     packet_builder.reset(23, 0, rows, logical_k, columns);
     for (const ResidualEvent & event : events) {
         if (!direct_builder.add_residual(event.local_row, event.original_k, event.residual) ||
@@ -1237,7 +1321,7 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     args.I                     = rows;
     args.J                     = columns;
     args.K                     = logical_k;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks         = weights.data();
     args.q8_hp1_block_count    = weights.size();
     args.q8_hp1_blocks_per_row = blocks_per_row;
@@ -1247,9 +1331,9 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     args.tiled_matmul_type     = WS;
     args.full_C                = true;
 
-    rmd::Correction direct_output = rmd::BlockScaledInt64Correction{};
+    ggml::gemmini::rmd::Correction direct_output = ggml::gemmini::rmd::BlockScaledInt64Correction{};
     if (!check(residual::execute_direct_stripe(args, *direct_payload, direct_output) ==
-                   rmd::RmdStatus::success,
+                   ggml::gemmini::rmd::RmdStatus::success,
                "CPU Q8_HP1 residual uses original INT32 direct executor")) {
         return false;
     }
@@ -1259,31 +1343,29 @@ bool test_q8_hp1_srmd_reference_and_routing() {
         return false;
     const auto & direct_correction = *direct_correction_ptr;
 
-#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    rmd::CompressedOutput rejected;
+    ggml::gemmini::rmd::CompressedOutput rejected;
     rejected.values = {123};
-    rmd::RmdExecutionMetrics rejected_metrics{};
+    ggml::gemmini::rmd::RmdExecutionMetrics rejected_metrics{};
     rejected_metrics.packet_call_count = 17;
-    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, rejected, &rejected_metrics) ==
-                       rmd::RmdStatus::unsupported_route &&
-                   rejected.values == std::vector<rmd::OutputValue>{123} &&
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_ws(args, *packet, rejected, &rejected_metrics) ==
+                       ggml::gemmini::rmd::RmdStatus::unsupported_route &&
+                   rejected.values == std::vector<ggml::gemmini::rmd::OutputValue>{123} &&
                    rejected_metrics.packet_call_count == 17 && rejected_metrics.ws_call_count == 0,
                "production HP1 without an SCU provider rejects atomically, without software "
                "fallback")) {
         return false;
     }
-#endif
-    rmd::CompressedOutput    compressed;
-    rmd::RmdExecutionMetrics metrics{};
-    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
-                       rmd::RmdStatus::success &&
+    ggml::gemmini::rmd::CompressedOutput    compressed;
+    ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    metrics.ws_call_count == 0 && metrics.packet_call_count == 1,
                "explicit HP1 reference evaluates one packet without hardware dispatch")) {
         return false;
     }
 
     for (size_t block_index = 0; block_index < packet->blocks.size(); ++block_index) {
-        const rmd::BlockDescriptor & block       = packet->blocks[block_index];
+        const ggml::gemmini::rmd::BlockDescriptor & block       = packet->blocks[block_index];
         const int64_t                block_scale = int64_t{1} << weights[block_index].m;
         for (size_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
             const uint8_t lane_id  = block.lane_ids[lane_position];
@@ -1291,9 +1373,9 @@ bool test_q8_hp1_srmd_reference_and_routing() {
             for (const ResidualEvent & event : events) {
                 if (event.original_k / QK8_HP != block.block_id)
                     continue;
-                rmd::NativeBalancedDigits digits{};
-                if (rmd::decompose_balanced_radix(event.residual, 8, digits) !=
-                    rmd::RmdStatus::success)
+                ggml::gemmini::rmd::NativeBalancedDigits digits{};
+                if (ggml::gemmini::rmd::decompose_balanced_radix(event.residual, 8, digits) !=
+                    ggml::gemmini::rmd::RmdStatus::success)
                     return false;
                 raw_lane += static_cast<int64_t>(digits.digits[lane_id]) *
                             weights[block_index].qs[event.original_k % QK8_HP];
@@ -1307,23 +1389,23 @@ bool test_q8_hp1_srmd_reference_and_routing() {
         }
     }
 
-    rmd::Correction composed = rmd::BlockScaledInt64Correction{};
-    if (!check(rmd::compose_rmd_output(*packet, compressed, composed) == rmd::RmdStatus::success,
+    ggml::gemmini::rmd::Correction composed = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    if (!check(ggml::gemmini::rmd::compose_rmd_output(*packet, compressed, composed) == ggml::gemmini::rmd::RmdStatus::success,
                "Q8_HP1 software WS compressed output composes") ||
         !check(integer_values_equal(composed, direct_correction),
                "Q8_HP1 signed radix and integer exponent match direct correction")) {
         return false;
     }
-    std::vector<rmd::OutputValue>       reference;
-    std::vector<rmd::ReferenceResidual> reference_residuals;
+    std::vector<ggml::gemmini::rmd::OutputValue>       reference;
+    std::vector<ggml::gemmini::rmd::ReferenceResidual> reference_residuals;
     reference_residuals.reserve(events.size());
     for (const ResidualEvent & event : events) {
         reference_residuals.push_back({static_cast<uint32_t>(event.local_row),
                                        static_cast<uint32_t>(event.original_k),
                                        event.residual});
     }
-    if (!check(rmd::reference_rmd_correction(args, rows, reference_residuals, reference) ==
-                   rmd::RmdStatus::success,
+    if (!check(ggml::gemmini::rmd::reference_rmd_correction(args, rows, reference_residuals, reference) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "Q8_HP1 independent reference accepts native blocks") ||
         !check(integer_values_equal(composed, reference),
                "Q8_HP1 software WS matches independent reference correction")) {
@@ -1334,7 +1416,7 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     args.f_out  = merged.data();
     auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
     meta.theta  = {1};
-    if (!check(rmd::merge_rmd_correction(args, *packet, composed) == rmd::RmdStatus::success,
+    if (!check(ggml::gemmini::rmd::merge_rmd_correction(args, *packet, composed) == ggml::gemmini::rmd::RmdStatus::success,
                "Q8_HP1 correction merges with shared scales") ||
         !check(merged[0] == static_cast<float>(direct_correction[0]) * 0.25f * 2.0f,
                "Q8_HP1 channel and activation scales apply once at FP32 merge")) {
@@ -1344,17 +1426,17 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     auto invalid_weights             = weights;
     invalid_weights[1].channel_scale = 0.5f;
     args.q8_hp1_blocks               = invalid_weights.data();
-    if (!check(rmd::merge_rmd_correction(args, *packet, composed) ==
-                   rmd::RmdStatus::unsupported_route,
+    if (!check(ggml::gemmini::rmd::merge_rmd_correction(args, *packet, composed) ==
+                   ggml::gemmini::rmd::RmdStatus::unsupported_route,
                "Q8_HP1 rejects inconsistent per-column channel scales")) {
         return false;
     }
     invalid_weights      = weights;
     invalid_weights[1].m = 63;
     args.q8_hp1_blocks   = invalid_weights.data();
-    rmd::CompressedOutput invalid_output;
-    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
-                   rmd::RmdStatus::success,
+    ggml::gemmini::rmd::CompressedOutput invalid_output;
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "HP1 exponent 63 stays a carrier instead of overflowing a host scale factor")) {
         return false;
     }
@@ -1368,8 +1450,8 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     }
     invalid_weights[1].m = INT16_MIN;
     args.q8_hp1_blocks   = invalid_weights.data();
-    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
-                   rmd::RmdStatus::success,
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "Q8_HP1 zero-block sentinel executes safely")) {
         return false;
     }
@@ -1381,8 +1463,8 @@ bool test_q8_hp1_srmd_reference_and_routing() {
     }
     const auto unchanged = invalid_output.values;
     invalid_weights[1].m = -1;
-    return check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
-                         rmd::RmdStatus::unsupported_route &&
+    return check(ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
+                         ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                      invalid_output.values == unchanged,
                  "invalid negative HP1 carrier rejects without publishing output");
 }
@@ -1411,7 +1493,7 @@ bool test_rmd_ws_contract_probe() {
         p.guard_before = -37;
         p.guard_after  = -73;
         asm volatile("" ::: "memory");
-        tiled_matmul(I,
+        tiled_matmul(*gemmini_rocc_transport(), I,
                      J,
                      K,
                      p.a,
@@ -1425,7 +1507,7 @@ bool test_rmd_ws_contract_probe() {
                      1.0f,
                      1.0f,
                      1.0f,
-                     NO_ACTIVATION,
+                     GEMMINI_ACT_NONE,
                      ACC_SCALE_IDENTITY,
                      ACC_SCALE_IDENTITY,
                      false,
@@ -1554,7 +1636,7 @@ bool test_rmd_ws_contract_probe() {
         const void * D       = nullptr;
         scale_t      scale_A = 1, scale_B = 1;
         scale_acc_t  scale_D = 1;
-        int          act     = NO_ACTIVATION;
+        int          act     = GEMMINI_ACT_NONE;
         acc_scale_t  scale = ACC_SCALE_IDENTITY, bert_scale = ACC_SCALE_IDENTITY;
         bool         repeating_bias = false;
         size_t       tile_I = 1, tile_J = 1, tile_K = 1;
@@ -1606,7 +1688,7 @@ bool test_rmd_ws_contract_probe() {
         buf.elem_guard_before = -37;
         buf.elem_guard_after  = -73;
         void * c = cfg.full_C ? static_cast<void *>(buf.acc) : static_cast<void *>(buf.elem);
-        tiled_matmul(cfg.I,
+        tiled_matmul(*gemmini_rocc_transport(), cfg.I,
                      cfg.J,
                      cfg.K,
                      dense_a,
@@ -1748,7 +1830,7 @@ bool test_rmd_cpu_direct_parity() {
     args.I                 = rows;
     args.J                 = columns;
     args.K                 = logical_k;
-    args.weight_format     = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    args.weight_format     = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
     args.B                 = weights.data();
     args.sB                = logical_k;
     args.transpose_B       = true;
@@ -1761,7 +1843,7 @@ bool test_rmd_cpu_direct_parity() {
     auto & meta            = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
     meta.theta             = {0};
 
-    rmd::RmdStripeBuilder builder;
+    ggml::gemmini::rmd::RmdStripeBuilder builder;
     builder.reset(0, 0, rows, logical_k, columns);
     for (size_t row = 0; row < rows; ++row) {
         for (size_t k = 0; k < logical_k; ++k) {
@@ -1771,28 +1853,28 @@ bool test_rmd_cpu_direct_parity() {
             }
         }
     }
-    const rmd::StripePacketHandle packet = builder.finish();
+    const ggml::gemmini::rmd::StripePacketHandle packet = builder.finish();
     if (!check(packet != nullptr, "RMD direct-parity packet built")) {
         return false;
     }
 
-    rmd::CompressedOutput    compressed;
-    rmd::RmdExecutionMetrics metrics{};
-    const rmd::RmdStatus     execution_status =
-        rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics);
-    if (execution_status != rmd::RmdStatus::success) {
+    ggml::gemmini::rmd::CompressedOutput    compressed;
+    ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
+    const ggml::gemmini::rmd::RmdStatus     execution_status =
+        ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics);
+    if (execution_status != ggml::gemmini::rmd::RmdStatus::success) {
         std::fprintf(stderr,
                      "FAIL: RMD direct-parity CPU execution: %s\n",
-                     rmd::rmd_status_message(execution_status));
+                     ggml::gemmini::rmd::rmd_status_message(execution_status));
         return false;
     }
     size_t       expected_calls   = 0;
     size_t       expected_i_tiles = 0;
-    const size_t j_tiles          = (packet->logical_j + rmd::kArrayDim - 1) / rmd::kArrayDim;
-    for (const rmd::BlockDescriptor & block : packet->blocks) {
-        const size_t calls = j_tiles * (block.padded_k_count / rmd::kArrayDim);
+    const size_t j_tiles          = (packet->logical_j + ggml::gemmini::rmd::kArrayDim - 1) / ggml::gemmini::rmd::kArrayDim;
+    for (const ggml::gemmini::rmd::BlockDescriptor & block : packet->blocks) {
+        const size_t calls = j_tiles * (block.padded_k_count / ggml::gemmini::rmd::kArrayDim);
         expected_calls += calls;
-        expected_i_tiles += calls * block.active_lane_count * (block.rows_padded / rmd::kArrayDim);
+        expected_i_tiles += calls * block.active_lane_count * (block.rows_padded / ggml::gemmini::rmd::kArrayDim);
     }
     if (!check(expected_i_tiles > expected_calls,
                "RMD reuse fixture spans multiple stacked I tiles") ||
@@ -1815,9 +1897,9 @@ bool test_rmd_cpu_direct_parity() {
                 metrics.stacked_i_tile_count,
                 metrics.baseline_stacked_i_tile_count,
                 metrics.stacked_i_tile_count - metrics.matmul_call_count);
-    rmd::Correction actual_correction = rmd::BlockScaledInt64Correction{};
-    if (!check(rmd::compose_rmd_output(*packet, compressed, actual_correction) ==
-                   rmd::RmdStatus::success,
+    ggml::gemmini::rmd::Correction actual_correction = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    if (!check(ggml::gemmini::rmd::compose_rmd_output(*packet, compressed, actual_correction) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "RMD direct-parity composition")) {
         return false;
     }
@@ -1855,7 +1937,7 @@ bool test_rmd_cpu_direct_parity() {
                 rows,
                 columns,
                 logical_k,
-                rmd::kBlockSize);
+                ggml::gemmini::rmd::kBlockSize);
     for (size_t row = 0; row < rows; ++row) {
         for (size_t j = 0; j < columns; ++j) {
             const size_t  index            = row * columns + j;
@@ -1880,8 +1962,8 @@ bool test_rmd_cpu_direct_parity() {
     args.f_out            = merged.data();
     args.stride_f_out     = columns;
     args.col_stride_f_out = 1;
-    if (!check(rmd::merge_rmd_correction(args, *packet, actual_correction) ==
-                   rmd::RmdStatus::success,
+    if (!check(ggml::gemmini::rmd::merge_rmd_correction(args, *packet, actual_correction) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "RMD direct-parity merge")) {
         return false;
     }
@@ -1903,25 +1985,25 @@ bool test_rmd_cpu_direct_parity() {
     }
 
 #if defined(__riscv)
-    rmd::CompressedOutput ws_compressed;
-    const rmd::RmdStatus  ws_execution_status =
-        rmd::execute_rmd_stripe_ws(args, *packet, ws_compressed);
-    rmd::Correction      ws_actual = rmd::BlockScaledInt64Correction{};
-    const rmd::RmdStatus ws_compose_status =
-        rmd::compose_rmd_output(*packet, ws_compressed, ws_actual);
+    ggml::gemmini::rmd::CompressedOutput ws_compressed;
+    const ggml::gemmini::rmd::RmdStatus  ws_execution_status =
+        ggml::gemmini::rmd::execute_rmd_stripe_ws(args, *packet, ws_compressed);
+    ggml::gemmini::rmd::Correction      ws_actual = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    const ggml::gemmini::rmd::RmdStatus ws_compose_status =
+        ggml::gemmini::rmd::compose_rmd_output(*packet, ws_compressed, ws_actual);
     const auto *       ws_actual_values = integer_values(ws_actual);
     std::vector<float> ws_merged(rows * columns);
     for (size_t index = 0; index < ws_merged.size(); ++index) {
         ws_merged[index] = static_cast<float>(baseline[index]);
     }
     args.f_out                           = ws_merged.data();
-    const rmd::RmdStatus ws_merge_status = rmd::merge_rmd_correction(args, *packet, ws_actual);
+    const ggml::gemmini::rmd::RmdStatus ws_merge_status = ggml::gemmini::rmd::merge_rmd_correction(args, *packet, ws_actual);
     size_t               mismatch_count  = 0;
     size_t               first_row = rows, first_column = columns;
     float                first_actual = 0.0f, first_expected = 0.0f;
-    if (ws_execution_status == rmd::RmdStatus::success &&
-        ws_compose_status == rmd::RmdStatus::success &&
-        ws_merge_status == rmd::RmdStatus::success && ws_actual_values != nullptr &&
+    if (ws_execution_status == ggml::gemmini::rmd::RmdStatus::success &&
+        ws_compose_status == ggml::gemmini::rmd::RmdStatus::success &&
+        ws_merge_status == ggml::gemmini::rmd::RmdStatus::success && ws_actual_values != nullptr &&
         ws_actual_values->size() == expected.size()) {
         for (size_t row = 0; row < rows; ++row) {
             for (size_t j = 0; j < columns; ++j) {
@@ -1959,8 +2041,8 @@ bool test_rmd_cpu_direct_parity() {
     auto & invalid_meta = args.act_quant.storage().emplace<quants::act::token::Meta>();
     invalid_meta.scales.assign(rows, 1.0f);
     invalid_meta.scales[1] = std::numeric_limits<float>::quiet_NaN();
-    if (!check(rmd::merge_rmd_correction(args, *packet, actual_correction) ==
-                       rmd::RmdStatus::invalid_arguments &&
+    if (!check(ggml::gemmini::rmd::merge_rmd_correction(args, *packet, actual_correction) ==
+                       ggml::gemmini::rmd::RmdStatus::invalid_arguments &&
                    merged == unchanged,
                "RMD merge failure preserves caller output")) {
         return false;
@@ -2027,7 +2109,7 @@ bool direct_host_profile_output(const std::filesystem::path & output_path, size_
             for (size_t j = 0; j < columns; ++j)
                 weights[k * columns + j] =
                     static_cast<elem_t>(static_cast<int>((k * 11 + j * 17) % 251) - 125);
-        std::vector<rmd::OutputValue> expected(rows * columns, 0);
+        std::vector<ggml::gemmini::rmd::OutputValue> expected(rows * columns, 0);
         for (const auto & event : events)
             for (size_t j = 0; j < columns; ++j)
                 expected[event.local_row * columns + j] +=
@@ -2049,19 +2131,19 @@ bool direct_host_profile_output(const std::filesystem::path & output_path, size_
             return false;
         residual::DirectExecutionMetrics metrics{};
         metrics.run_id           = run_id;
-        rmd::DirectOutput output = rmd::BlockScaledInt64Correction{};
+        ggml::gemmini::rmd::DirectOutput output = ggml::gemmini::rmd::BlockScaledInt64Correction{};
         const auto status = residual::execute_direct_stripe(args, *payload, output, &metrics);
         const auto profiled_size = std::filesystem::file_size(path);
         residual::testing::DirectExecutionTestHooks disabled_hooks{};
         disabled_hooks.disable_host_profile = true;
         residual::DirectExecutionMetrics disabled_metrics{};
         disabled_metrics.run_id           = run_id + 1;
-        rmd::DirectOutput disabled_output = rmd::BlockScaledInt64Correction{};
+        ggml::gemmini::rmd::DirectOutput disabled_output = ggml::gemmini::rmd::BlockScaledInt64Correction{};
         const auto        disabled_status = residual::execute_direct_stripe(
             args, *payload, disabled_output, &disabled_metrics, disabled_hooks);
         log::cycle.set_output(stderr);
-        if (!check(status == rmd::RmdStatus::success &&
-                       disabled_status == rmd::RmdStatus::success &&
+        if (!check(status == ggml::gemmini::rmd::RmdStatus::success &&
+                       disabled_status == ggml::gemmini::rmd::RmdStatus::success &&
                        integer_values_equal(output, expected) &&
                        integer_values_equal(disabled_output, expected),
                    "direct host profiling preserves independent reference output") ||
@@ -2308,14 +2390,14 @@ bool test_direct_cpu_executor() {
         };
     auto reference = [](const ggml_gemmini_args_t &     args,
                         const DirectStripePayload &     payload,
-                        std::vector<rmd::OutputValue> & output) {
-        std::vector<rmd::ReferenceResidual> events;
+                        std::vector<ggml::gemmini::rmd::OutputValue> & output) {
+        std::vector<ggml::gemmini::rmd::ReferenceResidual> events;
         for (const ResidualEvent & event : payload.events) {
             events.push_back({static_cast<uint32_t>(event.local_row),
                               static_cast<uint32_t>(event.original_k),
                               event.residual});
         }
-        return rmd::reference_direct_correction(args, payload.row_count, events, output);
+        return ggml::gemmini::rmd::reference_direct_correction(args, payload.row_count, events, output);
     };
 
     constexpr size_t      rows = 4, columns = 48, logical_k = 65, blocks_per_row = 3;
@@ -2353,7 +2435,7 @@ bool test_direct_cpu_executor() {
     native_args.I              = rows;
     native_args.J              = columns;
     native_args.K              = logical_k;
-    native_args.weight_format  = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    native_args.weight_format  = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
     native_args.B              = reinterpret_cast<elem_t *>(native_weights.data());
     native_args.sB             = logical_k;
     native_args.transpose_B    = true;
@@ -2362,17 +2444,17 @@ bool test_direct_cpu_executor() {
     native_args.R              = native_offsets.data();
     native_args.blocks_per_row = blocks_per_row;
     native_args.block_size_k   = QK8_0;
-    std::vector<rmd::OutputValue>    native_expected;
-    rmd::Correction                  native_actual = rmd::BlockScaledInt64Correction{{91, 92, 93}};
+    std::vector<ggml::gemmini::rmd::OutputValue>    native_expected;
+    ggml::gemmini::rmd::Correction                  native_actual = ggml::gemmini::rmd::BlockScaledInt64Correction{{91, 92, 93}};
     residual::DirectExecutionMetrics native_metrics{};
-    if (!check(reference(native_args, *native_payload, native_expected) == rmd::RmdStatus::success,
+    if (!check(reference(native_args, *native_payload, native_expected) == ggml::gemmini::rmd::RmdStatus::success,
                "direct native reference succeeds")) {
         return false;
     }
     quants::wreader::test_reset_weight_reader_counters();
     if (!check(residual::execute_direct_stripe(
                    native_args, *native_payload, native_actual, &native_metrics) ==
-                   rmd::RmdStatus::success,
+                   ggml::gemmini::rmd::RmdStatus::success,
                "direct native execution succeeds") ||
         !check(integer_values_equal(native_actual, native_expected),
                "direct sparse/decode/reused-K/multi-block/tail/cancellation parity") ||
@@ -2402,10 +2484,10 @@ bool test_direct_cpu_executor() {
     CpuScript                                         exact_script(expected_tile_count);
     const residual::testing::DirectExecutionTestHooks exact_hooks{&CpuScript::read, &exact_script};
     residual::DirectExecutionMetrics                  exact_metrics{};
-    rmd::Correction exact_output = rmd::BlockScaledInt64Correction{{101}};
+    ggml::gemmini::rmd::Correction exact_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{101}};
     if (!check(residual::execute_direct_stripe(
                    native_args, *native_payload, exact_output, &exact_metrics, exact_hooks) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(exact_output, native_expected),
                "J-tile sampling preserves exact numerical output") ||
         !check(exact_metrics.event_count == native_payload->events.size() &&
@@ -2420,11 +2502,11 @@ bool test_direct_cpu_executor() {
     CpuScript                                         null_metrics_script(expected_tile_count);
     const residual::testing::DirectExecutionTestHooks null_metrics_hooks{&CpuScript::read,
                                                                          &null_metrics_script};
-    rmd::Correction null_metrics_output = rmd::BlockScaledInt64Correction{{102}};
+    ggml::gemmini::rmd::Correction null_metrics_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{102}};
     if (!check(
             residual::execute_direct_stripe(
                 native_args, *native_payload, null_metrics_output, nullptr, null_metrics_hooks) ==
-                    rmd::RmdStatus::success &&
+                    ggml::gemmini::rmd::RmdStatus::success &&
                 integer_values_equal(null_metrics_output, native_expected),
             "null-metrics direct execution preserves exact numerical output")) {
         return false;
@@ -2471,12 +2553,12 @@ bool test_direct_cpu_executor() {
                                                                            &propagated_script};
         residual::DirectExecutionMetrics                  propagated_metrics{};
         propagated_metrics.run_id         = supplied_run_id;
-        rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
+        ggml::gemmini::rmd::Correction propagated_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{104}};
         if (!check(residual::execute_direct_stripe(native_args,
                                                    *native_payload,
                                                    propagated_output,
                                                    &propagated_metrics,
-                                                   propagated_hooks) == rmd::RmdStatus::success &&
+                                                   propagated_hooks) == ggml::gemmini::rmd::RmdStatus::success &&
                        integer_values_equal(propagated_output, native_expected) &&
                        propagated_metrics.cpu_tiles.size() == expected_tile_count,
                    "supplied run-ID execution preserves output and dynamic tile records")) {
@@ -2499,7 +2581,7 @@ bool test_direct_cpu_executor() {
 
     auto execute_with_script = [&](CpuScript &                        script,
                                    residual::DirectExecutionMetrics & metrics,
-                                   rmd::Correction &                  output) {
+                                   ggml::gemmini::rmd::Correction &                  output) {
         const residual::testing::DirectExecutionTestHooks hooks{&CpuScript::read, &script};
         return residual::execute_direct_stripe(
             native_args, *native_payload, output, &metrics, hooks);
@@ -2519,9 +2601,9 @@ bool test_direct_cpu_executor() {
     CpuScript invalid_end_script(expected_tile_count);
     invalid_end_script.tile_ends[1].valid = false;
     residual::DirectExecutionMetrics invalid_end_metrics{};
-    rmd::Correction                  invalid_end_output = rmd::BlockScaledInt64Correction{{103}};
+    ggml::gemmini::rmd::Correction                  invalid_end_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{103}};
     if (!check(execute_with_script(invalid_end_script, invalid_end_metrics, invalid_end_output) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(invalid_end_output, native_expected) &&
                    !invalid_end_metrics.cpu_tiles[1].valid &&
                    !invalid_end_metrics.cpu_tiles[1].delta_cycles.has_value() &&
@@ -2534,9 +2616,9 @@ bool test_direct_cpu_executor() {
     CpuScript owner_script(expected_tile_count);
     owner_script.tile_ends[1].owner += 1;
     residual::DirectExecutionMetrics owner_metrics{};
-    rmd::Correction                  owner_output = rmd::BlockScaledInt64Correction{{105}};
+    ggml::gemmini::rmd::Correction                  owner_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{105}};
     if (!check(execute_with_script(owner_script, owner_metrics, owner_output) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(owner_output, native_expected) &&
                    !owner_metrics.cpu_tiles[1].valid &&
                    owner_metrics.cpu_tiles[1].reason ==
@@ -2548,9 +2630,9 @@ bool test_direct_cpu_executor() {
     CpuScript generation_script(expected_tile_count);
     generation_script.tile_ends[2].generation += 1;
     residual::DirectExecutionMetrics generation_metrics{};
-    rmd::Correction                  generation_output = rmd::BlockScaledInt64Correction{{117}};
+    ggml::gemmini::rmd::Correction                  generation_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{117}};
     if (!check(execute_with_script(generation_script, generation_metrics, generation_output) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(generation_output, native_expected) &&
                    !generation_metrics.cpu_tiles[2].valid &&
                    generation_metrics.cpu_tiles[2].reason ==
@@ -2562,9 +2644,9 @@ bool test_direct_cpu_executor() {
     CpuScript missing_script(expected_tile_count);
     missing_script.available_tile_samples = expected_tile_count - 1;
     residual::DirectExecutionMetrics missing_metrics{};
-    rmd::Correction                  missing_output = rmd::BlockScaledInt64Correction{{113}};
+    ggml::gemmini::rmd::Correction                  missing_output = ggml::gemmini::rmd::BlockScaledInt64Correction{{113}};
     if (!check(execute_with_script(missing_script, missing_metrics, missing_output) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(missing_output, native_expected) &&
                    !missing_metrics.cpu_tiles.back().valid &&
                    !missing_metrics.cpu_tiles.back().delta_cycles.has_value() &&
@@ -2598,19 +2680,19 @@ bool test_direct_cpu_executor() {
     dense_args.sB                     = dense_columns;
     dense_args.weight_i8_scale_active = true;
     dense_args.weight_scale           = 0.25f;
-    std::vector<rmd::OutputValue> dense_expected;
-    rmd::Correction               dense_actual = rmd::BlockScaledInt64Correction{{-7}};
+    std::vector<ggml::gemmini::rmd::OutputValue> dense_expected;
+    ggml::gemmini::rmd::Correction               dense_actual = ggml::gemmini::rmd::BlockScaledInt64Correction{{-7}};
     if (!check(dense_payload != nullptr, "direct dense payload built") ||
-        !check(reference(dense_args, *dense_payload, dense_expected) == rmd::RmdStatus::success,
+        !check(reference(dense_args, *dense_payload, dense_expected) == ggml::gemmini::rmd::RmdStatus::success,
                "direct dense reference succeeds") ||
         !check(residual::execute_direct_stripe(dense_args, *dense_payload, dense_actual) ==
-                       rmd::RmdStatus::success &&
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    integer_values_equal(dense_actual, dense_expected),
                "direct dense route parity"))
         return false;
 
-    const std::vector<rmd::OutputValue> sentinel  = {11, 22, 33};
-    rmd::Correction                     failed    = rmd::BlockScaledInt64Correction{sentinel};
+    const std::vector<ggml::gemmini::rmd::OutputValue> sentinel  = {11, 22, 33};
+    ggml::gemmini::rmd::Correction                     failed    = ggml::gemmini::rmd::BlockScaledInt64Correction{sentinel};
     DirectStripePayload                 malformed = *dense_payload;
     std::swap(malformed.events[0], malformed.events[1]);
     CpuScript                        failure_script(1);
@@ -2623,7 +2705,7 @@ bool test_direct_cpu_executor() {
                                                                     &failure_script};
     if (!check(residual::execute_direct_stripe(
                    dense_args, malformed, failed, &failure_metrics, failure_hooks) ==
-                       rmd::RmdStatus::invalid_packet &&
+                       ggml::gemmini::rmd::RmdStatus::invalid_packet &&
                    integer_values_equal(failed, sentinel) && failure_metrics.event_count == 71 &&
                    failure_metrics.call_count == 73 && failure_metrics.cpu_tiles.size() == 1 &&
                    failure_metrics.cpu_tiles.front().run_id == 127 &&
@@ -2632,9 +2714,9 @@ bool test_direct_cpu_executor() {
                "direct invalid payload leaves output, metrics, and local tile endpoints unchanged"))
         return false;
     ggml_gemmini_args_t unsupported_args = dense_args;
-    unsupported_args.weight_format       = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    unsupported_args.weight_format       = ggml_gemmini_args_t::weight_format_t::q8_h0;
     if (!check(residual::execute_direct_stripe(unsupported_args, *dense_payload, failed) ==
-                       rmd::RmdStatus::unsupported_route &&
+                       ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                    integer_values_equal(failed, sentinel),
                "direct unsupported route fails atomically"))
         return false;
@@ -2646,7 +2728,7 @@ bool test_direct_cpu_executor() {
     ggml_gemmini_args_t overflow_shape_args = dense_args;
     overflow_shape_args.J                   = 3;
     if (!check(residual::execute_direct_stripe(overflow_shape_args, overflow_shape, failed) ==
-                       rmd::RmdStatus::overflow &&
+                       ggml::gemmini::rmd::RmdStatus::overflow &&
                    integer_values_equal(failed, sentinel),
                "direct output shape overflow fails atomically"))
         return false;
@@ -2656,22 +2738,22 @@ bool test_direct_cpu_executor() {
     ggml_gemmini_args_t allocation_args  = dense_args;
     allocation_args.J                    = 2;
     if (!check(residual::execute_direct_stripe(allocation_args, allocation_shape, failed) ==
-                       rmd::RmdStatus::allocation_failure &&
+                       ggml::gemmini::rmd::RmdStatus::allocation_failure &&
                    integer_values_equal(failed, sentinel),
                "direct impossible allocation fails atomically"))
         return false;
 
     auto execute_q16_h1 = [&](std::vector<block_q16_h1> &        blocks,
                               const std::vector<ResidualEvent> & events,
-                              rmd::Correction &                  output) {
+                              ggml::gemmini::rmd::Correction &                  output) {
         const size_t logical_k = blocks.size() * QK16_0;
         const auto   payload   = build_payload(1, logical_k, 1, events);
         if (payload == nullptr)
-            return rmd::RmdStatus::invalid_packet;
+            return ggml::gemmini::rmd::RmdStatus::invalid_packet;
         ggml_gemmini_args_t args{};
         args.I = args.J            = 1;
         args.K                     = logical_k;
-        args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+        args.weight_format         = ggml_gemmini_args_t::weight_format_t::q16_h1;
         args.q16_h1_blocks         = blocks.data();
         args.native_block_count    = blocks.size();
         args.native_blocks_per_row = blocks.size();
@@ -2689,9 +2771,9 @@ bool test_direct_cpu_executor() {
     auto expect_q16_overflow = [&](std::vector<block_q16_h1> &        blocks,
                                    const std::vector<ResidualEvent> & events,
                                    const char *                       message) {
-        const std::vector<rmd::OutputValue> unchanged = {211};
-        rmd::Correction                     output    = rmd::BlockScaledInt64Correction{unchanged};
-        return check(execute_q16_h1(blocks, events, output) == rmd::RmdStatus::overflow &&
+        const std::vector<ggml::gemmini::rmd::OutputValue> unchanged = {211};
+        ggml::gemmini::rmd::Correction                     output    = ggml::gemmini::rmd::BlockScaledInt64Correction{unchanged};
+        return check(execute_q16_h1(blocks, events, output) == ggml::gemmini::rmd::RmdStatus::overflow &&
                          integer_values_equal(output, unchanged),
                      message);
     };
@@ -2701,10 +2783,10 @@ bool test_direct_cpu_executor() {
     signed_result_blocks[0].c_b   = 2;
     signed_result_blocks[0].R     = 3;
     signed_result_blocks[0].s_rf  = 1.0f;
-    rmd::Correction signed_result = rmd::BlockScaledInt64Correction{{211}};
+    ggml::gemmini::rmd::Correction signed_result = ggml::gemmini::rmd::BlockScaledInt64Correction{{211}};
     if (!check(execute_q16_h1(signed_result_blocks, {{0, 0, -2}}, signed_result) ==
-                       rmd::RmdStatus::success &&
-                   integer_values_equal(signed_result, std::vector<rmd::OutputValue>{-30}),
+                       ggml::gemmini::rmd::RmdStatus::success &&
+                   integer_values_equal(signed_result, std::vector<ggml::gemmini::rmd::OutputValue>{-30}),
                "portable signed multiply and add produce the expected negative result")) {
         return false;
     }
@@ -2759,7 +2841,7 @@ bool test_direct_cpu_executor() {
     ggml_gemmini_args_t overflow_args{};
     overflow_args.I = overflow_args.J = 1;
     overflow_args.K                   = overflow_k;
-    overflow_args.weight_format  = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    overflow_args.weight_format  = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
     overflow_args.B              = reinterpret_cast<elem_t *>(overflow_weights.data());
     overflow_args.sB             = overflow_k;
     overflow_args.transpose_B    = true;
@@ -2770,7 +2852,7 @@ bool test_direct_cpu_executor() {
     overflow_args.block_size_k   = QK8_0;
     if (!check(overflow_payload != nullptr, "direct overflow payload built") ||
         !check(residual::execute_direct_stripe(overflow_args, *overflow_payload, failed) ==
-                       rmd::RmdStatus::overflow &&
+                       ggml::gemmini::rmd::RmdStatus::overflow &&
                    integer_values_equal(failed, sentinel),
                "direct arithmetic overflow fails atomically"))
         return false;
@@ -2798,7 +2880,7 @@ bool test_rmd_lane_partition() {
     args.I                 = 1;
     args.J                 = 1;
     args.K                 = logical_k;
-    args.weight_format     = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    args.weight_format     = ggml_gemmini_args_t::weight_format_t::q8_0_unpacked_to_h1;
     args.B                 = weights.data();
     args.sB                = logical_k;
     args.transpose_B       = true;
@@ -2809,27 +2891,27 @@ bool test_rmd_lane_partition() {
     args.block_size_k      = logical_k;
     args.tiled_matmul_type = CPU;
 
-    rmd::RmdStripeBuilder builder;
+    ggml::gemmini::rmd::RmdStripeBuilder builder;
     builder.reset(0, 0, 1, logical_k, 1);
     for (size_t k = 0; k < logical_k; ++k) {
         if (residuals[k] != 0 && !builder.add_residual(0, k, residuals[k])) {
             return check(false, "RMD lane-partition residual accepted");
         }
     }
-    const rmd::StripePacketHandle packet = builder.finish();
+    const ggml::gemmini::rmd::StripePacketHandle packet = builder.finish();
     if (!check(packet != nullptr, "RMD lane-partition packet built")) {
         return false;
     }
 
-    rmd::CompressedOutput    compressed;
-    rmd::RmdExecutionMetrics metrics{};
-    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
-                   rmd::RmdStatus::success,
+    ggml::gemmini::rmd::CompressedOutput    compressed;
+    ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
+    if (!check(ggml::gemmini::rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
+                   ggml::gemmini::rmd::RmdStatus::success,
                "RMD lane-partition execution")) {
         return false;
     }
-    rmd::Correction actual = rmd::BlockScaledInt64Correction{};
-    if (!check(rmd::compose_rmd_output(*packet, compressed, actual) == rmd::RmdStatus::success,
+    ggml::gemmini::rmd::Correction actual = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    if (!check(ggml::gemmini::rmd::compose_rmd_output(*packet, compressed, actual) == ggml::gemmini::rmd::RmdStatus::success,
                "RMD lane-partition composition")) {
         return false;
     }
@@ -2839,7 +2921,7 @@ bool test_rmd_lane_partition() {
         expected += static_cast<int64_t>(residuals[k]) * weights[k];
     }
     constexpr size_t expected_k_tiles = (logical_k + DIM - 1) / DIM;
-    return check(integer_values_equal(actual, std::vector<rmd::OutputValue>{expected}),
+    return check(integer_values_equal(actual, std::vector<ggml::gemmini::rmd::OutputValue>{expected}),
                  "RMD lane partition preserves exact output") &&
            check(metrics.matmul_call_count == expected_k_tiles,
                  "RMD lane partition preserves DIM-aware B-load count") &&
@@ -2851,7 +2933,7 @@ bool test_rmd_lane_partition() {
 }
 
 bool test_rmd_weight_gather() {
-    namespace wreader                        = ggml::gemmini::quants::wreader;
+    namespace wreader                        = ggml::npu::quants::wreader;
     constexpr size_t          logical_k      = 96;
     constexpr size_t          columns        = 3;
     constexpr size_t          blocks_per_row = 3;
@@ -2870,7 +2952,7 @@ bool test_rmd_weight_gather() {
     ggml_gemmini_args_t args{};
     args.J                     = columns;
     args.K                     = logical_k;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks         = h1.data();
     args.q8_hp1_block_count    = h1.size();
     args.q8_hp1_blocks_per_row = blocks_per_row;
@@ -2878,21 +2960,21 @@ bool test_rmd_weight_gather() {
     args.block_size_k          = QK8_0;
 
     constexpr size_t      production_rows = 17;
-    rmd::RmdStripeBuilder production_builder;
+    ggml::gemmini::rmd::RmdStripeBuilder production_builder;
     production_builder.reset(0, 0, production_rows, logical_k, columns);
     if (!production_builder.add_residual(0, 0, 1) || !production_builder.add_residual(0, 1, 1) ||
         !production_builder.add_residual(16, 0, 1))
         return check(false, "native HP1 production reuse events accepted");
     const auto               production_packet = production_builder.finish();
-    rmd::Correction          production_output = rmd::BlockScaledInt64Correction{};
-    rmd::RmdExecutionMetrics production_metrics{};
+    ggml::gemmini::rmd::Correction          production_output = ggml::gemmini::rmd::BlockScaledInt64Correction{};
+    ggml::gemmini::rmd::RmdExecutionMetrics production_metrics{};
     if (!check(production_packet &&
-                   rmd::execute_rmd_stripe_reference(
+                   ggml::gemmini::rmd::execute_rmd_stripe_reference(
                        args, *production_packet, production_output, &production_metrics) ==
-                       rmd::RmdStatus::success,
+                       ggml::gemmini::rmd::RmdStatus::success,
                "native HP1 production reuse executes"))
         return false;
-    std::vector<rmd::OutputValue> production_expected(production_rows * columns, 0);
+    std::vector<ggml::gemmini::rmd::OutputValue> production_expected(production_rows * columns, 0);
     for (size_t j = 0; j < columns; ++j) {
         const int64_t first_code              = static_cast<int64_t>(j) * 37 - 64;
         production_expected[j]                = first_code + first_code + 1;
@@ -2907,25 +2989,25 @@ bool test_rmd_weight_gather() {
         return false;
 
     const std::array<uint16_t, 3>                       local_k = {0, 15, 31};
-    std::array<elem_t, rmd::kArrayDim * rmd::kArrayDim> tile{};
+    std::array<elem_t, ggml::gemmini::rmd::kArrayDim * ggml::gemmini::rmd::kArrayDim> tile{};
     tile.fill(0x55);
-    rmd::RmdExecutionMetrics metrics{};
-    if (!check(rmd::gather_weight_tile_for_test(args,
+    ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(args,
                                                 1,
                                                 local_k.data(),
                                                 local_k.size(),
                                                 0,
                                                 columns,
                                                 tile.data(),
-                                                rmd::kArrayDim,
-                                                &metrics) == rmd::RmdStatus::success,
+                                                ggml::gemmini::rmd::kArrayDim,
+                                                &metrics) == ggml::gemmini::rmd::RmdStatus::success,
                "native HP1 gather succeeds")) {
         return false;
     }
     for (size_t k = 0; k < local_k.size(); ++k) {
         for (size_t j = 0; j < columns; ++j) {
             const int8_t expected = h1[j * blocks_per_row + 1].qs[local_k[k]];
-            if (!check(tile[k * rmd::kArrayDim + j] == expected,
+            if (!check(tile[k * ggml::gemmini::rmd::kArrayDim + j] == expected,
                        "native HP1 gather matches scalar layout")) {
                 return false;
             }
@@ -2945,9 +3027,9 @@ bool test_rmd_weight_gather() {
     };
     for (const auto & [block_id, block_local_k] : h1_boundaries) {
         tile.fill(0x55);
-        if (!check(rmd::gather_weight_tile_for_test(
-                       args, block_id, &block_local_k, 1, 0, 1, tile.data(), rmd::kArrayDim) ==
-                           rmd::RmdStatus::success &&
+        if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(
+                       args, block_id, &block_local_k, 1, 0, 1, tile.data(), ggml::gemmini::rmd::kArrayDim) ==
+                           ggml::gemmini::rmd::RmdStatus::success &&
                        tile[0] == h1[block_id].qs[block_local_k],
                    "native HP1 gather preserves K=31/32/64 boundaries")) {
             return false;
@@ -2955,18 +3037,18 @@ bool test_rmd_weight_gather() {
     }
 
     const uint16_t last_native_k = 31;
-    if (!check(rmd::gather_weight_tile_for_test(
-                   args, 2, &last_native_k, 1, 0, 1, tile.data(), rmd::kArrayDim) ==
-                       rmd::RmdStatus::success &&
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(
+                   args, 2, &last_native_k, 1, 0, 1, tile.data(), ggml::gemmini::rmd::kArrayDim) ==
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    tile[0] == h1[2].qs[31],
                "native HP1 gather preserves K=95 boundary"))
         return false;
     auto partial_native      = args;
     partial_native.K         = 65;
     const auto native_before = tile;
-    if (!check(rmd::gather_weight_tile_for_test(
-                   partial_native, 2, &last_native_k, 1, 0, 1, tile.data(), rmd::kArrayDim) ==
-                       rmd::RmdStatus::unsupported_route &&
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(
+                   partial_native, 2, &last_native_k, 1, 0, 1, tile.data(), ggml::gemmini::rmd::kArrayDim) ==
+                       ggml::gemmini::rmd::RmdStatus::unsupported_route &&
                    tile == native_before,
                "native HP1 rejects unaligned K=65 without output publication"))
         return false;
@@ -2987,32 +3069,32 @@ bool test_rmd_weight_gather() {
     partial.R              = partial_offsets.data();
     partial.blocks_per_row = blocks_per_row;
     const uint16_t tail_k  = 0;
-    if (!check(rmd::gather_weight_tile_for_test(
-                   partial, 2, &tail_k, 1, 0, columns, tile.data(), rmd::kArrayDim) ==
-                       rmd::RmdStatus::success &&
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(
+                   partial, 2, &tail_k, 1, 0, columns, tile.data(), ggml::gemmini::rmd::kArrayDim) ==
+                       ggml::gemmini::rmd::RmdStatus::success &&
                    tile[0] == partial_weights[64],
                "dense affine gather preserves the K=65 partial block"))
         return false;
     const auto     partial_before = tile;
     const uint16_t past_tail      = 1;
-    if (!check(rmd::gather_weight_tile_for_test(
-                   partial, 2, &past_tail, 1, 0, columns, tile.data(), rmd::kArrayDim) ==
-                       rmd::RmdStatus::execution_failed &&
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(
+                   partial, 2, &past_tail, 1, 0, columns, tile.data(), ggml::gemmini::rmd::kArrayDim) ==
+                       ggml::gemmini::rmd::RmdStatus::execution_failed &&
                    tile == partial_before,
                "dense affine gather rejects K=65 out of bounds atomically"))
         return false;
 
     const auto unchanged_tile    = tile;
     const auto unchanged_metrics = metrics;
-    if (!check(rmd::gather_weight_tile_for_test(args,
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(args,
                                                 3,
                                                 local_k.data(),
                                                 local_k.size(),
                                                 0,
                                                 columns,
                                                 tile.data(),
-                                                rmd::kArrayDim,
-                                                &metrics) == rmd::RmdStatus::execution_failed &&
+                                                ggml::gemmini::rmd::kArrayDim,
+                                                &metrics) == ggml::gemmini::rmd::RmdStatus::execution_failed &&
                    tile == unchanged_tile &&
                    metrics.weight_values_gathered == unchanged_metrics.weight_values_gathered &&
                    metrics.weight_baseline_address_resolutions ==
@@ -3049,22 +3131,22 @@ bool test_rmd_weight_gather() {
     tile.fill(0x55);
     metrics = {};
     wreader::test_reset_weight_reader_counters();
-    if (!check(rmd::gather_weight_tile_for_test(args,
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(args,
                                                 1,
                                                 dense_local_k.data(),
                                                 dense_local_k.size(),
                                                 1,
                                                 3,
                                                 tile.data(),
-                                                rmd::kArrayDim,
-                                                &metrics) == rmd::RmdStatus::success,
+                                                ggml::gemmini::rmd::kArrayDim,
+                                                &metrics) == ggml::gemmini::rmd::RmdStatus::success,
                "dense JxK gather succeeds")) {
         return false;
     }
     for (size_t k = 0; k < dense_local_k.size(); ++k) {
         const size_t global_k = QK8_0 + dense_local_k[k];
         for (size_t col = 0; col < 3; ++col) {
-            if (!check(tile[k * rmd::kArrayDim + col] ==
+            if (!check(tile[k * ggml::gemmini::rmd::kArrayDim + col] ==
                            dense_jxk[(1 + col) * jxk_stride + global_k],
                        "dense JxK gather preserves padded stride")) {
                 return false;
@@ -3081,15 +3163,15 @@ bool test_rmd_weight_gather() {
     const auto valid_jxk_tile    = tile;
     const auto valid_jxk_metrics = metrics;
     args.sB                      = dense_k - 1;
-    if (!check(rmd::gather_weight_tile_for_test(args,
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(args,
                                                 1,
                                                 dense_local_k.data(),
                                                 dense_local_k.size(),
                                                 1,
                                                 3,
                                                 tile.data(),
-                                                rmd::kArrayDim,
-                                                &metrics) == rmd::RmdStatus::execution_failed &&
+                                                ggml::gemmini::rmd::kArrayDim,
+                                                &metrics) == ggml::gemmini::rmd::RmdStatus::execution_failed &&
                    tile == valid_jxk_tile &&
                    metrics.weight_values_gathered == valid_jxk_metrics.weight_values_gathered &&
                    metrics.weight_address_resolutions ==
@@ -3104,22 +3186,22 @@ bool test_rmd_weight_gather() {
     tile.fill(0x55);
     metrics = {};
     wreader::test_reset_weight_reader_counters();
-    if (!check(rmd::gather_weight_tile_for_test(args,
+    if (!check(ggml::gemmini::rmd::gather_weight_tile_for_test(args,
                                                 1,
                                                 dense_local_k.data(),
                                                 dense_local_k.size(),
                                                 1,
                                                 3,
                                                 tile.data(),
-                                                rmd::kArrayDim,
-                                                &metrics) == rmd::RmdStatus::success,
+                                                ggml::gemmini::rmd::kArrayDim,
+                                                &metrics) == ggml::gemmini::rmd::RmdStatus::success,
                "dense KxJ gather succeeds")) {
         return false;
     }
     for (size_t k = 0; k < dense_local_k.size(); ++k) {
         const size_t global_k = QK8_0 + dense_local_k[k];
         for (size_t col = 0; col < 3; ++col) {
-            if (!check(tile[k * rmd::kArrayDim + col] == dense_kxj[global_k * kxj_stride + 1 + col],
+            if (!check(tile[k * ggml::gemmini::rmd::kArrayDim + col] == dense_kxj[global_k * kxj_stride + 1 + col],
                        "dense KxJ gather preserves padded stride")) {
                 return false;
             }
@@ -3161,10 +3243,10 @@ GatherBenchResult benchmark_gather_layout(const std::string &              layou
     auto             run              = [&](bool                       scalar,
                                             size_t                     iterations,
                                             uint64_t &                 checksum,
-                                            rmd::RmdExecutionMetrics & metrics) {
+                                            ggml::gemmini::rmd::RmdExecutionMetrics & metrics) {
         const auto           start = Clock::now();
-        const rmd::RmdStatus status =
-            scalar ? rmd::repeat_scalar_weight_tile_gather_for_test(args,
+        const ggml::gemmini::rmd::RmdStatus status =
+            scalar ? ggml::gemmini::rmd::repeat_scalar_weight_tile_gather_for_test(args,
                                                                     block_count,
                                                                     local_k.data(),
                                                                     local_k.size(),
@@ -3172,7 +3254,7 @@ GatherBenchResult benchmark_gather_layout(const std::string &              layou
                                                                     args.J,
                                                                     iterations,
                                                                     checksum)
-                   : rmd::repeat_weight_tile_gather_for_test(args,
+                   : ggml::gemmini::rmd::repeat_weight_tile_gather_for_test(args,
                                                              block_count,
                                                              local_k.data(),
                                                              local_k.size(),
@@ -3182,7 +3264,7 @@ GatherBenchResult benchmark_gather_layout(const std::string &              layou
                                                              checksum,
                                                              metrics);
         const auto stop = Clock::now();
-        if (status != rmd::RmdStatus::success) {
+        if (status != ggml::gemmini::rmd::RmdStatus::success) {
             return -1.0;
         }
         return std::chrono::duration<double, std::nano>(stop - start).count();
@@ -3192,7 +3274,7 @@ GatherBenchResult benchmark_gather_layout(const std::string &              layou
     for (;;) {
         uint64_t                 scalar_checksum    = 0;
         uint64_t                 candidate_checksum = 0;
-        rmd::RmdExecutionMetrics metrics{};
+        ggml::gemmini::rmd::RmdExecutionMetrics metrics{};
         const double             scalar_ns    = run(true, iterations, scalar_checksum, metrics);
         const double             candidate_ns = run(false, iterations, candidate_checksum, metrics);
         if (scalar_ns >= minimum_batch_ns && candidate_ns >= minimum_batch_ns) {
@@ -3205,11 +3287,11 @@ GatherBenchResult benchmark_gather_layout(const std::string &              layou
     std::vector<double>      candidate_batches;
     uint64_t                 scalar_checksum    = 0;
     uint64_t                 candidate_checksum = 0;
-    rmd::RmdExecutionMetrics candidate_metrics{};
+    ggml::gemmini::rmd::RmdExecutionMetrics candidate_metrics{};
     for (size_t batch = 0; batch < 7; ++batch) {
         uint64_t                 batch_scalar_checksum    = 0;
         uint64_t                 batch_candidate_checksum = 0;
-        rmd::RmdExecutionMetrics batch_metrics{};
+        ggml::gemmini::rmd::RmdExecutionMetrics batch_metrics{};
         const double scalar_ns    = run(true, iterations, batch_scalar_checksum, batch_metrics);
         const double candidate_ns = run(false, iterations, batch_candidate_checksum, batch_metrics);
         scalar_batches.push_back(scalar_ns);
@@ -3262,7 +3344,7 @@ bool run_rmd_gather_benchmark(const std::filesystem::path & json_path, double ma
     ggml_gemmini_args_t args{};
     args.J                     = columns;
     args.K                     = logical_k;
-    args.weight_format         = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.weight_format         = ggml_gemmini_args_t::weight_format_t::q8_hp1;
     args.q8_hp1_blocks         = h1.data();
     args.q8_hp1_block_count    = h1.size();
     args.q8_hp1_blocks_per_row = block_count;
@@ -3445,8 +3527,8 @@ int main(int argc, char ** argv) {
     if (argc == 3 && std::string(argv[1]) == "--profile-context") {
 #if EXSIA_PROFILE_LOG_ENABLED
         using namespace ggml::gemmini;
-        using namespace ggml::gemmini::quants::act::exsia;
-        using namespace ggml::gemmini::quants::act::exsia::detail;
+        using namespace ggml::npu::quants::act::exsia;
+        using namespace ggml::npu::quants::act::exsia::detail;
         log::cycle.set_output(nullptr);
         performance::reset();
         performance::start_request(1);
@@ -3582,6 +3664,7 @@ int main(int argc, char ** argv) {
     const bool ok =
         (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_outlier_limb_policy() &&
+         test_folding_integer_boundaries() &&
          test_exsia_packet_capture() && test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
@@ -3601,7 +3684,8 @@ int main(int argc, char ** argv) {
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
         (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" && test_non_outlier_clipping_policy()) ||
-        (case_name == "outlier-limb" && test_outlier_limb_policy()) ||
+        (case_name == "outlier-limb" && test_outlier_limb_policy() &&
+         test_folding_integer_boundaries()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

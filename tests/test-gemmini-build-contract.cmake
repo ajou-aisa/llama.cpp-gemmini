@@ -58,7 +58,6 @@ function(run_test_registration_case name dynamic_backend gemmini)
         -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
         -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DGGML_OPENMP=OFF
         -DLOG_CYCLE=1 -DCYCLE_DETAIL=1 -DGGML_CPU_CYCLE_LOG=ON -DLLAMA_CURL=OFF
-        "-DIM2P_SIM_ROOT=${TEST_REAL_IM2P_ROOT}"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
     record_configure("${name}" TRUE "${result}" "${output}\n${error}")
     if(NOT result EQUAL 0)
@@ -85,10 +84,15 @@ function(expect_ws_cycle_build_script script_name)
             RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
         file(WRITE "${TEST_BINARY_ROOT}/${script_name}-ws-cycle-${value}.log"
             "exit=${rc}\n${stdout}\n${stderr}")
-        string(REGEX MATCH "\"effective\": *\\{[^}]*\\}" effective "${stderr}")
-        if(NOT rc EQUAL 0 OR
-           NOT effective MATCHES "\"GGML_GEMMINI_WS_LOOP_CYCLE\": *\"${expected}\"")
-            message(FATAL_ERROR "${script_name} did not resolve WS_LOOP_CYCLE=${value}: ${stdout}\n${stderr}")
+        if(NOT rc EQUAL 0)
+            message(FATAL_ERROR "${script_name} dry-run failed: ${stdout}\n${stderr}")
+        endif()
+        if(value STREQUAL "default")
+            if(stdout MATCHES "-DGGML_GEMMINI_WS_LOOP_CYCLE(:[A-Za-z]+)?=1")
+                message(FATAL_ERROR "${script_name} overrides the CMake WS loop logging default")
+            endif()
+        elseif(NOT stdout MATCHES "-DGGML_GEMMINI_WS_LOOP_CYCLE=${expected}([ \n]|$)")
+            message(FATAL_ERROR "${script_name} lost WS_LOOP_CYCLE=${value}: ${stdout}")
         endif()
     endforeach()
     string(CONCAT deprecated_option "GGML_GEMMINI_WS_LOOP_" "DE" "BUG")
@@ -96,21 +100,10 @@ function(expect_ws_cycle_build_script script_name)
 endfunction()
 
 function(expect_dynamic_backend_production_script script_name)
-    set(script_path "${TEST_SOURCE_DIR}/${script_name}")
-    execute_process(COMMAND env -i "PATH=$ENV{PATH}" BUILD_JOBS=2
-        PYTHONDONTWRITEBYTECODE=1 bash "${script_path}" --dry-run
-        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
-    file(WRITE "${TEST_BINARY_ROOT}/${script_name}-backend-policy.log"
-        "exit=${rc}\n${stdout}\n${stderr}")
-    string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${stderr}")
-    set(config "${CMAKE_MATCH_1}")
-    if(NOT rc EQUAL 0 OR config STREQUAL "")
-        message(FATAL_ERROR "${script_name} backend policy dry-run failed: ${stdout}\n${stderr}")
-    endif()
-    string(JSON dynamic_backend GET "${config}" effective GGML_BACKEND_DL)
-    string(JSON build_tests GET "${config}" effective LLAMA_BUILD_TESTS)
-    if(NOT dynamic_backend STREQUAL "ON" OR NOT build_tests STREQUAL "OFF")
-        message(FATAL_ERROR "${script_name} must use dynamic backends with production tests disabled")
+    execute_process(COMMAND env -i "PATH=$ENV{PATH}" BUILD_JOBS=2 bash "${TEST_SOURCE_DIR}/${script_name}" --dry-run
+        RESULT_VARIABLE rc OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT rc EQUAL 0 OR NOT output MATCHES "-DGGML_BACKEND_DL=ON" OR NOT output MATCHES "-DLLAMA_BUILD_TESTS=OFF")
+        message(FATAL_ERROR "${script_name} production policy failed: ${output} ${error}")
     endif()
 endfunction()
 
@@ -178,7 +171,7 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
                 "Expected configure success for ${name}, got ${rc}\nstdout:\n${stdout}\nstderr:\n${stderr}")
         endif()
         set(cache_path "${build_dir}/CMakeCache.txt")
-        set(config_path "${build_dir}/generated/ggml-gemmini-matmul-config.hpp")
+        set(config_path "${build_dir}/generated/npu-matmul-config.hpp")
         if (NOT EXISTS "${cache_path}")
             message(FATAL_ERROR "Missing CMakeCache.txt for ${name}")
         endif()
@@ -195,12 +188,9 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
         expect_contains("${cache_path}" "GGML_GEMMINI_BLOCK_SIZE:STRING=${block_size}")
         expect_contains("${cache_path}" "GGML_GEMMINI_WEIGHT_BITS:STRING=8")
         expect_contains("${cache_path}" "GGML_GEMMINI_EXECUTION_BACKEND:STRING=HARDWARE")
-        expect_not_contains("${cache_path}" "GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE")
-        expect_not_contains("${cache_path}" "GGML_GEMMINI_IM2P_SIM_ARCHIVE")
         set(gemmini_link_path
             "${build_dir}/ggml/src/ggml-gemmini/CMakeFiles/ggml-gemmini.dir/link.txt")
         if(EXISTS "${gemmini_link_path}")
-            expect_not_contains("${gemmini_link_path}" "libim2p")
         endif()
         string(CONCAT retired_stripe_rows
                "GGML_GEMMINI_DEFAULT_STRIPE_" "ROWS")
@@ -259,461 +249,12 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
     endif()
 endfunction()
 
-function(write_fake_im2p_manifest root activation_bits weight_bits dim block_size)
-    execute_process(
-        COMMAND uname -m
-        RESULT_VARIABLE uname_rc
-        OUTPUT_VARIABLE fixture_arch
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(NOT uname_rc EQUAL 0 OR fixture_arch STREQUAL "")
-        message(FATAL_ERROR "Unable to resolve host architecture for fixture")
-    endif()
-    execute_process(
-        COMMAND uname -r
-        RESULT_VARIABLE release_rc
-        OUTPUT_VARIABLE fixture_release
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(NOT release_rc EQUAL 0 OR fixture_release STREQUAL "")
-        message(FATAL_ERROR "Unable to resolve host release for fixture")
-    endif()
-    set(artifact_id "a${activation_bits}-w${weight_bits}-d${dim}")
-    set(frontend_source
-        "${root}/build/lib/${artifact_id}/libim2p_gemmini_frontend.a")
-    set(simulator_source
-        "${root}/build/cargo/${artifact_id}/release/libim2p_sim.a")
-    if(NOT EXISTS "${frontend_source}" OR NOT EXISTS "${simulator_source}")
-        message(FATAL_ERROR
-            "Cannot manifest incomplete fake IM2P pair ${artifact_id}")
-    endif()
-    set(selected "${root}/build/selected/LEGACY_BSV/${artifact_id}")
-    set(generation "${selected}/generations/fixture")
-    file(MAKE_DIRECTORY "${generation}")
-    configure_file("${frontend_source}"
-        "${generation}/libim2p_gemmini_frontend.a" COPYONLY)
-    configure_file("${simulator_source}"
-        "${generation}/libim2p_sim.a" COPYONLY)
-    foreach(relative IN ITEMS
-            scripts/__init__.py scripts/real_lib_cache.py scripts/real_lib_manifest.py
-            scripts/real_lib_materialize.py scripts/real_lib_toolchain.py
-            scripts/im2p_config.py scripts/gemmini_replay_contract.py scripts/im2p_paths.py
-            scripts/gemmini_tools.py scripts/gemmini_resolve_profile.py
-            config/im2p_profiles.json src/common/Config.bsv sim/ffi/im2p_config.h)
-        configure_file(
-            "${TEST_REAL_IM2P_ROOT}/${relative}"
-            "${root}/${relative}" COPYONLY)
-    endforeach()
-    string(SHA256 fixture_fingerprint "fixture-${artifact_id}")
-    execute_process(COMMAND "${Python3_EXECUTABLE}" -B -c [=[
-import sys
-from pathlib import Path
-root, generation, fingerprint, artifact_id, activation, weight, dim, block, platform, release, arch = sys.argv[1:]
-sys.path.insert(0, root)
-from scripts.im2p_config import profile_config
-from scripts.real_lib_manifest import SCHEMA, artifact_rows, atomic_json
-identity = dict(profile_config(int(activation), int(weight), int(dim)),
-                id=artifact_id, implementation="LEGACY_BSV", block_size=int(block),
-                platform=platform, platform_release=release, arch=arch)
-generation = Path(generation)
-atomic_json(generation / "real-lib.json", dict(
-    schema=SCHEMA, fingerprint=fingerprint, identity=identity,
-    toolchains={}, build_config={}, artifact_root=".",
-    artifacts=artifact_rows(generation, (Path("libim2p_gemmini_frontend.a"), Path("libim2p_sim.a")))))
-]=] "${root}" "${generation}" "${fixture_fingerprint}" "${artifact_id}"
-        "${activation_bits}" "${weight_bits}" "${dim}" "${block_size}"
-        "${CMAKE_HOST_SYSTEM_NAME}" "${fixture_release}" "${fixture_arch}"
-        RESULT_VARIABLE manifest_rc ERROR_VARIABLE manifest_stderr)
-    if(NOT manifest_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to write fixture manifest: ${manifest_stderr}")
-    endif()
-    file(REMOVE "${selected}/current")
-    file(CREATE_LINK "generations/fixture" "${selected}/current" SYMBOLIC)
-endfunction()
 
-function(make_fake_im2p_root name path_activation_bits path_weight_bits path_dim
-         reported_abi reported_activation_bits reported_weight_bits reported_dim
-         out_var)
-    if(NOT DEFINED TEST_CXX_COMPILER OR NOT EXISTS "${TEST_CXX_COMPILER}")
-        message(FATAL_ERROR "TEST_CXX_COMPILER must point to a usable C++ compiler")
-    endif()
-    if(NOT DEFINED TEST_AR OR NOT EXISTS "${TEST_AR}")
-        message(FATAL_ERROR "TEST_AR must point to a usable archive tool")
-    endif()
 
-    set(root "${TEST_BINARY_ROOT}/fake-im2p/${name}")
-    set(artifact_id
-        "a${path_activation_bits}-w${path_weight_bits}-d${path_dim}")
-    set(frontend_dir "${root}/build/lib/${artifact_id}")
-    set(sim_dir "${root}/build/cargo/${artifact_id}/release")
-    file(MAKE_DIRECTORY
-        "${root}/frontend/include" "${root}/sim/include"
-        "${frontend_dir}" "${sim_dir}")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include/" DESTINATION "${root}/frontend/include")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include/" DESTINATION "${root}/sim/include")
-    configure_file("${matching_root}/build/lib/${artifact_id}/libim2p_gemmini_frontend.a"
-        "${frontend_dir}/libim2p_gemmini_frontend.a" COPYONLY)
-    set(source "${root}/identity.cpp")
-    set(object "${root}/identity.o")
-    if(reported_activation_bits STREQUAL "16")
-        set(reported_activation_storage_bytes 2)
-    else()
-        set(reported_activation_storage_bytes 1)
-    endif()
-    if(reported_weight_bits STREQUAL "16")
-        set(reported_weight_storage_bytes 2)
-    else()
-        set(reported_weight_storage_bytes 1)
-    endif()
-    file(WRITE "${source}"
-        "#include \"im2p_sim.h\"\n"
-        "extern \"C\" const char *im2p_compiled_numerical_semantics_revision(){return IM2P_SCU_NUMERICAL_REVISION;}\n"
-        "extern \"C\" const char *im2p_sim_implementation(){return \"legacy-bsv-v1\";}\n"
-        "extern \"C\" unsigned im2p_sim_abi_version(){return ${reported_abi};}\nextern \"C\" unsigned im2p_sim_activation_bits(){return ${reported_activation_bits};}\nextern \"C\" unsigned im2p_sim_activation_storage_bytes(){return ${reported_activation_storage_bytes};}\nextern \"C\" unsigned im2p_sim_weight_bits(){return ${reported_weight_bits};}\nextern \"C\" unsigned im2p_sim_weight_storage_bytes(){return ${reported_weight_storage_bytes};}\nextern \"C\" unsigned im2p_sim_dim(){return ${reported_dim};}\n"
-        "extern \"C\" int im2p_execute_matmul_extended(im2p_sim_t*, const im2p_matmul_desc_t*, im2p_work_stats_extended_t*){return IM2P_INVALID_LAYOUT;}\n"
-        "extern \"C\" int im2p_begin_striped_matmul(im2p_sim_t*, const im2p_stripe_work_desc_t*, im2p_stream_t**){return IM2P_ERROR;}\n"
-        "extern \"C\" int im2p_publish_stripe(im2p_stream_t*, const im2p_activation_stripe_t*){return IM2P_INVALID_LAYOUT;}\n")
-    execute_process(
-        COMMAND "${TEST_CXX_COMPILER}" -I "${root}/sim/include" -c "${source}" -o "${object}"
-        RESULT_VARIABLE compile_rc ERROR_VARIABLE compile_stderr)
-    if(NOT compile_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to compile fake IM2P archive: ${compile_stderr}")
-    endif()
-    foreach(archive IN ITEMS
-            "${sim_dir}/libim2p_sim.a")
-        execute_process(
-            COMMAND "${TEST_AR}" rcs "${archive}" "${object}"
-            RESULT_VARIABLE ar_rc ERROR_VARIABLE ar_stderr)
-        if(NOT ar_rc EQUAL 0)
-            message(FATAL_ERROR "Failed to create fake IM2P archive: ${ar_stderr}")
-        endif()
-    endforeach()
-    write_fake_im2p_manifest(
-        "${root}" "${path_activation_bits}" "${path_weight_bits}"
-        "${path_dim}" 32)
-    set(${out_var} "${root}" PARENT_SCOPE)
-endfunction()
 
-function(make_matching_fake_im2p_root out_var)
-    set(root "${TEST_BINARY_ROOT}/fake-im2p/matching")
-    file(MAKE_DIRECTORY "${root}/frontend" "${root}/sim")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include" DESTINATION "${root}/frontend")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include" DESTINATION "${root}/sim")
-    foreach(pair IN ITEMS
-            4:16 4:32 4:64
-            8:16 8:32 8:64
-            16:16 16:32 16:64)
-        string(REPLACE ":" ";" fields "${pair}")
-        list(GET fields 0 bits)
-        list(GET fields 1 dim)
-        set(artifact_id "a${bits}-w${bits}-d${dim}")
-        file(MAKE_DIRECTORY
-            "${root}/build/lib/${artifact_id}"
-            "${root}/build/cargo/${artifact_id}/release")
-        set(frontend_source "${root}/frontend-${artifact_id}.cpp")
-        set(frontend_object "${root}/frontend-${artifact_id}.o")
-        set(params_dir "${root}/params/${artifact_id}")
-        file(MAKE_DIRECTORY "${params_dir}")
-        file(READ
-            "${TEST_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include/gemmini_params.h"
-            params_content)
-        string(REGEX REPLACE "#define DIM [0-9]+"
-            "#define DIM ${dim}" params_content "${params_content}")
-        if(bits STREQUAL "16")
-            string(REPLACE "typedef int8_t elem_t;"
-                "typedef int16_t elem_t;" params_content "${params_content}")
-            string(REPLACE "static const elem_t elem_t_max = 127;"
-                "static const elem_t elem_t_max = 32767;"
-                params_content "${params_content}")
-            string(REPLACE "static const elem_t elem_t_min = -128;"
-                "static const elem_t elem_t_min = -32768;"
-                params_content "${params_content}")
-            string(REPLACE "INT8_MAX" "INT16_MAX"
-                params_content "${params_content}")
-            string(REPLACE "INT8_MIN" "INT16_MIN"
-                params_content "${params_content}")
-        endif()
-        file(WRITE "${params_dir}/gemmini_params.h" "${params_content}")
-        file(WRITE "${frontend_source}"
-            "#include \"im2p_gemmini_frontend.hpp\"\n"
-            "#include \"ggml-gemmini-args.h\"\n"
-            "namespace im2p::gemmini {\n"
-            "uint32_t compiled_activation_bits() noexcept { return ${bits}; }\n"
-            "uint32_t compiled_weight_bits() noexcept { return ${bits}; }\n"
-            "uint32_t compiled_dim() noexcept { return ${dim}; }\n"
-            "ArgsLayoutFingerprint compiled_args_layout_fingerprint() noexcept {\n"
-            "  ggml_gemmini_args_t args{};\n"
-            "  const auto *base = reinterpret_cast<const uint8_t *>(&args);\n"
-            "  const auto offset = [base](const auto *member) -> uint64_t {\n"
-            "    return static_cast<uint64_t>(reinterpret_cast<const uint8_t *>(member) - base);\n"
-            "  };\n"
-            "  return {sizeof(args), offset(&args.native_weight_bytes),\n"
-            "          offset(&args.col_stride_f_out), offset(&args.stride_f_out),\n"
-            "          offset(&args.tile_I)};\n"
-            "}\n"
-            "}\n")
-        execute_process(
-            COMMAND "${TEST_CXX_COMPILER}" -std=c++20
-                "-DGGML_GEMMINI_ACTIVATION_BITS=${bits}"
-                "-DGGML_GEMMINI_WEIGHT_BITS=${bits}"
-                -I "${root}/frontend/include"
-                -I "${root}/sim/include"
-                -I "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini"
-                -I "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/include"
-                -I "${TEST_SOURCE_DIR}/ggml/include"
-                -I "${TEST_SOURCE_DIR}/ggml/src"
-                -I "${params_dir}"
-                -I "${TEST_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include/include"
-                -c "${frontend_source}" -o "${frontend_object}"
-            RESULT_VARIABLE frontend_rc ERROR_VARIABLE frontend_stderr)
-        if(NOT frontend_rc EQUAL 0)
-            message(FATAL_ERROR
-                "Failed to compile matching frontend ${artifact_id}: ${frontend_stderr}")
-        endif()
-        set(simulator_source "${root}/simulator-${artifact_id}.cpp")
-        set(simulator_object "${root}/simulator-${artifact_id}.o")
-        if(bits STREQUAL "16")
-            set(storage_bytes 2)
-        else()
-            set(storage_bytes 1)
-        endif()
-        file(WRITE "${simulator_source}"
-            "#include \"im2p_sim.h\"\n"
-            "extern \"C\" {\n"
-            "uint32_t im2p_sim_abi_version(){return IM2P_ABI_VERSION;}\n"
-            "const char *im2p_compiled_numerical_semantics_revision(){return IM2P_SCU_NUMERICAL_REVISION;}\n"
-            "const char *im2p_sim_implementation(){return \"legacy-bsv-v1\";}\n"
-            "uint32_t im2p_sim_activation_bits(){return ${bits};}\n"
-            "uint32_t im2p_sim_activation_storage_bytes(){return ${storage_bytes};}\n"
-            "uint32_t im2p_sim_weight_bits(){return ${bits};}\n"
-            "uint32_t im2p_sim_weight_storage_bytes(){return ${storage_bytes};}\n"
-            "uint32_t im2p_sim_dim(){return ${dim};}\n"
-            "int im2p_execute_matmul_extended(im2p_sim_t*, const im2p_matmul_desc_t*, im2p_work_stats_extended_t*){return IM2P_INVALID_LAYOUT;}\n"
-            "int im2p_begin_striped_matmul(im2p_sim_t*, const im2p_stripe_work_desc_t*, im2p_stream_t**){return IM2P_ERROR;}\n"
-            "int im2p_publish_stripe(im2p_stream_t*, const im2p_activation_stripe_t*){return IM2P_INVALID_LAYOUT;}\n"
-            "}\n")
-        execute_process(
-            COMMAND "${TEST_CXX_COMPILER}" -std=c++20
-                -I "${root}/sim/include"
-                -c "${simulator_source}" -o "${simulator_object}"
-            RESULT_VARIABLE simulator_rc ERROR_VARIABLE simulator_stderr)
-        if(NOT simulator_rc EQUAL 0)
-            message(FATAL_ERROR
-                "Failed to compile matching simulator ${artifact_id}: ${simulator_stderr}")
-        endif()
-        execute_process(
-            COMMAND "${TEST_AR}" rcs
-                "${root}/build/lib/${artifact_id}/libim2p_gemmini_frontend.a"
-                "${frontend_object}"
-            RESULT_VARIABLE frontend_ar_rc ERROR_VARIABLE frontend_ar_stderr)
-        execute_process(
-            COMMAND "${TEST_AR}" rcs
-                "${root}/build/cargo/${artifact_id}/release/libim2p_sim.a"
-                "${simulator_object}"
-            RESULT_VARIABLE simulator_ar_rc ERROR_VARIABLE simulator_ar_stderr)
-        if(NOT frontend_ar_rc EQUAL 0 OR NOT simulator_ar_rc EQUAL 0)
-            message(FATAL_ERROR
-                "Failed to archive matching ${artifact_id}: ${frontend_ar_stderr}${simulator_ar_stderr}")
-        endif()
-        write_fake_im2p_manifest(
-            "${root}" "${bits}" "${bits}" "${dim}" 32)
-    endforeach()
-    set(${out_var} "${root}" PARENT_SCOPE)
-endfunction()
 
-function(make_stale_frontend_root out_var)
-    if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
-       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" OR
-       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d32/release/libim2p_sim.a")
-        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain real A8/DIM16 frontend and A8/DIM32 simulator archives")
-    endif()
-    set(root "${TEST_BINARY_ROOT}/stale-frontend-root")
-    file(MAKE_DIRECTORY
-        "${root}/frontend" "${root}/sim"
-        "${root}/build/lib/a8-w8-d32"
-        "${root}/build/cargo/a8-w8-d32/release")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include" DESTINATION "${root}/frontend")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include" DESTINATION "${root}/sim")
-    configure_file(
-        "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a"
-        "${root}/build/lib/a8-w8-d32/libim2p_gemmini_frontend.a" COPYONLY)
-    configure_file(
-        "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d32/release/libim2p_sim.a"
-        "${root}/build/cargo/a8-w8-d32/release/libim2p_sim.a" COPYONLY)
-    write_fake_im2p_manifest("${root}" 8 8 32 32)
-    set(${out_var} "${root}" PARENT_SCOPE)
-endfunction()
 
-function(make_extended_poll_stale_simulator_root out_var)
-    if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
-       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a")
-        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain the fresh A8/W8/DIM16 frontend archive")
-    endif()
-    set(root "${TEST_BINARY_ROOT}/extended-poll-stale-simulator-root")
-    file(MAKE_DIRECTORY
-        "${root}/frontend/include" "${root}/sim/include"
-        "${root}/build/lib/a8-w8-d16"
-        "${root}/build/cargo/a8-w8-d16/release")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include/" DESTINATION "${root}/frontend/include")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include/" DESTINATION "${root}/sim/include")
-    configure_file(
-        "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a"
-        "${root}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" COPYONLY)
-    set(source "${root}/old-simulator.cpp")
-    set(object "${root}/old-simulator.o")
-    file(WRITE "${source}" [=[
-#include "im2p_sim.h"
-extern "C" {
-im2p_sim_t *im2p_sim_create(void) { return reinterpret_cast<im2p_sim_t *>(1); }
-void im2p_sim_destroy(im2p_sim_t *) {}
-uint32_t im2p_sim_abi_version(void) { return IM2P_ABI_VERSION; }
-const char *im2p_compiled_numerical_semantics_revision(void) { return IM2P_SCU_NUMERICAL_REVISION; }
-const char *im2p_sim_implementation(void) { return "legacy-bsv-v1"; }
-uint32_t im2p_sim_activation_bits(void) { return 8; }
-uint32_t im2p_sim_activation_storage_bytes(void) { return 1; }
-uint32_t im2p_sim_weight_bits(void) { return 8; }
-uint32_t im2p_sim_weight_storage_bytes(void) { return 1; }
-uint32_t im2p_sim_dim(void) { return 16; }
-int im2p_execute_matmul_extended(im2p_sim_t *, const im2p_matmul_desc_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
-int im2p_begin_striped_matmul(im2p_sim_t *, const im2p_stripe_work_desc_t *, im2p_stream_t **) { return IM2P_ERROR; }
-int im2p_publish_stripe(im2p_stream_t *, const im2p_activation_stripe_t *) { return IM2P_INVALID_LAYOUT; }
-int im2p_progress_stream(im2p_stream_t *, uint64_t) { return IM2P_ERROR; }
-uint64_t im2p_stream_progress_count(const im2p_stream_t *) { return 0; }
-int im2p_finish_stream_extended(im2p_stream_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
-void im2p_destroy_stream(im2p_stream_t *) {}
-}
-]=])
-    execute_process(
-        COMMAND "${TEST_CXX_COMPILER}" -std=c++20
-            -I "${root}/sim/include" -c "${source}" -o "${object}"
-        RESULT_VARIABLE compile_rc ERROR_VARIABLE compile_stderr)
-    if(NOT compile_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to compile stale simulator: ${compile_stderr}")
-    endif()
-    execute_process(
-        COMMAND "${TEST_AR}" rcs
-            "${root}/build/cargo/a8-w8-d16/release/libim2p_sim.a" "${object}"
-        RESULT_VARIABLE ar_rc ERROR_VARIABLE ar_stderr)
-    if(NOT ar_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to archive stale simulator: ${ar_stderr}")
-    endif()
-    write_fake_im2p_manifest("${root}" 8 8 16 32)
-    set(${out_var} "${root}" PARENT_SCOPE)
-endfunction()
 
-function(make_abi_stale_frontend_root out_var)
-    if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
-       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d16/release/libim2p_sim.a")
-        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain the real A8/W8/DIM16 simulator archive")
-    endif()
-    set(root "${TEST_BINARY_ROOT}/abi-stale-frontend-root")
-    file(MAKE_DIRECTORY
-        "${root}/frontend/include" "${root}/sim/include"
-        "${root}/build/lib/a8-w8-d16"
-        "${root}/build/cargo/a8-w8-d16/release")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include/" DESTINATION "${root}/frontend/include")
-    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include/" DESTINATION "${root}/sim/include")
-    configure_file(
-        "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d16/release/libim2p_sim.a"
-        "${root}/build/cargo/a8-w8-d16/release/libim2p_sim.a" COPYONLY)
-    set(source "${root}/stale-identity.cpp")
-    set(object "${root}/stale-identity.o")
-    file(WRITE "${source}" [=[
-#include <cstdint>
-namespace im2p::gemmini {
-struct ArgsLayoutFingerprint {
-    std::uint64_t size, native_weight_bytes, col_stride_f_out,
-        stride_f_out, tile_i;
-};
-std::uint32_t compiled_activation_bits() noexcept { return 8; }
-std::uint32_t compiled_weight_bits() noexcept { return 8; }
-std::uint32_t compiled_dim() noexcept { return 16; }
-ArgsLayoutFingerprint compiled_args_layout_fingerprint() noexcept { return {}; }
-}
-]=])
-    execute_process(
-        COMMAND "${TEST_CXX_COMPILER}" -std=c++20 -c "${source}" -o "${object}"
-        RESULT_VARIABLE compile_rc ERROR_VARIABLE compile_stderr)
-    if(NOT compile_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to compile ABI-stale frontend: ${compile_stderr}")
-    endif()
-    execute_process(
-        COMMAND "${TEST_AR}" rcs
-            "${root}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" "${object}"
-        RESULT_VARIABLE ar_rc ERROR_VARIABLE ar_stderr)
-    if(NOT ar_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to archive ABI-stale frontend: ${ar_stderr}")
-    endif()
-    write_fake_im2p_manifest("${root}" 8 8 16 32)
-    set(${out_var} "${root}" PARENT_SCOPE)
-endfunction()
-
-function(run_im2p_configure_case name root activation_bits weight_bits dim
-         backend expect_success failure_needle)
-    set(build_dir "${TEST_BINARY_ROOT}/${name}")
-    file(REMOVE_RECURSE "${build_dir}")
-    set(cmake_args
-        -S "${TEST_SOURCE_DIR}" -B "${build_dir}"
-        -DGGML_GEMMINI=ON
-        -DGGML_GEMMINI_OPTION=WS
-        -DGGML_GEMMINI_EXECUTION_BACKEND=${backend}
-        -DGGML_GEMMINI_ACTIVATION_BITS=${activation_bits}
-        -DGGML_GEMMINI_WEIGHT_BITS=${weight_bits}
-        -DGGML_GEMMINI_DIM=${dim}
-        -DIM2P_SIM_ROOT=${root}
-        -DLLAMA_BUILD_COMMON=OFF
-        -DLLAMA_BUILD_TESTS=OFF
-        -DLLAMA_BUILD_TOOLS=OFF
-        -DLLAMA_BUILD_EXAMPLES=OFF
-        -DLLAMA_BUILD_SERVER=OFF
-        -DLLAMA_CURL=OFF)
-    if(ARGC GREATER 8)
-        set(block_size "${ARGV8}")
-    else()
-        set(block_size 32)
-    endif()
-    list(APPEND cmake_args -DGGML_GEMMINI_BLOCK_SIZE=${block_size})
-    if(TEST_GENERATOR)
-        list(APPEND cmake_args -G "${TEST_GENERATOR}")
-    endif()
-    if(TEST_GENERATOR_PLATFORM)
-        list(APPEND cmake_args -A "${TEST_GENERATOR_PLATFORM}")
-    endif()
-    if(TEST_GENERATOR_TOOLSET)
-        list(APPEND cmake_args -T "${TEST_GENERATOR_TOOLSET}")
-    endif()
-    execute_process(
-        COMMAND "${TEST_CMAKE_COMMAND}" ${cmake_args}
-        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
-    string(CONCAT output "${stdout}" "\n" "${stderr}")
-    record_configure("${name}" "${expect_success}" "${rc}" "${output}")
-    if(expect_success)
-        if(NOT rc EQUAL 0)
-            message(FATAL_ERROR "Expected IM2P configure success for ${name}\n${output}")
-        endif()
-        set(artifact_id "a${activation_bits}-w${weight_bits}-d${dim}")
-        string(FIND "${output}"
-            "build/selected/LEGACY_BSV/${artifact_id}/generations/fixture/libim2p_gemmini_frontend.a"
-            frontend_at)
-        string(FIND "${output}"
-            "build/selected/LEGACY_BSV/${artifact_id}/generations/fixture/libim2p_sim.a"
-            simulator_at)
-        if(frontend_at EQUAL -1 OR simulator_at EQUAL -1)
-            message(FATAL_ERROR "${name} did not report the exact pair archives\n${output}")
-        endif()
-        expect_contains("${build_dir}/generated/gemmini_params.h" "#define DIM ${dim}")
-        expect_contains("${build_dir}/CMakeCache.txt"
-            "GGML_GEMMINI_BLOCK_SIZE:STRING=${block_size}")
-        return()
-    endif()
-    if(rc EQUAL 0)
-        message(FATAL_ERROR "Expected IM2P configure failure for ${name}")
-    endif()
-    string(REGEX REPLACE "[ \t\r\n]+" " " normalized_output "${output}")
-    string(FIND "${normalized_output}" "${failure_needle}" failure_at)
-    if(failure_at EQUAL -1)
-        message(FATAL_ERROR
-            "Expected ${name} failure to mention '${failure_needle}'\n${output}")
-    endif()
-endfunction()
 
 function(run_option_backend_case name option backend root expect_success failure_needle)
     set(build_dir "${TEST_BINARY_ROOT}/${name}")
@@ -727,7 +268,6 @@ function(run_option_backend_case name option backend root expect_success failure
         -DGGML_GEMMINI_WEIGHT_BITS=8
         -DGGML_GEMMINI_BLOCK_SIZE=32
             -DGGML_GEMMINI_DIM=16
-        -DIM2P_SIM_ROOT=${root}
         -DLLAMA_BUILD_COMMON=OFF
         -DLLAMA_BUILD_TESTS=OFF
         -DLLAMA_BUILD_TOOLS=OFF
@@ -764,18 +304,6 @@ function(run_option_backend_case name option backend root expect_success failure
             "Expected ${name} failure to mention '${failure_needle}'\n${output}")
     endif()
 
-    set(artifact_probe_count 0)
-    set(runtime_dispatch_count 0)
-    if(EXISTS "${build_dir}/im2p-build-contract-probe.cpp")
-        math(EXPR artifact_probe_count "${artifact_probe_count} + 1")
-    endif()
-    if(EXISTS "${build_dir}/im2p-frontend-pair-probe.cpp")
-        math(EXPR runtime_dispatch_count "${runtime_dispatch_count} + 1")
-    endif()
-    if(NOT artifact_probe_count EQUAL 0 OR NOT runtime_dispatch_count EQUAL 0)
-        message(FATAL_ERROR
-            "${name} reached backend probes: artifact=${artifact_probe_count}, dispatch=${runtime_dispatch_count}")
-    endif()
 endfunction()
 
 function(run_hardware_width_case name option activation_bits weight_bits mode expect_success)
@@ -817,11 +345,6 @@ function(run_hardware_width_case name option activation_bits weight_bits mode ex
         message(FATAL_ERROR
             "Expected universal matched-width rejection for ${name}\n${output}")
     endif()
-    foreach(probe IN ITEMS im2p-build-contract-probe.cpp im2p-frontend-pair-probe.cpp)
-        if(EXISTS "${build_dir}/${probe}")
-            message(FATAL_ERROR "${name} reached forbidden artifact probe ${probe}")
-        endif()
-    endforeach()
 endfunction()
 
 function(run_host_dim_case name dim)
@@ -895,64 +418,6 @@ function(run_riscv_dim_mismatch_case)
     endif()
 endfunction()
 
-function(run_arm64_bootstrap_contract)
-    set(root "${TEST_BINARY_ROOT}/arm64-bootstrap-contract")
-    set(bin "${root}/bin")
-    set(log "${root}/commands.log")
-    file(MAKE_DIRECTORY "${bin}")
-    file(WRITE "${bin}/make" [=[#!/bin/bash
-printf 'make:%s\n' "$*" >> "$CONTRACT_LOG"
-]=])
-    file(WRITE "${bin}/cargo" [=[#!/bin/bash
-printf 'cargo:repo=%s build=%s a=%s w=%s d=%s target=%s args=%s\n' \
-    "$IM2P_REPO_ROOT" "$IM2P_BUILD_DIR" "$IM2P_ACTIVATION_BITS" \
-    "$IM2P_WEIGHT_BITS" "$IM2P_DIM" "$CARGO_TARGET_DIR" "$*" >> "$CONTRACT_LOG"
-]=])
-    file(WRITE "${bin}/cmake" [=[#!/bin/bash
-printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
-]=])
-    execute_process(COMMAND chmod +x "${bin}/make" "${bin}/cargo" "${bin}/cmake")
-    execute_process(
-        COMMAND "${TEST_CMAKE_COMMAND}" -E env
-            "PATH=${bin}:$ENV{PATH}"
-            "CONTRACT_LOG=${log}"
-            "BUILD_DIR=${root}/llama-build"
-            "BUILD_JOBS=1"
-            "IM2P_SIM_ROOT=${TEST_REAL_IM2P_ROOT}"
-            "LOG_CYCLE=0"
-            "GGML_GEMMINI=ON"
-            "GGML_GEMMINI_OPTION=WS"
-            "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
-            "GGML_GEMMINI_DIM=64"
-            bash "${TEST_SOURCE_DIR}/build-arm64.sh"
-        WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
-        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
-    if(NOT rc EQUAL 0)
-        message(FATAL_ERROR "build-arm64 bootstrap contract failed: ${stdout}\n${stderr}")
-    endif()
-    file(READ "${log}" commands)
-    string(FIND "${commands}"
-        "GEMMINI_FRONTEND_BLOCK_SIZE=32" frontend_block_size_at)
-    string(FIND "${commands}" "gemmini-frontend-real-lib" cache_target_at)
-    string(FIND "${commands}" "cargo:" direct_cargo_at)
-    string(FIND "${commands}" "cmake:-B" configure_at)
-    string(FIND "${commands}" "-DGGML_GEMMINI_OPTION=WS" option_at)
-    string(FIND "${commands}"
-        "-DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM" backend_at)
-    string(FIND "${commands}" "-DGGML_GEMMINI_DIM=64" dim_at)
-    string(FIND "${commands}" "-DGGML_GEMMINI_BLOCK_SIZE=32" cmake_block_size_at)
-    string(FIND "${commands}" "cmake:--build" build_at)
-    if(frontend_block_size_at EQUAL -1 OR cache_target_at EQUAL -1 OR
-       NOT direct_cargo_at EQUAL -1 OR
-       configure_at EQUAL -1 OR option_at EQUAL -1 OR
-       backend_at EQUAL -1 OR
-       dim_at EQUAL -1 OR
-       cmake_block_size_at EQUAL -1 OR build_at EQUAL -1 OR
-       NOT cache_target_at LESS configure_at OR NOT configure_at LESS build_at)
-        message(FATAL_ERROR
-            "build-arm64 WS/IM2P DIM64 overrides must delegate matching B32/DIM64 cache selection before configure/build without direct Cargo orchestration:\n${commands}")
-    endif()
-endfunction()
 
 function(run_host_script_dim_contract script dim)
     set(root "${TEST_BINARY_ROOT}/${script}-dim-contract")
@@ -1059,21 +524,9 @@ foreach(host_dim IN ITEMS 16 32 64)
 endforeach()
 run_riscv_dim_mismatch_case()
 
-make_matching_fake_im2p_root(matching_root)
-set(option_backend_fake_root "${matching_root}")
-set(legal_pairs_text
-    "legal combinations are CPU+HARDWARE, WS+HARDWARE, WS+IM2P_SIM")
 run_option_backend_case(option_cpu_hardware CPU HARDWARE "" TRUE "")
 run_option_backend_case(option_ws_hardware ws HARDWARE "" TRUE "")
-run_option_backend_case(option_ws_im2p WS IM2P_SIM "${option_backend_fake_root}" TRUE "")
-run_option_backend_case(option_os_hardware OS HARDWARE "" FALSE
-    "Illegal Gemmini option/backend combination: OS+HARDWARE; ${legal_pairs_text}")
-run_option_backend_case(option_os_im2p OS IM2P_SIM "${option_backend_fake_root}" FALSE
-    "Illegal Gemmini option/backend combination: OS+IM2P_SIM; ${legal_pairs_text}")
-run_option_backend_case(option_cpu_im2p CPU IM2P_SIM "${option_backend_fake_root}" FALSE
-    "Illegal Gemmini option/backend combination: CPU+IM2P_SIM; ${legal_pairs_text}")
-run_option_backend_case(option_malformed_im2p " WS" IM2P_SIM "${matching_root}" FALSE
-    "GGML_GEMMINI_OPTION must be one of CPU|OS|WS")
+run_option_backend_case(option_os_hardware OS HARDWARE "" FALSE "Gemmini OPTION=OS is unsupported")
 foreach(hardware_option IN ITEMS CPU WS)
     foreach(hardware_mode IN ITEMS FULL STRIPE_PIPELINE)
         foreach(activation_bits IN ITEMS 4 8 16)
@@ -1091,37 +544,6 @@ foreach(hardware_option IN ITEMS CPU WS)
         endforeach()
     endforeach()
 endforeach()
-make_fake_im2p_root(width_mismatch 16 16 32 5 8 16 32
-    width_mismatch_root)
-make_fake_im2p_root(a4_archive_mismatch 4 4 16 5 8 8 16
-    a4_archive_mismatch_root)
-make_fake_im2p_root(weight_mismatch 16 16 32 5 16 8 32
-    weight_mismatch_root)
-make_fake_im2p_root(dim_mismatch 16 16 32 5 16 16 16
-    dim_mismatch_root)
-make_fake_im2p_root(abi_mismatch 16 16 32 3 16 16 32
-    abi_mismatch_root)
-foreach(matched_width IN ITEMS 4 8 16)
-    foreach(real_dim IN ITEMS 16 32 64)
-        set(real_id "a${matched_width}-w${matched_width}-d${real_dim}")
-        if(NOT EXISTS "${matching_root}/build/lib/${real_id}/libim2p_gemmini_frontend.a" OR
-           NOT EXISTS "${matching_root}/build/cargo/${real_id}/release/libim2p_sim.a")
-            message(FATAL_ERROR
-                "Expected complete real IM2P ${real_id} frontend/simulator pair")
-        endif()
-        run_im2p_configure_case(
-            "im2p_matching_a${matched_width}_d${real_dim}"
-            "${matching_root}" "${matched_width}" "${matched_width}"
-            "${real_dim}" IM2P_SIM TRUE "")
-    endforeach()
-endforeach()
-run_im2p_configure_case(im2p_dim64_block32 "" 8 8 64 IM2P_SIM FALSE
-    "IM2P_SIM_ROOT is required" 32)
-run_im2p_configure_case(im2p_missing_root "" 8 8 32 IM2P_SIM FALSE "IM2P_SIM_ROOT is required")
-run_im2p_configure_case(im2p_invalid_backend "" 8 8 32 simulator FALSE
-    "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM")
-run_im2p_configure_case(im2p_malformed_backend "" 8 8 32 " IM2P_SIM" FALSE
-    "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM")
 foreach(enabled IN ITEMS ON OFF)
     execute_process(COMMAND "${TEST_CMAKE_COMMAND}"
         -S "${TEST_SOURCE_DIR}" -B "${TEST_BINARY_ROOT}/deprecated-backend-${enabled}"
@@ -1151,39 +573,6 @@ foreach(enabled IN ITEMS ON OFF)
         message(FATAL_ERROR "Gemmini OFF must ignore its unused header path: ${stdout}\n${stderr}")
     endif()
 endforeach()
-run_im2p_configure_case(im2p_invalid_width "${matching_root}" 5 8 32 IM2P_SIM FALSE
-    "GGML_GEMMINI_ACTIVATION_BITS must be one of")
-run_im2p_configure_case(im2p_invalid_weight_width "${matching_root}" 8 5 32 IM2P_SIM FALSE
-    "GGML_GEMMINI_WEIGHT_BITS must be one of")
-run_im2p_configure_case(im2p_invalid_dim "${matching_root}" 8 8 17 IM2P_SIM FALSE
-    "GGML_GEMMINI_DIM must be 16, 32, or 64")
-run_im2p_configure_case(im2p_width_mismatch "${width_mismatch_root}" 16 16 32 IM2P_SIM FALSE
-    "IM2P activation width mismatch: llama requests 16, archive reports 8")
-run_im2p_configure_case(im2p_a4_archive_mismatch "${a4_archive_mismatch_root}" 4 4 16 IM2P_SIM FALSE
-    "IM2P activation width mismatch: llama requests 4, archive reports 8")
-run_im2p_configure_case(im2p_mixed_a4_w8 "${matching_root}" 4 8 16 IM2P_SIM FALSE
-    "Gemmini requires matched activation and weight widths")
-run_im2p_configure_case(im2p_mixed_a8_w4 "${matching_root}" 8 4 16 IM2P_SIM FALSE
-    "Gemmini requires matched activation and weight widths")
-run_im2p_configure_case(im2p_weight_mismatch "${weight_mismatch_root}" 16 16 32 IM2P_SIM FALSE
-    "IM2P weight width mismatch: llama requests 16, archive reports 8")
-run_im2p_configure_case(im2p_dim_mismatch "${dim_mismatch_root}" 16 16 32 IM2P_SIM FALSE
-    "IM2P DIM mismatch: llama requests 32, archive reports 16")
-run_im2p_configure_case(im2p_abi_mismatch "${abi_mismatch_root}" 16 16 32 IM2P_SIM FALSE
-    "IM2P simulator ABI mismatch: llama requires 5, archive reports 3")
-run_im2p_configure_case(im2p_missing_pair "${width_mismatch_root}" 8 8 32 IM2P_SIM FALSE
-    "Missing atomic IM2P selected generation")
-make_stale_frontend_root(stale_frontend_root)
-run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 8 8 32 IM2P_SIM FALSE
-    "IM2P frontend DIM mismatch")
-make_abi_stale_frontend_root(abi_stale_frontend_root)
-run_im2p_configure_case(im2p_abi_stale_frontend "${abi_stale_frontend_root}"
-    8 8 16 IM2P_SIM FALSE "IM2P frontend args layout mismatch")
-make_extended_poll_stale_simulator_root(extended_poll_stale_simulator_root)
-run_im2p_configure_case(im2p_extended_poll_stale_simulator
-    "${extended_poll_stale_simulator_root}" 8 8 16 IM2P_SIM FALSE
-    "im2p_poll_completed_extended")
-run_arm64_bootstrap_contract()
 run_host_script_dim_contract(build-x86.sh 64)
 run_host_script_dim_contract(build-riscv.sh 16)
 
@@ -1198,12 +587,8 @@ endforeach()
 
 expect_contains("${TEST_SOURCE_DIR}/cmake/ggml-gemmini-options.cmake"
     "GGML_GEMMINI_EXECUTION_BACKEND")
-expect_contains("${TEST_SOURCE_DIR}/cmake/ggml-gemmini-options.cmake"
-    "IM2P_SIM_ROOT")
 expect_not_contains("${TEST_SOURCE_DIR}/cmake/ggml-gemmini-options.cmake"
     "ExSIA A4/Q4 and A16/Q16 remain TODO pending RMD scale integration")
-expect_contains("${TEST_SOURCE_DIR}/cmake/ggml-gemmini-im2p.cmake"
-    "im2p_begin_striped_matmul")
 run_test_registration_case(registered_linked_tests OFF ON)
 run_test_registration_case(registered_dynamic_tests ON OFF)
 run_test_registration_case(registered_gemmini_module_tests ON ON)
@@ -1221,7 +606,3 @@ if(width_gate_at EQUAL -1 OR allocation_at EQUAL -1 OR
     message(FATAL_ERROR
         "Universal product width gate must precede activation allocation and quantization")
 endif()
-expect_contains("${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/CMakeLists.txt"
-    "GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE")
-expect_contains("${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/CMakeLists.txt"
-    "GGML_GEMMINI_IM2P_SIM_ARCHIVE")

@@ -7,6 +7,8 @@ endforeach()
 file(READ "${DENSE_SOURCE}" dense_source)
 file(READ "${EXECUTION_SOURCE}" execution_source)
 file(READ "${TYPES_HEADER}" types_header)
+file(READ "${GEMMINI_SOURCE_ROOT}/../ggml-npu-common/profiling/matmul-types.hpp" common_types_header)
+string(APPEND types_header "\n${common_types_header}")
 file(READ "${EXECUTION_HEADER}" execution_header)
 file(READ "${MATMUL_TELEMETRY}" telemetry_source)
 set(gemmini_source_dir "${GEMMINI_SOURCE_ROOT}")
@@ -300,41 +302,6 @@ require_order("${emitter_compact}" "nonthrowing CPU telemetry boundary"
     "noexcept" "#ifLOG_CYCLE" "try{" "project_matmul_cpu_identity"
     "log::cycle.write_decorated" "serialize_matmul_cpu_interval" "catch(...)"
     "log::cycle.report_failure")
-file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p)
-file(READ "${gemmini_source_dir}/im2p/route.cpp" im2p_route)
-foreach(owner IN ITEMS im2p im2p_route)
-    require_absent("${${owner}}" "rmd::CompressedOutput" "IM2P stages final corrections")
-    require_absent("${${owner}}" "rmd::compose_rmd_output" "IM2P reconstruction belongs to backend interval")
-endforeach()
-foreach(projection IN ITEMS "Result translate(" "Completion translate("
-                            "Result gate_route(" "translate_stats("
-                            "validate_stripe_timings(" "validate_residual_stripe_timings(")
-    require_token("${im2p_route}" "${projection}" "pure IM2P projection owner")
-endforeach()
-require_count("${im2p}" "if (failure == TestFailure::compose)" 2
-    "FULL and PIPELINE preserve compose failure injection before merge")
-# Restrict this assertion to HostCpuInterval: unrelated upstream callbacks may
-# contain their own try/catch before this class in the translation unit.
-string(FIND "${im2p}" "class HostCpuInterval {" im2p_host_begin)
-string(FIND "${im2p}" "bool checked_output_extent(" im2p_host_end)
-if(im2p_host_begin EQUAL -1 OR im2p_host_end LESS_EQUAL im2p_host_begin)
-    message(FATAL_ERROR "Cannot locate the actual IM2P host interval class")
-endif()
-math(EXPR im2p_host_length "${im2p_host_end} - ${im2p_host_begin}")
-string(SUBSTRING "${im2p}" ${im2p_host_begin} ${im2p_host_length} im2p_host_interval)
-string(FIND "${im2p_host_interval}" "void finish(" im2p_finish_begin)
-string(FIND "${im2p_host_interval}" "private:" im2p_finish_end)
-if(im2p_finish_begin EQUAL -1 OR im2p_finish_end LESS_EQUAL im2p_finish_begin)
-    message(FATAL_ERROR "Cannot locate the actual IM2P host interval finish boundary")
-endif()
-math(EXPR im2p_finish_length "${im2p_finish_end} - ${im2p_finish_begin}")
-string(SUBSTRING "${im2p_host_interval}" ${im2p_finish_begin} ${im2p_finish_length} im2p_finish)
-string(REGEX REPLACE "[ \t\r\n]" "" im2p_finish_compact "${im2p_finish}")
-require_order("${im2p_finish_compact}" "IM2P retains its measurement and failure boundary"
-    "voidfinish(" "noexcept" "#ifLOG_CYCLE" "if(!active_)return"
-    "constautoend=read_matmul_cpu_sample()" "active_=false"
-    "try{" "log::cycle.write_decorated" "serialize_matmul_cpu_interval"
-    "record_,start_,end," "catch(...)" "log::cycle.report_failure")
 require_absent("${emitter}" "CYCLE_DETAIL" "raw CPU logging survives DETAIL=0")
 require_order("${types_header}" "one native sample plus host and thread CPU snapshot"
     "result.native = cycle::read_sample()" "const auto host = cycle::read_host_sample()"

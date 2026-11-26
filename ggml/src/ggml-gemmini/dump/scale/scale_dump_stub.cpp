@@ -1,6 +1,6 @@
 #include "scale_dump_internal.hpp"
 
-#include <gemmini/log.hpp>
+#include "../../../ggml-npu-common/profiling/include/npu/log.hpp"
 
 namespace ggml::gemmini::log::scale::detail {
 DumpResult dump_tile(FILE *                 out,

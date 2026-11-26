@@ -3,9 +3,9 @@
 #include <ggml-backend.h>
 
 #include "../ggml/src/ggml-common.h"
-#include "../ggml/src/ggml-gemmini/ggml-gemmini-config.hpp"
+#include "../ggml/src/ggml-npu-common/config/software.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
-#include "../ggml/src/ggml-gemmini-utils/include/gemmini/log.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
 
 #include "../common/json.hpp"
 
@@ -248,20 +248,14 @@ bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols) {
 }
 
 bool verify_cycle_log([[maybe_unused]] const char * requested_path,
-                      [[maybe_unused]] bool expect_im2p_compact) {
+                      [[maybe_unused]] bool expect_compact) {
 #if !LOG_CYCLE
     std::fprintf(stderr, "FAIL: --cycle requires LOG_CYCLE=1\n");
     return false;
 #else
-    const std::filesystem::path path = ggml::gemmini::log::resolve_output_path(requested_path);
+    const std::filesystem::path path = ggml::npu::log::resolve_output_path(requested_path);
     std::ifstream input(path);
     std::set<uint64_t> quant_runs;
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    std::set<uint64_t> rmd_runs;
-    uint64_t rmd_dot_calls = 0;
-    uint64_t rmd_cycles = 0;
-    size_t rmd_events = 0;
-#endif
     size_t quant_events = 0;
     for (std::string line; std::getline(input, line);) {
         if (line.empty()) continue;
@@ -272,14 +266,9 @@ bool verify_cycle_log([[maybe_unused]] const char * requested_path,
             std::fprintf(stderr, "FAIL: baseline BLOCK emitted detailed cycle telemetry\n");
             return false;
         }
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-        const bool im2p_rmd = op == "rmd.im2p.execute";
-#else
-        constexpr bool im2p_rmd = false;
-#endif
-        if (!quant && !im2p_rmd) continue;
-        if (event.value("schema", "") != ggml::gemmini::kCycleTelemetrySchema ||
-            event.value("version", 0U) != ggml::gemmini::kCycleTelemetryVersion ||
+        if (!quant) continue;
+        if (event.value("schema", "") != ggml::npu::kCycleTelemetrySchema ||
+            event.value("version", 0U) != ggml::npu::kCycleTelemetryVersion ||
             !event.contains("run_id") || event.at("run_id").is_null()) {
             std::fprintf(stderr, "FAIL: public cycle record lacks schema or run id\n");
             return false;
@@ -288,37 +277,12 @@ bool verify_cycle_log([[maybe_unused]] const char * requested_path,
         if (quant) {
             ++quant_events;
             quant_runs.insert(run_id);
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-        } else {
-            ++rmd_events;
-            rmd_runs.insert(run_id);
-            rmd_dot_calls += event.value("rmd_dot_calls", 0ULL);
-            rmd_cycles += event.value("rmd_work_total_cycles", 0ULL);
-#endif
         }
     }
     if (quant_events == 0) {
         std::fprintf(stderr, "FAIL: public quantization cycle records missing\n");
         return false;
     }
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    std::set<uint64_t> shared_rmd_runs;
-    std::set_intersection(quant_runs.begin(), quant_runs.end(), rmd_runs.begin(), rmd_runs.end(),
-                          std::inserter(shared_rmd_runs, shared_rmd_runs.end()));
-    if (expect_im2p_compact &&
-        (rmd_events == 0 || rmd_dot_calls == 0 || rmd_cycles == 0 || shared_rmd_runs.empty())) {
-        std::fprintf(stderr, "FAIL: public IM2P compact telemetry rmd=%zu dots=%llu cycles=%llu shared=%zu\n",
-                     rmd_events, static_cast<unsigned long long>(rmd_dot_calls),
-                     static_cast<unsigned long long>(rmd_cycles), shared_rmd_runs.size());
-        return false;
-    }
-    if (expect_im2p_compact) {
-        std::printf("BLOCK_E2E_IM2P rmd_events=%zu rmd_dot_calls=%llu rmd_cycles=%llu shared_run=%llu PASS\n",
-                    rmd_events, static_cast<unsigned long long>(rmd_dot_calls),
-                    static_cast<unsigned long long>(rmd_cycles),
-                    static_cast<unsigned long long>(*shared_rmd_runs.begin()));
-    }
-#endif
     std::printf("BLOCK_E2E_CYCLE quant_events=%zu block_detail_events=0 PASS\n", quant_events);
     return true;
 #endif
@@ -327,7 +291,7 @@ bool verify_cycle_log([[maybe_unused]] const char * requested_path,
 }
 
 int main(int argc, char ** argv) {
-    using ggml::gemmini::config::ActivationQuantAlgo;
+    using ggml::npu::config::ActivationQuantAlgo;
     const char * cycle_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--cycle" && i + 1 < argc) {
@@ -336,36 +300,27 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (!check(ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ActivationQuantAlgo::BLOCK,
+    if (!check(ggml::npu::config::CURRENT_ACTIVATION_QUANT == ActivationQuantAlgo::BLOCK,
                "test was built with BLOCK selected")) return 1;
     std::printf("BLOCK_E2E_CONFIG activation_bits=%d weight_bits=%d rmd=%d group=%zu block_size=%d dim=%d\n",
                 GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_WEIGHT_BITS,
                 GGML_GEMMINI_ENABLE_RMD, kGroup, GGML_GEMMINI_BLOCK_SIZE, DIM);
 
-    const auto options = ggml::gemmini::resolve_matmul_options();
-    if (!check(options.ok() && options.options.mode == ggml::gemmini::MatmulInvocationMode::full,
+    const auto options = ggml::npu::resolve_matmul_options();
+    if (!check(options.ok() && options.options.mode == ggml::npu::MatmulInvocationMode::full,
                "BLOCK public fixture resolves FULL")) return 1;
 #if GGML_GEMMINI_ENABLE_RMD
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    const auto configured_rmd = static_cast<ggml::gemmini::RmdBackend>(
-        ggml::gemmini::config::DEFAULT_RMD_BACKEND);
-    if (!check(options.options.rmd_backend == configured_rmd,
-               "BLOCK IM2P fixture honors configured residual backend")) return 1;
-    std::printf("BLOCK_E2E_IM2P_ROUTE rmd_backend=%s\n",
-                configured_rmd == ggml::gemmini::RmdBackend::gemmini_ws_compact ? "compact" : "cpu_direct");
-#else
-    if (!check(options.options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct,
+    if (!check(options.options.rmd_backend == ggml::npu::RmdBackend::cpu_direct,
                "BLOCK host fixture selects CPU-direct residual backend")) return 1;
-#endif
 #endif
 
     std::filesystem::path cycle_output;
     if (cycle_path != nullptr) {
-        cycle_output = ggml::gemmini::log::resolve_output_path(cycle_path);
+        cycle_output = ggml::npu::log::resolve_output_path(cycle_path);
         std::error_code error;
         if (!cycle_output.parent_path().empty()) std::filesystem::create_directories(cycle_output.parent_path(), error);
         std::filesystem::remove(cycle_output, error);
-        if (!check(ggml::gemmini::log::cycle.set_output_path(cycle_path, true),
+        if (!check(ggml::npu::log::cycle.set_output_path(cycle_path, true),
                    "public cycle sink initializes")) return 1;
     }
     ggml_backend_load_all();
@@ -376,7 +331,7 @@ int main(int argc, char ** argv) {
         run_happy_case(backend, static_cast<size_t>(DIM) + 1, 64) &&
         run_happy_case(backend, 2, 96);
     ggml_backend_free(backend);
-    if (cycle_path != nullptr) ggml::gemmini::log::cycle.set_output(stderr);
+    if (cycle_path != nullptr) ggml::npu::log::cycle.set_output(stderr);
     return ok && (cycle_path == nullptr || verify_cycle_log(
-        cycle_path, options.options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact)) ? 0 : 1;
+        cycle_path, options.options.rmd_backend == ggml::npu::RmdBackend::npu_compact)) ? 0 : 1;
 }

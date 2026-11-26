@@ -1,6 +1,6 @@
 #include "../ggml/src/ggml-gemmini/potal-sensitivity.hpp"
 #include "ggml-gemmini.h"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/local.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/local.hpp"
 #include "../common/json.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +24,7 @@ int main(int argc, char ** argv) {
         std::fesetround(FE_UPWARD);
         const std::vector<float> ties{.5f,1.5f,2.5f,-.5f,-1.5f,-2.5f,1.49f,-1.49f,4,-4};
         const std::vector<int32_t> expected{1,2,3,-1,-2,-3,1,-1,4,-4};
-        ggml::gemmini::quants::act::exsia::WideQuantizer quantizer;
+        ggml::npu::quants::act::exsia::WideQuantizer quantizer;
         for (int16_t theta : {-8,0,4}) {
             auto values = ties;
             for (auto & value : values) value = std::ldexp(value,theta);
