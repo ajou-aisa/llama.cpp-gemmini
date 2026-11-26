@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#include "../ggml/src/ggml-npu-common/evaluation/cuda-exact/ggml-cuda-hp1-scu.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-npu-common/quantization/common/hp1_scu.hpp"
 

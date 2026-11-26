@@ -2,10 +2,10 @@
 
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
 #include "ggml-gemmini.h"
-#include "../ggml-cuda/cpu-exact/ggml-cuda-cpu-exact.h"
-#include "../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#include "../cuda-exact/ggml-cuda-cpu-exact.h"
+#include "../cuda-exact/ggml-cuda-hp1-scu.h"
 #if defined(GGML_GEMMINI_CUDA_RTN_ATTENTION)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../cuda-rtn/ggml-cuda-rtn.h"
 #endif
 namespace gemmini_gpu {
 constexpr auto enabled = ggml_cuda_cpu_exact_int_enabled;

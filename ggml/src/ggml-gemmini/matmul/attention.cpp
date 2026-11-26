@@ -14,7 +14,7 @@
 #include "../../ggml-npu-common/residual/rmd/rmd-bitmap-builder.hpp"
 #include "../residual/rmd/rmd-run-aware.hpp"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 #endif
 
 #include <algorithm>

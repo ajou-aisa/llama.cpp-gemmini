@@ -5,7 +5,7 @@
 #include "../pb/pb-exec.hpp"
 #endif
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../ggml-gpu-cpu-exact.hpp"
+#include "../../ggml-npu-common/evaluation/gemmini/graph.hpp"
 #endif
 #include "detail.hpp"
 #include "../../ggml-npu-common/quantization/common/weight_reader.hpp"

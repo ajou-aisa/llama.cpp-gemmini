@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../ggml/src/ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 #include "../ggml/src/ggml-npu-common/quantization/common/hp1_scu.hpp"
 #include <algorithm>
 #include <array>

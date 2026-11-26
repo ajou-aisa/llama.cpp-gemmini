@@ -2,10 +2,10 @@
 
 #include "common.h"
 #include "npu-matmul-config.hpp"
-#include "../../ggml/src/ggml-gemmini/ggml-gpu-cpu-exact.hpp"
+#include "../../ggml/src/ggml-npu-common/evaluation/gemmini/graph.hpp"
 #include "../../ggml/src/ggml-gemmini/matmul/attention.hpp"
 #include "../../ggml/src/ggml-gemmini/potal-sensitivity.hpp"
-#include "../../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../../ggml/src/ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 
 #include <cstdio>
 #include <cstdlib>

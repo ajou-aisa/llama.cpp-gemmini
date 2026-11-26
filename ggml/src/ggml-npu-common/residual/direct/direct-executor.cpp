@@ -7,8 +7,8 @@
 #include "../../quantization/common/weight_reader.hpp"
 #include "../../quantization/common/weight_route.hpp"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../../../ggml-cuda/cpu-exact/ggml-cuda-cpu-exact.h"
-#include "../../../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#include "../../evaluation/cuda-exact/ggml-cuda-cpu-exact.h"
+#include "../../evaluation/cuda-exact/ggml-cuda-hp1-scu.h"
 #endif
 #include "../../profiling/include/npu/cpu-timing.h"
 #include "../../profiling/include/npu/log.h"

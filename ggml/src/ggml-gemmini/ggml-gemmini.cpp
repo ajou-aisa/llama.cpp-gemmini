@@ -21,7 +21,7 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "ggml-gpu-cpu-exact.hpp"
+#include "../ggml-npu-common/evaluation/gemmini/graph.hpp"
 #endif
 #include "../ggml-npu-common/config/software.hpp"
 #include "ggml-gemmini-buffer.hpp"
@@ -65,7 +65,7 @@
 #include "ops.hpp"
 #include "potal-sensitivity.hpp"
 #if defined(GGML_GEMMINI_CUDA_RTN)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
 #endif
 
 // Cycle 측정 용

@@ -8,7 +8,7 @@
 #include <tuple>
 #include <vector>
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 #endif
 
 namespace ggml::gemmini {
