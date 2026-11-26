@@ -1,0 +1,50 @@
+{
+  "schema": "socmulator.baseline.configurations/1",
+  "note": "Hardware configurations of the lab's experiments, as build inputs. Values are RTL-confirmed (hardware-parameters.md, rtl.json); parameter_header_sha256 is the RTL-generated header that cmake/npu-config.cmake reproduces byte for byte.",
+  "configurations": [
+    {
+      "name": "gemmini-int8-d16",
+      "rtl": "gemmini-aisa aisa-customizations 185293e8 GemminiDefaultConfig (Configs.scala:21-66)",
+      "npu": { "GGML_NPU": "GEMMINI", "NPU_PRECISION": "INT8", "NPU_D": 16, "NPU_SPAD_BANKS": 4, "NPU_SPAD_BANK_ROWS": 4096, "NPU_ACC_BANKS": 2, "NPU_ACC_ROWS": 1024, "NPU_DMA_MAX_BYTES": 64 },
+      "derived": { "acc_bank_rows": 512, "spad_row_bytes": 16, "acc_row_bytes": 64, "max_block_len": 4, "max_block_len_acc": 1, "spad_bytes": 262144, "acc_bytes": 65536 },
+      "parameter_header_sha256": "d6db18f8edbfeb854780286d8c2afb81ae3b9103224522478a9047d5550272e5",
+      "header_note": "the SDK develop gemmini_params.h; it differs from the RTL-generated gemmini-aisa header only by the missing '#define ACC_READ_FULL_WIDTH' (no consumer in llama.cpp)",
+      "preset": "gemmini-int8-d16-reference / gemmini-int8-d16-rocc"
+    },
+    {
+      "name": "potal-int8-d16",
+      "rtl": "chipyard-aisa potal fab3d262 generators/potal a8w8D16Sat32",
+      "npu": { "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": 16, "NPU_SPAD_BANKS": 4, "NPU_SPAD_BANK_ROWS": 4096, "NPU_ACC_BANKS": 2, "NPU_ACC_ROWS": 1024, "NPU_INDEX_ENTRIES": 32, "NPU_SCALE_ENTRIES": 256, "NPU_DMA_MAX_BYTES": 64 },
+      "parameter_header": "gemmini_potal_params.h",
+      "parameter_header_sha256": "b4cd8b9efef9f3cd9b598ae3cc84af6478f83e628ed73d94a77fb1c452df1fc7",
+      "preset": "potal-int8-d16-reference / potal-int8-d16-rocc"
+    },
+    {
+      "name": "potal-int8-d32",
+      "rtl": "chipyard-aisa potal fab3d262 a8w8D32Sat32",
+      "npu": { "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": 32, "NPU_SPAD_BANKS": 4, "NPU_SPAD_BANK_ROWS": 2048, "NPU_ACC_BANKS": 2, "NPU_ACC_ROWS": 512, "NPU_INDEX_ENTRIES": 64, "NPU_SCALE_ENTRIES": 256, "NPU_DMA_MAX_BYTES": 64 },
+      "parameter_header": "gemmini_potal_d32_params.h",
+      "parameter_header_sha256": "3580b84f15ed8de9f9d311edea64eaa7c1f9bb308b1552a8f79453ec2c05ea33",
+      "preset": "potal-int8-d32-reference / potal-int8-d32-rocc"
+    },
+    {
+      "name": "potal-int8-d64",
+      "rtl": "chipyard-aisa potal fab3d262 a8w8D64Sat32",
+      "npu": { "GGML_NPU": "POTAL", "NPU_PRECISION": "INT8", "NPU_D": 64, "NPU_SPAD_BANKS": 4, "NPU_SPAD_BANK_ROWS": 1024, "NPU_ACC_BANKS": 2, "NPU_ACC_ROWS": 256, "NPU_INDEX_ENTRIES": 128, "NPU_SCALE_ENTRIES": 256, "NPU_DMA_MAX_BYTES": 64 },
+      "parameter_header": "gemmini_potal_d64_params.h",
+      "parameter_header_sha256": "5c3b625cf21748322dab3ef32112f0edf43aee89e0c17e763c097ddda484a506",
+      "preset": "potal-int8-d64-reference",
+      "software_note": "potal-stripe-api-test static-asserts DIM16/32; the API-only D64 build fails to compile that test at baseline as well"
+    },
+    {
+      "name": "potal-int4-d32",
+      "rtl": "chipyard-aisa potal fab3d262 generators/potal potalw4 a4w4D32Sat32",
+      "npu": { "GGML_NPU": "POTAL", "NPU_PRECISION": "INT4", "NPU_D": 32, "NPU_SPAD_BANKS": 4, "NPU_SPAD_BANK_ROWS": 2048, "NPU_ACC_BANKS": 2, "NPU_ACC_ROWS": 512, "NPU_INDEX_ENTRIES": 64, "NPU_SCALE_ENTRIES": 256, "NPU_DMA_MAX_BYTES": 64 },
+      "derived": { "packing_abi": 1, "spad_row_bytes": 16, "max_block_len": 4, "max_block_len_acc": 1, "spad_bytes": 131072, "storage": "int8_t container in DRAM, two nibbles per SPAD byte (even column low)" },
+      "parameter_header": "gemmini_potal_w4a4_d32_params.h",
+      "parameter_header_sha256": "4b29d84eff0bd4a01c6db0519c79904b808ba0f2dc9bc3727cb395ca9e30eaf0",
+      "software_policy": "ggml-potal-w4a4 also requires GGML_GEMMINI_EXSIA_STRIPE_ANCHOR=3 GGML_GEMMINI_ENABLE_RMD=ON GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE GGML_GEMMINI_DEFAULT_RMD_BACKEND=WS GGML_POTAL_PAIRED_AUTO=ON",
+      "preset": "potal-int4-d32-reference / potal-int4-d32-rocc"
+    }
+  ]
+}
