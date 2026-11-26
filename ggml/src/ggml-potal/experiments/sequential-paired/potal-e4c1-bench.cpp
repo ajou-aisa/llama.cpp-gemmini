@@ -1,12 +1,14 @@
 // Same fixture helpers and production graph entry point as the hardware smoke.
 // Link support/e4c1-sequential.cpp and the backend adapter, not another ops.cpp.
+#include "matmul/paired-auto.hpp"
+
 int e4c1_original_smoke_main(int, char **);
 #define main e4c1_original_smoke_main
-#include "potal-paired-smoke.cpp"
+#include "../../tests/potal-paired-smoke.cpp"
 #undef main
 
 #include "matmul/stripe.hpp"
-#include "support/e4c1-sequential.hpp"
+#include "e4c1-sequential.hpp"
 
 #include <climits>
 #include <stdexcept>

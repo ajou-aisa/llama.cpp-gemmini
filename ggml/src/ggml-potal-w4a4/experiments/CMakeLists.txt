@@ -1,0 +1,70 @@
+# Explicit prototype builds; production source lists are defined by the parent.
+option(POTAL_E3_TESTS "Build isolated H3-6E3 acceptance executables" OFF)
+if (POTAL_E3_TESTS)
+    include(experiments/microtile-pipeline/CMakeLists.txt)
+endif()
+
+option(POTAL_E4A_TESTS "Build isolated resident-B interface acceptance executables" OFF)
+if (POTAL_E4A_TESTS)
+    add_library(potal-resident-api STATIC experiments/resident-weight/potal-resident.c)
+    target_include_directories(potal-resident-api PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${POTAL_HW_GENERATED_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    set_target_properties(potal-resident-api PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_executable(potal-resident-test tests/potal-resident-test.cpp)
+    target_compile_features(potal-resident-test PRIVATE cxx_std_17)
+    target_link_libraries(potal-resident-test PRIVATE potal-resident-api)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+        target_sources(potal-resident-test PRIVATE ${POTAL_BACKEND_SOURCES}
+            matmul/tiling.cpp matmul/stripe-api.cpp)
+        target_include_directories(potal-resident-test PRIVATE ${POTAL_PRIVATE_INCLUDES})
+        target_compile_definitions(potal-resident-test PRIVATE ${POTAL_LOG_DEFINITIONS})
+        target_link_libraries(potal-resident-test PRIVATE ggml ggml-npu-profiling Threads::Threads)
+    else()
+        add_test(NAME potal-resident-test COMMAND potal-resident-test)
+    endif()
+    add_executable(potal-resident-model-test tests/potal-resident-model-test.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-resident-model-test)
+    target_include_directories(potal-resident-model-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-resident-model-test PRIVATE ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-resident-model-test COMMAND potal-resident-model-test)
+    endif()
+endif()
+
+option(POTAL_E4B1_TESTS "Build software-only general resident contract tests" OFF)
+if (POTAL_E4B1_TESTS)
+    add_library(potal-e4b1-contract STATIC experiments/resident-weight/potal-e4b1.cpp)
+    target_compile_features(potal-e4b1-contract PUBLIC cxx_std_17)
+    target_include_directories(potal-e4b1-contract PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4b1-contract PUBLIC potal-api)
+    add_executable(potal-e4b1-test tests/potal-e4b1-test.cpp)
+    target_link_libraries(potal-e4b1-test PRIVATE potal-e4b1-contract)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-e4b1-test COMMAND potal-e4b1-test)
+    endif()
+endif()
+
+option(POTAL_E4C1_TESTS "Build isolated sequential paired microtile acceptance and benchmark" OFF)
+if (POTAL_E4C1_TESTS)
+    add_executable(potal-e4c1-test tests/potal-e4c1-test.cpp
+        experiments/sequential-paired/e4c1-sequential.cpp ${POTAL_BACKEND_SOURCES})
+    potal_add_backend_settings(potal-e4c1-test)
+    target_include_directories(potal-e4c1-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4c1-test PRIVATE ggml)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME potal-e4c1-test COMMAND potal-e4c1-test)
+    endif()
+
+    set(_e4c1_sources ${POTAL_BACKEND_SOURCES})
+    list(REMOVE_ITEM _e4c1_sources ops.cpp)
+    add_executable(potal-e4c1-bench experiments/sequential-paired/potal-e4c1-bench.cpp
+        experiments/sequential-paired/potal-e4c1-backend.cpp experiments/sequential-paired/e4c1-sequential.cpp
+        ggml-potal.cpp ${_e4c1_sources})
+    potal_add_backend_settings(potal-e4c1-bench)
+    target_include_directories(potal-e4c1-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(potal-e4c1-bench PRIVATE ggml)
+    set_source_files_properties(tests/potal-e4c1-test.cpp experiments/sequential-paired/potal-e4c1-bench.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+endif()

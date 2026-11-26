@@ -28,9 +28,9 @@
 #include "ggml-quants.h"
 #include "matmul/dense.hpp"
 #include "matmul/paired-auto.hpp"
-#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
-#include "support/paired-h2-emulator.hpp"
-#include "support/stripe-golden.hpp"
+#include "../../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../tests/support/paired-h2-emulator.hpp"
+#include "../../tests/support/stripe-golden.hpp"
 
 #include <algorithm>
 #include <array>

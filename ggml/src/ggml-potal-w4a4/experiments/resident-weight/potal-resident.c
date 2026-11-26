@@ -2,7 +2,7 @@
  * The core remains unchanged and owns the accelerator. This closed harness
  * mediates every command and owns DMA storage that the core cannot track.
  */
-#include "../potal.c"
+#include "../../potal.c"
 #include "potal-resident.h"
 #if defined(__riscv)
 #include <sys/mman.h>

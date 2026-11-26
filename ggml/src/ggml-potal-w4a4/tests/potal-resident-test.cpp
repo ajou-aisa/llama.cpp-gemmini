@@ -4,7 +4,7 @@
 // Hardware additionally needs the existing issuer_owner backend-source closure,
 // with its potal-api dependency replaced by that same resident object.
 // No core-taking, legacy Scale, raw RoCC, or production runner calls here.
-#include "potal-resident.h"
+#include "../experiments/resident-weight/potal-resident.h"
 #include "potal_hw_params.h"
 
 #include <algorithm>

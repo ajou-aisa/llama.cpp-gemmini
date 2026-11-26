@@ -2,7 +2,7 @@
  * Compile as C11 with exactly potal-api's generated/original header paths.
  * This keeps the current private issuer, trace, counters and sticky failures.
  */
-#include "../potal.c"
+#include "../../potal.c"
 #include "potal-e3-context.h"
 
 potal_status potal_e3_acc_restore_issue(potal_paired_session *s,

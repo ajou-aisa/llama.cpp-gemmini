@@ -9,6 +9,6 @@ pipeline_report e4c1_run_pipeline(const ggml_tensor *, npu_matmul_args &, const 
 
 #define potal_tile_select e4c1_tile_select
 #define run_stripe_pipeline e4c1_run_pipeline
-#include "../ops.cpp"
+#include "../../ops.cpp"
 #undef run_stripe_pipeline
 #undef potal_tile_select

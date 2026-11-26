@@ -11,7 +11,7 @@ foreach(_source IN LISTS _e3_sources)
 endforeach()
 
 add_executable(potal-e3-context-test
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/potal-e3-context.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/microtile-pipeline/potal-e3-context.c
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/potal-e3-context-test.cpp)
 target_include_directories(potal-e3-context-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${POTAL_HW_GENERATED_DIR})
@@ -32,15 +32,15 @@ potal_add_backend_settings(potal-e3-prototype-test)
 target_include_directories(potal-e3-prototype-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(potal-e3-prototype-test PRIVATE ggml)
 add_executable(potal-e3-kbench
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/potal-e3-kbench.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/potal-e3-backend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/microtile-pipeline/potal-e3-kbench.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/microtile-pipeline/potal-e3-backend.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ggml-potal.cpp ${_e3_absolute_sources})
 potal_add_backend_settings(potal-e3-kbench)
 target_include_directories(potal-e3-kbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(potal-e3-kbench PRIVATE ggml)
 
 add_executable(potal-e3-window-diag
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/potal-e3-window-diag.cpp ${POTAL_BACKEND_SOURCES})
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/microtile-pipeline/potal-e3-window-diag.cpp ${POTAL_BACKEND_SOURCES})
 potal_add_backend_settings(potal-e3-window-diag)
 target_include_directories(potal-e3-window-diag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(potal-e3-window-diag PRIVATE ggml)

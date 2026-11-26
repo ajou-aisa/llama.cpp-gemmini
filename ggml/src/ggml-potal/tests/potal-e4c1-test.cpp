@@ -1,7 +1,7 @@
 // Link the real support/e4c1-sequential.cpp, the checked production C11 API,
 // and the same ggml/PoTal objects as potal-resident-model-test. No wrappers.
 // Default and only execution mode: software command model, hardware=0.
-#include "support/e4c1-sequential.hpp"
+#include "../experiments/sequential-paired/e4c1-sequential.hpp"
 #include "support/e4b2-emulator.hpp"
 #include "support/paired-support.hpp"
 #include "support/paired-h2-emulator.hpp"

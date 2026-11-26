@@ -8,7 +8,7 @@
 // Unknown DMA buffers below have static process lifetime. A failed fence is
 // never retried. Host ownership poison runs LAST; no injection on hardware.
 
-#include "potal-e3-context.h"
+#include "../experiments/microtile-pipeline/potal-e3-context.h"
 #include "potal_hw_params.h"
 
 #include <algorithm>

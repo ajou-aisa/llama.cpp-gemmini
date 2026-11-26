@@ -1,12 +1,12 @@
 // H3-6E3 controlled K28 experiment. Reuse the exact existing fixture, graph,
 // cache, golden, route execution and output guards. This is not a new tiler.
 #define main e3_original_smoke_main
-#include "potal-paired-smoke.cpp"
+#include "../../tests/potal-paired-smoke.cpp"
 #undef main
 
 #include "matmul/stripe.hpp"
 #include "matmul/stripe-api.hpp"
-#include "support/potal-emulator.hpp"
+#include "../../tests/support/potal-emulator.hpp"
 
 #include <stdexcept>
 

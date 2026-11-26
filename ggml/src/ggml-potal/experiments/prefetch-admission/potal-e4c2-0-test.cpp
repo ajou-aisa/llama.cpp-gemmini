@@ -1,5 +1,5 @@
 #include "potal.h"
-#include "support/e4b2-emulator.hpp"
+#include "../../tests/support/e4b2-emulator.hpp"
 
 #include <algorithm>
 #include <array>
