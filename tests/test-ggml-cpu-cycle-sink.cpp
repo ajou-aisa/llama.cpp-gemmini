@@ -2,8 +2,8 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "../common/json.hpp"
-#include <gemmini/layer.h>
-#include <gemmini/log.h>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/layer.h"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.h"
 
 #include <array>
 #include <filesystem>

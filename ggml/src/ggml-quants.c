@@ -14,9 +14,9 @@
 #include <stdio.h>  // for GGML_ASSERT
 #include <stdint.h>
 
-// Mirror of gemmini_ldexp_fast_pos from ggml-gemmini-args.h; duplicated here so
+// Mirror of npu_ldexp_fast_pos from ggml-gemmini-args.h; duplicated here so
 // ggml-quants.c stays free of Gemmini-backend includes.
-static inline float gemmini_ldexp_fast_pos(float x, int m) {
+static inline float npu_ldexp_fast_pos(float x, int m) {
     uint32_t u;
     memcpy(&u, &x, sizeof(u));
     const int32_t exp = (int32_t)((u >> 23) & 0xFFu);
@@ -5675,7 +5675,7 @@ static bool validate_q8_hp_block(
 
     // Ponytail: skips ldexpf libc call in the validator loop; same upgrade constraint as above.
     {
-        const float block_scale = gemmini_ldexp_fast_pos(channel_scale, (int) m);
+        const float block_scale = npu_ldexp_fast_pos(channel_scale, (int) m);
         if (!isfinite(block_scale) || block_scale == 0.0f) {
             fprintf(stderr, "ggml_validate_row_data: invalid block scale at block %zu\n", i);
             return false;

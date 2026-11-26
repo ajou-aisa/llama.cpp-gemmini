@@ -4,7 +4,7 @@
 #include "pb-exec.hpp"
 #include "ggml-impl.h"
 #include "../ggml-gemmini-args.h"
-#include "../quants/act/block/block.hpp"
+#include "../../ggml-npu-common/quantization/activation/block/block.hpp"
 
 #include <cstring>
 #include <new>

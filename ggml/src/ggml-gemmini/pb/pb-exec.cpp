@@ -2,9 +2,12 @@
 
 #if defined(GGML_GEMMINI_PB)
 #include "../ggml-gemmini-args.h"
-#include "../quants/common/weight_reader.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
 #include "ggml-quants.h"
-#include <gemmini.h>
+#include "matmul/execution.hpp"
+#if defined(GEMMINI_ROCC_MODEL)
+#include "pb-rocc-model.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -222,6 +225,9 @@ struct IssuerRequest {
 
 struct Runtime {
     int issuer_cpu = -1;
+#if defined(GGML_GEMMINI_TESTING)
+    uint64_t config_commands = 0, loop_commands = 0, drains = 0;
+#endif
     std::vector<int> helper_cpus;
     size_t lanes = 1;                          // coordinator plus helpers
     std::vector<std::thread> threads;          // [0] issuer, [1..] helpers
@@ -266,6 +272,13 @@ bool wait_for_session(Runtime & r, uint64_t & seen) {
 
 // Runs every Gemmini command of the process while the runtime is active.
 void issuer_main(Runtime & r) {
+#if defined(GEMMINI_ROCC_MODEL)
+    FunctionalTransport model;
+    const auto &transport = model.transport();
+#else
+    const auto &transport = *gemmini_rocc_transport();
+#endif
+
     ThreadStats & st = r.stats[0];
     st.tid.store(long(syscall(SYS_gettid)), std::memory_order_relaxed);
     st.cpu_assigned.store(r.issuer_cpu, std::memory_order_relaxed);
@@ -285,7 +298,10 @@ void issuer_main(Runtime & r) {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (rq.kind == KIND_FLUSH) {
                     // Linux sfence.vma does not reach Gemmini's TLB, and per-call buffers can land on remapped pages.
-                    gemmini_flush(0);
+                    gemmini_command_t command;
+                    const gemmini_flush_desc_t flush{false};
+                    require_command("PB flush encoding", gemmini_encode_flush(&flush, &command));
+                    require_command("PB flush", gemmini_issue(&transport, &command, nullptr));
                     st.flushes.add(1);
 #if defined(GGML_GEMMINI_TESTING)
                     ++flushes;
@@ -293,12 +309,22 @@ void issuer_main(Runtime & r) {
                 } else {
                     gemmini_memory_barrier(rq.a);
                     gemmini_memory_barrier(rq.b);
-                    tiled_matmul_auto(rq.m, rq.j, rq.width, rq.a, rq.b, nullptr, rq.c,
+#if defined(GEMMINI_ROCC_MODEL) && defined(GGML_GEMMINI_TESTING)
+                    const auto config_before = model.command_count(GEMMINI_FUNCT_CONFIG);
+                    const auto loops_before = model.command_count(GEMMINI_FUNCT_LOOP_WS);
+                    const auto drains_before = model.drain_count();
+#endif
+                    tiled_matmul_auto(transport, rq.m, rq.j, rq.width, rq.a, rq.b, nullptr, rq.c,
                                       rq.width, rq.j, 0, rq.j,
                                       MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-                                      NO_ACTIVATION, ACC_SCALE_IDENTITY, 0,
+                                      GEMMINI_ACT_NONE, ACC_SCALE_IDENTITY, 0,
                                       false, false, false, true, false, 0, WS);
                     gemmini_memory_barrier(rq.c);
+#if defined(GEMMINI_ROCC_MODEL) && defined(GGML_GEMMINI_TESTING)
+                    r.config_commands = model.command_count(GEMMINI_FUNCT_CONFIG) - config_before;
+                    r.loop_commands = model.command_count(GEMMINI_FUNCT_LOOP_WS) - loops_before;
+                    r.drains = model.drain_count() - drains_before;
+#endif
                     st.gemm_calls.add(1);
 #if defined(GGML_GEMMINI_TESTING)
                     ++calls;
@@ -490,7 +516,8 @@ Status run_blocks_five(Runtime & r, const int8_t * a, const float * s_a, const W
             run_phase(r, &block_phase<Weights>, &job, KIND_SCALE_PREP, block);
 #if defined(GGML_GEMMINI_TESTING)
             if (observer) observer({block, m, j, width, job.pa[s], job.pb[s], acc.data(),
-                                    job.sa[s], job.sb[s], output, row_stride, column_stride}, observer_context);
+                                    job.sa[s], job.sb[s], output, row_stride, column_stride,
+                                     r.config_commands, r.loop_commands, r.drains}, observer_context);
 #endif
         }
         ++counters[type].nodes;
@@ -555,6 +582,12 @@ Status run_blocks(const int8_t * a, const float * s_a, const Weights & weights,
     if (runtime) return run_blocks_five(*runtime, a, s_a, weights, m, j, k, blocks, c_count,
                                         output, row_stride, column_stride, type);
     try {
+#if defined(GEMMINI_ROCC_MODEL)
+        FunctionalTransport model;
+        const auto &transport = model.transport();
+#else
+        const auto &transport = *gemmini_rocc_transport();
+#endif
         size_t packed_a_count, packed_b_count;
         if (!product(m, std::min(k, size_t{32}), packed_a_count) ||
             !product(j, std::min(k, size_t{32}), packed_b_count)) return Status::invalid_arguments;
@@ -564,7 +597,10 @@ Status run_blocks(const int8_t * a, const float * s_a, const Weights & weights,
         for (size_t i = 0; i < m; ++i)
             for (size_t col = 0; col < j; ++col) output[i * row_stride + col * column_stride] = +0.0f;
         // Linux sfence.vma does not reach Gemmini's TLB, and these per-call buffers can land on remapped pages.
-        gemmini_flush(0);
+        gemmini_command_t command;
+                    const gemmini_flush_desc_t flush{false};
+                    require_command("PB flush encoding", gemmini_encode_flush(&flush, &command));
+                    require_command("PB flush", gemmini_issue(&transport, &command, nullptr));
 #if defined(GGML_GEMMINI_TESTING)
         ++flushes;
 #endif
@@ -578,10 +614,15 @@ Status run_blocks(const int8_t * a, const float * s_a, const Weights & weights,
             const float * scales_b = weights.scales(block, j, scratch_b);
             gemmini_memory_barrier(packed_a.data());
             gemmini_memory_barrier(packed_b.data());
-            tiled_matmul_auto(m, j, width, packed_a.data(), packed_b.data(), nullptr, acc.data(),
+#if defined(GEMMINI_ROCC_MODEL) && defined(GGML_GEMMINI_TESTING)
+            const auto config_before = model.command_count(GEMMINI_FUNCT_CONFIG);
+            const auto loops_before = model.command_count(GEMMINI_FUNCT_LOOP_WS);
+            const auto drains_before = model.drain_count();
+#endif
+            tiled_matmul_auto(transport, m, j, width, packed_a.data(), packed_b.data(), nullptr, acc.data(),
                               width, j, 0, j,
                               MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-                              NO_ACTIVATION, ACC_SCALE_IDENTITY, 0,
+                              GEMMINI_ACT_NONE, ACC_SCALE_IDENTITY, 0,
                               false, false, false, true, false, 0, WS);
             gemmini_memory_barrier(acc.data());
 #if defined(GGML_GEMMINI_TESTING)
@@ -604,8 +645,16 @@ Status run_blocks(const int8_t * a, const float * s_a, const Weights & weights,
                 }
             }
 #if defined(GGML_GEMMINI_TESTING)
-            if (observer) observer({block, m, j, width, packed_a.data(), packed_b.data(), acc.data(),
-                                    scales_a.data(), scales_b, output, row_stride, column_stride}, observer_context);
+            if (observer) {
+                BlockObservation observation{block, m, j, width, packed_a.data(), packed_b.data(), acc.data(),
+                                             scales_a.data(), scales_b, output, row_stride, column_stride};
+#if defined(GEMMINI_ROCC_MODEL)
+                observation.config_commands = model.command_count(GEMMINI_FUNCT_CONFIG) - config_before;
+                observation.loop_commands = model.command_count(GEMMINI_FUNCT_LOOP_WS) - loops_before;
+                observation.drains = model.drain_count() - drains_before;
+#endif
+                observer(observation, observer_context);
+            }
 #endif
         }
         ++counters[type].nodes;
@@ -811,7 +860,7 @@ Status execute_linear(const ggml_gemmini_args_t & args) {
     const size_t blocks = args.K / 32;
     size_t a_count, c_count, stored_blocks, s_count;
     if (!args.I || !args.J || !args.K || args.K % 32 || !args.mxint_weight ||
-        args.weight_format != ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 ||
+        args.weight_format != ggml_gemmini_args_t::weight_format_t::q8_hp1 ||
         args.tiled_matmul_type != WS || args.A.bits != 8 || !args.A.valid() ||
         args.A.rows != args.I || args.A.cols != args.K || !args.f_out || !meta ||
         meta->cols != args.K || args.activation_row_offset > meta->rows ||

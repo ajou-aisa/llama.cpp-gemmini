@@ -123,20 +123,18 @@ def validate_recipe(info: Record, recipe: str) -> None:
     actual = tuple(integer(info, name) for name in
                    ("activation_metrics", "residual_metrics"))
     require(actual == expected[recipe], f"script/build metric flag mismatch for {recipe}")
-    require(integer(info, "cycle_sim") in (0, 1), "invalid CYCLE_SIM build value")
     if recipe != "e2e":
-        require(integer(info, "cycle_sim") == 1 and info.get("backend") == "IM2P_SIM" and info.get("hp1") is True,
-                "metric recipe requires explicit CPU-functional CYCLE_SIM=1 HP1 artifact; device/RTL collection is unsupported")
-        require(integer(info, "gemmini") == 1 and info.get("gemmini_option") == "WS",
-                "metric recipe requires actual offloaded Gemmini WS route")
+        require(info.get("backend") == "HARDWARE", "metric recipe requires a supported Gemmini backend")
+        require(integer(info, "gemmini") == 1 and info.get("gemmini_option") in ("CPU", "WS"),
+                "metric recipe requires an enabled Gemmini route")
         require(integer(info, "activation_bits") == integer(info, "weight_bits") and
                 integer(info, "activation_bits") in (4, 8) and integer(info, "dim") in (16, 32, 64),
                 "unsupported metric hardware profile")
         require(info.get("activation_mode") == "EXSIA" and integer(info, "block_size") == 32,
                 "metric hooks require production EXSIA block32 route")
     if recipe == "residual":
-        require(info.get("hp1") is True and integer(info, "rmd_enabled") == 1 and
-                info.get("rmd_backend") == "WS", "RES recipe requires enabled run-aware HP1 WS residual route")
+        require(integer(info, "rmd_enabled") == 1 and info.get("rmd_backend") in ("CPU", "WS"),
+                "RES recipe requires enabled residual compensation")
 
 
 def clean_environment() -> None:

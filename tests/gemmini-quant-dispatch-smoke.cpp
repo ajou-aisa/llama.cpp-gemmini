@@ -1,8 +1,10 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/types.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/tensor/types.hpp"
-#include <gemmini.h>
+#include "../ggml/src/ggml-npu-common/quantization/activation/dispatch.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/tensor/types.hpp"
+#include "matmul/baseline.hpp"
+#include "matmul/execution.hpp"
+#include "reference/cpu.hpp"
 
 #include <cstdlib>
 #include <string_view>
@@ -47,7 +49,7 @@ static void assert_exsia_baseline() {
     elem_t b = 4;
     float out = 0.0f;
     auto args = cpu_1x1_args(a, b, out);
-    auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::exsia::Meta>();
+    auto &meta = args.act_quant.storage().emplace<ggml::npu::quants::act::exsia::Meta>();
     meta.theta = {1};
 
     ggml::gemmini::tiled_matmul_auto_baseline(
@@ -64,7 +66,7 @@ static void assert_tensor_baseline() {
     elem_t b = 4;
     float out = 0.0f;
     auto args = cpu_1x1_args(a, b, out);
-    auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>();
+    auto &meta = args.act_quant.storage().emplace<ggml::npu::quants::act::tensor::Meta>();
     meta.scale = 0.25f;
 
     ggml::gemmini::tiled_matmul_auto_baseline(
@@ -82,7 +84,7 @@ static void assert_token_baseline() {
     float out = 0.0f;
     auto args = cpu_1x1_args(a, b, out);
     args.transpose_B = true;
-    auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::token::Meta>();
+    auto &meta = args.act_quant.storage().emplace<ggml::npu::quants::act::token::Meta>();
     meta.scales = {0.25f};
 
     ggml::gemmini::tiled_matmul_auto_baseline(

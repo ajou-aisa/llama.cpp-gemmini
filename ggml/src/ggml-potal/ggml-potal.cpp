@@ -16,9 +16,9 @@
 #include "potal.h"
 #include "trace/timeline.hpp"
 
-#include <gemmini/log.hpp>
-#include <gemmini/semantic.h>
-#include <gemmini/trace-context.hpp>
+#include "../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml-npu-common/profiling/include/npu/semantic.h"
+#include "../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -299,7 +299,7 @@ void potal_free(ggml_backend_t backend) {
             (unsigned long long)st.attention_loop_ws, (unsigned long long)st.attention_qk_limb_jobs,
             (unsigned long long)st.attention_bias_mvins);
     }
-    (void) ggml::gemmini::log::cycle.flush();
+    (void) ggml::npu::log::cycle.flush();
     {
         std::lock_guard<std::mutex> lk(g_live_mu);
         g_live.erase(std::remove(g_live.begin(), g_live.end(), backend), g_live.end());
@@ -362,7 +362,7 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
         }
         ::potal::timeline::scoped_span node_setup(::potal::timeline::active(), ::potal::timeline::stage::gc_node_setup,
                                                   0, 0, ::potal::timeline::no_id, uint32_t(i));
-#if LOG_CYCLE || CYCLE_SIM
+#if LOG_CYCLE
         // The node's semantic identity (phase, graph occurrence, ordinal) for the
         // records below, bound as the Gemmini and CPU backends do; one issuing
         // worker. The C entry turns a node outside the captured graph into a
@@ -376,7 +376,7 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
             return GGML_STATUS_FAILED;
         }
 #endif
-        ggml::gemmini::trace::ScopedContext operator_context(
+        ggml::npu::trace::ScopedContext operator_context(
             gemmini_trace_operator(graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
                                    static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
         node_setup.close();

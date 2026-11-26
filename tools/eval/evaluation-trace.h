@@ -2,16 +2,14 @@
 
 #include "common.h"
 #include "evaluation-lifecycle.h"
-#include <gemmini/semantic.hpp>
-#include <gemmini/cycle_sim_log.hpp>
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/semantic.hpp"
 #include <memory>
 #include <optional>
 
 class evaluation_trace {
 public:
     evaluation_trace(const common_params & params, const std::string & model_identity,
-                     size_t prompt_count, size_t generated_count, bool forced_cost_only = false,
-                     bool prefill_cycle_trace = false);
+                     size_t prompt_count, size_t generated_count, bool forced_cost_only = false);
     void phase(const std::string & kind, const std::vector<llama_token> & tokens,
                std::optional<uint64_t> decode_index = {});
     void request_start();
@@ -22,11 +20,7 @@ public:
     void forced_complete(uint64_t index, llama_token token);
     void finish(bool success);
 private:
-    std::shared_ptr<ggml::gemmini::semantic::Session> semantic_;
+    std::shared_ptr<ggml::npu::semantic::Session> semantic_;
     std::unique_ptr<evaluation_lifecycle> lifecycle_;
     bool pipeline_collection_ = false;
-#if CYCLE_SIM
-    std::shared_ptr<ggml::gemmini::cycle_sim::Session> target_;
-    ggml::gemmini::cycle_sim::Context context_;
-#endif
 };

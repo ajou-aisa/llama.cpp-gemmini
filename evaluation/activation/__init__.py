@@ -60,7 +60,7 @@ def observed_counts(rows: Sequence[Sequence[float]], selected: Sequence[Sequence
 
 
 def reduce(path: Path, manifest: Manifest) -> Record:
-    return summarize(metric_rows(path, "im2p-activation-quant-metrics", manifest), path, manifest)
+    return summarize(metric_rows(path, "gemmini-activation-quant-metrics", manifest), path, manifest)
 
 
 def summarize(rows: Iterator[Record], path: Path, manifest: Manifest) -> Record:

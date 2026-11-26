@@ -1,0 +1,37 @@
+{
+  "schema": "socmulator.npu_config/1",
+  "architecture": "@GGML_NPU@",
+  "isa_revision": "@_NPU_ISA_REVISION@",
+  "precision": {
+    "name": "@NPU_PRECISION@",
+    "input_bits": @_NPU_PRECISION_BITS@,
+    "input_storage_bytes": @_NPU_INPUT_STORAGE_BYTES@,
+    "acc_bits": @_NPU_ACC_BITS@,
+    "packing_abi": @_NPU_PACKING_ABI@
+  },
+  "geometry": {
+    "d": @NPU_D@,
+    "spad_banks": @NPU_SPAD_BANKS@,
+    "spad_bank_rows": @NPU_SPAD_BANK_ROWS@,
+    "spad_total_rows": @_NPU_SPAD_TOTAL_ROWS@,
+    "spad_row_bytes": @_NPU_SPAD_ROW_BYTES@,
+    "spad_capacity_bytes": @_NPU_SPAD_CAPACITY_BYTES@,
+    "acc_banks": @_NPU_ACC_BANKS_JSON@,
+    "acc_rows": @NPU_ACC_ROWS@,
+    "acc_bank_rows": @_NPU_ACC_BANK_ROWS_JSON@,
+    "acc_row_bytes": @_NPU_ACC_ROW_BYTES@,
+    "acc_capacity_bytes": @_NPU_ACC_CAPACITY_BYTES@
+  },
+  "dma": {
+    "max_bytes": @NPU_DMA_MAX_BYTES@,
+    "max_block_len": @_NPU_MAX_BLOCK_LEN@,
+    "max_block_len_acc": @_NPU_MAX_BLOCK_LEN_ACC@
+  },
+  "potal": {
+    "index_entries": @_NPU_INDEX_ENTRIES_VALUE@,
+    "scale_entries": @_NPU_SCALE_ENTRIES_VALUE@
+  },
+  "transport": "@NPU_TRANSPORT@",
+  "matmul_algorithm": "@NPU_MATMUL_ALGORITHM@",
+  "execution_policy": "@GGML_GEMMINI_OPTION@"
+}

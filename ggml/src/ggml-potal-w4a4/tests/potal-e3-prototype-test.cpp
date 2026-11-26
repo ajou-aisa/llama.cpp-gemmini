@@ -112,7 +112,7 @@ bool resource_overlay(const paired_tile_plan & plan,const paired_residual_reques
             if (op.path==paired_path::residual) {
                 if (op.fragment>=residual.fragments.size()) return false;
                 const auto & fragment=residual.fragments[op.fragment];
-                if (!fragment.count || fragment.count>PD || fragment.count>POTAL_INDEX_ENTRIES) return false;
+                if (!fragment.count || fragment.count>PD || fragment.count>POTAL_HW_INDEX_ENTRIES) return false;
                 size_t first,last; paired_window_blocks(plan,op.window,first,last);
                 for (size_t x=0;x<fragment.count;++x) {
                     const size_t original=residual.original_k(fragment,x);
@@ -146,7 +146,7 @@ bool resource_overlay(const paired_tile_plan & plan,const paired_residual_reques
                 "dependency_edges=%llu logical_preloads=%llu shared_scale_peak_bound=%u "
                 "Index_capacity=%u generation=%u physical_overlap=Not_measured\n",
                 schedule.stripe,main_seen.size(),residual_seen.size(),(unsigned long long)dependencies,
-                (unsigned long long)preloads,2*plan.scale_slots,POTAL_INDEX_ENTRIES,generation);
+                (unsigned long long)preloads,2*plan.scale_slots,POTAL_HW_INDEX_ENTRIES,generation);
     return clear && main_seen.size()==expected_main && residual_seen.size()==expected_residual &&
            preloads==expected_main+expected_residual;
 }

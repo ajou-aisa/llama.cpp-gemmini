@@ -1,5 +1,6 @@
-#if defined(GGML_GEMMINI_PB) && !defined(__riscv)
-#include <gemmini.h>
+#include "gemmini_params.h"
+#include "pb-rocc-model.hpp"
+#include <stdexcept>
 
 #include <algorithm>
 #include <array>
@@ -7,10 +8,10 @@
 #include <cstdlib>
 #include <vector>
 
+namespace ggml::gemmini::pb {
 namespace {
 [[noreturn]] void reject(const char * reason) {
-    std::fprintf(stderr, "gemmini-pb RoCC model: %s\n", reason);
-    std::abort();
+    throw std::invalid_argument(reason);
 }
 void require(bool condition, const char * reason) {
     if (!condition) reject(reason);
@@ -21,7 +22,9 @@ struct Operand {
     size_t rows = 0, cols = 0;
 };
 
-struct Model {
+} // namespace
+
+struct FunctionalTransport::State {
     size_t i = 0, j = 0, k = 0, pad_i = 0, pad_j = 0, pad_k = 0;
     uint64_t a = 0, b = 0, d = 0, c = 0;
     size_t sa = 0, sb = 0, sd = 0, sc = 0;
@@ -31,7 +34,12 @@ struct Model {
     std::vector<int32_t> accumulator;
     size_t acc_rows = 0, acc_cols = 0;
     bool pending = false;
-} state;
+    std::array<uint64_t, 128> commands{};
+    uint64_t drains = 0;
+    bool failed = false;
+};
+
+namespace {
 
 const Operand & load(std::array<Operand, 3> & cache, unsigned id, uint64_t address,
                      size_t rows, size_t cols, size_t stride) {
@@ -53,7 +61,7 @@ const Operand & load(std::array<Operand, 3> & cache, unsigned id, uint64_t addre
     return operand;
 }
 
-void run(uint64_t rs1, uint64_t rs2) {
+void run(FunctionalTransport::State &state, uint64_t rs1, uint64_t rs2) {
     require(state.config_mask == 31 && state.loop_mask == 31, "incomplete WS configuration");
     require(rs2 == 0 && (rs1 & ~uint64_t{0xf0003}) == 0 && (rs1 & 2),
             "only full-width, non-transposed, no-activation WS matmul is modeled");
@@ -107,27 +115,28 @@ void run(uint64_t rs1, uint64_t rs2) {
 }
 } // namespace
 
-void gemmini_pb_rocc_model_issue(uint64_t rs1, uint64_t rs2, uint32_t funct) {
+namespace {
+void issue_command(FunctionalTransport::State &state, uint64_t rs1, uint64_t rs2, uint32_t funct) {
     switch (funct) {
-    case k_CONFIG:
+    case GEMMINI_FUNCT_CONFIG:
         switch (rs1 & 3) {
-        case CONFIG_EX:
+        case GEMMINI_CONFIG_EX:
             require(rs1 == ((uint64_t{0x3f800000} << 32) | (uint64_t{1} << 16) |
-                            (uint64_t{WEIGHT_STATIONARY} << 2) | CONFIG_EX) &&
+                            (uint64_t{GEMMINI_DATAFLOW_WS} << 2) | GEMMINI_CONFIG_EX) &&
                     rs2 == (uint64_t{1} << 48), "unsupported execute configuration");
             require(!state.pending && state.loop_mask == 0, "execute config during unfinished loop");
             state.config_mask = 1;
             break;
-        case CONFIG_ST:
-            require(rs1 == CONFIG_ST && (rs2 >> 32) == 0x3f800000, "unsupported store configuration");
+        case GEMMINI_CONFIG_ST:
+            require(rs1 == GEMMINI_CONFIG_ST && (rs2 >> 32) == 0x3f800000, "unsupported store configuration");
             state.store_stride = static_cast<uint32_t>(rs2);
             state.config_mask |= 2;
             break;
-        case CONFIG_LD: {
+        case GEMMINI_CONFIG_LD: {
             const unsigned id = (rs1 >> 3) & 3;
             require(id < 3 &&
                     rs1 == ((uint64_t{0x3f800000} << 32) | (uint64_t{DIM} << 16) |
-                            (uint64_t{1} << 8) | (uint64_t{id} << 3) | CONFIG_LD),
+                            (uint64_t{1} << 8) | (uint64_t{id} << 3) | GEMMINI_CONFIG_LD),
                     "unsupported load configuration");
             state.load_stride[id] = rs2;
             state.config_mask |= 4U << id;
@@ -136,35 +145,68 @@ void gemmini_pb_rocc_model_issue(uint64_t rs1, uint64_t rs2, uint32_t funct) {
         default: reject("unsupported CONFIG command");
         }
         return;
-    case k_LOOP_WS_CONFIG_BOUNDS:
+    case GEMMINI_FUNCT_LOOP_WS_CONFIG_BOUNDS:
         require((rs1 >> 48) == 0 && (rs2 >> 48) == 0, "invalid bounds encoding");
         state.pad_i = rs1 & 0xffff; state.pad_j = (rs1 >> 16) & 0xffff; state.pad_k = (rs1 >> 32) & 0xffff;
         state.i = rs2 & 0xffff; state.j = (rs2 >> 16) & 0xffff; state.k = (rs2 >> 32) & 0xffff;
         state.loop_mask |= 1;
         return;
-    case k_LOOP_WS_CONFIG_ADDRS_AB:
+    case GEMMINI_FUNCT_LOOP_WS_CONFIG_ADDRS_AB:
         state.a = rs1; state.b = rs2; state.loop_mask |= 2;
         return;
-    case k_LOOP_WS_CONFIG_ADDRS_DC:
+    case GEMMINI_FUNCT_LOOP_WS_CONFIG_ADDRS_DC:
         state.d = rs1; state.c = rs2; state.loop_mask |= 4;
         return;
-    case k_LOOP_WS_CONFIG_STRIDES_AB:
+    case GEMMINI_FUNCT_LOOP_WS_CONFIG_STRIDES_AB:
         state.sa = rs1; state.sb = rs2; state.loop_mask |= 8;
         return;
-    case k_LOOP_WS_CONFIG_STRIDES_DC:
+    case GEMMINI_FUNCT_LOOP_WS_CONFIG_STRIDES_DC:
         state.sd = rs1; state.sc = rs2; state.loop_mask |= 16;
         return;
-    case k_LOOP_WS:
-        run(rs1, rs2);
+    case GEMMINI_FUNCT_LOOP_WS:
+        run(state, rs1, rs2);
         return;
-    case k_FLUSH:
+    case GEMMINI_FUNCT_FLUSH:
         return;
     default:
         reject("unrecognized command");
     }
 }
 
-void gemmini_pb_rocc_model_fence(void) {
+void drain_commands(FunctionalTransport::State &state) {
     require(state.loop_mask == 0 && !state.pending, "fence with unfinished output");
 }
-#endif
+
+} // namespace
+FunctionalTransport::FunctionalTransport() : state_(new State), transport_{state_.get(), issue, drain} {}
+FunctionalTransport::~FunctionalTransport() = default;
+gemmini_status_t FunctionalTransport::issue(void *context, const gemmini_command_t *command, uint64_t *) {
+    auto &state = *static_cast<State *>(context);
+    if (state.failed) return GEMMINI_ERR_TRANSPORT;
+    try {
+        issue_command(state, command->rs1, command->rs2, command->funct);
+        ++state.commands[command->funct];
+        return GEMMINI_OK;
+    } catch (const std::invalid_argument &) {
+        state.failed = true;
+        return GEMMINI_ERR_TRANSPORT;
+    } catch (const std::bad_alloc &) {
+        state.failed = true;
+        return GEMMINI_ERR_CAPACITY;
+    }
+}
+gemmini_status_t FunctionalTransport::drain(void *context) {
+    auto &state = *static_cast<State *>(context);
+    if (state.failed) return GEMMINI_ERR_TRANSPORT;
+    try {
+        drain_commands(state);
+        ++state.drains;
+        return GEMMINI_OK;
+    } catch (const std::invalid_argument &) {
+        state.failed = true;
+        return GEMMINI_ERR_TRANSPORT;
+    }
+}
+uint64_t FunctionalTransport::command_count(uint8_t funct) const { return state_->commands.at(funct); }
+uint64_t FunctionalTransport::drain_count() const { return state_->drains; }
+} // namespace ggml::gemmini::pb

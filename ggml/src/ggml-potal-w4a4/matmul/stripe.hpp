@@ -2,7 +2,7 @@
 
 // Stripe pipeline of one F32 x Q8_HP1 MUL_MAT (GGML_GEMMINI_DEFAULT_MATMUL_MODE
 // or GEMMINI_MATMUL_MODE = STRIPE_PIPELINE, ExSIA activations), after the
-// IM2P.sim frontend PIPELINE contract (docs/HOST_STRIPE_CONTRACT.md):
+// Stripe pipeline contract:
 //
 //   producer: calling thread                consumer: accelerator owner (hart-0 issuer)
 //   ExSIA stripe s: local adaptation,
@@ -67,10 +67,10 @@
 #include "paired-auto.hpp"
 #include "tiling.hpp"
 
-#include "quants/act/exsia/exsia-event.hpp"
-#include "residual/rmd/rmd-types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia-event.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
-#include <gemmini/trace-context.h>
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.h"
 
 #include <condition_variable>
 #include <atomic>
@@ -86,7 +86,7 @@
 
 namespace ggml::potal {
 
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 
 enum class slot_state : uint8_t {
     free,
@@ -321,7 +321,7 @@ class stripe_run {
     // args: the node's arguments (init_args) after nothing but allocation: the
     // run reads I/J/K, the stripe geometry and the weight view from it, now.
     // w and plan are borrowed and must outlive the consumer.
-    stripe_run(const pipeline_config & cfg, const ggml_gemmini_args_t & args, const hp1_weight & w,
+    stripe_run(const pipeline_config & cfg, const npu_matmul_args & args, const hp1_weight & w,
                const potal_tile_plan & plan);
     ~stripe_run();
     stripe_run(const stripe_run &)             = delete;
@@ -334,7 +334,7 @@ class stripe_run {
     // One folding-committed stripe; producer_args: the arguments ExSIA writes
     // (their A rows of the stripe are copied). Blocks while the pipeline is
     // full. false: the run failed (now or earlier), the stripe was not taken.
-    bool submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_args_t & producer_args);
+    bool submit(const exsia::StripeReadyEvent & e, const npu_matmul_args & producer_args);
     // Closes the input and waits until every expected stripe completed or the
     // run failed. true: all stripes semantically done.
     bool finish();
@@ -432,10 +432,10 @@ class stripe_run {
 //   args) (ExSIA submits every committed stripe at once) -> finish (or abort) ->
 //   owner.join -> on success copy the private output into args.f_out.
 // args: init_args of this node with the frozen Main plan (its
-// activation_rows_per_stripe is plan.tile_I * DIM). The output is written
+// activation_rows_per_stripe is plan.tile_I * NPU_D). The output is written
 // only when the report is ok; a fatal report means the run abandoned its
 // buffers and w must be abandoned by its owner.
-pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_t & args, const hp1_weight & w,
+pipeline_report run_stripe_pipeline(const ggml_tensor * src1, npu_matmul_args & args, const hp1_weight & w,
                                     const potal_tile_plan & plan, const pipeline_config & cfg, stripe_owner & owner);
 
 } // namespace ggml::potal

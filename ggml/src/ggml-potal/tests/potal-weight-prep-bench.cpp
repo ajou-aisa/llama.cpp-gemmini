@@ -19,8 +19,8 @@
 #include "gguf.h"
 #include "matmul/dense.hpp"
 #include "matmul/weight_cache.hpp"
-#include "quants/common/weight_reader.hpp"
-#include "quants/common/weight_route.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_route.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -34,8 +34,8 @@
 
 using namespace ggml::potal;
 namespace hp1     = ggml::potal::quants::weight::hp1;
-namespace wreader = ggml::gemmini::quants::wreader;
-namespace wroute  = ggml::gemmini::quants::wroute;
+namespace wreader = ggml::npu::quants::wreader;
+namespace wroute  = ggml::npu::quants::wroute;
 
 namespace {
 
@@ -81,9 +81,9 @@ void bench_cache(ggml_backend_t cpu, const char * source, const bench_case & c, 
     ggml_backend_tensor_set(tw, w->data, 0, ggml_nbytes(w));
 
     const hp1_shape     s = { c.m, c.n, c.k };
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     if (!init_args(tw, const_cast<ggml_tensor *>(dst), s, "gpt2", "bench",
-                   ggml::gemmini::residual::ResidualRoute::cpu_direct, plan, args)) {
+                   ggml::npu::residual::ResidualRoute::cpu_direct, plan, args)) {
         std::printf("BENCH_FAIL case=%s init_args\n", c.name);
         return;
     }
@@ -151,8 +151,8 @@ void bench(const char * source, const bench_case & c, ggml_tensor * w, int reps,
     std::vector<double> t_alloc, t_plan, t_validate, t_carrier, t_reorder, t_prepare;
     size_t              plan_validations = 0, unpack_validations = 0, unpack_code_reads = 0;
     for (int r = 0; r < reps; ++r) {
-        ggml_gemmini_args_t args;
-        if (!init_args(w, dst, s, "gpt2", "bench", ggml::gemmini::residual::ResidualRoute::cpu_direct, plan, args)) {
+        npu_matmul_args args;
+        if (!init_args(w, dst, s, "gpt2", "bench", ggml::npu::residual::ResidualRoute::cpu_direct, plan, args)) {
             std::printf("BENCH_FAIL case=%s init_args\n", c.name);
             return;
         }

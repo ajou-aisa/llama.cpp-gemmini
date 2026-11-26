@@ -10,7 +10,7 @@ c++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -shared -fPIC \
     "$source_dir/nvfp4-reference.cpp" -o "$out/libnvfp4-reference.so"
 "${CUDACXX:-$cuda/bin/nvcc}" -std=c++17 -O2 -shared -Xcompiler -fPIC \
     --ftz=false --fmad=false --prec-div=true -arch=sm_86 --cudart shared \
-    -I"$root/ggml/include" -I"$root/ggml/src/ggml-cuda/cpu-exact" \
+    -I"$root/ggml/include" -I"$root/ggml/src/ggml-npu-common/evaluation/cuda-exact" \
     "$source_dir/ggml-nvfp4-preload.cu" -L"$cuda/lib64" -lcublas -ldl \
     -Xlinker -rpath -Xlinker "$cuda/lib64" -o "$out/libggml-nvfp4-preload.so"
 python3 - "$root" "$out" <<'PY'

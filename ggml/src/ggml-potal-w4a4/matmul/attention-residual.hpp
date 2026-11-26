@@ -2,7 +2,7 @@
 
 #include "attention.hpp"
 #include "residual/stripe-residual.hpp"
-#include "ggml-gemmini/quants/common/math.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
 
 #include <memory>
 #include <vector>
@@ -15,7 +15,7 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
         const stream & activation, size_t row_begin, size_t rows, role operation) {
     constexpr size_t block_k = 32;
     constexpr int bits = 4, radix = 16, bias = 8;
-    namespace rmd = ggml::gemmini::rmd;
+    namespace rmd = ggml::npu::rmd;
     const auto require = [](bool valid, potal_status status = POTAL_ERR_INVALID_ARGUMENT) {
         if (!valid) throw status;
     };
@@ -42,7 +42,7 @@ inline std::shared_ptr<const residual::decoded_packet> decode_upper(
             uint8_t lane = 0;
             while (value) {
                 require(lane < capacity, POTAL_ERR_CAPACITY);
-                const int32_t digit = ggml::gemmini::lowdigit(uint64_t(value), bits);
+                const int32_t digit = ggml::npu::lowdigit(uint64_t(value), bits);
                 value = (value - digit) / radix;
                 if (digit) {
                     events.push_back({uint32_t(k), uint16_t(row), lane, int8_t(digit)});

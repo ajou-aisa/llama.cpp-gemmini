@@ -5,13 +5,14 @@
 #endif
 
 #include <cstdint>
-#include <gemmini/log.hpp>
+#include "../../ggml-npu-common/profiling/include/npu/log.hpp"
 
 struct ggml_tensor;
 
 namespace ggml {
 namespace gemmini {
 namespace log {
+using namespace ggml::npu::log;
 enum class DumpPhase : uint8_t {
     unknown = 0,
     prefill = 1,

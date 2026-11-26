@@ -40,8 +40,8 @@ def _split(root: Path, name: str, chunks: int) -> tuple[Path, list[Path]]:
 
 def shards(root: Path, manifest: Manifest) -> None:
     streams: dict[str, tuple[Callable[[Path], Iterator[Record]], Callable[..., Record]]] = {
-        "activation": (lambda path: metric_rows(path, "im2p-activation-quant-metrics", manifest), activation.summarize),
-        "residual": (lambda path: metric_rows(path, "im2p-residual-path-metrics", manifest), residual.summarize),
+        "activation": (lambda path: metric_rows(path, "gemmini-activation-quant-metrics", manifest), activation.summarize),
+        "residual": (lambda path: metric_rows(path, "gemmini-residual-path-metrics", manifest), residual.summarize),
         "scale": (lambda path: weight_alignment.rows(path, manifest), weight_alignment.summarize)}
     for name, (rows, summarize) in streams.items():
         # Given one stream over three chunks and the same observations as three shard streams.
@@ -59,7 +59,7 @@ def shards(root: Path, manifest: Manifest) -> None:
             raise AssertionError("mismatched shard header accepted: " + name)
     # Without moving invocation ids past the previous shard, the residual reducer sees duplicate stripes.
     _, parts = _split(root, "residual", 2)
-    first, second = (metric_rows(path, "im2p-residual-path-metrics", manifest) for path in parts)
+    first, second = (metric_rows(path, "gemmini-residual-path-metrics", manifest) for path in parts)
     header = next(first)
     next(second)
     try:

@@ -1,13 +1,13 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia-profile.hpp"
-#include <gemmini/trace-context.hpp>
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/exsia-profile.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/trace-context.hpp"
 #include "../common/json.hpp"
 
 #include <ggml.h>
-#include <gemmini/host-timing.hpp>
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/host-timing.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
 
 #include <array>
 #include <condition_variable>
@@ -22,7 +22,7 @@
 
 namespace {
 
-using namespace ggml::gemmini::quants::act::exsia;
+using namespace ggml::npu::quants::act::exsia;
 
 constexpr std::array<uint64_t, 4> kStageSentinels{100001, 100003, 100007, 100009};
 
@@ -46,14 +46,14 @@ ProfileInterval interval(uint64_t cycles, uint64_t owner, uint64_t generation) {
 #if defined(__linux__) && defined(__aarch64__)
     result.start_sample = {result.start,
                            true,
-                           ggml::gemmini::cycle::NativeCycleReason::none,
-                           ggml::gemmini::cycle::NativeCycleSource::perf_cpu_cycles,
+                           ggml::npu::cycle::NativeCycleReason::none,
+                           ggml::npu::cycle::NativeCycleSource::perf_cpu_cycles,
                            owner,
                            generation};
     result.end_sample   = {result.end,
                            true,
-                           ggml::gemmini::cycle::NativeCycleReason::none,
-                           ggml::gemmini::cycle::NativeCycleSource::perf_cpu_cycles,
+                           ggml::npu::cycle::NativeCycleReason::none,
+                           ggml::npu::cycle::NativeCycleSource::perf_cpu_cycles,
                            owner,
                            generation};
 #endif
@@ -191,11 +191,11 @@ bool test_stage_aggregation_preserves_missing_and_invalid_samples() {
     StageCycleStats failed;
     failed.add(ProfileCycleValue{{},
                                  ProfileCycleStatus::invalid_start,
-                                 ggml::gemmini::cycle::NativeCycleReason::multiplexed});
+                                 ggml::npu::cycle::NativeCycleReason::multiplexed});
     StageCycleStats merged;
     merged.merge(failed);
     if (!check(merged.count == 0 && merged.total_count == 1 &&
-                   merged.sample_reason == ggml::gemmini::cycle::NativeCycleReason::multiplexed,
+                   merged.sample_reason == ggml::npu::cycle::NativeCycleReason::multiplexed,
                "aggregate retains the endpoint failure reason"))
         return false;
 #endif
@@ -316,7 +316,7 @@ bool test_invalid_run_keeps_caller_cpu(const std::filesystem::path & cycle_path)
 
 bool test_workload_and_recompute(const std::filesystem::path & detail_path,
                                  const std::filesystem::path & cycle_path) {
-    namespace perf          = ggml::gemmini::performance;
+    namespace perf          = ggml::npu::performance;
     constexpr size_t   rows = 2 * DIM + 1, columns = BLOCK_SIZE + 3;
     std::vector<float> source(rows * columns, 0.5f);
     for (size_t row = 0; row + 1 < rows; ++row) {
@@ -364,15 +364,15 @@ bool test_workload_and_recompute(const std::filesystem::path & detail_path,
             if (!args.A.allocate(rows, columns, GGML_GEMMINI_ACTIVATION_BITS))
                 return false;
             perf::reset();
-            perf::start_request(ggml::gemmini::cycle::timestamp_ns());
-            perf::begin_operation(perf::Phase::prefill, ggml::gemmini::cycle::timestamp_ns());
+            perf::start_request(ggml::npu::cycle::timestamp_ns());
+            perf::begin_operation(perf::Phase::prefill, ggml::npu::cycle::timestamp_ns());
             const auto            producer_context = nlohmann::json::parse(perf::log_context());
             const StripeReadySink sink{
                 nullptr, [](void *, const StripeReadyEvent & event) {
                     if (event.stripe_id == 0) {
-                        perf::end_operation(ggml::gemmini::cycle::timestamp_ns(), true);
+                        perf::end_operation(ggml::npu::cycle::timestamp_ns(), true);
                         perf::begin_operation(perf::Phase::decode,
-                                              ggml::gemmini::cycle::timestamp_ns());
+                                              ggml::npu::cycle::timestamp_ns());
                     }
                     event.submission_wait_ns = 0;
                     return true;
@@ -382,8 +382,8 @@ bool test_workload_and_recompute(const std::filesystem::path & detail_path,
             quantizer.set_execution_mode(mode);
             if (!check(quantizer.run(meta, &tensor, args, &sink), "workload fixture quantizes"))
                 return false;
-            perf::end_operation(ggml::gemmini::cycle::timestamp_ns(), true);
-            perf::finish_request(ggml::gemmini::cycle::timestamp_ns());
+            perf::end_operation(ggml::npu::cycle::timestamp_ns(), true);
+            perf::finish_request(ggml::npu::cycle::timestamp_ns());
             perf::finish_recording();
             if (!gemmini_log_cycle_flush())
                 return false;
@@ -431,7 +431,7 @@ bool test_workload_and_recompute(const std::filesystem::path & detail_path,
                 if (!check(event.at("inference_context") == producer_context,
                            "delayed profile serialization keeps producer prefill context"))
                     return false;
-                if (!check(event.at("execution_id") == ggml::gemmini::cycle::host_execution_id(),
+                if (!check(event.at("execution_id") == ggml::npu::cycle::host_execution_id(),
                            "all profile records retain execution identity"))
                     return false;
                 if (event.at("record_type") != "EXSIA_WORKLOAD")
@@ -484,7 +484,7 @@ bool test_workload_and_recompute(const std::filesystem::path & detail_path,
 
 bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::path & detail_path,
                                                        const std::filesystem::path & cycle_path) {
-    namespace perf             = ggml::gemmini::performance;
+    namespace perf             = ggml::npu::performance;
     constexpr size_t   rows    = 2 * DIM + 1;
     constexpr size_t   columns = 32;
     std::vector<float> source(rows * columns, 0.5f);
@@ -554,7 +554,7 @@ bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::pa
                         return false;
                     }
                     const size_t index               = trace.count;
-                    trace.callback_start_ns[index]   = ggml::gemmini::cycle::timestamp_ns();
+                    trace.callback_start_ns[index]   = ggml::npu::cycle::timestamp_ns();
                     trace.quantization_end_ns[index] = event.quantization_end_ns;
                     trace.valid  = trace.valid &&
                                    event.quantization_start_ns <= event.quantization_end_ns &&
@@ -565,25 +565,25 @@ bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::pa
                         std::unique_lock<std::mutex> lock(trace.mutex);
                         ++trace.requested;
                         trace.cv.notify_all();
-                        const uint64_t start = ggml::gemmini::cycle::timestamp_ns();
+                        const uint64_t start = ggml::npu::cycle::timestamp_ns();
                         trace.cv.wait(lock, [&trace] { return trace.released == trace.requested; });
-                        event.submission_wait_ns = ggml::gemmini::cycle::timestamp_ns() - start;
+                        event.submission_wait_ns = ggml::npu::cycle::timestamp_ns() - start;
                     } else if (trace.kind != SinkKind::Uninstrumented) {
                         event.submission_wait_ns = 0;
                     }
                     trace.waits[index] = event.submission_wait_ns.value_or(0);
                     trace.wait_ns += trace.waits[index];
-                    trace.callback_end_ns[index] = ggml::gemmini::cycle::timestamp_ns();
+                    trace.callback_end_ns[index] = ggml::npu::cycle::timestamp_ns();
                     return trace.kind != SinkKind::Rejected || trace.count < 2;
                 }};
             Meta  meta;
             ExSIA quantizer;
             quantizer.set_execution_mode(mode);
-            perf::start_request(ggml::gemmini::cycle::timestamp_ns());
-            perf::begin_operation(perf::Phase::prefill, ggml::gemmini::cycle::timestamp_ns());
+            perf::start_request(ggml::npu::cycle::timestamp_ns());
+            perf::begin_operation(perf::Phase::prefill, ggml::npu::cycle::timestamp_ns());
             const bool success = quantizer.run(meta, &tensor, args, &sink);
-            perf::end_operation(ggml::gemmini::cycle::timestamp_ns(), success);
-            perf::finish_request(ggml::gemmini::cycle::timestamp_ns());
+            perf::end_operation(ggml::npu::cycle::timestamp_ns(), success);
+            perf::finish_request(ggml::npu::cycle::timestamp_ns());
             if (releaser.joinable()) {
                 {
                     std::lock_guard<std::mutex> lock(trace.mutex);
@@ -822,7 +822,7 @@ bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::pa
 int main(int argc, char ** argv) {
     if (argc == 3 && std::string(argv[1]) == "--origin-order") {
         using namespace ggml::gemmini;
-        using namespace ggml::gemmini::quants::act::exsia::detail;
+        using namespace ggml::npu::quants::act::exsia::detail;
         using Json = nlohmann::json;
         const std::filesystem::path root(argv[2]);
         std::filesystem::create_directories(root);
@@ -913,10 +913,10 @@ int main(int argc, char ** argv) {
         argc > 1
             ? std::filesystem::path(argv[1])
             : std::filesystem::temp_directory_path() /
-                  ("gemmini-exsia-host-" + std::to_string(ggml::gemmini::cycle::host_thread_id()) +
-                   "-" + std::to_string(ggml::gemmini::cycle::timestamp_ns()) + ".jsonl");
+                  ("gemmini-exsia-host-" + std::to_string(ggml::npu::cycle::host_thread_id()) +
+                   "-" + std::to_string(ggml::npu::cycle::timestamp_ns()) + ".jsonl");
     const std::filesystem::path cycle_path = detail_path.string() + ".cycle.jsonl";
-    if (!ggml::gemmini::log::cycle.set_output_path(cycle_path.string().c_str(), true))
+    if (!ggml::npu::log::cycle.set_output_path(cycle_path.string().c_str(), true))
         return 1;
 #if defined(_WIN32)
     if (_putenv_s("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail_path.string().c_str()) != 0)

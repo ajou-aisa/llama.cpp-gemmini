@@ -57,7 +57,7 @@
 #include "log.hpp"
 #include "matmul/dense.hpp"
 #include "matmul/execution.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/stripe.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
@@ -68,9 +68,9 @@
 #include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
-#include "quants/act/exsia/types.hpp"
-#include "quants/act/quantize.hpp"
-#include "quants/common/weight_reader.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/common/weight_reader.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -103,9 +103,9 @@
 #endif
 
 using namespace ggml::potal;
-namespace grmd     = ggml::gemmini::rmd;
-namespace exsia_ns = ggml::gemmini::quants::act::exsia;
-namespace wreader  = ggml::gemmini::quants::wreader;
+namespace grmd     = ggml::npu::rmd;
+namespace exsia_ns = ggml::npu::quants::act::exsia;
+namespace wreader  = ggml::npu::quants::wreader;
 using kind         = stripe_event_kind;
 
 namespace {
@@ -153,7 +153,7 @@ struct node {
         ggml_quantize_chunk(weight_type, wf.data(), w->data, 0, (int64_t) N, (int64_t) K, nullptr);
         set_activations(seed + 1, outlier);
         s                       = { (int64_t) M, (int64_t) N, (int64_t) K };
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         ok = potal_tile_select(M, N, K, 32 / D, &plan) == POTAL_OK && args_for(args) &&
              weight.allocate((int64_t) N, (int64_t) K) &&
              prepare_weight(args, weight) == quants::weight::hp1::status::ok;
@@ -173,8 +173,8 @@ struct node {
         }
     }
 
-    bool args_for(ggml_gemmini_args_t & args) const {
-        return init_args(w, y, s, "gpt2", "pipeline-test", ggml::gemmini::residual::ResidualRoute::ws_packet, plan,
+    bool args_for(npu_matmul_args & args) const {
+        return init_args(w, y, s, "gpt2", "pipeline-test", ggml::npu::residual::ResidualRoute::ws_packet, plan,
                          args);
     }
 
@@ -184,7 +184,7 @@ struct node {
 
 // FULL-style ExSIA of the same node (no sink): the golden's codes, theta and packets.
 struct golden_node {
-    ggml_gemmini_args_t                  args;
+    npu_matmul_args                  args;
     hp1_operands                         o;
     std::vector<float>                   want;
     std::map<size_t, grmd::StripePacketHandle> packets; // by stripe id
@@ -569,11 +569,11 @@ const uint32_t sentinel_bits = 0x7fc0beefu;
 
 // One pipelined MUL_MAT of nd through the production driver.
 run_result run_pipeline(node & nd, size_t capacity, gated_runner & runner, recorder & rec,
-                        const std::function<void(ggml_gemmini_args_t &, const stripe_event &)> & producer_hook = {},
+                        const std::function<void(npu_matmul_args &, const stripe_event &)> & producer_hook = {},
                         bool measure_timing = true, bool roles = false,
                         const std::function<bool(const char *, size_t)> & checkpoint = {}, bool paired = false,
                         bool strict = false) {
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     run_result          r;
     if (!nd.args_for(args)) {
         r.report.stage = "fixture";
@@ -793,7 +793,7 @@ void test_immutability(const golden_node & g2, node & two) {
     recorder     rec;
     runner.arm(0, POTAL_STRIPE_WORK_MAIN);
     bool scribbled = false;
-    const run_result r = run_pipeline(two, 2, runner, rec, [&](ggml_gemmini_args_t & args, const stripe_event & ev) {
+    const run_result r = run_pipeline(two, 2, runner, rec, [&](npu_matmul_args & args, const stripe_event & ev) {
         if (ev.kind != kind::quant_end) {
             return;
         }
@@ -880,7 +880,7 @@ void test_failures(node & nd) {
     }
     {
         potal_test::refusing_owner owner;
-        ggml_gemmini_args_t        args;
+        npu_matmul_args        args;
         pipeline_config            cfg;
         cfg.residual = options::compensation;
         float sentinel;
@@ -890,13 +890,13 @@ void test_failures(node & nd) {
                                                     : pipeline_report{};
         check("D unavailable owner: refused before quantization, nothing committed",
               !r.ok && r.stage != nullptr && std::string(r.stage) == "issuer" && r.status == POTAL_ERR_NO_HARDWARE &&
-                  r.counts.stripes_accepted == 0 && args.act_quant.kind() == ggml::gemmini::quants::act::MetaKind::none &&
+                  r.counts.stripes_accepted == 0 && args.act_quant.kind() == ggml::npu::quants::act::MetaKind::none &&
                   nd.dst()[0] != nd.dst()[0]);
     }
     {
         // A configuration the pipeline does not run is refused, never replaced.
         potal_test::refusing_owner owner;
-        ggml_gemmini_args_t        args;
+        npu_matmul_args        args;
         pipeline_config            cfg;
         cfg.residual     = options::compensation;
         cfg.job_capacity = 3;
@@ -908,7 +908,7 @@ void test_failures(node & nd) {
 
 // Producer-side contract on synthetic events, through the production run.
 void test_contract(node & nd) {
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     if (!nd.args_for(args)) {
         check("D contract fixture", false);
         return;
@@ -926,29 +926,29 @@ void test_contract(node & nd) {
     };
     struct violation {
         const char *                                                         name;
-        std::function<bool(stripe_run &, const ggml_gemmini_args_t &)>       apply; // false: the violating call failed
+        std::function<bool(stripe_run &, const npu_matmul_args &)>       apply; // false: the violating call failed
     };
     const std::vector<violation> violations = {
         { "out-of-order stripe",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) { return run.submit(event(9, 1, rows, 2 * rows), a); } },
+          [&](stripe_run & run, const npu_matmul_args & a) { return run.submit(event(9, 1, rows, 2 * rows), a); } },
         { "duplicate stripe",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               return run.submit(event(9, 0, 0, rows), a) && run.submit(event(9, 0, 0, rows), a);
           } },
         { "stripe of another run id",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               return run.submit(event(9, 0, 0, rows), a) && run.submit(event(10, 1, rows, 2 * rows), a);
           } },
         { "rows outside the frozen stripe height",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) { return run.submit(event(9, 0, 0, rows - 1), a); } },
+          [&](stripe_run & run, const npu_matmul_args & a) { return run.submit(event(9, 0, 0, rows - 1), a); } },
         { "missing theta",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               auto e = event(9, 0, 0, rows);
               e.activation_metadata.reset();
               return run.submit(e, a);
           } },
         { "foreign residual packet",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               grmd::RmdStripeBuilder b;
               b.reset(5, 0, rows, nd.K, nd.N, 8);
               b.add_residual(0, 3, 300);
@@ -957,13 +957,13 @@ void test_contract(node & nd) {
               return run.submit(e, a);
           } },
         { "cpu_direct payload",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               auto e            = event(9, 0, 0, rows);
-              e.direct_residual = std::make_shared<ggml::gemmini::residual::DirectStripePayload>();
+              e.direct_residual = std::make_shared<ggml::npu::residual::DirectStripePayload>();
               return run.submit(e, a);
           } },
         { "missing stripes at finish",
-          [&](stripe_run & run, const ggml_gemmini_args_t & a) {
+          [&](stripe_run & run, const npu_matmul_args & a) {
               return run.submit(event(9, 0, 0, rows), a) && run.finish();
           } },
     };
@@ -1538,7 +1538,7 @@ void test_roles(bool timeline_only) {
 #if !defined(__riscv)
         const std::string map = std::getenv("GGML_POTAL_HART_MAP");
         unsetenv("GGML_POTAL_HART_MAP");
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         potal_test::refusing_owner owner;
         pipeline_config cfg;
         cfg.hart_roles = true;
@@ -1669,7 +1669,7 @@ void test_strict(bool timeline_only = false) {
                       failed.report.stage != nullptr && std::string(failed.report.stage) == "prepare_job" &&
                       fail_rec.seq(kind::run_commit) < 0 && fail_rec.seq(kind::main_begin, 1) < 0);
         }
-        ggml_gemmini_args_t args;
+        npu_matmul_args args;
         potal_test::refusing_owner owner;
         pipeline_config cfg;
         cfg.residual = options::compensation;
@@ -1683,7 +1683,7 @@ void test_strict(bool timeline_only = false) {
         setenv("GGML_POTAL_HART_ROLES", "ON", 1);
         cfg.paired_ktile_scale_reuse = true;
         cfg.paired_stream = potal_paired_stream_mode::continuous;
-        ggml_gemmini_args_t args2;
+        npu_matmul_args args2;
         refused = nd.args_for(args2) ? run_stripe_pipeline(nd.x, args2, nd.weight, nd.plan, cfg, owner)
                                      : pipeline_report{};
         check("STRICT with stream mode refuses before any work",
@@ -1750,14 +1750,14 @@ int main(int argc, char ** argv) {
         }
     }
     ggml::potal::log::ensure_outputs(); // Gemmini debug/cycle JSONL, not stdout
-    std::printf("potal-stripe-pipeline-test DIM=%u backend=EMULATED (host threads, no hardware) activation=%s "
+    std::printf("potal-stripe-pipeline-test NPU_D=%u backend=EMULATED (host threads, no hardware) activation=%s "
                 "compensation=%s residual_executor=%s\n",
                 (unsigned) POTAL_HW_DIM, options::activation_quant_name(), options::compensation_name,
                 options::residual_executor_name(options::MatmulInvocationMode::stripe_pipeline));
     test_affinity();
     if (options::activation_quant != options::ActivationQuantAlgo::EXSIA) {
         node                       nd(48, 32, 64, 1, 0.0f);
-        ggml_gemmini_args_t        args;
+        npu_matmul_args        args;
         potal_test::refusing_owner owner;
         pipeline_config            cfg;
         cfg.residual            = options::compensation;

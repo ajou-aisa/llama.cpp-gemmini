@@ -23,17 +23,17 @@
 #include "matmul/attention.hpp"
 #include "matmul/attention-residual.hpp"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/paired-auto.hpp"
 #include "matmul/stripe-api.hpp"
 #include "matmul/stripe.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
 #include "potal_hw_params.h"
-#include "quants/act/exsia/types.hpp"
-#include "quants/act/quantize.hpp"
-#include "residual/rmd/rmd-types.hpp"
-#include "residual/rmd/rmd-bitmap-builder.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-types.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-bitmap-builder.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -206,13 +206,13 @@ bool make_dense(const dense_spec & c, dense_node & nd) {
 // ggml-gemmini's own ExSIA at 4/4 on args from the fork's init_args.
 void exsia_cross_check(const dense_spec & c, const dense_node & nd, const potal_tile_plan & plan,
                        const gold::dense_result & g) {
-    namespace exsia = ggml::gemmini::quants::act::exsia;
-    namespace grmd  = ggml::gemmini::rmd;
+    namespace exsia = ggml::npu::quants::act::exsia;
+    namespace grmd  = ggml::npu::rmd;
     const hp1_shape     s = { (int64_t) c.M, (int64_t) c.N, (int64_t) c.K };
-    ggml_gemmini_args_t args;
-    if (!init_args(nd.w, nd.y, s, "qwen2", "w4a4-golden-exsia", ggml::gemmini::residual::ResidualRoute::ws_packet, plan,
+    npu_matmul_args args;
+    if (!init_args(nd.w, nd.y, s, "qwen2", "w4a4-golden-exsia", ggml::npu::residual::ResidualRoute::ws_packet, plan,
                    args) ||
-        !ggml::gemmini::quants::quantize_activation(nd.x, args)) {
+        !ggml::npu::quants::quantize_activation(nd.x, args)) {
         verdict("X", c.name, false, "reason=gemmini_quantize_activation_failed");
         return;
     }
@@ -283,9 +283,9 @@ void dense_case(const dense_spec & c) {
     exsia_cross_check(c, nd, plan, g);
 
     const hp1_shape     s = { (int64_t) c.M, (int64_t) c.N, (int64_t) c.K };
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_weight          weight;
-    if (!init_args(nd.w, nd.y, s, "qwen2", "w4a4-golden", ggml::gemmini::residual::ResidualRoute::ws_packet, plan, args) ||
+    if (!init_args(nd.w, nd.y, s, "qwen2", "w4a4-golden", ggml::npu::residual::ResidualRoute::ws_packet, plan, args) ||
         !weight.allocate((int64_t) c.N, (int64_t) c.K) || prepare_weight(args, weight) != quants::weight::hp1::status::ok) {
         verdict("D", c.name, false, "reason=fork_init_args_or_prepare_weight");
         return;
@@ -643,8 +643,8 @@ void attention_case(const att_spec & c) {
 }
 
 void test_main_merge() {
-    namespace grmd = ggml::gemmini::rmd;
-    namespace exsia_ns = ggml::gemmini::quants::act::exsia;
+    namespace grmd = ggml::npu::rmd;
+    namespace exsia_ns = ggml::npu::quants::act::exsia;
     const auto check = [](const std::string & name, bool ok) { verdict("MERGE", name, ok, ""); };
 
     constexpr size_t cols = 7, rows = 3, ldc = 11, stride = 19;
@@ -708,7 +708,7 @@ void test_main_merge() {
 }
 
 void test_upper_decode() {
-    namespace rmd = ggml::gemmini::rmd;
+    namespace rmd = ggml::npu::rmd;
     bool equal = true;
     const int32_t edges[] = {INT32_MIN, INT32_MAX, -129, -128, -9, -8, -1, 0, 1, 7, 8, 127, 128};
     for (auto role : {att::role::qk, att::role::pv})
@@ -723,7 +723,7 @@ void test_upper_decode() {
             const size_t index = row * a.kp + col;
             const int32_t value = zero ? 0 : role == att::role::qk ? edges[(row * k + col) % 13] : (row * k + col) % 256;
             a.codes[index] = value;
-            a.limbs[0][index] = int8_t(ggml::gemmini::lowdigit(uint64_t(int64_t(value) - (role == att::role::pv ? 8 : 0)), 4));
+            a.limbs[0][index] = int8_t(ggml::npu::lowdigit(uint64_t(int64_t(value) - (role == att::role::pv ? 8 : 0)), 4));
         }
         std::vector<uint64_t> selected((rows * a.kp + 63) / 64, UINT64_MAX);
         rmd::RmdBitmapBuilder builder;

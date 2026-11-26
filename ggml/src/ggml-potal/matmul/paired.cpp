@@ -3,7 +3,7 @@
 
 #include "paired.hpp"
 
-#include "quants/act/exsia/exsia-event.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia-event.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +15,7 @@ namespace ggml::potal {
 
 namespace {
 
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 
 // Finite tests on the bits (valid under -ffast-math), as stripe-residual.cpp.
 bool finite_bits(double value) {

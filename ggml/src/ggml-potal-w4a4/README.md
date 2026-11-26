@@ -2,7 +2,7 @@
 
 Standalone C11 API for the PoTal SCU hardware (Gemmini-derived, Sat32 ACC),
 and the `POTAL` GGML backend built on it. Neither uses `gemmini.h`,
-`xcustom.h`, a Gemmini header path or `IM2P.sim`. `build-riscv.sh` builds this
+`xcustom.h` or an external Gemmini header path. `build-riscv.sh` builds this
 backend by default (`GGML_GEMMINI=OFF`, `GGML_POTAL=ON`).
 
 | Configuration | Result |
@@ -322,7 +322,7 @@ from all finite values, no correction work at all. ON captures outlier
 residuals in the quantizer and corrects dst on the CPU (`cpu_direct`, the
 `GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU` route) in FULL mode. The WS residual
 route (`gemmini_ws_compact`) never uses the Gemmini WS executor
-(`rmd-executor.cpp`, gemmini.h/IM2P): in STRIPE_PIPELINE mode it runs as a
+(`rmd-executor.cpp`, the Gemmini SDK): in STRIPE_PIPELINE mode it runs as a
 PoTal Residual GEMM (`potal_ws`, next section); in FULL mode it is refused
 (configure fails for `DEFAULT_RMD_BACKEND=WS` with a FULL default, a FULL node
 with `GEMMINI_RMD_BACKEND=WS` at run time fails, a ws_packet payload reaching

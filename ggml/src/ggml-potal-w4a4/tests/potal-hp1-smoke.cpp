@@ -22,7 +22,7 @@
 #include "ggml-potal.h"
 #include "ggml-quants.h"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "potal.h"
 
 #include <cmath>
@@ -59,12 +59,12 @@ bool golden(const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * expected
     hp1_shape           s = { x->ne[1], w->ne[1], w->ne[0] };
     potal_tile_plan     plan;
     hp1_operands        o;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1::stats          ws;
     route_plan          route;
     if (potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k, hp1::block_k / POTAL_HW_DIM, &plan) != POTAL_OK ||
         !o.allocate(s) ||
-        !init_args(w, expected, s, "", "golden", ggml::gemmini::residual::ResidualRoute::cpu_direct, plan, args) ||
+        !init_args(w, expected, s, "", "golden", ggml::npu::residual::ResidualRoute::cpu_direct, plan, args) ||
         !quantize_activations(x, args, o) || !select_route(args, route) ||
         unpack_weights(args, o, &ws) != hp1::status::ok) {
         return false;

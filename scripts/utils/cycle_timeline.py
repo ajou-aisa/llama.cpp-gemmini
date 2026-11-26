@@ -24,8 +24,6 @@ except ImportError:
 
 COMPACT_KINDS = frozenset({"cpu", "segment", "cycle"})
 FULL_CPU_TYPES = frozenset({"CPU_INTERVAL", "OPERATOR_SEGMENT"})
-DEVICE_INTERVAL_TYPES = frozenset({"IM2P_STRIPE_TELEMETRY"})
-DEVICE_SUMMARY_TYPES = frozenset({"IM2P_EXECUTION_TELEMETRY"})
 EVENT_TYPE = "INFERENCE_EVENT"
 
 
@@ -310,44 +308,6 @@ def _event(record: Mapping[str, JsonValue], line: int, execution: Optional[str])
     )
 
 
-def _device_interval(record: Mapping[str, JsonValue], line: int, execution: Optional[str]) -> TimelineRow:
-    common = _common(record, line)
-    common["execution_id"] = common["execution_id"] or execution
-    start = _uint(record.get("publish_cycle"), line, "publish_cycle", optional=False)
-    end = _uint(record.get("completion_cycle"), line, "completion_cycle", optional=False)
-    delta = _uint(record.get("latency_cycles"), line, "latency_cycles", optional=False)
-    if end < start or delta != end - start:
-        raise CycleSchemaError(line, "device cycle interval has inconsistent endpoints/delta")
-    return TimelineRow(
-        row_type="device", source_line=line, kind="device",
-        tid=None, tid_start=None, tid_end=None,
-        ns_start=None, ns_end=None, wall_ns=None,
-        cycle_clock=_string(record.get("source"), line, "source") or "rtl_cycle",
-        cycle_start=start, cycle_end=end, cycles=delta,
-        cycle_valid=True, cycle_reason=None,
-        cpu_interval_sequence=None, cpu_interval_samples=None, expected_stripes=None, event=None,
-        token_index=None, token_id=None, **common,
-    )
-
-
-def _device_summary(record: Mapping[str, JsonValue], line: int, execution: Optional[str]) -> TimelineRow:
-    common = _common(record, line)
-    common["execution_id"] = common["execution_id"] or execution
-    expected_stripes = _uint(record.get("rtl_stripes_published"), line, "rtl_stripes_published")
-    cycles = _uint(record.get("rtl_work_total_cycles"), line, "rtl_work_total_cycles")
-    return TimelineRow(
-        row_type="device_summary", source_line=line, kind="device_summary",
-        tid=None, tid_start=None, tid_end=None,
-        ns_start=None, ns_end=None, wall_ns=None,
-        cycle_clock=_string(record.get("source"), line, "source") or "rtl_cycle",
-        cycle_start=None, cycle_end=None, cycles=cycles,
-        cycle_valid=True if cycles is not None else None, cycle_reason=None,
-        cpu_interval_sequence=None, cpu_interval_samples=None,
-        expected_stripes=expected_stripes, event=None, token_index=None, token_id=None,
-        **common,
-    )
-
-
 def read_rows(path: Path) -> tuple[list[TimelineRow], ValidationSummary]:
     rows: list[TimelineRow] = []
     summary = ValidationSummary()
@@ -379,10 +339,6 @@ def read_rows(path: Path) -> tuple[list[TimelineRow], ValidationSummary]:
                 summary.full_cpu_rows += 1
             elif record_type == EVENT_TYPE:
                 row = _event(record, line_number, execution)
-            elif record_type in DEVICE_INTERVAL_TYPES:
-                row = _device_interval(record, line_number, execution)
-            elif record_type in DEVICE_SUMMARY_TYPES:
-                row = _device_summary(record, line_number, execution)
 
             if row is None:
                 continue
@@ -498,52 +454,6 @@ def validate_cpu_cardinality(rows: list[TimelineRow]) -> tuple[list[str], dict[s
         "verified_operations": verified,
         "legacy_operation_ends": legacy_operation_ends,
         "unverified_sequence_operations": len(orphan_sequence_keys),
-    }
-
-
-def validate_stripe_cardinality(rows: list[TimelineRow]) -> tuple[list[str], dict[str, int | str]]:
-    errors: list[str] = []
-    stripes: dict[tuple[Optional[str], int, Optional[str]], list[tuple[int, int]]] = defaultdict(list)
-    expected: dict[tuple[Optional[str], int, Optional[str]], tuple[int, int]] = {}
-
-    for row in rows:
-        if row.row_type == "device":
-            if row.run_id is None or row.stripe_id is None:
-                errors.append(f"line {row.source_line}: device stripe lacks run_id/stripe_id")
-                continue
-            stripes[(row.execution_id, row.run_id, row.layer)].append((row.stripe_id, row.source_line))
-        elif row.row_type == "device_summary" and row.expected_stripes is not None:
-            if row.run_id is None:
-                errors.append(f"line {row.source_line}: device summary stripe contract lacks run_id")
-                continue
-            key = (row.execution_id, row.run_id, row.layer)
-            if key in expected:
-                errors.append(f"line {row.source_line}: duplicate device stripe count contract")
-            else:
-                expected[key] = (row.expected_stripes, row.source_line)
-
-    verified = 0
-    for key, (count, source_line) in expected.items():
-        observed = sorted(value for value, _ in stripes.get(key, []))
-        target = list(range(count))
-        if observed != target:
-            errors.append(
-                f"line {source_line}: IM2P stripe cardinality mismatch for run={key[1]} "
-                f"expected=0..{count - 1 if count else -1} observed={observed[:16]}"
-            )
-        else:
-            verified += 1
-
-    unverified = len(set(stripes) - set(expected))
-    status = "verified" if expected and not errors and unverified == 0 else (
-        "partial" if expected and not errors else "unverified" if not expected else "invalid"
-    )
-    return errors, {
-        "status": status,
-        "runs_with_count_contract": len(expected),
-        "verified_runs": verified,
-        "unverified_stripe_runs": unverified,
-        "stripe_rows": sum(len(value) for value in stripes.values()),
     }
 
 
@@ -674,8 +584,7 @@ def write_trace(path: Path, rows: list[TimelineRow], included_only: bool,
 
 
 def report(rows: list[TimelineRow], summary: ValidationSummary, relationship_errors: list[str],
-           cpu_interval_coverage: Mapping[str, int | str],
-           stripe_coverage: Mapping[str, int | str]) -> dict[str, Any]:
+           cpu_interval_coverage: Mapping[str, int | str]) -> dict[str, Any]:
     by_kind = Counter(row.kind for row in rows)
     by_op = Counter(row.op for row in rows if row.op is not None)
     invalid = Counter(row.cycle_reason or "unknown" for row in rows if row.cycle_valid is False)
@@ -692,7 +601,6 @@ def report(rows: list[TimelineRow], summary: ValidationSummary, relationship_err
         "thread_ids": threads if len(threads) <= 64 else threads[:64],
         "thread_ids_truncated": len(threads) > 64,
         "cpu_interval_coverage": dict(cpu_interval_coverage),
-        "stripe_coverage": dict(stripe_coverage),
         "relationship_errors": relationship_errors,
         "status": "ok" if not relationship_errors else "invalid",
         "timeline_semantics": {
@@ -753,8 +661,6 @@ def main() -> int:
         errors = validate_relationships(rows, not args.allow_invalid_cycles)
         cardinality_errors, cpu_interval_coverage = validate_cpu_cardinality(rows)
         errors.extend(cardinality_errors)
-        stripe_errors, stripe_coverage = validate_stripe_cardinality(rows)
-        errors.extend(stripe_errors)
         rows_path.parent.mkdir(parents=True, exist_ok=True)
         write_rows(rows_path, rows)
         trace_dir.mkdir(parents=True, exist_ok=True)
@@ -763,7 +669,7 @@ def main() -> int:
             trace_path = trace_dir / f"{base_name}.timeline.{view}.chrome.json"
             stats = write_trace(trace_path, rows, args.included_only, view)
             traces[view] = {**stats, "path": str(trace_path)}
-        result = report(rows, summary, errors, cpu_interval_coverage, stripe_coverage)
+        result = report(rows, summary, errors, cpu_interval_coverage)
         result["rows_output"] = str(rows_path)
         result["traces"] = traces
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))

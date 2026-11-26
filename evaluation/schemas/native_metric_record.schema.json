@@ -89,9 +89,9 @@
     },
     "schema": {
       "enum": [
-        "im2p-activation-quant-metrics",
-        "im2p-residual-path-metrics",
-        "im2p-scale-alignment-metrics"
+        "gemmini-activation-quant-metrics",
+        "gemmini-residual-path-metrics",
+        "gemmini-scale-alignment-metrics"
       ]
     },
     "scu_shift_offset": {

@@ -52,7 +52,7 @@ class ReducerTests(unittest.TestCase):
         reduce = self.reducer("activation_summary")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "counts.jsonl"
-            rows = [dict(kind="RUN", schema="im2p-activation-quant-metrics", version=1,
+            rows = [dict(kind="RUN", schema="gemmini-activation-quant-metrics", version=1,
                          definition_status="PROPOSED_NOT_CONFIRMED",reference_revision="proposed-invocation-finite-population-v1"),
                     dict(kind="COUNTS", chunk_id=0, invocation_id=1, layer="linear", m=1,k=32,
                          valid_positions=32, fp_selected=0, potal_selected=2, intersection=0,
@@ -70,7 +70,7 @@ class ReducerTests(unittest.TestCase):
         reduce = self.reducer("residual_summary")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shapes.jsonl"
-            rows = [dict(kind="RUN",schema="im2p-residual-path-metrics",version=1,
+            rows = [dict(kind="RUN",schema="gemmini-residual-path-metrics",version=1,
                          run_id="run",workload_id="work"),
                     dict(kind="MAIN_STRIPE",chunk_id=0,invocation_id=1,stripe_id=0,m=2,n=3,k=32),
                     dict(kind="MAIN_STRIPE",chunk_id=0,invocation_id=2,stripe_id=0,m=4,n=5,k=64),
@@ -122,7 +122,7 @@ class BoundaryTests(unittest.TestCase):
         from metric_reducers import activation_summary
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unbound.jsonl"
-            write_stream(path,[dict(kind="RUN",schema="im2p-activation-quant-metrics",
+            write_stream(path,[dict(kind="RUN",schema="gemmini-activation-quant-metrics",
                                    definition_status="CONFIRMED",reference_revision="manual-marker"),
                                dict(kind="RUN_END",success=True)])
             with self.assertRaisesRegex(ValueError,"reference authority"):
@@ -155,26 +155,26 @@ class BoundaryTests(unittest.TestCase):
         from eval_common import validate_recipe
         for activation, residual in ((1,0),(0,1),(1,1),(2,0),(True,0)):
             with self.subTest(activation=activation,residual=residual), self.assertRaises(ValueError):
-                validate_recipe(dict(activation_metrics=activation,residual_metrics=residual,cycle_sim=0), "e2e")
+                validate_recipe(dict(activation_metrics=activation,residual_metrics=residual), "e2e")
 
-    def test_residual_cpu_fallback_is_not_residual_free_coverage(self) -> None:
+    def test_residual_requires_enabled_compensation(self) -> None:
         from eval_common import validate_recipe
         with self.assertRaises(ValueError):
-            validate_recipe(dict(activation_metrics=0,residual_metrics=1,cycle_sim=1,
-                                 activation_mode="EXSIA",block_size=32,hp1=True,backend="IM2P_SIM",
+            validate_recipe(dict(activation_metrics=0,residual_metrics=1,
+                                 activation_mode="EXSIA",block_size=32,hp1=True,backend="HARDWARE",
                                  gemmini=1,gemmini_option="WS",activation_bits=8,weight_bits=8,dim=16,
-                                 rmd_enabled=1,rmd_backend="CPU"), "residual")
+                                 rmd_enabled=0,rmd_backend="CPU"), "residual")
 
     def test_actual_offloaded_profile_required_for_metrics(self) -> None:
         from eval_common import validate_recipe
-        base = dict(activation_metrics=1,residual_metrics=0,cycle_sim=1,
+        base = dict(activation_metrics=1,residual_metrics=0,
                     activation_mode="EXSIA",block_size=32,gemmini=1,gemmini_option="WS",
-                    backend="IM2P_SIM",hp1=True)
+                    backend="HARDWARE",hp1=True)
         for bits in (4,8):
             for dim in (16,32,64):
                 validate_recipe(dict(base,activation_bits=bits,weight_bits=bits,dim=dim),"activation")
-        for changes in (dict(gemmini=0),dict(gemmini_option="CPU"),dict(dim=128),dict(weight_bits=4),
-                        dict(backend="FPGA_UART"),dict(cycle_sim=0)):
+        for changes in (dict(gemmini=0),dict(gemmini_option="OS"),dict(dim=128),dict(weight_bits=4),
+                        dict(backend="FPGA_UART"),dict(backend="unsupported")):
             wrong: Record = dict(base,activation_bits=8,weight_bits=8,dim=16)
             wrong.update(changes)
             with self.assertRaises(ValueError):
@@ -184,7 +184,7 @@ class BoundaryTests(unittest.TestCase):
         from metric_reducers import activation_summary
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "counts.jsonl"
-            rows = [dict(kind="RUN",schema="im2p-activation-quant-metrics",
+            rows = [dict(kind="RUN",schema="gemmini-activation-quant-metrics",
                          definition_status="PROPOSED_NOT_CONFIRMED",reference_revision="proposed-invocation-finite-population-v1"),
                     dict(kind="COUNTS",chunk_id=0,invocation_id=0,m=1,k=32,valid_positions=32,
                          finite_positions=32,nonfinite_positions=0,fp_selected=2,potal_selected=3,
@@ -202,7 +202,7 @@ class BoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shapes.jsonl"
             row = dict(kind="MAIN_STRIPE",chunk_id=0,invocation_id=0,stripe_id=0,m=2,n=3,k=32)
-            rows = [dict(kind="RUN",schema="im2p-residual-path-metrics"),dict(row),dict(row),
+            rows = [dict(kind="RUN",schema="gemmini-residual-path-metrics"),dict(row),dict(row),
                     dict(kind="RUN_END",success=True)]
             write_stream(path,rows)
             with self.assertRaises(ValueError):
@@ -212,7 +212,7 @@ class BoundaryTests(unittest.TestCase):
         from metric_reducers import residual_summary
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shapes.jsonl"
-            rows = [dict(kind="RUN",schema="im2p-residual-path-metrics"),
+            rows = [dict(kind="RUN",schema="gemmini-residual-path-metrics"),
                     dict(kind="MAIN_STRIPE",chunk_id=0,invocation_id=0,stripe_id=0,m=1,n=5,k=128),
                     dict(kind="COMPACT_WORK",chunk_id=0,invocation_id=0,stripe_id=0,m=2,n=5,k=22,
                          original_k=128,tile_i_count=1,tile_j_count=1,tile_k_count=1,

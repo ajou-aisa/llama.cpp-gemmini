@@ -8,7 +8,9 @@ import re
 from statistics import median
 
 from eval_common import Record, integer, read_json, record, records, require, sha256, text, validate_recipe
-from scheduled_endpoints import rational
+def rational(value: Fraction) -> Record:
+    return {"numerator": value.numerator, "denominator": value.denominator}
+
 
 
 def integer_array(row: Record, name: str) -> list[int]:
@@ -81,61 +83,6 @@ def validate_pair(full_cpu: Record, potal: Record) -> None:
         require(text(full_cpu, key) == text(potal, key), "FullCPU/PoTal pairing mismatch: " + key)
 
 
-def load_potal_collection(result_path: Path, service_path: Path, provenance_path: Path,
-                          join_path: Path) -> Record:
-    row = read_json(result_path)
-    require(row.get("schema") == "potal-e2e-run" and row.get("version") == 1 and
-            row.get("role") == "potal" and row.get("measurement_kind") == "COLLECTION_OBSERVATION_ONLY",
-            "certified result requires native PoTal collection")
-    endpoints_path = result_path.parent / "native/application.jsonl"
-    endpoints = list(records(endpoints_path))
-    require(len(endpoints) == 1 and endpoints[0].get("source_role") == "potal_collection",
-            "one native PoTal application trajectory required")
-    endpoint = endpoints[0]
-    measured = application_result(endpoint)
-    require(integer(row, "chunk_id") == integer(endpoint, "chunk_id") and
-            row.get("application_sha256") == sha256(endpoints_path) and
-            row.get("generated_tokens_sha256") == measured["generated_tokens_sha256"] and
-            row.get("collection_observation") == measured,
-            "PoTal result/application endpoint binding mismatch")
-    sampling = application_services(service_path, endpoint)
-    require(isinstance(sampling.get("prefill_prepare_samples"), int) and
-            integer(sampling, "prefill_prepare_samples", 1) >= 1,
-            "certified PoTal collection requires source-bound prefill preparation")
-    require(row.get("application_services") == sampling, "PoTal result/sampler service binding mismatch")
-    proof = read_json(provenance_path)
-    artifacts = record(proof.get("artifacts"))
-    require(proof.get("schema") == "im2p-collection-provenance" and proof.get("version") == 2 and
-            proof.get("source_role") == "POTAL_COLLECTION" and proof.get("collection_success") is True and
-            integer(proof, "actual_sampler_calls") == 128 and integer(proof, "decode_calls") == 127 and
-            integer(proof, "chunk_id") == integer(row, "chunk_id") and
-            proof.get("input_tokens_sha256") == row.get("input_tokens_sha256") and
-            proof.get("output_tokens_sha256") == row.get("generated_tokens_sha256") and
-            proof.get("recipe_id") == row.get("recipe_id") and
-            proof.get("model_sha256") == row.get("model_sha256") and
-            record(artifacts.get("application_endpoints")).get("sha256") == sha256(endpoints_path) and
-            record(artifacts.get("application_cpu")).get("sha256") == sha256(service_path) and
-            record(row.get("collection_provenance")).get("sha256") == sha256(provenance_path),
-            "PoTal native producer provenance binding mismatch")
-    join = read_json(join_path)
-    fingerprints = record(join.get("decode_token_fingerprint_matches"))
-    require(join.get("status") == "PASS" and join.get("scope") == "structural-three-source-reconstruction" and
-            join.get("model_sha256") == row.get("model_sha256") and
-            join.get("potal_provenance_sha256") == sha256(provenance_path) and
-            len(fingerprints) == 127 and all(value is True for value in fingerprints.values()),
-            "PoTal collection lacks complete official source join")
-    request = read_json(result_path.parent.parent / "request.json")
-    info = record(request.get("build_info"))
-    validate_recipe(info, "e2e")
-    require(info.get("backend") == "IM2P_SIM" and info.get("hp1") is True and
-            integer(info, "cycle_sim") == 1 and integer(info, "log_cycle") == 1 and
-            row.get("host_id") == record(request.get("host")).get("host_id") and
-            row.get("model_sha256") == request.get("model_sha256") and
-            row.get("dataset_sha256") == request.get("dataset_sha256"),
-            "PoTal collection request/build/host binding mismatch")
-    return row
-
-
 def cuda_placement(log: Path) -> Record:
     matches = re.findall(r"offloaded (\d+)/(\d+) layers to GPU", log.read_text(errors="replace"))
     require(len(matches) == 1, "missing/ambiguous GPU layer-count evidence")
@@ -154,9 +101,6 @@ def load_measurement(path: Path, publication: bool = True) -> Record:
     row = read_json(path)
     require(row.get("schema") == "potal-e2e-run" and row.get("version") == 1,
             "unsupported application result schema")
-    if row.get("role") == "potal" and row.get("measurement_kind") == "VALIDATED_RECONSTRUCTION":
-        from certified_reconstruction import load_reconstructed_measurement
-        return load_reconstructed_measurement(row, publication)
     require(row.get("role") == "cuda" and row.get("measurement_kind") == "NATIVE_APPLICATION",
             "only bound native CUDA direct latency currently admitted; reconstructed publication requires service/clock proof")
     root = path.parent
@@ -169,7 +113,7 @@ def load_measurement(path: Path, publication: bool = True) -> Record:
     request = read_json(root.parent / "request.json")
     info = record(request.get("build_info"))
     validate_recipe(info, "e2e")
-    require(info.get("cuda") == 1 and info.get("cycle_sim") == 0 and info.get("log_cycle") == 0
+    require(info.get("cuda") == 1 and info.get("log_cycle") == 0
             and info.get("ggml_cpu_cycle_log") == 0, "direct latency artifact contains instrumentation")
     require(row.get("host_id") == record(request.get("host")).get("host_id"), "result host binding mismatch")
     placement = cuda_placement(root / "process.log")

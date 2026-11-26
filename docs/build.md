@@ -11,88 +11,40 @@ The following sections describe how to build with different backends and options
 
 ## Gemmini developer builds
 
-This fork provides `build-x86.sh`, `build-arm64.sh`, `build-arm64-cpu.sh`, and
-`build-riscv.sh`. FPGA support and its dedicated wrapper are retired. The x86 and
-RISC-V wrappers default to the PoTal backend (`GGML_POTAL=ON`, `GGML_GEMMINI=OFF`,
-TENSOR A8/W8/D16). On x86 no accelerator exists: it builds the host PoTal unit tests
-and `llama-quantize` (Q8_HP1 conversion). The Gemmini `IM2P_SIM` lane needs
-`-DGGML_POTAL=OFF -DGGML_GEMMINI=ON -DGEMMINI_SW_PATH=...`, an ExSIA activation
-mode and an existing `IM2P_SIM_ROOT`. Developer builds are distinct
-from the receipt-verified [measurement builds](../scripts/eval/README.md).
+The native wrappers `build-arm64.sh` and `build-arm64-cpu.sh` default to CPU builds.
+`build-x86.sh` selects `potal-int8-d16-reference`; `build-riscv.sh` selects the
+matching RoCC preset. Each wrapper invokes CMake directly. `--dry-run` prints its
+configure command, and trailing `-DNAME[:TYPE]=value` arguments take precedence.
+`BUILD_DIR` and `BUILD_JOBS` control the shell output directory and build parallelism.
 
-Each wrapper visibly declares applicable defaults from the managed CMake
-options, plus its platform policy. `scripts/im2p-build-options.py`
-resolves them in this order: command-line `-DNAME[:TYPE]=value`, `NAME` environment,
-`NAME_DEFAULT` environment, then the script default. It preserves an explicit
-CMake type and emits one effective definition per option. Inspect the resolved
-options, their origins, and paths without provisioning or building:
+CMake owns generic option resolution in `cmake/npu-config.cmake`: explicit cache/CLI,
+then `NAME` environment, then `NAME_DEFAULT` environment, then native CMake defaults.
+The primary ARM wrapper defaults debug and cycle logging to zero. Typed CLI values
+remain supported. An explicit CPU logging option remains independent of cycle logging.
 
-```bash
-./build-x86.sh --dry-run
-./build-arm64-cpu.sh --dry-run -DLOG_CYCLE:STRING=0
-```
+NPU geometry is a build input: `GGML_NPU`, `NPU_PRECISION`, `NPU_D`, `NPU_SPAD_*`,
+`NPU_ACC_*`, `NPU_DMA_MAX_BYTES`, `NPU_INDEX_ENTRIES`, `NPU_SCALE_ENTRIES` and
+`NPU_TRANSPORT`. Select `REFERENCE` for host execution or `ROCC` for RISC-V hardware.
+See [NPU configuration](socmulator/npu-build.md) for presets and parameter validation.
+The Gemmini API is internal; `GEMMINI_SW_PATH` is accepted only for the FP32 overlay.
 
-`BUILD_DIR`, `BUILD_JOBS`, `IM2P_ARTIFACT_SET`, and `IM2P_CACHE_JOBS` are shell
-controls; `-DBUILD_DIR=...` does not set the wrapper output directory. Set shell
-controls in the environment; ARM also uses `APPLE_SILICON_ARCH` and `LIBOMP_PREFIX`.
-The common host resolver uses the effective backend,
-geometry, simulator root, and build directory when selecting SDK artifacts.
-CMake consumes the resolved simulator paths and validates the active backend's
-requirements. There is no default Gemmini header location: the PoTal build
-(`GGML_POTAL=ON`, `GGML_GEMMINI=OFF`) needs no Gemmini headers, and
-`GGML_GEMMINI=ON` requires an explicit `-DGEMMINI_SW_PATH=<include tree>`.
+### Optional PoTal attention quantization
 
-`CYCLE_SIM=1` selects CPU-functional execution. It is not evidence of physical
-hardware support. The `GEMMINI_HP1` route rejects H1 weights when `CYCLE_SIM=0`;
-selecting HP1 or enabling RMD does not remove that guard.
-
-### Optional PoTal attention quantization and offload
-
-`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION` selects the PoTal Q/K/P/V quantization
-policy. `GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION` independently selects its Gemmini
-HP1 RTL executor. Both default to `OFF` in CMake and every build wrapper.
-
-| Quantization (`ENABLE`) | RTL execution (`OFFLOAD`) | Attention behavior |
-| --- | --- | --- |
-| OFF | OFF | Original floating-point attention graph |
-| ON | OFF | PoTal quantization with CPU integer SCU functional execution |
-| ON | ON | The same quantization with Gemmini HP1 RTL execution |
-| OFF | ON | Rejected at configuration time |
-
-Linear projection routing uses its existing settings. With quantization ON and
-offload OFF, attention uses the CPU executor even if linear layers use WS with
-HARDWARE or IM2P_SIM. CPU functional execution does not measure RTL cycles.
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION` selects PoTal Q/K/P/V quantization with the
+CPU integer SCU executor. It defaults to OFF. Linear projection routing retains
+its existing settings. CPU functional execution does not measure RTL cycles.
 The A4 attention policy quantizes Q/K/P/V at 8/8/8/4-bit precision; A8 uses
 16/16/16/8. Both execute signed PE-width digits, including two K passes and
-the P zero-point correction. This changes integer precision, not KV-cache storage.
-Use matched activation/weight widths, DIM32/BK32, INT, sigma 2, and `CYCLE_SIM=0`:
+the P zero-point correction. KV-cache storage remains unchanged.
+Use matched activation/weight widths, DIM32/BK32, INT and sigma 2.
 
-```bash
-# Nano/native host with the matching IM2P Gemmini RTL artifacts.
-./build-arm64.sh \
-  -DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON \
-  -DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON \
-  -DGGML_GEMMINI_ACTIVATION_BITS=8 -DGGML_GEMMINI_WEIGHT_BITS=8 \
-  -DGGML_GEMMINI_DIM=32 \
-  -DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM -DGGML_GEMMINI_OPTION=WS \
-  -DIM2P_SIM_IMPLEMENTATION=GEMMINI_HP1 -DIM2P_SIM_ROOT=/path/to/IM2P.sim
-```
-
-The same `-D` options work with direct CMake. The wrappers also accept environment
-overrides; `--dry-run` prints the resolved settings without building. RTL offload
-requires `GGML_GEMMINI_OPTION=WS`, `GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM`, and
-`IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1`. Physical RISC-V attention offload is not
-supported. Quantization requires `GGML_GEMMINI=ON`, including CPU execution.
-
-At runtime, leave flash attention disabled and KV offloading enabled.
-`--no-kv-offload` bypasses the PoTal policy and selects the existing attention
-path even when quantization is enabled. Set both build options to `OFF` to
-omit PoTal attention dispatch.
-`GGML_GEMMINI_QK_SCHEDULE=full|tile` selects the runtime QK schedule; the default
-is `full`. Both schedules execute the same main and residual digit GEMMs.
-`full` computes every key region; `tile` skips only completely masked QK tiles.
-The softmax mask is applied for both schedules. PV always computes its full
-reduction, including the P zero-point correction.
+Quantization requires `GGML_GEMMINI=ON`, including CPU execution. At runtime, leave
+flash attention disabled and KV offloading enabled. `--no-kv-offload` selects the
+existing attention path. Set `GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=OFF` to omit this policy.
+`GGML_GEMMINI_QK_SCHEDULE=full|tile` selects the runtime QK schedule; the default is
+`full`. Both schedules execute the same main and residual digit GEMMs. `full` computes
+every key region; `tile` skips only completely masked QK tiles. The softmax mask applies
+to both schedules. PV computes its full reduction, including the P zero-point correction.
 
 ### Component and lifetime boundaries
 
@@ -106,11 +58,6 @@ reduction, including the P zero-point correction.
   A residual packet owns its buffers and survives slot release. Borrowed inputs
   must remain valid through their consumer's completion. Folding seals residual
   data and commits metadata before the stripe-ready callback publishes the event.
-- `im2p/route.*` owns route eligibility and status/metadata translation;
-  `ggml-gemmini-im2p.cpp` owns frontend runs, fences, and output publication.
-  Jobs retain their input leases through the fence; cancellation and failure
-  paths join or drain outstanding work and release slots exactly once. Successful
-  completion and validation precede caller-output publication.
 - `ggml-gemmini-utils` owns observation: captured identity, native and host timing,
   serialization, and dump phases. Observation failures do not manufacture valid
   counters or successful run termination. CPU and accelerator clock domains stay
@@ -140,8 +87,7 @@ SDK ABI/configuration fixtures likewise do not establish simulator execution.
 `LOG_DUMP_SCALE=1` additionally registers `test-gemmini-dump-output`, which invokes
 the same executable with `--outputs`. Exercise both `LOG_CYCLE=0` with
 `CYCLE_DETAIL=0` and `LOG_CYCLE=1` with `CYCLE_DETAIL=1`; compact logging
-(`LOG_CYCLE=1`, `CYCLE_DETAIL=0`) is supplemental. `CYCLE_SIM` independently
-selects CPU-functional execution and does not disable cycle logging. Run the
+(`LOG_CYCLE=1`, `CYCLE_DETAIL=0`) is supplemental. Run the
 dump tests with
 `ctest --test-dir build --output-on-failure --no-tests=error -R '^test-gemmini-dump-(phase|output)$'`.
 Host compilation, including a Linux-labelled cross configuration driven by an

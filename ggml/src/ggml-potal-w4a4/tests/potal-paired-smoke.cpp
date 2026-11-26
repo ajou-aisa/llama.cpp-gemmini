@@ -38,7 +38,7 @@
 #include "ggml-quants.h"
 #include "log.hpp"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/paired-auto.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
@@ -49,7 +49,7 @@
 #include "matmul/planning-profile.hpp"
 #endif
 
-#include "ggml-gemmini/matmul/options.hpp"
+#include "../../ggml-npu-common/matmul/options.hpp"
 
 #include <algorithm>
 #include <array>
@@ -123,13 +123,13 @@ golden_result golden(const ggml_tensor * w, const ggml_tensor * x, ggml_tensor *
     const hp1_shape     s = { x->ne[1], w->ne[1], w->ne[0] };
     potal_tile_plan     plan;
     hp1_operands        o;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1::stats          ws;
     std::vector<float>  want;
     g.ok = potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k, hp1::block_k / POTAL_HW_DIM, &plan) ==
                POTAL_OK &&
            o.allocate(s) &&
-           init_args(w, expected, s, "", "golden", ggml::gemmini::residual::ResidualRoute::ws_packet, plan, args) &&
+           init_args(w, expected, s, "", "golden", ggml::npu::residual::ResidualRoute::ws_packet, plan, args) &&
            unpack_weights(args, o, &ws) == hp1::status::ok && quantize_activations(x, args, o) &&
            potal_test::pipeline_golden(args, o, want, &g.counts);
     if (g.ok) {
@@ -383,7 +383,7 @@ void print_stats(const char * name, const char * phase, route_kind route, int it
         const uint64_t residual_tiles = a.paired_residual_loop_ws - b.paired_residual_loop_ws;
         const uint64_t resident_main = a.paired_resident_main_loop_ws - b.paired_resident_main_loop_ws;
         const uint64_t prefetch_tiles = a.paired_prefetch_loads - b.paired_prefetch_loads;
-        // Whole LOOP_WS/operand Tiles, not DIM operations or measured DMA bytes.
+        // Whole LOOP_WS/operand Tiles, not NPU_D operations or measured DMA bytes.
         std::printf(" gemm_tiles_issued=%llu activation_tiles_command_declared=%llu"
                     " weight_tiles_command_declared=%llu separate_b_prefetch_tiles_command_declared=%llu",
                     (unsigned long long)(main_tiles + residual_tiles),
@@ -552,16 +552,16 @@ void warm_up(ggml_backend_t potal, std::mt19937 & rng) {
 }
 
 bool select_pipeline_mode() {
-    namespace cfg = ggml::gemmini::config;
-    using ggml::gemmini::MatmulInvocationMode;
-    using ggml::gemmini::RmdBackend;
+    namespace cfg = ggml::npu::config;
+    using ggml::npu::MatmulInvocationMode;
+    using ggml::npu::RmdBackend;
     if (cfg::DEFAULT_MATMUL_MODE != (int) MatmulInvocationMode::stripe_pipeline) {
         setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
     }
-    if (options::compensation && cfg::DEFAULT_RMD_BACKEND != (int) RmdBackend::gemmini_ws_compact) {
+    if (options::compensation && cfg::DEFAULT_RMD_BACKEND != (int) RmdBackend::npu_compact) {
         setenv("GEMMINI_RMD_BACKEND", "WS", 1);
     }
-    const auto   r   = ggml::gemmini::resolve_matmul_options();
+    const auto   r   = ggml::npu::resolve_matmul_options();
     const char * why = r.ok() ? options::unsupported_combination(r.options.mode, r.options.rmd_backend,
                                                                  r.options.job_capacity)
                               : "matmul options do not resolve (runtime override disabled?)";
@@ -889,7 +889,7 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "POTAL_BENCH_FAIL diagnostics enabled\n"); return 2;
         }
         if (compare_stream) {
-#if LOG_DEBUG || LOG_CYCLE || CYCLE_SIM || CYCLE_DETAIL
+#if LOG_DEBUG || LOG_CYCLE || CYCLE_DETAIL
             if (!observe_stream) {
                 std::fprintf(stderr, "POTAL_BENCH_FAIL primary measurement requires a logging-disabled build\n");
                 return 2;

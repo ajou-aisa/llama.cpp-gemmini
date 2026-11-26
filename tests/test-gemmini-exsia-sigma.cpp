@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-gemmini/quants/act/exsia/local.hpp"
+#include "../ggml/src/ggml-npu-common/quantization/activation/exsia/local.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +8,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ex = ggml::gemmini::quants::act::exsia;
+namespace ex = ggml::npu::quants::act::exsia;
 
 static_assert(std::is_same_v<decltype(ex::SigmaDetector::SigmaContext::n), int64_t>);
 static_assert(std::is_same_v<decltype(ex::SigmaDetector::SigmaContext::S), int64_t>);
@@ -41,7 +41,7 @@ static bool check_sigma(const std::vector<int32_t> & values) {
 }
 
 static bool check_local(const std::vector<float> & values, size_t block_size,
-                        int16_t rho = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_RHO) {
+                        int16_t rho = ggml::npu::config::GGML_GEMMINI_ACTIVATION_RHO) {
     ex::Meta meta;
     meta.rho = rho;
     ex::ExSIAState state;

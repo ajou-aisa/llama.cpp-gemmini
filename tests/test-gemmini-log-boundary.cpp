@@ -1,7 +1,7 @@
-#include <gemmini/cycle_reader.h>
-#include <gemmini/cycle_reader.hpp>
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.h"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
 #if defined(__linux__) && defined(__aarch64__)
 #include "cycle_reader_internal.h"
 #endif
@@ -96,7 +96,7 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
     auto zero_end  = valid_end;
     zero_end.value = valid_start.value;
     emit(valid_start, zero_end, 1);
-    const ggml::gemmini::log::CycleRecord multiplexed{"private",
+    const ggml::npu::log::CycleRecord multiplexed{"private",
                                                       "matrix.multiplexed",
                                                       10,
                                                       12,
@@ -105,8 +105,8 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
                                                       nullptr,
                                                       "linux_perf_cpu_cycles",
                                                       "cycle"};
-    ggml::gemmini::log::cycle.write_json(
-        ggml::gemmini::log::serialize_checked_cycle_record(multiplexed, false, "multiplexed"));
+    ggml::npu::log::cycle.write_json(
+        ggml::npu::log::serialize_checked_cycle_record(multiplexed, false, "multiplexed"));
     gemmini_log_cycle_set_output(stderr);
 
     const std::string output    = read_file(path);
@@ -154,11 +154,11 @@ static bool test_scalar_cycle_shared_timeline(const std::filesystem::path & root
     gemmini_cycle_record_v2 outer = inner;
     outer.interval.op             = "scalar.outer";
 
-    outer.interval.start = ggml::gemmini::cycle::read();
+    outer.interval.start = ggml::npu::cycle::read();
     inner.interval.start = gemmini_read_cycles();
     inner.interval.end   = gemmini_read_cycles();
     gemmini_log_cycle_record_v2(&inner);
-    outer.interval.end = ggml::gemmini::cycle::read();
+    outer.interval.end = ggml::npu::cycle::read();
     gemmini_log_cycle_record_v2(&outer);
 
     const bool flushed = gemmini_log_cycle_flush() != 0;
@@ -201,7 +201,7 @@ static int open_descriptor_count() {
 }
 
 static bool test_buffered_cycle_output(const std::filesystem::path & root) {
-    using namespace ggml::gemmini::log;
+    using namespace ggml::npu::log;
     const auto path          = root / "buffered.jsonl";
     const auto targeted      = root / "buffered-target.jsonl";
     const auto borrowed_path = root / "borrowed.jsonl";
@@ -307,8 +307,8 @@ static bool test_buffered_cycle_output(const std::filesystem::path & root) {
 }
 
 static bool test_inference_log_context(const std::filesystem::path & root) {
-    namespace perf = ggml::gemmini::performance;
-    ggml::gemmini::log::CycleLog output;
+    namespace perf = ggml::npu::performance;
+    ggml::npu::log::CycleLog output;
     const auto                   path = root / "inference-context.jsonl";
     output.set_buffered(true);
     if (!output.set_output_path(path.c_str()))
@@ -357,8 +357,8 @@ static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem
     (void)root;
     return true;
 #else
-    namespace perf = ggml::gemmini::performance;
-    using ggml::gemmini::log::cycle;
+    namespace perf = ggml::npu::performance;
+    using ggml::npu::log::cycle;
     const auto path = root / "operation-end-worker-drain.jsonl";
     if (!cycle.set_output_path(path.c_str(), true))
         return false;
@@ -392,10 +392,10 @@ static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem
     // The worker stays alive with its thread-local buffer populated. Ending the
     // operation must drain that buffer before publishing operation_end, but it
     // must not force stdio to the backing file.
-    ggml::gemmini::log::testing::set_log_fault(ggml::gemmini::log::testing::LogFault::flush);
+    ggml::npu::log::testing::set_log_fault(ggml::npu::log::testing::LogFault::flush);
     perf::end_operation(140, true);
     const bool boundary_healthy = cycle.healthy();
-    ggml::gemmini::log::testing::clear_log_fault();
+    ggml::npu::log::testing::clear_log_fault();
     release.set_value();
     worker.join();
     perf::finish_request(150);
@@ -415,7 +415,7 @@ static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem
 }
 
 static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
-    using namespace ggml::gemmini::performance;
+    using namespace ggml::npu::performance;
     const auto path = root / "hardware-summary.jsonl";
     if (!gemmini_log_cycle_set_output_path(path.c_str()))
         return false;
@@ -428,11 +428,11 @@ static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
     identity.identity_mask =
         GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
     {
-        const ggml::gemmini::log::ScopedWsCycleIdentity dense(identity, "gemmini_hw_dense");
+        const ggml::npu::log::ScopedWsCycleIdentity dense(identity, "gemmini_hw_dense");
         gemmini_log_ws_cycle(1000, 11, 22, 33, 44, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0);
         {
             identity.stripe_id = 1;
-            const ggml::gemmini::log::ScopedWsCycleIdentity residual(identity,
+            const ggml::npu::log::ScopedWsCycleIdentity residual(identity,
                                                                      "gemmini_hw_residual");
             gemmini_log_ws_cycle(0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0);
         }
@@ -444,7 +444,7 @@ static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
     end_operation(4, true);
     finish_request(5);
     finish_recording();
-    const bool        recording_healthy = ggml::gemmini::log::cycle.healthy();
+    const bool        recording_healthy = ggml::npu::log::cycle.healthy();
     const auto        replay            = read_summary(path);
     const std::string summary           = replay.serialize();
     gemmini_log_cycle_set_buffered(0);
@@ -493,7 +493,7 @@ static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
 
 static bool test_worker_cycle_buffers(const std::filesystem::path & root) {
 #if EXPECT_LOG_CYCLE
-    using namespace ggml::gemmini::log;
+    using namespace ggml::npu::log;
     const auto path = root / "worker-buffers.jsonl";
     CycleLog   output;
     output.set_buffered(true);
@@ -565,8 +565,8 @@ static bool test_worker_cycle_buffers(const std::filesystem::path & root) {
 
 static bool test_cycle_buffer_bytes(const std::filesystem::path & root) {
 #if EXPECT_LOG_CYCLE
-    using namespace ggml::gemmini::log;
-    namespace perf  = ggml::gemmini::performance;
+    using namespace ggml::npu::log;
+    namespace perf  = ggml::npu::performance;
     const auto path = root / "buffer-bytes.jsonl";
     CycleLog   output;
     output.set_buffered(true);
@@ -600,7 +600,7 @@ static bool test_cycle_buffer_bytes(const std::filesystem::path & root) {
 
 static bool test_cycle_buffer_ownership(const std::filesystem::path & root) {
 #if EXPECT_LOG_CYCLE
-    using namespace ggml::gemmini::log;
+    using namespace ggml::npu::log;
     const auto first_path  = root / "first-owner.jsonl";
     const auto second_path = root / "second-owner.jsonl";
     const auto routed_path = root / "rerouted-owner.jsonl";
@@ -665,7 +665,7 @@ static bool test_cycle_buffer_ownership(const std::filesystem::path & root) {
 
 static bool test_queued_cycle_faults(const std::filesystem::path & root) {
 #if EXPECT_LOG_CYCLE
-    using namespace ggml::gemmini::log;
+    using namespace ggml::npu::log;
     {
         CycleLog output;
         output.set_buffered(true);
@@ -749,9 +749,9 @@ static bool test_queued_cycle_faults(const std::filesystem::path & root) {
 }
 
 int main() {
-    using ggml::gemmini::log::testing::LogFault;
+    using ggml::npu::log::testing::LogFault;
     // Synthetic checked output, not a physical PMU reading on this host.
-    const ggml::gemmini::log::CycleRecord checked_fixture{"fixture",
+    const ggml::npu::log::CycleRecord checked_fixture{"fixture",
                                                           "sample_failure",
                                                           0,
                                                           5000,
@@ -760,9 +760,9 @@ int main() {
                                                           nullptr,
                                                           "linux_perf_cpu_cycles",
                                                           "cycle"};
-    const std::string checked_failure = ggml::gemmini::log::serialize_checked_cycle_record(
+    const std::string checked_failure = ggml::npu::log::serialize_checked_cycle_record(
         checked_fixture, false, "invalid_start", "unavailable_event");
-    const std::string checked_zero = ggml::gemmini::log::serialize_checked_cycle_record(
+    const std::string checked_zero = ggml::npu::log::serialize_checked_cycle_record(
         {"fixture", "valid_zero", 0, 0, nullptr, 0, nullptr, "linux_perf_cpu_cycles", "cycle"},
         true,
         nullptr);
@@ -773,20 +773,20 @@ int main() {
         std::fprintf(stderr, "checked output must preserve sample failure and valid zero\n");
         return 19;
     }
-    const std::string scalar = ggml::gemmini::log::serialize_cycle_record(
+    const std::string scalar = ggml::npu::log::serialize_cycle_record(
         {"scalar", "public", 10, 12, nullptr, 0, nullptr});
-    const std::string legacy_equal = ggml::gemmini::log::serialize_cycle_record(
+    const std::string legacy_equal = ggml::npu::log::serialize_cycle_record(
         {"scalar", "public.equal", 10, 10, nullptr, 0, nullptr});
-    const std::string legacy_regression = ggml::gemmini::log::serialize_cycle_record(
+    const std::string legacy_regression = ggml::npu::log::serialize_cycle_record(
         {"scalar", "public", 12, 10, nullptr, 0, nullptr});
     const bool regression_matches =
         legacy_regression.find("\"start\":12,\"end\":10,\"delta\":null,\"valid\":false,\"reason\":"
                                "\"counter_regression\"") != std::string::npos;
     const std::string linux_monotonic =
-        ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+        ggml::npu::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
             {"scalar", "linux.monotonic", 10, 12, nullptr, 0, nullptr});
     const std::string linux_equal =
-        ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+        ggml::npu::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
             {"scalar", "linux.equal", 10, 10, nullptr, 0, nullptr});
     if (scalar.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") == std::string::npos ||
         legacy_equal.find("\"start\":10,\"end\":10,\"delta\":0,\"valid\":true") ==
@@ -826,7 +826,7 @@ int main() {
     };
     for (const ScalarCase & scalar_case : scalar_cases) {
         const std::string json =
-            ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+            ggml::npu::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
                 {"scalar",
                  "linux.sentinel",
                  scalar_case.start,
@@ -889,7 +889,7 @@ int main() {
         return 2;
 
 #if EXPECT_LOG_CYCLE
-    ggml::gemmini::log::testing::set_log_fault(LogFault::filesystem);
+    ggml::npu::log::testing::set_log_fault(LogFault::filesystem);
     if (gemmini_log_c_boundary_call(0, fault_path.c_str()) != 0)
         return 3;
 #else
@@ -898,10 +898,10 @@ int main() {
 #endif
 
 #if EXPECT_LOG_DEBUG
-    ggml::gemmini::log::testing::set_log_fault(LogFault::format);
+    ggml::npu::log::testing::set_log_fault(LogFault::format);
     if (!gemmini_log_c_boundary_call(1, nullptr))
         return 4;
-    ggml::gemmini::log::testing::set_log_fault(LogFault::mutex);
+    ggml::npu::log::testing::set_log_fault(LogFault::mutex);
     if (!gemmini_log_c_boundary_call(2, nullptr))
         return 5;
 #else
@@ -910,7 +910,7 @@ int main() {
 #endif
 
 #if EXPECT_LOG_CYCLE
-    ggml::gemmini::log::testing::set_log_fault(LogFault::allocation);
+    ggml::npu::log::testing::set_log_fault(LogFault::allocation);
     if (!gemmini_log_c_boundary_call(3, nullptr))
         return 6;
 #else
@@ -931,7 +931,7 @@ int main() {
     for (const LogFault fault : {LogFault::format, LogFault::allocation}) {
         for (int operation = 4; operation <= 6; ++operation) {
             for (int attempt = 0; attempt != 16; ++attempt) {
-                ggml::gemmini::log::testing::set_log_fault(fault);
+                ggml::npu::log::testing::set_log_fault(fault);
                 if (!gemmini_log_c_boundary_call(operation, targeted_path.c_str()))
                     return 9;
             }

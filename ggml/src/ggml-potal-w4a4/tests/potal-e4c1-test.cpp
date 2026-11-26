@@ -1,7 +1,7 @@
 // Link the real support/e4c1-sequential.cpp, the checked production C11 API,
 // and the same ggml/PoTal objects as potal-resident-model-test. No wrappers.
 // Default and only execution mode: software command model, hardware=0.
-#include "support/e4c1-sequential.hpp"
+#include "../experiments/sequential-paired/e4c1-sequential.hpp"
 #include "support/e4b2-emulator.hpp"
 #include "support/paired-support.hpp"
 #include "support/paired-h2-emulator.hpp"
@@ -435,7 +435,7 @@ void check_results(const paired_fixture &f, const paired_inputs &in, const expec
         }
     }
     if (in.packets[stripe]) {
-        ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot meta;
+        ggml::npu::quants::act::exsia::StripeMetadataSnapshot meta;
         meta.theta = in.theta[stripe];
         require(residual::merge_prepared_hp1(f.weight, begin, begin + v.request.rows, meta, correction,
                                             actual.data(), f.M, f.N, 1, nullptr) == grmd::RmdStatus::success,

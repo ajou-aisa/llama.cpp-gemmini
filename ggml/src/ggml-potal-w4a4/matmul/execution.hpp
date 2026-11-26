@@ -11,7 +11,7 @@
 #include "stripe-api.hpp"
 #include "tiling.hpp"
 
-#include <gemmini/trace-context.h>
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.h"
 
 #include <cstddef>
 #include <array>

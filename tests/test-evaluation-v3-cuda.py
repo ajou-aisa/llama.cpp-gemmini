@@ -50,7 +50,7 @@ class CudaPlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'request.json').write_text(json.dumps(dict(
-                build_info=dict(activation_metrics=0, residual_metrics=0, cycle_sim=0,
+                build_info=dict(activation_metrics=0, residual_metrics=0,
                                 cuda=1, log_cycle=0, ggml_cpu_cycle_log=0),
                 host=dict(host_id='fixture-host'))))
             paths = [layer_count_fixture(root, index) for index in range(10)]

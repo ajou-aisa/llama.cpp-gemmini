@@ -8,12 +8,12 @@
 // whole weight, and reads every block's column scale: the bitwise reference
 // and the "before" of the prepared merge.
 
-#include "ggml-gemmini-args.h"
-#include "quants/act/exsia/exsia-event.hpp"
-#include "quants/act/exsia/types.hpp"
-#include "quants/act/meta.hpp"
-#include "residual/rmd/rmd-compose.hpp"
-#include "residual/rmd/rmd-types.hpp"
+#include "../../../ggml-npu-common/types/matmul.hpp"
+#include "../../../ggml-npu-common/quantization/activation/exsia/exsia-event.hpp"
+#include "../../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../../ggml-npu-common/quantization/activation/meta.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-compose.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,8 +26,8 @@ namespace potal_test {
 // quantizer writes: I/J/K, the Q8_HP1 weight view, the layer identity, the
 // tile geometry and the residual route; f_out = out (row stride out_stride,
 // column stride 1). No activation buffer, no metadata, no stripe sink.
-inline void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_t out_stride,
-                            ggml_gemmini_args_t & merge) {
+inline void init_merge_args(const npu_matmul_args & args, float * out, size_t out_stride,
+                            npu_matmul_args & merge) {
     merge.I                          = args.I;
     merge.J                          = args.J;
     merge.K                          = args.K;
@@ -53,23 +53,23 @@ inline void init_merge_args(const ggml_gemmini_args_t & args, float * out, size_
 
 // Rows [row_begin, row_end) of merge.f_out += correction, stripe theta only;
 // the correction is moved in, as the pipeline's merge did.
-inline ggml::gemmini::rmd::RmdStatus gemmini_merge(
-    const ggml_gemmini_args_t & merge, size_t row_begin, size_t row_end, uint64_t run_id,
-    const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & snapshot,
-    ggml::gemmini::rmd::BlockScaledInt64Correction && correction, size_t * nonzero) try {
-    namespace exsia = ggml::gemmini::quants::act::exsia;
-    ggml::gemmini::quants::act::Meta meta;
+inline ggml::npu::rmd::RmdStatus gemmini_merge(
+    const npu_matmul_args & merge, size_t row_begin, size_t row_end, uint64_t run_id,
+    const ggml::npu::quants::act::exsia::StripeMetadataSnapshot & snapshot,
+    ggml::npu::rmd::BlockScaledInt64Correction && correction, size_t * nonzero) try {
+    namespace exsia = ggml::npu::quants::act::exsia;
+    ggml::npu::quants::act::Meta meta;
     exsia::Meta &                    e = meta.storage().emplace<exsia::Meta>();
     e.run_id                           = run_id;
     e.e_s                              = snapshot.e_s;
     e.rho                              = snapshot.rho;
     e.sigma                            = snapshot.sigma;
     e.theta.assign(1, snapshot.theta);
-    const ggml::gemmini::rmd::Correction tagged = std::move(correction);
-    return ggml::gemmini::rmd::detail::merge_rmd_correction_with_metadata(merge, row_begin, row_end, tagged, meta,
+    const ggml::npu::rmd::Correction tagged = std::move(correction);
+    return ggml::npu::rmd::detail::merge_rmd_correction_with_metadata(merge, row_begin, row_end, tagged, meta,
                                                                           nonzero, nullptr);
 } catch (const std::bad_alloc &) {
-    return ggml::gemmini::rmd::RmdStatus::allocation_failure;
+    return ggml::npu::rmd::RmdStatus::allocation_failure;
 }
 
 } // namespace potal_test

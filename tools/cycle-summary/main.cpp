@@ -1,4 +1,4 @@
-#include <gemmini/performance.hpp>
+#include "../../ggml/src/ggml-npu-common/profiling/include/npu/performance.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -10,7 +10,7 @@ int main(int argc, char ** argv) {
         std::fprintf(help ? stdout : stderr, "usage: %s [--json] cycle-log.jsonl\n", argv[0]);
         return help ? 0 : 2;
     }
-    const auto summary = ggml::gemmini::performance::read_summary(argv[json ? 2 : 1]);
+    const auto summary = ggml::npu::performance::read_summary(argv[json ? 2 : 1]);
     if (json) std::printf("%s\n", summary.serialize().c_str());
     else summary.print(stdout);
     return summary.available ? 0 : 1;

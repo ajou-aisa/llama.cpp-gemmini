@@ -3,10 +3,10 @@
 #include "ggml-cpu.h"
 #include "ggml-gemmini.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-buffer.hpp"
-#include "../ggml/src/ggml-gemmini/ggml-gpu-cpu-exact.hpp"
+#include "../ggml/src/ggml-npu-common/evaluation/gemmini/graph.hpp"
 #include "../tools/perplexity/perplexity-cuda-cpu-exact.hpp"
 #if defined(GGML_GEMMINI_CUDA_RTN_ATTENTION) && GGML_GEMMINI_CUDA_RTN_ATTENTION
-#include "../ggml/src/ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../ggml/src/ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
 #endif
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"

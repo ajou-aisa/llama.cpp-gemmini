@@ -2,166 +2,28 @@
 set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=scripts/im2p-host-provision.sh
-source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
-
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
-      "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
-  printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
-  printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*, POTAL_*.'
-  printf '%s\n' 'PoTal FireSim H3-7C profiles: bash build-potal-firesim.sh functional|performance 16|32 [--dry-run].'
-  printf '%s\n' '  RISCV_LIBGOMP=/target/libgomp.so.1 overrides automatic OpenMP runtime discovery (ELF/ABI validated).'
-  printf '%s\n' 'Default: GGML PoTal backend (GGML_GEMMINI=OFF, GGML_POTAL=ON, GGML_BACKEND_DL=OFF,'
-  printf '%s\n' '  POTAL_EXPECTED_DIM=16, POTAL_HW_PARAMS=<potal>/software/gemmini-rocc-tests/include/gemmini_potal_params.h).'
-  printf '%s\n' '  Builds potal-api-test, potal-api-smoke, potal-multicore-smoke, potal-ggml-unit-test,'
-  printf '%s\n' '  potal-tiling-unit-test, potal-ggml-smoke, potal-hp1-smoke, potal-stripe-api-test,'
-  printf '%s\n' '  potal-residual-unit-test, potal-stripe-pipeline-test, potal-stripe-smoke,'
-  printf '%s\n' '  potal-paired-auto-test, potal-paired-execution-test, potal-paired-smoke,'
-  printf '%s\n' '  potal-attention-api-test, potal-attention-test and potal-attention-smoke,'
-  printf '%s\n' '  then llama-cli and llama-perplexity.'
-  printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>] selects another header.'
-  printf '%s\n' '  Defaults here: GGML_GEMMINI_ACTIVATION_QUANT=TENSOR, GGML_GEMMINI_ENABLE_RMD=OFF (compensation),'
-  printf '%s\n' '  GGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU. PoTal accepts EXSIA|TENSOR|TOKEN|BLOCK|STRIPE and RMD ON with'
-  printf '%s\n' '  the CPU (cpu_direct) backend in FULL mode; STRIPE_PIPELINE (stripe matmul pipeline) needs'
-  printf '%s\n' '  -DGGML_GEMMINI_ACTIVATION_QUANT=EXSIA -DGGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE and, with'
-  printf '%s\n' '  RMD ON, -DGGML_GEMMINI_DEFAULT_RMD_BACKEND=WS (residual GEMM on PoTal); use its own BUILD_DIR.'
-  printf '%s\n' '  8-bit activations/weights and block size 32 are required.'
-  printf '%s\n' '  Q8_HP1 models: llama-quantize <model-f16.gguf> <model-q8_hp1.gguf> Q8_HP1 (host build).'
-  printf '%s\n' 'PoTal API only: -DGGML_POTAL=OFF -DPOTAL_API_ONLY=ON [-DPOTAL_EXPECTED_DIM=16|32|64]'
-  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16/32) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
-  printf '%s\n' '  -DPOTAL_ENABLE_OPENMP=ON adds --mode=openmp to potal-multicore-smoke (needs libgomp.so.1 on target).'
-  printf '%s\n' 'Gemmini backend: -DGGML_POTAL=OFF -DGGML_GEMMINI=ON -DGEMMINI_SW_PATH=/abs/gemmini/include/tree'
-  printf '%s\n' '  (no default header location); GGML_GEMMINI_DIM=16|32|64 must match that header.'
-  printf '%s\n' '  GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON enables PoTal Q/K/P/V quantization; default OFF.'
-  printf '%s\n' '  GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON additionally requires native WS+IM2P_SIM+GEMMINI_HP1; default OFF.'
-  exit 0
-fi
-
-target=riscv
+BUILD_JOBS=${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}
+static_args=(-DBUILD_SHARED_LIBS=ON)
 if [[ "${1:-}" == static ]]; then
-  target=riscv-static
+  static_args=(-DBUILD_SHARED_LIBS=OFF)
+  BUILD_DIR=${BUILD_DIR:-build-riscv-static}
   shift
-fi
-
-# Shell controls; these are not CMake cache defaults.
-BUILD_DIR=${BUILD_DIR:-${BUILD_DIR_DEFAULT:-build-$target}}
-BUILD_JOBS_DEFAULT=${BUILD_JOBS:-${BUILD_JOBS_DEFAULT:-$(im2p_host_jobs)}}
-IM2P_ARTIFACT_SET_DEFAULT=${IM2P_ARTIFACT_SET_DEFAULT:-SELECTED}
-IM2P_CACHE_JOBS_DEFAULT=${IM2P_CACHE_JOBS_DEFAULT:-}
-
-# Backends: ON | OFF; override with -DGGML_<NAME>=ON|OFF or GGML_<NAME>=ON|OFF.
-GGML_CPU_DEFAULT=${GGML_CPU_DEFAULT:-ON}
-GGML_GEMMINI_DEFAULT=${GGML_GEMMINI_DEFAULT:-OFF}
-GGML_POTAL_DEFAULT=${GGML_POTAL_DEFAULT:-ON}
-GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-OFF}
-GGML_CUDA_DEFAULT=${GGML_CUDA_DEFAULT:-OFF}
-GGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT:-OFF}
-GGML_VULKAN_DEFAULT=${GGML_VULKAN_DEFAULT:-OFF}
-GGML_OPENCL_DEFAULT=${GGML_OPENCL_DEFAULT:-OFF}
-GGML_RPC_DEFAULT=${GGML_RPC_DEFAULT:-OFF}
-GGML_BACKEND_DL_DEFAULT=${GGML_BACKEND_DL_DEFAULT:-OFF}
-
-# PoTal hardware parameters: the RTL-generated header (validated by
-# cmake/potal-hw-params.cmake); dropped unless GGML_POTAL or POTAL_API_ONLY is ON.
-POTAL_HW_PARAMS_DEFAULT=${POTAL_HW_PARAMS_DEFAULT:-"$SCRIPT_ROOT/../../gemmini-rocc-tests/include/gemmini_potal_params.h"}
-POTAL_EXPECTED_DIM_DEFAULT=${POTAL_EXPECTED_DIM_DEFAULT:-16}
-
-# Gemmini backend and platform policy.
-GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT:-HARDWARE}
-GGML_GEMMINI_OPTION_DEFAULT=${GGML_GEMMINI_OPTION_DEFAULT:-WS}
-GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-OFF}
-GGML_OPENMP_DEFAULT=${GGML_OPENMP_DEFAULT:-OFF}
-GGML_GEMMINI_ENABLE_OPENMP_DEFAULT=${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT:-OFF}
-LLAMA_BUILD_TESTS_DEFAULT=${LLAMA_BUILD_TESTS_DEFAULT:-ON}
-LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF}
-CMAKE_TOOLCHAIN_FILE_DEFAULT=${CMAKE_TOOLCHAIN_FILE_DEFAULT:-"$SCRIPT_ROOT/cmake/$target.cmake"}
-if [[ "$target" == riscv-static ]]; then
-  CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-DEBUG}
-  BUILD_SHARED_LIBS_DEFAULT=${BUILD_SHARED_LIBS_DEFAULT:-OFF}
 else
-  CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Release}
-  BUILD_SHARED_LIBS_DEFAULT=${BUILD_SHARED_LIBS_DEFAULT:-ON}
+  BUILD_DIR=${BUILD_DIR:-build-riscv}
 fi
-
-# Geometry and precision.
-GGML_GEMMINI_COMPUTE_TYPE_DEFAULT=${GGML_GEMMINI_COMPUTE_TYPE_DEFAULT:-INT}
-GGML_GEMMINI_DEQUANT_FP_TEST_DEFAULT=${GGML_GEMMINI_DEQUANT_FP_TEST_DEFAULT:-OFF}
-GGML_GEMMINI_ACTIVATION_BITS_DEFAULT=${GGML_GEMMINI_ACTIVATION_BITS_DEFAULT:-8}
-GGML_GEMMINI_WEIGHT_BITS_DEFAULT=${GGML_GEMMINI_WEIGHT_BITS_DEFAULT:-8}
-GGML_GEMMINI_DIM_DEFAULT=${GGML_GEMMINI_DIM_DEFAULT:-16}
-GGML_GEMMINI_BLOCK_SIZE_DEFAULT=${GGML_GEMMINI_BLOCK_SIZE_DEFAULT:-32}
-GGML_GEMMINI_PRINT_TILE_DEFAULT=${GGML_GEMMINI_PRINT_TILE_DEFAULT:-0}
-GGML_GEMMINI_FULL_C_DEFAULT=${GGML_GEMMINI_FULL_C_DEFAULT:-1}
-GGML_GEMMINI_LOW_D_DEFAULT=${GGML_GEMMINI_LOW_D_DEFAULT:-0}
-GGML_GEMMINI_TRANSPOSE_B_DEFAULT=${GGML_GEMMINI_TRANSPOSE_B_DEFAULT:-1}
-GGML_GEMMINI_WS_DEBUG_DEFAULT=${GGML_GEMMINI_WS_DEBUG_DEFAULT:-0}
-GGML_GEMMINI_WS_LOOP_CYCLE_DEFAULT=${GGML_GEMMINI_WS_LOOP_CYCLE_DEFAULT:-0}
-GGML_GEMMINI_DISABLE_WS_REUSE_DEFAULT=${GGML_GEMMINI_DISABLE_WS_REUSE_DEFAULT:-0}
-
-# Matmul and residual execution.
-GGML_GEMMINI_ENABLE_A4NKS_ATTENTION_DEFAULT=${GGML_GEMMINI_ENABLE_A4NKS_ATTENTION_DEFAULT:-OFF}
-GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION_DEFAULT=${GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION_DEFAULT:-OFF}
-GGML_GEMMINI_ENABLE_STRIPE_MATMUL_DEFAULT=${GGML_GEMMINI_ENABLE_STRIPE_MATMUL_DEFAULT:-ON}
-GGML_GEMMINI_ENABLE_STRIPE_PIPELINE_DEFAULT=${GGML_GEMMINI_ENABLE_STRIPE_PIPELINE_DEFAULT:-ON}
-GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT=${GGML_GEMMINI_DEFAULT_MATMUL_MODE_DEFAULT:-FULL}
-GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT=${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY_DEFAULT:-2}
-GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT=${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_DEFAULT:-ON}
-# Error compensation is a selectable path; the HP1 validation runs it OFF.
-# FULL uses the CPU (cpu_direct) residual; STRIPE_PIPELINE uses the PoTal WS residual.
-GGML_GEMMINI_ENABLE_RMD_DEFAULT=${GGML_GEMMINI_ENABLE_RMD_DEFAULT:-OFF}
-GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT=${GGML_GEMMINI_DEFAULT_RMD_BACKEND_DEFAULT:-CPU}
-
-# ExSIA activation staging.
-GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-TENSOR} # HP1 validation setting; all five are supported
-GGML_GEMMINI_EXSIA_SIGMA_DEFAULT=${GGML_GEMMINI_EXSIA_SIGMA_DEFAULT:-2}
-GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT=${GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT:-SEQUENTIAL}
-GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT:-4}
-GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT:-OFF}
-
-# Logs and independent metrics. CPU logging follows final LOG_CYCLE unless overridden.
-LOG_DEBUG_DEFAULT=${LOG_DEBUG_DEFAULT:-1}
-LOG_CYCLE_DEFAULT=${LOG_CYCLE_DEFAULT:-1}
-LOG_DUMP_DEFAULT=${LOG_DUMP_DEFAULT:-0}
-LOG_DUMP_SCALE_DEFAULT=${LOG_DUMP_SCALE_DEFAULT:-0}
-CYCLE_DETAIL_DEFAULT=${CYCLE_DETAIL_DEFAULT:-0}
-CYCLE_SIM_DEFAULT=${CYCLE_SIM_DEFAULT:-0}
-GGML_CPU_CYCLE_LOG_DEFAULT=${GGML_CPU_CYCLE_LOG_DEFAULT:-$LOG_CYCLE_DEFAULT}
-GGML_GEMMINI_ACT_QUANT_METRICS_DEFAULT=${GGML_GEMMINI_ACT_QUANT_METRICS_DEFAULT:-0}
-GGML_GEMMINI_RESIDUAL_METRICS_DEFAULT=${GGML_GEMMINI_RESIDUAL_METRICS_DEFAULT:-0}
-GGML_GEMMINI_SCALE_METRICS_DEFAULT=${GGML_GEMMINI_SCALE_METRICS_DEFAULT:-0}
-
-# Simulator selection; an empty cache path derives from the final simulator root.
-IM2P_SIM_ROOT_DEFAULT=${IM2P_SIM_ROOT_DEFAULT:-"$SCRIPT_ROOT/../IM2P.sim"}
-IM2P_SIM_BUILD_DIR_DEFAULT=${IM2P_SIM_BUILD_DIR_DEFAULT:-}
-IM2P_SIM_IMPLEMENTATION_DEFAULT=${IM2P_SIM_IMPLEMENTATION_DEFAULT:-GEMMINI_HP1}
-
-im2p_resolve_build_options "$BUILD_DIR" "${0##*/}" "$@"
-if [[ "$IM2P_ARTIFACT_SET_DEFAULT" == ALL_MATCHED && "$CYCLE_SIM_DEFAULT" == 0 ]]; then
-  printf '%s\n' 'IM2P_ARTIFACT_SET=ALL_MATCHED is host-only; build-riscv.sh is hardware-only' >&2
-  exit 2
-fi
-if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
-  printf 'Dry run: no provisioning, configure, build, or device access.\n'
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+  printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
   exit 0
 fi
-
-im2p_configure_build "$BUILD_DIR" "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
-if [[ "${POTAL_API_ONLY_DEFAULT:-OFF}" == ON ]]; then
-  # API-only configure defines only the PoTal targets.
-  cmake --build "$BUILD_DIR" -j"${BUILD_JOBS_DEFAULT}"
-elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
-  # PoTal tests first, so they exist even if llama-cli does not link.
-  cmake --build "$BUILD_DIR" --target potal-api-test potal-api-smoke potal-multicore-smoke \
-    potal-ggml-unit-test potal-tiling-unit-test potal-ggml-smoke potal-hp1-smoke \
-    potal-stripe-api-test potal-residual-unit-test potal-stripe-pipeline-test potal-stripe-smoke \
-    potal-paired-auto-test potal-paired-execution-test potal-paired-smoke \
-    potal-attention-api-test potal-attention-test potal-attention-smoke \
-    -j"${BUILD_JOBS_DEFAULT}"
-  cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"
-else
-  cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
+dry_run=0
+if [[ "${1:-}" == --dry-run ]]; then dry_run=1; shift; fi
+configure=(cmake -S "$SCRIPT_ROOT" -B "$BUILD_DIR" -G Ninja --preset "${NPU_PRESET:-potal-int8-d${POTAL_EXPECTED_DIM:-${POTAL_EXPECTED_DIM_DEFAULT:-16}}-rocc}" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLOG_DEBUG="${LOG_DEBUG:-${LOG_DEBUG_DEFAULT:-1}}" -DLOG_CYCLE="${LOG_CYCLE:-${LOG_CYCLE_DEFAULT:-1}}" -DGGML_RVV=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF "${static_args[@]}" "$@")
+if (( dry_run )); then
+  printf '%q ' "${configure[@]}"
+  printf '\n'
+  exit 0
 fi
-
-# shellcheck source=scripts/stage-riscv-runtime.sh
+"${configure[@]}"
+cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"$BUILD_JOBS"
 source "$SCRIPT_ROOT/scripts/stage-riscv-runtime.sh"
 stage_riscv_openmp_runtime "$BUILD_DIR"

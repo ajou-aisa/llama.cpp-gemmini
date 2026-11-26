@@ -2,7 +2,7 @@
 
 #include "scale_dump_group_select.hpp"
 #include "scale_dump_types.hpp"
-#include <gemmini/log.hpp>
+#include "../../../ggml-npu-common/profiling/include/npu/log.hpp"
 
 #ifndef LOG_DUMP_SCALE
 #ifdef LOG_DUMP
@@ -23,7 +23,7 @@ using GroupDumpConfig = config::Tensor;
 using GroupDumpConfig = config::Auto;
 #endif
 
-DumpResult dump_scale_groups(LogTarget               target,
+DumpResult dump_scale_groups(ggml::npu::log::LogTarget               target,
                              const DumpMeta &        meta,
                              const ScaleTableView &  view,
                              const GroupDumpConfig & cfg);

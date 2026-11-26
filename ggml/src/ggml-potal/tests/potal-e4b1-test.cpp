@@ -1,6 +1,6 @@
 // E4B1 proposed interface conformance. Every completion and byte image here is
 // software-only. This executable has no issuer, sink, or accelerator handle.
-#include "potal-e4b1.hpp"
+#include "../experiments/resident-weight/potal-e4b1.hpp"
 
 #include <algorithm>
 #include <array>

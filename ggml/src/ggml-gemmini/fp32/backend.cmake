@@ -1,6 +1,7 @@
-message(STATUS "Gemmini FP32 DIM8 WS backend (opt-in)")
-if(NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h")
-    message(FATAL_ERROR "FP32 requires the FP32 DIM8 SDK overlay")
+message(STATUS "Gemmini FP32 DIM8 independent comparison baseline")
+if(NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h" OR
+   NOT EXISTS "${GEMMINI_SW_PATH}/gemmini_params.h")
+    message(FATAL_ERROR "FP32 requires gemmini.h and gemmini_params.h from the explicit FP32 DIM8 SDK overlay")
 endif()
 ggml_add_backend_library(ggml-gemmini
     fp32/backend.cpp fp32/exec.cpp ggml-gemmini-buffer.cpp)

@@ -7,7 +7,7 @@
 //   residual_golden  the compact run-aware Residual GEMM, without padding: for
 //                    every (lane, source row) with a nonzero digit (lane-major,
 //                    then row), every column n: runs in packet (block) order,
-//                    each run's compact K in fragments of at most DIM,
+//                    each run's compact K in fragments of at most NPU_D,
 //                      p   = exact INT8 dot of the fragment
 //                      q   = Sat32(HP1 shift of p by the run's carrier)
 //                      acc = q for the first fragment, then Sat32(acc + q)
@@ -22,10 +22,10 @@
 
 #include "matmul/dense.hpp"
 #include "potal_hw_params.h"
-#include "quants/act/exsia/types.hpp"
-#include "quants/common/hp1_scu.hpp"
-#include "residual/rmd/rmd-builder.hpp"
-#include "residual/rmd/rmd-types.hpp"
+#include "../../../ggml-npu-common/quantization/activation/exsia/types.hpp"
+#include "../../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
+#include "../../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -36,7 +36,7 @@
 
 namespace potal_test {
 
-namespace grmd = ggml::gemmini::rmd;
+namespace grmd = ggml::npu::rmd;
 
 __extension__ typedef __int128 golden_wide;
 
@@ -50,7 +50,7 @@ struct golden_lane_row {
 template <class Code, class Carrier>
 bool residual_golden(const grmd::StripePacket & p, size_t n, size_t dim, Code code, Carrier carrier,
                      std::vector<golden_lane_row> & out) {
-    namespace hp1 = ggml::gemmini::quants::hp1;
+    namespace hp1 = ggml::npu::quants::hp1;
     out.clear();
     for (uint8_t lane = 0; lane < p.lane_capacity; ++lane) {
         for (size_t row = 0; row < p.row_count; ++row) {
@@ -147,9 +147,9 @@ struct pipeline_golden_counts {
 // One node's pipeline result from FULL-style ExSIA output: args after
 // quantize_activations (ExSIA metadata and packets), o its staged codes and
 // prepared weight. false if anything is missing or a value leaves INT64.
-inline bool pipeline_golden(const ggml_gemmini_args_t & args, const ggml::potal::hp1_operands & o,
+inline bool pipeline_golden(const npu_matmul_args & args, const ggml::potal::hp1_operands & o,
                             std::vector<float> & want, pipeline_golden_counts * counts = nullptr) {
-    namespace exsia = ggml::gemmini::quants::act::exsia;
+    namespace exsia = ggml::npu::quants::act::exsia;
     const auto * meta = std::get_if<exsia::Meta>(&args.act_quant.storage());
     const size_t I = args.I, J = args.J, K = args.K, rows_per = args.activation_rows_per_stripe;
     if (meta == nullptr || rows_per == 0 || meta->theta.size() != (I + rows_per - 1) / rows_per) {

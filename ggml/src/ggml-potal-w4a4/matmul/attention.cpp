@@ -4,11 +4,11 @@
 #include "dense.hpp"
 #include "paired-auto.hpp"
 #include "potal-int4.h"
-#include "ggml-gemmini/residual/rmd/rmd-bitmap-builder.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-bitmap-builder.hpp"
 #include "ggml-gemmini.h"
-#include "ggml-gemmini/quants/act/exsia/local.hpp"
-#include "ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
-#include "ggml-gemmini/quants/common/math.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/local.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia_shift.hpp"
+#include "../../ggml-npu-common/quantization/common/math.hpp"
 
 #include <algorithm>
 #include <cfenv>
@@ -35,11 +35,11 @@
 namespace ggml::potal::attention {
 namespace {
 
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 constexpr int16_t zero_exp = std::numeric_limits<int16_t>::min();
 constexpr int bits = 4, code_bits = 8, radix = 16, bias = 8, rho = 6;
 static_assert(POTAL_HW_DIM == 32 && block_k == POTAL_HW_DIM, "W4 attention requires DIM32/K32");
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 
 void require(bool condition, potal_status status = POTAL_ERR_INVALID_ARGUMENT) {
     if (!condition) {
@@ -158,7 +158,7 @@ void split(stream & out, size_t index, int64_t value) {
     size_t limb = 0;
     do {
         require(limb < max_limbs, POTAL_ERR_CAPACITY);
-        const int32_t digit = ggml::gemmini::lowdigit(static_cast<uint64_t>(value), bits);
+        const int32_t digit = ggml::npu::lowdigit(static_cast<uint64_t>(value), bits);
         out.limbs[limb][index] = static_cast<int8_t>(digit);
         value = (value - digit) / radix;
         ++limb;
@@ -248,7 +248,7 @@ void prepare_weight(const ggml_tensor & tensor, size_t head, size_t batch, role 
                 const int32_t code = std::clamp(codes[k], operation == role::qk ? -128 : -8,
                                                operation == role::qk ? 119 : 7);
                 const size_t index = (block * block_k + k) * out.n + j;
-                const int32_t low = operation == role::qk ? ggml::gemmini::lowdigit(code, bits) : code;
+                const int32_t low = operation == role::qk ? ggml::npu::lowdigit(code, bits) : code;
                 out.limbs[0][index] = static_cast<int8_t>(low);
                 if (operation == role::qk) {
                     out.limbs[1][index] = static_cast<int8_t>((code - low) / radix);
@@ -386,7 +386,7 @@ void fold_activation(role operation, stream & out, activation_parts & parts) {
             const int64_t code = int64_t(out.codes[index]) - (operation == role::pv ? bias : 0);
             if (parts.main_only) {
                 // The paired runner decomposes the upper residual once in stage_job.
-                out.limbs[0][index] = int8_t(ggml::gemmini::lowdigit(uint64_t(code), bits));
+                out.limbs[0][index] = int8_t(ggml::npu::lowdigit(uint64_t(code), bits));
                 out.limb_count = 1;
             } else {
                 split(out, index, code);

@@ -10,7 +10,7 @@
 #include "paired.hpp"
 #include "include/potal-int4.h"
 
-#include "quants/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +20,7 @@ namespace ggml::potal {
 
 namespace {
 
-namespace hp1s = ggml::gemmini::quants::hp1;
+namespace hp1s = ggml::npu::quants::hp1;
 
 constexpr size_t   D   = paired_dim;
 constexpr uint32_t PPB = (uint32_t) (paired_block_k / D);

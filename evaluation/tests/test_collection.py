@@ -23,7 +23,7 @@ def collection(root: Path) -> None:
     write_json(manifest_path, raw_manifest)
     manifest = Manifest.load(manifest_path)
     info: Record = {"activation_metrics": 1, "residual_metrics": 0, "scale_metrics": 0,
-                    "cycle_sim": 1, "backend": "IM2P_SIM", "hp1": True, "gemmini": 1,
+                    "backend": "HARDWARE", "hp1": True, "gemmini": 1,
                     "gemmini_option": "WS", "activation_bits": 8, "weight_bits": 8,
                     "dim": 64, "activation_mode": "EXSIA", "block_size": 32}
     args = metric_run.parser_for("activation").parse_args([

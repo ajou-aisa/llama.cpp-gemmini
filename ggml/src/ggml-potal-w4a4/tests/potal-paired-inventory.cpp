@@ -14,7 +14,7 @@
 #include "ggml-quants.h"
 #include "matmul/dense.hpp"
 #include "matmul/paired-auto.hpp"
-#include "quants/act/exsia/types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
 #include "support/paired-h2-emulator.hpp"
 
 #include <algorithm>
@@ -35,7 +35,7 @@ using namespace ggml::potal;
 namespace {
 
 constexpr size_t D = POTAL_HW_DIM;
-namespace exsia = ggml::gemmini::quants::act::exsia;
+namespace exsia = ggml::npu::quants::act::exsia;
 
 struct bench_case {
     const char * name;
@@ -350,12 +350,12 @@ bool run_case(const bench_case & c) {
     auto * y = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n, c.m);
     const hp1_shape shape = { (int64_t) c.m, (int64_t) c.n, (int64_t) c.k };
     potal_tile_plan serial;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1_operands operands;
     quants::weight::hp1::stats weight_stats;
     if (potal_tile_select(c.m, c.n, c.k, 32 / D, &serial) != POTAL_OK ||
         !operands.allocate(shape) ||
-        !init_args(w, y, shape, "", "golden", ggml::gemmini::residual::ResidualRoute::ws_packet, serial, args) ||
+        !init_args(w, y, shape, "", "golden", ggml::npu::residual::ResidualRoute::ws_packet, serial, args) ||
         unpack_weights(args, operands, &weight_stats) != quants::weight::hp1::status::ok ||
         !quantize_activations(x, args, operands)) {
         return failure(c, 0, "prepare");
@@ -366,7 +366,7 @@ bool run_case(const bench_case & c) {
     if (meta == nullptr || meta->theta.size() != stripes) {
         return failure(c, 0, "EXSIA_required");
     }
-    std::map<size_t, const ggml::gemmini::rmd::StripePacket *> packets;
+    std::map<size_t, const ggml::npu::rmd::StripePacket *> packets;
     for (const auto & packet : meta->rmd_packets) {
         if (!packet || packet->stripe_id >= stripes || !packets.emplace(packet->stripe_id, packet.get()).second) {
             return failure(c, 0, "packet_identity");
@@ -376,10 +376,10 @@ bool run_case(const bench_case & c) {
         return failure(c, 0, "RMD_required");
     }
     record(c, 0, "fixture") << " seed=20261023 M=" << c.m << " N=" << c.n << " K=" << c.k
-        << " outlier=400 blocks=2 step=" << c.step << " DIM=" << D << " stripes=" << stripes
+        << " outlier=400 blocks=2 step=" << c.step << " NPU_D=" << D << " stripes=" << stripes
         << " packets=" << packets.size() << " ranges=half_open execution=H2_command_emulator\n";
     const auto hw = potal_paired_hw_geometry();
-    record(c, 0, "geometry") << " DIM=" << hw.dim << " banks=" << hw.bank_num << " bank_sp_rows=" << hw.bank_rows
+    record(c, 0, "geometry") << " NPU_D=" << hw.dim << " banks=" << hw.bank_num << " bank_sp_rows=" << hw.bank_rows
         << " ACC_rows=" << hw.acc_rows << " index_entries_per_pair=" << hw.index_entries
         << " scale_slots=" << hw.scale_entries << " work_ids=" << hw.work_ids << " block_K=" << hw.block_k << '\n';
     inventory_totals totals;
@@ -390,7 +390,7 @@ bool run_case(const bench_case & c) {
         const auto packet = packets.find(s);
         if (packet != packets.end()) {
             if (residual::decode_packet(*packet->second, operands.own, decoded) !=
-                ggml::gemmini::rmd::RmdStatus::success) {
+                ggml::npu::rmd::RmdStatus::success) {
                 return failure(c, s, "decode");
             }
             decoded_ptr = &decoded;

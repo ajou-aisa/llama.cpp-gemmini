@@ -7,7 +7,7 @@
 
 #include "potal_hw_params.h"
 
-#include <gemmini/trace-context.hpp>
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -617,7 +617,7 @@ gemm_report issuer::execute(const gemm_job & job) {
 
 // Tiled GEMM on the issuer: every invocation is Scale WRITE -> LOOP_WS -> FENCE -> RELEASE.
 tiled_report issuer::execute_tiled(const tiled_job & job) {
-    ggml::gemmini::trace::ScopedContext trace_scope(job.trace);
+    ggml::npu::trace::ScopedContext trace_scope(job.trace);
     tiled_report                        r;
     if (sched_getcpu() != cpu) {
         r.stage = "affinity"; // custom-3 would trap off hart 0

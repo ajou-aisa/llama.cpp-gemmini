@@ -4,10 +4,7 @@ This document covers the `STRIPE_PIPELINE` execution mode of the GGML PoTal
 backend (`matmul/stripe.hpp`), the PoTal WS residual
 (`residual/stripe-residual.hpp`) and the C API it executes through
 (`potal_tiled_matmul_stripe`, `include/potal.h`, library `potal-tiled-api`).
-The behavioral contract follows the IM2P.sim frontend PIPELINE mode
-(`docs/HOST_STRIPE_CONTRACT.md`, `docs/NUMERICAL_CONTRACT.md`,
-`frontend/src/im2p_gemmini_frontend.cpp`), mapped onto one physical PoTal and
-its one issuer thread. Nothing of IM2P.sim is built or linked.
+The stripe pipeline maps onto one physical PoTal and its one issuer thread.
 
 ## 1. What runs where
 
@@ -208,7 +205,7 @@ Main: `C_main = PoTal(A_stripe, B, carriers)` with the frozen plan;
 the FULL route's formula (`reconstruct_row`), into the stripe's rows of the
 private output.
 
-Residual request (IM2P run-aware meaning, rebuilt from the packet):
+Residual request (run-aware semantics, rebuilt from the packet):
 runs = the packet's original weight blocks in block order, each with its
 selected block-local K ascending; rows = every (original lane, source row)
 with a nonzero digit in any run, lane-major then row; a run without a digit
@@ -224,7 +221,7 @@ DIM16. No DIM partial mixes runs; zero K and all-zero passes add
 SCU(0) = 0. The residual plan is selected once, when the sealed packet becomes
 a request, before its first command; the Main plan is never changed for it.
 Compact K 31 is one logical GEMM with passes of 16 and 15 (+1 zero) K.
-This is a padded representation chosen for PoTal's command set, not IM2P's
+This padded representation fits PoTal's command set and its
 physical encoding; `residual_compact_k` and `residual_execution_k` record the
 cost difference.
 
@@ -329,7 +326,7 @@ STRIPE_OPTS=(-DGGML_POTAL=ON -DGGML_GEMMINI=OFF -DPOTAL_API_ONLY=OFF -DGGML_BACK
   -DGGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE -DGGML_GEMMINI_ENABLE_STRIPE_MATMUL=ON
   -DGGML_GEMMINI_ENABLE_STRIPE_PIPELINE=ON -DGGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY=2
   -DGGML_GEMMINI_EXSIA_DEFAULT_MODE=SEQUENTIAL -DGGML_OPENMP=OFF -DGGML_GEMMINI_ENABLE_OPENMP=OFF
-  -DLOG_DEBUG=1 -DLOG_CYCLE=1 -DCYCLE_SIM=0 -DLLAMA_CURL=OFF)
+  -DLOG_DEBUG=1 -DLOG_CYCLE=1 -DLLAMA_CURL=OFF)
 cmake -S . -B build-potal-stripe-host "${STRIPE_OPTS[@]}"
 cmake --build build-potal-stripe-host --target potal-stripe-api-test potal-residual-unit-test \
   potal-stripe-pipeline-test potal-residual-merge-bench -j

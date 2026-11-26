@@ -2,9 +2,9 @@
 
 #include "ggml-impl.h"
 
-#include <gemmini/log.hpp>
-#include <gemmini/performance.hpp>
-#include <gemmini/trace-context.hpp>
+#include "../ggml-npu-common/profiling/include/npu/log.hpp"
+#include "../ggml-npu-common/profiling/include/npu/performance.hpp"
+#include "../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 
 #include <cinttypes>
 #include <cstdarg>
@@ -16,7 +16,7 @@ namespace ggml::potal::log {
 void ensure_outputs() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const auto result = ggml::gemmini::log::setup_default_outputs();
+        const auto result = ggml::npu::log::setup_default_outputs();
         if (!result.cycle || !result.debug) {
             // The logger itself is unavailable: stderr is the only place left.
             GGML_LOG_WARN("[POTAL_BACKEND] default log outputs: cycle=%d debug=%d\n", result.cycle ? 1 : 0,
@@ -30,7 +30,7 @@ void debug(const char * layer, const char * fmt, ...) {
     ensure_outputs();
     va_list ap;
     va_start(ap, fmt);
-    ggml::gemmini::log::debug.v_layer(layer, fmt, ap);
+    ggml::npu::log::debug.v_layer(layer, fmt, ap);
     va_end(ap);
 #else
     (void) layer;
@@ -43,7 +43,7 @@ void failure(const char * layer, const char * fmt, ...) {
     va_start(ap, fmt);
 #if LOG_DEBUG
     ensure_outputs();
-    ggml::gemmini::log::debug.v_layer(layer, fmt, ap);
+    ggml::npu::log::debug.v_layer(layer, fmt, ap);
 #else
     char text[1024];
     std::vsnprintf(text, sizeof(text), fmt, ap);
@@ -53,9 +53,9 @@ void failure(const char * layer, const char * fmt, ...) {
 }
 
 std::string trace_fields() {
-    namespace perf                = ggml::gemmini::performance;
+    namespace perf                = ggml::npu::performance;
     const gemmini_trace_context t = gemmini_trace_capture();
-    const perf::Context         p = ggml::gemmini::trace::inference_context(t);
+    const perf::Context         p = ggml::npu::trace::inference_context(t);
     // The trace context has no decode ordinal; the published context has it
     // while the same operation is current.
     const perf::Context g      = perf::capture_context();

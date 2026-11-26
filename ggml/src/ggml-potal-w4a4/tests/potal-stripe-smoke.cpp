@@ -38,12 +38,12 @@
 #include "ggml-quants.h"
 #include "log.hpp"
 #include "matmul/dense.hpp"
-#include "matmul/options.hpp"
+#include "../matmul/options.hpp"
 #include "matmul/tiling.hpp"
 #include "potal.h"
 #include "support/stripe-golden.hpp"
 
-#include "ggml-gemmini/matmul/options.hpp"
+#include "../../ggml-npu-common/matmul/options.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -118,13 +118,13 @@ golden_result golden(const ggml_tensor * w, const ggml_tensor * x, ggml_tensor *
     const hp1_shape     s = { x->ne[1], w->ne[1], w->ne[0] };
     potal_tile_plan     plan;
     hp1_operands        o;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     hp1::stats          ws;
     std::vector<float>  want;
     g.ok = potal_tile_select((size_t) s.m, (size_t) s.n, (size_t) s.k, hp1::block_k / POTAL_HW_DIM, &plan) ==
                POTAL_OK &&
            o.allocate(s) &&
-           init_args(w, expected, s, "", "golden", ggml::gemmini::residual::ResidualRoute::ws_packet, plan, args) &&
+           init_args(w, expected, s, "", "golden", ggml::npu::residual::ResidualRoute::ws_packet, plan, args) &&
            unpack_weights(args, o, &ws) == hp1::status::ok && quantize_activations(x, args, o) &&
            potal_test::pipeline_golden(args, o, want, &g.counts);
     if (g.ok) {
@@ -215,16 +215,16 @@ void run_case(ggml_backend_t potal, const char * name, int64_t M, int64_t N, int
 
 // Configure the run for STRIPE_PIPELINE unless the build already defaults to it.
 bool select_pipeline_mode() {
-    namespace cfg = ggml::gemmini::config;
-    using ggml::gemmini::MatmulInvocationMode;
-    using ggml::gemmini::RmdBackend;
+    namespace cfg = ggml::npu::config;
+    using ggml::npu::MatmulInvocationMode;
+    using ggml::npu::RmdBackend;
     if (cfg::DEFAULT_MATMUL_MODE != (int) MatmulInvocationMode::stripe_pipeline) {
         setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
     }
-    if (options::compensation && cfg::DEFAULT_RMD_BACKEND != (int) RmdBackend::gemmini_ws_compact) {
+    if (options::compensation && cfg::DEFAULT_RMD_BACKEND != (int) RmdBackend::npu_compact) {
         setenv("GEMMINI_RMD_BACKEND", "WS", 1);
     }
-    const auto r = ggml::gemmini::resolve_matmul_options();
+    const auto r = ggml::npu::resolve_matmul_options();
     const char * why = r.ok() ? options::unsupported_combination(r.options.mode, r.options.rmd_backend,
                                                                  r.options.job_capacity)
                               : "matmul options do not resolve (runtime override disabled?)";

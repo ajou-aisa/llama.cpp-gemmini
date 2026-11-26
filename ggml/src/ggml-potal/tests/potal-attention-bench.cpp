@@ -94,12 +94,7 @@ void summary(const char * name, const char * boundary, const std::vector<double>
 
 // Reject diagnostic builds rather than presenting their overhead as baseline.
 bool diagnostics_off() {
-#if (defined(LOG_DEBUG) && LOG_DEBUG) || (defined(LOG_CYCLE) && LOG_CYCLE) || \
-    (defined(CYCLE_DETAIL) && CYCLE_DETAIL) || (defined(CYCLE_SIM) && CYCLE_SIM) || \
-    (defined(LOG_DUMP) && LOG_DUMP) || (defined(LOG_DUMP_SCALE) && LOG_DUMP_SCALE) || \
-    defined(POTAL_PLANNING_DIAGNOSTICS) || \
-    (defined(EXSIA_VALIDATION) && EXSIA_VALIDATION) || \
-    (defined(EXSIA_BRANCH_COUNTS_ENABLED) && EXSIA_BRANCH_COUNTS_ENABLED)
+#if (defined(LOG_DEBUG) && LOG_DEBUG) || (defined(LOG_CYCLE) && LOG_CYCLE) ||      (defined(CYCLE_DETAIL) && CYCLE_DETAIL) || (0 && 0) ||      (defined(LOG_DUMP) && LOG_DUMP) || (defined(LOG_DUMP_SCALE) && LOG_DUMP_SCALE) ||      defined(POTAL_PLANNING_DIAGNOSTICS) ||      (defined(EXSIA_VALIDATION) && EXSIA_VALIDATION) ||      (defined(EXSIA_BRANCH_COUNTS_ENABLED) && EXSIA_BRANCH_COUNTS_ENABLED)
     return false;
 #else
     for (const char * key : {"POTAL_RAW_TRACE", "POTAL_PAIRED_PROFILE", "GEMMINI_EXSIA_PROFILE"}) {

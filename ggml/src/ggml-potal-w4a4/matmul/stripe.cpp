@@ -9,10 +9,10 @@
 #include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
 
-#include "quants/act/quantize.hpp"
-#include "quants/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/quantization/activation/quantize.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
 
-#include <gemmini/trace-context.hpp>
+#include "../../ggml-npu-common/profiling/include/npu/trace-context.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -34,9 +34,9 @@ namespace ggml::potal {
 
 namespace {
 
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 
-constexpr size_t   HW_DIM        = POTAL_HW_DIM; // not DIM: <gemmini_params.h> defines that macro
+constexpr size_t   HW_DIM        = POTAL_HW_DIM; // not NPU_D: <gemmini_params.h> defines that macro
 constexpr uint32_t SCALE_BLOCK_K = quants::weight::hp1::block_k;
 
 #ifndef GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE
@@ -71,7 +71,7 @@ uint64_t now_ns() {
 // The producer's view of a run while ExSIA quantizes: StripeReadySink::user_data.
 struct sink_binding {
     stripe_run *                run;
-    const ggml_gemmini_args_t * args;
+    const npu_matmul_args * args;
 
     static bool on_ready(void * user, const exsia::StripeReadyEvent & e) {
         const auto * b = static_cast<const sink_binding *>(user);
@@ -209,7 +209,7 @@ void stripe_run::timeline(unsigned stage, unsigned event, size_t stripe, size_t 
     }
 }
 
-stripe_run::stripe_run(const pipeline_config & cfg, const ggml_gemmini_args_t & args, const hp1_weight & w,
+stripe_run::stripe_run(const pipeline_config & cfg, const npu_matmul_args & args, const hp1_weight & w,
                        const potal_tile_plan & plan) :
     cfg_(cfg),
     w_(w),
@@ -463,7 +463,7 @@ void stripe_run::emit_run(stripe_event_kind kind, const char * detail) {
     emit(ev);
 }
 
-bool stripe_run::submit(const exsia::StripeReadyEvent & e, const ggml_gemmini_args_t & producer_args) {
+bool stripe_run::submit(const exsia::StripeReadyEvent & e, const npu_matmul_args & producer_args) {
     try {
         const size_t rows = e.row_end > e.row_begin ? e.row_end - e.row_begin : 0;
         {
@@ -979,7 +979,7 @@ potal_paired_request stripe_run::paired_request(const slot & s, stripe_work & wo
 
 stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & main_begin, const owner_runners & runners) {
     const planned_runner & exec = runners.planned;
-    ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
+    ggml::npu::trace::ScopedContext trace_scope(s.trace);
     stripe_result res;
     bool gemm_fatal = false;
     // Keep the serial path's stack-owned scratch; only ROLES transfers ownership.
@@ -1164,7 +1164,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
                 compare("MAIN_INT32", s.c, main_ref, rows);
 
                 if (s.packet && !decoded.rows.empty()) {
-                    namespace hp1ref = ggml::gemmini::quants::hp1;
+                    namespace hp1ref = ggml::npu::quants::hp1;
 
                     std::vector<int32_t> residual_ref(
                         decoded.rows.size() * ldc_, 0);
@@ -1221,7 +1221,7 @@ stripe_run::stripe_result stripe_run::execute(slot & s, const stripe_event & mai
 
             n.paired_stripes++;
             // Packet properties, route-independent; residual_execution_k stays the serial
-            // route's K32-padded K (a paired stripe executes fragments x DIM, see paired_end).
+            // route's K32-padded K (a paired stripe executes fragments x NPU_D, see paired_end).
             n.residual_compact_k += decoded.k_compact;
             n.residual_active_lane_rows += decoded.rows.size();
             done.paired        = true;
@@ -1401,7 +1401,7 @@ void stripe_run::finalizer_loop() {
 }
 
 stripe_run::stripe_result stripe_run::finalize(slot & s, stripe_work & work) {
-    ggml::gemmini::trace::ScopedContext trace_scope(s.trace);
+    ggml::npu::trace::ScopedContext trace_scope(s.trace);
     stripe_result res;
     auto & n = work.counts;
     auto & done = work.done;
@@ -1547,7 +1547,7 @@ void stripe_run::abandon() {
     }
 }
 
-pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_t & args, const hp1_weight & w,
+pipeline_report run_stripe_pipeline(const ggml_tensor * src1, npu_matmul_args & args, const hp1_weight & w,
                                     const potal_tile_plan & plan, const pipeline_config & cfg, stripe_owner & owner) {
     pipeline_report r;
     const auto refuse = [&r](const char * stage, std::string detail) {
@@ -1577,7 +1577,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         return refuse("options", "GGML_POTAL_STRICT_ISSUER requires ROLES and the paired route, with stream mode and "
                                  "the paired stage/window diagnostics OFF");
     }
-    if (run_cfg.hart_roles && args.residual_route != ggml::gemmini::residual::ResidualRoute::ws_packet)
+    if (run_cfg.hart_roles && args.residual_route != ggml::npu::residual::ResidualRoute::ws_packet)
         return refuse("options", "ROLES requires STRIPE_PIPELINE+WS");
     const char * auto_env = std::getenv("POTAL_PAIRED_AUTO_JK");
     if (auto_env != nullptr && std::strcmp(auto_env, "0") != 0 && std::strcmp(auto_env, "1") != 0) {
@@ -1619,7 +1619,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
         return refuse("options", "STRIPE_PIPELINE runs 1 or 2 semantic stripes in flight");
     }
     if (cfg.residual != (options::compensation && args.residual_route ==
-                                                      ggml::gemmini::residual::ResidualRoute::ws_packet) ||
+                                                      ggml::npu::residual::ResidualRoute::ws_packet) ||
         (options::compensation && !cfg.residual)) {
         return refuse("options", "STRIPE_PIPELINE with compensation=ON needs the ws_packet residual route");
     }
@@ -1719,8 +1719,42 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
                 roles.pin = [&run_cfg](unsigned hart, std::string & error) {
                     return pin_role_cpu(run_cfg.role_cpus[hart], error);
                 };
-                roles.timeline_run = run_cfg.timeline_run;
-                roles.timeline_layer = run_cfg.timeline_layer;
+#if GGML_POTAL_TIMELINE_HOOKS
+                roles.trace_span = [&run_cfg, enabled = false](unsigned stage, bool begin) mutable {
+                    if (stage == 52 && begin) enabled = ::potal::timeline::active();
+                    if (!enabled) return false;
+                    ::potal::timeline::record(static_cast<::potal::timeline::stage>(stage),
+                        begin ? ::potal::timeline::event::begin : ::potal::timeline::event::end,
+                        0, run_cfg.timeline_run, run_cfg.timeline_layer, UINT32_MAX, UINT32_MAX,
+                        UINT32_MAX, 0, 0);
+                    return true;
+                };
+                roles.trace_before_pin = [] { return ::potal::timeline::mono_if_on(); };
+                roles.trace_after_pin = [&run_cfg](unsigned hart, uint64_t start) {
+                    if (!::potal::timeline::enabled()) return;
+                    int expected_hart = -1;
+#if defined(__riscv)
+                    expected_hart = static_cast<int>(hart);
+#endif
+                    ::potal::timeline::register_thread(
+                        hart == 1 ? ::potal::timeline::role::exsia_local0 :
+                        hart == 2 ? ::potal::timeline::role::exsia_local1 : ::potal::timeline::role::exsia_fold,
+                        expected_hart, sched_getcpu());
+                    ::potal::timeline::record_role_start(run_cfg.timeline_run, run_cfg.timeline_layer, start);
+                };
+                roles.trace_edge = [] {
+                    return ::potal::timeline::enabled() ? ::potal::timeline::next_edge_id() : 0;
+                };
+                roles.trace_event = [&run_cfg](unsigned stage, unsigned type, size_t stripe,
+                                               size_t task, uint32_t edge) {
+                    if (::potal::timeline::enabled())
+                        ::potal::timeline::record(static_cast<::potal::timeline::stage>(stage),
+                            static_cast<::potal::timeline::event>(type), 0,
+                            run_cfg.timeline_run, run_cfg.timeline_layer, static_cast<uint32_t>(stripe),
+                            static_cast<uint32_t>(task), stripe == SIZE_MAX ? UINT32_MAX :
+                            static_cast<uint32_t>(stripe % exsia::EXSIA_PIPELINE_SLOT_COUNT), edge, 0);
+                };
+#endif
                 roles.checkpoint = run_cfg.role_checkpoint;
                 roles.cancelled = [run] { return run->cancelled(); };
                 roles.on_failure = [run](const char * code, size_t stripe) {
@@ -1732,7 +1766,7 @@ pipeline_report run_stripe_pipeline(const ggml_tensor * src1, ggml_gemmini_args_
             run->emit_run(stripe_event_kind::quant_begin);
             const auto quant_start = cfg.measure_timing ? std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point{};
-            const bool quantized = ggml::gemmini::quants::quantize_activation(src1, args);
+            const bool quantized = ggml::npu::quants::quantize_activation(src1, args);
             if (cfg.measure_timing)
                 act_quant_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - quant_start).count();
             args.exsia_stripe_ready_sink = nullptr;

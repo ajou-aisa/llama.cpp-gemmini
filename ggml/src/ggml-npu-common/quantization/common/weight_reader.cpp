@@ -1,0 +1,744 @@
+#include "weight_reader.hpp"
+#include "hp1_scu.hpp"
+
+#include "../../types/storage.hpp"
+
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <type_traits>
+
+namespace ggml::npu::quants::wreader {
+
+namespace {
+
+using Format      = npu_matmul_args::weight_format_t;
+using Route       = wroute::WeightRouteKind;
+using ScaleDomain = wroute::WeightScaleDomain;
+
+constexpr size_t kBlockSize = 32;
+
+#if defined(GGML_GEMMINI_TESTING)
+std::atomic_size_t storage_validation_count{0};
+std::atomic_size_t code_address_resolution_count{0};
+#endif
+
+bool checked_mul_size(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+        return false;
+    result = lhs * rhs;
+    return true;
+}
+
+bool checked_block_offset(
+    size_t row, size_t blocks_per_row, size_t block, size_t block_count, size_t & offset) {
+    size_t row_offset = 0;
+    if (!checked_mul_size(row, blocks_per_row, row_offset) ||
+        block > std::numeric_limits<size_t>::max() - row_offset) {
+        return false;
+    }
+    offset = row_offset + block;
+    return offset < block_count;
+}
+
+bool finite_float(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const volatile uint32_t observed = bits;
+    return (observed & 0x7f800000u) != 0x7f800000u;
+}
+
+bool zero_bytes(const uint8_t * data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] != 0)
+            return false;
+    }
+    return true;
+}
+
+bool native_extent_covers(const npu_matmul_args & args,
+                          size_t                      block_count,
+                          size_t                      block_bytes) {
+    if (args.native_weight_bytes == 0)
+        return false;
+
+    size_t required = 0;
+    return checked_mul_size(block_count, block_bytes, required) &&
+           args.native_weight_bytes >= required;
+}
+
+bool describe_format(Format format, Route & route, uint8_t & bits) {
+    switch (format) {
+    case Format::q4_h0:
+        route = Route::H0;
+        bits  = 4;
+        return true;
+    case Format::q4_hp1:
+        route = Route::HP1;
+        bits  = 4;
+        return true;
+    case Format::q8_h0:
+        route = Route::H0;
+        bits  = 8;
+        return true;
+    case Format::q8_0_unpacked_to_h1:
+        route = Route::H1;
+        bits  = 8;
+        return true;
+    case Format::q8_hp1:
+        route = Route::HP1;
+        bits  = 8;
+        return true;
+    case Format::q16_h0:
+        route = Route::H0;
+        bits  = 16;
+        return true;
+    case Format::q16_h1:
+        route = Route::H1;
+        bits  = 16;
+        return true;
+    case Format::q16_hp1:
+        route = Route::HP1;
+        bits  = 16;
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool dense_extent_is_addressable(const npu_matmul_args &     args,
+                                 const wroute::WeightRoutePlan & plan) {
+    const bool   column_major = plan.layout == wroute::WeightLayout::JxK_ColMajor;
+    const size_t major_count  = column_major ? args.J : args.K;
+    const size_t minor_count  = column_major ? args.K : args.J;
+    if (major_count == 0 || minor_count == 0 || plan.weight_stride < minor_count)
+        return false;
+
+    size_t major_offset = 0;
+    return checked_mul_size(major_count - 1, plan.weight_stride, major_offset) &&
+           minor_count - 1 <= std::numeric_limits<size_t>::max() - major_offset;
+}
+
+WeightReaderStatus validate_dense_affine(const npu_matmul_args &     args,
+                                         const wroute::WeightRoutePlan & plan) {
+    size_t scale_count = 0;
+    if (args.B == nullptr || args.J == 0 || args.K == 0 || args.blocks_per_row == 0 ||
+        args.c_b == nullptr || args.K > std::numeric_limits<size_t>::max() - (kBlockSize - 1) ||
+        args.blocks_per_row != (args.K + kBlockSize - 1) / kBlockSize ||
+        !checked_mul_size(args.J, args.blocks_per_row, scale_count) ||
+        !dense_extent_is_addressable(args, plan)) {
+        return WeightReaderStatus::InvalidMetadata;
+    }
+
+    if (args.stripe_J > 1) {
+        if (args.s_rf_stripe == nullptr || args.R_stripe == nullptr)
+            return WeightReaderStatus::InvalidMetadata;
+    } else if (args.s_rf == nullptr || args.R == nullptr) {
+        return WeightReaderStatus::InvalidMetadata;
+    }
+    return WeightReaderStatus::Success;
+}
+
+WeightReaderStatus validate_storage(const npu_matmul_args &     args,
+                                    const wroute::WeightRoutePlan & plan) {
+#if defined(GGML_GEMMINI_TESTING)
+    storage_validation_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (args.J == 0 || args.K == 0)
+        return WeightReaderStatus::InvalidMetadata;
+
+    if (plan.route == Route::Dense || plan.route == Route::Q8ChannelDirect ||
+        plan.route == Route::Q8ChannelSidecar) {
+        if (plan.weight_bits != 8)
+            return WeightReaderStatus::UnsupportedFormat;
+        return args.B != nullptr && dense_extent_is_addressable(args, plan)
+                   ? WeightReaderStatus::Success
+                   : WeightReaderStatus::InvalidMetadata;
+    }
+
+    Route   expected_route = Route::Unsupported;
+    uint8_t expected_bits  = 0;
+    if (!describe_format(args.weight_format, expected_route, expected_bits) ||
+        plan.route != expected_route || plan.weight_bits != expected_bits) {
+        return WeightReaderStatus::UnsupportedFormat;
+    }
+
+    size_t expected_blocks = 0;
+    switch (args.weight_format) {
+    case Format::q4_h0:
+    case Format::q4_hp1:
+    case Format::q16_h0:
+    case Format::q16_h1:
+    case Format::q16_hp1:
+        if (!args.has_native_matched_width_contract() ||
+            !native_extent_covers(args,
+                                  args.native_block_count,
+                                  args.weight_format == Format::q4_h0    ? sizeof(block_q4_h0)
+                                  : args.weight_format == Format::q4_hp1 ? sizeof(block_q4_hp1)
+                                  : args.weight_format == Format::q16_h0 ? sizeof(block_q16_h0)
+                                  : args.weight_format == Format::q16_h1 ? sizeof(block_q16_h1)
+                                                                         : sizeof(block_q16_hp1))) {
+            return WeightReaderStatus::InvalidMetadata;
+        }
+        return WeightReaderStatus::Success;
+
+    case Format::q8_h0:
+        if (args.K % kBlockSize != 0 || args.blocks_K != args.K / kBlockSize ||
+            args.blocks_J != args.J || !checked_mul_size(args.J, args.blocks_K, expected_blocks)) {
+            return WeightReaderStatus::InvalidMetadata;
+        }
+        if (args.B_blocks != nullptr) {
+            return reinterpret_cast<uintptr_t>(args.B_blocks) % alignof(block_q8_0) == 0 &&
+                           native_extent_covers(args, expected_blocks, sizeof(block_q8_0))
+                       ? WeightReaderStatus::Success
+                       : WeightReaderStatus::InvalidMetadata;
+        }
+        return args.B != nullptr && args.B_scales != nullptr &&
+                       dense_extent_is_addressable(args, plan)
+                   ? WeightReaderStatus::Success
+                   : WeightReaderStatus::InvalidMetadata;
+
+    case Format::q8_hp1:
+        if (!wroute::has_q8_hp1_native_contract(args) ||
+            !native_extent_covers(args, args.q8_hp1_block_count, sizeof(block_q8_hp1))) {
+            return WeightReaderStatus::InvalidMetadata;
+        }
+        return WeightReaderStatus::Success;
+
+    case Format::q8_0_unpacked_to_h1:
+        return validate_dense_affine(args, plan);
+
+    default:
+        return WeightReaderStatus::UnsupportedFormat;
+    }
+}
+
+template <typename Block>
+const Block * native_block(
+    const Block * blocks, size_t block_count, size_t blocks_per_row, size_t row, size_t block) {
+    size_t offset = 0;
+    return blocks != nullptr &&
+                   checked_block_offset(row, blocks_per_row, block, block_count, offset)
+               ? blocks + offset
+               : nullptr;
+}
+
+int32_t decode_q4(const uint8_t * quants, size_t index) {
+    const size_t  byte_index = index % (kBlockSize / 2);
+    const uint8_t shift      = index < (kBlockSize / 2) ? 0 : 4;
+    return static_cast<int32_t>((quants[byte_index] >> shift) & 0x0fu) - 8;
+}
+
+WeightScaleResult invalid_scale(WeightReaderStatus status) {
+    WeightScaleResult result{};
+    result.status = status;
+    return result;
+}
+
+WeightScaleResult make_h0_scale(float scale) {
+    if (!finite_float(scale))
+        return invalid_scale(WeightReaderStatus::InvalidMetadata);
+    WeightScaleResult result{};
+    result.status               = WeightReaderStatus::Success;
+    result.domain               = ScaleDomain::FloatingBlock;
+    result.floating_block_scale = scale;
+    return result;
+}
+
+WeightScaleResult make_h1_scale(uint64_t block_scale, float column_scale) {
+    if (!finite_float(column_scale))
+        return invalid_scale(WeightReaderStatus::InvalidMetadata);
+    WeightScaleResult result{};
+    result.status              = WeightReaderStatus::Success;
+    result.domain              = ScaleDomain::IntegerBlockTimesColumn;
+    result.integer_block_scale = block_scale;
+    result.column_scale        = column_scale;
+    return result;
+}
+
+WeightScaleResult make_hp1_scale(int16_t exponent, float column_scale, ScaleDomain domain) {
+    if (!finite_float(column_scale))
+        return invalid_scale(WeightReaderStatus::InvalidMetadata);
+    if (domain == ScaleDomain::FloatingBlock) {
+        if (exponent == INT16_MIN)
+            return make_h0_scale(0.0f);
+        return make_h0_scale(std::ldexp(column_scale, static_cast<int>(exponent)));
+    }
+    if (domain != ScaleDomain::IntegerBlockTimesColumn)
+        return invalid_scale(WeightReaderStatus::InvalidMetadata);
+    if (exponent == INT16_MIN)
+        return make_h1_scale(0, column_scale);
+    if (exponent < 0)
+        return invalid_scale(WeightReaderStatus::InvalidMetadata);
+    if (exponent >= 63)
+        return invalid_scale(WeightReaderStatus::ScaleOverflow);
+    return make_h1_scale(uint64_t{1} << static_cast<unsigned>(exponent), column_scale);
+}
+
+WeightScaleResult read_scale_unchecked(const npu_matmul_args &     args,
+                                       const wroute::WeightRoutePlan & plan,
+                                       size_t                          j,
+                                       size_t                          block_index) {
+    if (j >= args.J || plan.scales.block_size == 0 || block_index >= plan.scales.cols) {
+        return invalid_scale(WeightReaderStatus::InvalidArguments);
+    }
+
+    switch (args.weight_format) {
+    case Format::q4_h0: {
+        const block_q4_h0 * block = native_block(
+            args.q4_h0_blocks, args.native_block_count, args.native_blocks_per_row, j, block_index);
+        return block == nullptr ? invalid_scale(WeightReaderStatus::InvalidMetadata)
+                                : make_h0_scale(ggml_fp16_to_fp32(block->d));
+    }
+    case Format::q8_h0:
+        if (args.B_blocks != nullptr) {
+            size_t offset      = 0;
+            size_t block_count = 0;
+            if (!checked_mul_size(args.blocks_J, args.blocks_K, block_count) ||
+                !checked_block_offset(j, args.blocks_K, block_index, block_count, offset)) {
+                return invalid_scale(WeightReaderStatus::InvalidMetadata);
+            }
+            return make_h0_scale(ggml_fp16_to_fp32(args.B_blocks[offset].d));
+        }
+        return args.B_scales == nullptr
+                   ? invalid_scale(WeightReaderStatus::InvalidMetadata)
+                   : make_h0_scale(args.B_scales[j * args.blocks_K + block_index]);
+    case Format::q16_h0: {
+        const block_q16_h0 * block = native_block(args.q16_h0_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        return block == nullptr ? invalid_scale(WeightReaderStatus::InvalidMetadata)
+                                : make_h0_scale(ggml_fp16_to_fp32(block->d));
+    }
+    case Format::q8_0_unpacked_to_h1: {
+        const size_t   index  = j * args.blocks_per_row + block_index;
+        const size_t   stripe = args.stripe_J > 1 ? j / args.stripe_J : 0;
+        const uint64_t offset = args.stripe_J > 1 ? args.R_stripe[stripe] : args.R[j];
+        const float    column = args.stripe_J > 1 ? args.s_rf_stripe[stripe] : args.s_rf[j];
+        return make_h1_scale(static_cast<uint64_t>(args.c_b[index]) + offset, column);
+    }
+    case Format::q16_h1: {
+        const block_q16_h1 * block = native_block(args.q16_h1_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        if (block == nullptr || !zero_bytes(block->padding, sizeof(block->padding)) ||
+            !zero_bytes(block->tail_padding, sizeof(block->tail_padding))) {
+            return invalid_scale(WeightReaderStatus::InvalidMetadata);
+        }
+        return make_h1_scale(static_cast<uint64_t>(block->c_b) + block->R, block->s_rf);
+    }
+    case Format::q4_hp1: {
+        const block_q4_hp1 * block = native_block(args.q4_hp1_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        if (block == nullptr || !zero_bytes(block->padding, sizeof(block->padding)))
+            return invalid_scale(WeightReaderStatus::InvalidMetadata);
+        return make_hp1_scale(block->m, block->channel_scale, plan.scale_domain);
+    }
+    case Format::q8_hp1: {
+        const block_q8_hp1 * block = args.q8_hp1_block(j, block_index);
+        if (block == nullptr || !zero_bytes(block->padding, sizeof(block->padding)))
+            return invalid_scale(WeightReaderStatus::InvalidMetadata);
+        return make_hp1_scale(block->m, block->channel_scale, plan.scale_domain);
+    }
+    case Format::q16_hp1: {
+        const block_q16_hp1 * block = native_block(args.q16_hp1_blocks,
+                                                   args.native_block_count,
+                                                   args.native_blocks_per_row,
+                                                   j,
+                                                   block_index);
+        if (block == nullptr || !zero_bytes(block->padding, sizeof(block->padding)))
+            return invalid_scale(WeightReaderStatus::InvalidMetadata);
+        return make_hp1_scale(block->m, block->channel_scale, plan.scale_domain);
+    }
+    default:
+        return invalid_scale(WeightReaderStatus::UnsupportedFormat);
+    }
+}
+
+} // namespace
+
+Hp1CarrierResult read_hp1_carrier_validated(const npu_matmul_args &     args,
+                                            const wroute::WeightRoutePlan & plan,
+                                            size_t                          column,
+                                            size_t                          original_block) {
+    Hp1CarrierResult result;
+    if (plan.route != Route::HP1)
+        return result;
+    result.status = WeightReaderStatus::InvalidMetadata;
+    if (column >= args.J || plan.scales.block_size != 32 || original_block >= plan.scales.cols)
+        return result;
+    const auto read = [&](const auto * block) {
+        if (block == nullptr || !zero_bytes(block->padding, sizeof(block->padding)) ||
+            !finite_float(block->channel_scale) || !hp1::encode_carrier(block->m, result.carrier))
+            return;
+        result.column_scale = block->channel_scale;
+        result.status       = WeightReaderStatus::Success;
+    };
+    switch (args.weight_format) {
+    case Format::q4_hp1:
+        read(native_block(args.q4_hp1_blocks,
+                          args.native_block_count,
+                          args.native_blocks_per_row,
+                          column,
+                          original_block));
+        break;
+    case Format::q8_hp1:
+        read(args.q8_hp1_block(column, original_block));
+        break;
+    case Format::q16_hp1:
+        read(native_block(args.q16_hp1_blocks,
+                          args.native_block_count,
+                          args.native_blocks_per_row,
+                          column,
+                          original_block));
+        break;
+    default:
+        result.status = WeightReaderStatus::UnsupportedFormat;
+        break;
+    }
+    return result;
+}
+
+ColumnScaleResult read_column_scale_validated(const npu_matmul_args &     args,
+                                              const wroute::WeightRoutePlan & plan,
+                                              size_t                          column,
+                                              size_t                          original_block) {
+    if (plan.hp1_carriers) {
+        const auto value = read_hp1_carrier_validated(args, plan, column, original_block);
+        return {value.status, value.column_scale};
+    }
+    const auto value = read_scale_validated(args, plan, column, original_block);
+    if (value.ok() && value.domain != ScaleDomain::IntegerBlockTimesColumn)
+        return {WeightReaderStatus::InvalidMetadata, 0.0f};
+    return {value.status, value.column_scale};
+}
+
+WeightReaderStatus validate(const npu_matmul_args &     args,
+                            const wroute::WeightRoutePlan & plan) {
+    const WeightReaderStatus storage = validate_storage(args, plan);
+    if (storage != WeightReaderStatus::Success)
+        return storage;
+    if (plan.scales.cols == 0 || plan.scales.block_size != kBlockSize)
+        return WeightReaderStatus::InvalidMetadata;
+
+    auto * cache = args.weight_format == Format::q4_hp1 || args.weight_format == Format::q8_hp1
+                      ? args.weight_validation.get() : nullptr;
+    std::unique_lock<std::mutex> lock;
+    npu_matmul_args::WeightValidation::Key key{};
+    if (cache) {
+        const bool q4 = args.weight_format == Format::q4_hp1;
+        key = std::make_tuple(reinterpret_cast<uintptr_t>(q4 ? static_cast<const void *>(args.q4_hp1_blocks)
+                                 : static_cast<const void *>(args.q8_hp1_blocks)),
+                              args.J,args.K,
+                              q4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row,
+                              q4 ? args.native_block_count : args.q8_hp1_block_count,
+                              args.native_weight_bytes,plan.scales.cols,int(args.weight_format),
+                              int(plan.scale_domain),plan.hp1_carriers);
+        lock = std::unique_lock<std::mutex>(cache->mutex);
+        if (cache->accepted.count(key)) return WeightReaderStatus::Success;
+    }
+
+    for (size_t j = 0; j < args.J; ++j) {
+        for (size_t block = 0; block < plan.scales.cols; ++block) {
+            if (plan.hp1_carriers) {
+                const auto carrier = read_hp1_carrier_validated(args, plan, j, block);
+                if (!carrier.ok())
+                    return carrier.status;
+            } else {
+                const WeightScaleResult scale = read_scale_unchecked(args, plan, j, block);
+                if (!scale.ok())
+                    return scale.status;
+            }
+        }
+    }
+    if (cache) cache->accepted.insert(key);
+    return WeightReaderStatus::Success;
+}
+
+WeightCodeResult read_code_validated(const npu_matmul_args &     args,
+                                     const wroute::WeightRoutePlan & plan,
+                                     size_t                          j,
+                                     size_t                          k) {
+    WeightCodeResult result{};
+    if (j >= args.J || k >= args.K) {
+        result.status = WeightReaderStatus::InvalidArguments;
+        return result;
+    }
+    result.status = WeightReaderStatus::Success;
+
+#if defined(GGML_GEMMINI_TESTING)
+    code_address_resolution_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+
+    if (plan.route == Route::Dense || plan.route == Route::Q8ChannelDirect ||
+        plan.route == Route::Q8ChannelSidecar) {
+        const size_t offset = plan.layout == wroute::WeightLayout::JxK_ColMajor
+                                  ? j * plan.weight_stride + k
+                                  : k * plan.weight_stride + j;
+        result.value        = reinterpret_cast<const int8_t *>(args.B)[offset];
+        return result;
+    }
+
+    const size_t block_index = k / kBlockSize;
+    const size_t local_index = k % kBlockSize;
+    switch (args.weight_format) {
+    case Format::q4_h0: {
+        const block_q4_h0 * block = native_block(
+            args.q4_h0_blocks, args.native_block_count, args.native_blocks_per_row, j, block_index);
+        if (block != nullptr)
+            result.value = decode_q4(block->qs, local_index);
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    case Format::q4_hp1: {
+        const block_q4_hp1 * block = native_block(args.q4_hp1_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        if (block != nullptr)
+            result.value = decode_q4(block->qs, local_index);
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    case Format::q8_h0:
+        if (args.B_blocks != nullptr) {
+            size_t offset = 0;
+            size_t count  = 0;
+            if (checked_mul_size(args.blocks_J, args.blocks_K, count) &&
+                checked_block_offset(j, args.blocks_K, block_index, count, offset)) {
+                result.value = args.B_blocks[offset].qs[local_index];
+            } else {
+                result.status = WeightReaderStatus::InvalidMetadata;
+            }
+        } else {
+            const size_t offset = plan.layout == wroute::WeightLayout::JxK_ColMajor
+                                      ? j * plan.weight_stride + k
+                                      : k * plan.weight_stride + j;
+            result.value        = reinterpret_cast<const int8_t *>(args.B)[offset];
+        }
+        break;
+    case Format::q8_0_unpacked_to_h1: {
+        const size_t offset = plan.layout == wroute::WeightLayout::JxK_ColMajor
+                                  ? j * plan.weight_stride + k
+                                  : k * plan.weight_stride + j;
+        result.value        = reinterpret_cast<const int8_t *>(args.B)[offset];
+        break;
+    }
+    case Format::q8_hp1: {
+        const block_q8_hp1 * block = args.q8_hp1_block(j, block_index);
+        if (block != nullptr)
+            result.value = block->qs[local_index];
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    case Format::q16_h0: {
+        const block_q16_h0 * block = native_block(args.q16_h0_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        if (block != nullptr)
+            result.value = block->qs[local_index];
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    case Format::q16_h1: {
+        const block_q16_h1 * block = native_block(args.q16_h1_blocks,
+                                                  args.native_block_count,
+                                                  args.native_blocks_per_row,
+                                                  j,
+                                                  block_index);
+        if (block != nullptr)
+            result.value = block->qs[local_index];
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    case Format::q16_hp1: {
+        const block_q16_hp1 * block = native_block(args.q16_hp1_blocks,
+                                                   args.native_block_count,
+                                                   args.native_blocks_per_row,
+                                                   j,
+                                                   block_index);
+        if (block != nullptr)
+            result.value = block->qs[local_index];
+        else
+            result.status = WeightReaderStatus::InvalidMetadata;
+        break;
+    }
+    default:
+        result.status = WeightReaderStatus::UnsupportedFormat;
+        return result;
+    }
+
+    return result;
+}
+
+WeightReaderStatus read_code_tile_validated(const npu_matmul_args &     args,
+                                            const wroute::WeightRoutePlan & plan,
+                                            size_t                          block_index,
+                                            const uint16_t *                local_k,
+                                            size_t                          valid_k,
+                                            size_t                          col_base,
+                                            size_t                          valid_cols,
+                                            int32_t *                       values,
+                                            size_t &                        address_resolutions) {
+    if (local_k == nullptr || values == nullptr || valid_k == 0 || valid_k > NPU_D ||
+        valid_k > kBlockSize || valid_cols == 0 || valid_cols > NPU_D || col_base > args.J ||
+        valid_cols > args.J - col_base || args.K == 0 || block_index > (args.K - 1) / kBlockSize) {
+        return WeightReaderStatus::InvalidArguments;
+    }
+    const size_t k_base = block_index * kBlockSize;
+    for (size_t index = 0; index < valid_k; ++index) {
+        if (local_k[index] >= kBlockSize || local_k[index] >= args.K - k_base)
+            return WeightReaderStatus::InvalidArguments;
+    }
+
+    size_t     resolutions = 0;
+    const auto gather      = [&](auto resolve_block) {
+        std::array<decltype(resolve_block(col_base)), NPU_D> blocks{};
+        for (size_t col = 0; col < valid_cols; ++col) {
+            blocks[col] = resolve_block(col_base + col);
+            if (blocks[col] == nullptr)
+                return WeightReaderStatus::InvalidMetadata;
+            ++resolutions;
+#if defined(GGML_GEMMINI_TESTING)
+            code_address_resolution_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
+        for (size_t k = 0; k < valid_k; ++k) {
+            for (size_t col = 0; col < valid_cols; ++col) {
+                const auto * block = blocks[col];
+                if constexpr (std::is_same_v<
+                                  std::remove_cv_t<std::remove_reference_t<decltype(block->qs[0])>>,
+                                  uint8_t>) {
+                    values[k * NPU_D + col] = decode_q4(block->qs, local_k[k]);
+                } else {
+                    values[k * NPU_D + col] = block->qs[local_k[k]];
+                }
+            }
+        }
+        address_resolutions = resolutions;
+        return WeightReaderStatus::Success;
+    };
+    if (plan.route == Route::H1 || plan.route == Route::HP1) {
+        switch (args.weight_format) {
+        case Format::q4_hp1:
+            return gather([&](size_t j) {
+                return native_block(args.q4_hp1_blocks,
+                                    args.native_block_count,
+                                    args.native_blocks_per_row,
+                                    j,
+                                    block_index);
+            });
+        case Format::q8_hp1:
+            return gather([&](size_t j) { return args.q8_hp1_block(j, block_index); });
+        case Format::q16_h1:
+            return gather([&](size_t j) {
+                return native_block(args.q16_h1_blocks,
+                                    args.native_block_count,
+                                    args.native_blocks_per_row,
+                                    j,
+                                    block_index);
+            });
+        case Format::q16_hp1:
+            return gather([&](size_t j) {
+                return native_block(args.q16_hp1_blocks,
+                                    args.native_block_count,
+                                    args.native_blocks_per_row,
+                                    j,
+                                    block_index);
+            });
+        default:
+            break;
+        }
+    }
+    for (size_t k = 0; k < valid_k; ++k) {
+        for (size_t col = 0; col < valid_cols; ++col) {
+            const WeightCodeResult code =
+                read_code(args, plan, col_base + col, k_base + local_k[k]);
+            if (!code.ok())
+                return code.status;
+            ++resolutions;
+            values[k * NPU_D + col] = code.value;
+        }
+    }
+    address_resolutions = resolutions;
+    return WeightReaderStatus::Success;
+}
+
+WeightCodeResult read_code(const npu_matmul_args &     args,
+                           const wroute::WeightRoutePlan & plan,
+                           size_t                          j,
+                           size_t                          k) {
+    WeightCodeResult         result{};
+    const WeightReaderStatus storage = validate_storage(args, plan);
+    if (storage != WeightReaderStatus::Success) {
+        result.status = storage;
+        return result;
+    }
+    return read_code_validated(args, plan, j, k);
+}
+
+WeightScaleResult read_scale_validated(const npu_matmul_args &     args,
+                                       const wroute::WeightRoutePlan & plan,
+                                       size_t                          j,
+                                       size_t                          block_index) {
+    return read_scale_unchecked(args, plan, j, block_index);
+}
+
+WeightScaleResult read_scale(const npu_matmul_args &     args,
+                             const wroute::WeightRoutePlan & plan,
+                             size_t                          j,
+                             size_t                          block_index) {
+    const WeightReaderStatus storage = validate_storage(args, plan);
+    return storage == WeightReaderStatus::Success ? read_scale_validated(args, plan, j, block_index)
+                                                  : invalid_scale(storage);
+}
+
+const char * weight_reader_status_name(WeightReaderStatus status) {
+    switch (status) {
+    case WeightReaderStatus::Success:
+        return "success";
+    case WeightReaderStatus::InvalidArguments:
+        return "invalid-arguments";
+    case WeightReaderStatus::InvalidMetadata:
+        return "invalid-metadata";
+    case WeightReaderStatus::ScaleOverflow:
+        return "scale-overflow";
+    case WeightReaderStatus::UnsupportedFormat:
+        return "unsupported-format";
+    }
+    return "unsupported-format";
+}
+
+#if defined(GGML_GEMMINI_TESTING)
+void test_reset_weight_reader_counters() {
+    storage_validation_count.store(0, std::memory_order_relaxed);
+    code_address_resolution_count.store(0, std::memory_order_relaxed);
+}
+
+size_t test_weight_reader_storage_validations() {
+    return storage_validation_count.load(std::memory_order_relaxed);
+}
+
+size_t test_weight_reader_code_address_resolutions() {
+    return code_address_resolution_count.load(std::memory_order_relaxed);
+}
+#endif
+
+} // namespace ggml::npu::quants::wreader

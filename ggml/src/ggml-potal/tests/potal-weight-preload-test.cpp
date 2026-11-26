@@ -149,7 +149,7 @@ void test_selection_and_failure() {
 void test_cache_contract() {
     using namespace ggml::potal;
     fixture f;
-    ggml_gemmini_args_t args;
+    npu_matmul_args args;
     check("weight-only arguments initialize", init_weight_args(f.w[0], args));
     weight_cache eager, lazy;
     check("direct static preparation succeeds", eager.prepare(f.w[0]) == GGML_STATUS_SUCCESS);

@@ -29,7 +29,7 @@
 // exactly as the compact request would. E.g. compact K 31 is one logical GEMM:
 // passes of 16 and 15 (+1 zero) K, not two host GEMMs.
 //
-// Reconstruction (rmd-executor.cpp execute_rmd_stripe_im2p_run_aware):
+// Reconstruction (RMD run-aware reconstruction):
 //   R[source_row][n] = sum over rows of C_r[row][n] * 16^lane    (checked __int128)
 // then the INT64 range check. C_r already went through the SCU and Sat32: the
 // HP1 exponent is never applied again on the CPU.
@@ -45,8 +45,8 @@
 #include "matmul/dense.hpp"
 #include "matmul/tiling.hpp"
 
-#include "quants/act/exsia/exsia-event.hpp"
-#include "residual/rmd/rmd-types.hpp"
+#include "../../ggml-npu-common/quantization/activation/exsia/exsia-event.hpp"
+#include "../../ggml-npu-common/residual/rmd/rmd-types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +54,7 @@
 
 namespace ggml::potal::residual {
 
-namespace rmd = ggml::gemmini::rmd;
+namespace rmd = ggml::npu::rmd;
 
 // A4 residuals: balanced radix 16, nine slots including the bit-32 carry.
 constexpr uint8_t digit_bits = 4;
@@ -177,7 +177,7 @@ rmd::RmdStatus reconstruct_rows(const rmd::StripePacket & packet, const std::vec
 // staged first; out and *nonzero (raw nonzero corrections) are written only
 // on success.
 rmd::RmdStatus merge_prepared_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
-                                  const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & metadata,
+                                  const ggml::npu::quants::act::exsia::StripeMetadataSnapshot & metadata,
                                   const rmd::BlockScaledInt64Correction & correction, float * out, size_t out_rows,
                                   size_t row_stride, size_t col_stride, size_t * nonzero);
 
@@ -189,7 +189,7 @@ struct main_readback {
 
 // Preserve separate Main/residual float rounding in one staged traversal.
 rmd::RmdStatus merge_main_residual_hp1(const hp1_weight & weight, size_t row_begin, size_t row_end,
-    const ggml::gemmini::quants::act::exsia::StripeMetadataSnapshot & metadata,
+    const ggml::npu::quants::act::exsia::StripeMetadataSnapshot & metadata,
     const rmd::BlockScaledInt64Correction & correction, main_readback main,
     float * out, size_t out_rows, size_t row_stride, size_t col_stride, size_t * nonzero);
 

@@ -1,6 +1,6 @@
 #include "potal-sensitivity.hpp"
 #include "ggml-gemmini.h"
-#include "ggml-gemmini-matmul-config.hpp"
+#include "npu-matmul-config.hpp"
 #include "../../../common/json.hpp"
 #include <algorithm>
 #include <chrono>
@@ -15,8 +15,8 @@
 #include <stdexcept>
 #include <vector>
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
-#include "../ggml-cuda/cpu-exact/ggml-cuda-potal-attention.h"
+#include "../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-hp1-scu.h"
+#include "../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-potal-attention.h"
 #endif
 
 namespace ggml::gemmini::sensitivity {

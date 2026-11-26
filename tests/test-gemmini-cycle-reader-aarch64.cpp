@@ -1,5 +1,5 @@
-#include <gemmini/cycle_reader.h>
-#include <gemmini/cycle_reader.hpp>
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.h"
+#include "../ggml/src/ggml-npu-common/profiling/include/npu/cycle_reader.hpp"
 
 #include <array>
 #include <atomic>
@@ -13,7 +13,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace cycle = ggml::gemmini::cycle;
+namespace cycle = ggml::npu::cycle;
 using cycle::NativeCycleReason;
 using cycle::NativeCycleSample;
 

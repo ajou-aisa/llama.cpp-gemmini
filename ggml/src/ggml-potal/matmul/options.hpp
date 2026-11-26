@@ -21,14 +21,14 @@
 //   FULL             every activation algorithm; compensation ON runs the
 //                    cpu_direct residual route (rmd_backend CPU) on the CPU
 //   STRIPE_PIPELINE  EXSIA only (matmul/stripe.hpp); compensation ON runs the
-//                    ws_packet route (rmd_backend WS, enum gemmini_ws_compact)
+//                    ws_packet route (rmd_backend WS, enum npu_compact)
 //                    on the PoTal WS residual executor "potal_ws": the Residual
 //                    GEMM on PoTal, radix reconstruction and merge on the CPU.
 //                    Compensation OFF runs the Main GEMMs alone. 1 or 2
 //                    semantic stripes in flight.
 
-#include "ggml-gemmini-config.hpp"
-#include "ggml-gemmini/matmul/options.hpp"
+#include "../../ggml-npu-common/config/software.hpp"
+#include "../../ggml-npu-common/matmul/options.hpp"
 #include "potal.h"
 #include "tiling.hpp"
 
@@ -43,8 +43,8 @@ namespace ggml::potal::options {
 
 static_assert(GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8, "PoTal hardware is A8W8");
 
-using ggml::gemmini::config::ActivationQuantAlgo;
-constexpr ActivationQuantAlgo activation_quant = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT;
+using ggml::npu::config::ActivationQuantAlgo;
+constexpr ActivationQuantAlgo activation_quant = ggml::npu::config::CURRENT_ACTIVATION_QUANT;
 
 // Upper-case name of the configured algorithm (the CMake option value).
 constexpr const char * activation_quant_name() {
@@ -69,8 +69,8 @@ constexpr const char * weight_granularity = "block"; // one carrier per (32-wide
 constexpr uint32_t scale_window_base  = ::ggml::potal::scale_window_base;
 constexpr uint32_t scale_window_slots = ::ggml::potal::scale_window_slots;
 
-using ggml::gemmini::MatmulInvocationMode;
-using ggml::gemmini::RmdBackend;
+using ggml::npu::MatmulInvocationMode;
+using ggml::npu::RmdBackend;
 
 constexpr const char * matmul_mode_name(MatmulInvocationMode mode) {
     return mode == MatmulInvocationMode::full ? "FULL" : "STRIPE_PIPELINE";
@@ -78,7 +78,7 @@ constexpr const char * matmul_mode_name(MatmulInvocationMode mode) {
 
 // The configured residual backend (the shared enum names).
 constexpr const char * rmd_backend_name(RmdBackend backend) {
-    return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+    return backend == RmdBackend::cpu_direct ? "cpu_direct" : "npu_compact";
 }
 
 // The residual executor that actually runs for a mode: "none" (compensation
@@ -123,7 +123,7 @@ constexpr const char * unsupported_combination(MatmulInvocationMode mode, RmdBac
     if (activation_quant != ActivationQuantAlgo::EXSIA) {
         return "STRIPE_PIPELINE needs GGML_GEMMINI_ACTIVATION_QUANT=EXSIA (ExSIA stripe-ready events)";
     }
-    if (compensation && backend != RmdBackend::gemmini_ws_compact) {
+    if (compensation && backend != RmdBackend::npu_compact) {
         return "STRIPE_PIPELINE with compensation=ON executes rmd_backend=WS (PoTal WS residual GEMM) only; "
                "the cpu_direct residual is not part of the pipeline";
     }

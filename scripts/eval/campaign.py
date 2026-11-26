@@ -33,10 +33,8 @@ from eval_common import (
 sys.path.insert(0, str(REPO))
 from campaign_metrics import OUTPUT_FILENAMES, outputs
 from metric_run import (
-    TERMINAL_LM_HEAD_MODES,
     collect_combined,
     collect_metric,
-    metric_execution,
     parser_for,
     validate_metric_recipe,
 )
@@ -50,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Metrics (activation, residual, scu): independent build, run, manifest "
                                                  "and evidence; no performance run and no timeline. `cycle` is the "
                                                  "legacy certified replay adapter.")
-    result.add_argument("kind", choices=("cycle", "activation", "residual", "scu", COMBINED),
+    result.add_argument("kind", choices=("activation", "residual", "scu", COMBINED),
                         help=f"{COMBINED}: activation, residual and aggregate SCU from one forward of one combined "
                              "build (the collection of `metric all`; not a fourth metric)")
     result.add_argument("--model", choices=("gpt2", "llama3.2-1B"), required=True)
@@ -71,12 +69,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reuse-shards", type=Path,
                         help=f"{COMBINED} only: collection/ of an unfinished attempt; its finished, valid shards of "
                              "this exact plan are hard-linked instead of run again")
-    result.add_argument("--terminal-lm-head", choices=TERMINAL_LM_HEAD_MODES,
-                        help=f"{COMBINED} only (default full): metrics-only observes the terminal lm_head completely "
-                             "but never computes its logits, which no metric and no later layer reads")
     result.add_argument("--jobs", type=int, default=4)
     result.add_argument("--timeout", type=int, default=1800)
-    result.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
     result.add_argument("--prepared-build", type=Path, help="explicit previously verified build_measurement.sh directory")
     result.add_argument("--workload-manifest", type=Path, help="optional exact native chunk identity from another metric")
     result.add_argument("--evaluation-manifest", type=Path,
@@ -84,11 +78,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model-manifest", type=Path,
                         help="frozen model manifest (model_manifest.py): records the shared model identity that "
                              "performance runs reference; the model must be one of its artifacts")
-    result.add_argument("--trace-source", type=Path, help="existing actual-inference trace; omission captures a fresh prefill")
-    result.add_argument("--source-provenance", type=Path, help="required for existing trace replay")
-    result.add_argument("--certificate", type=Path, help="stateful production certificate admitting exact trace")
-    result.add_argument("--evidence-root", type=Path, help="existing certificate evidence root")
-    result.add_argument("--library", type=Path, help="explicit certified cycle runtime library")
     return result
 
 
@@ -112,24 +101,16 @@ def canonical_aliases(output: Path, kind: str, raw: Path) -> None:
 def run_campaign(args: argparse.Namespace) -> Path:
     clean_environment()
     require(args.max_chunks >= 0 and 0 <= args.seed < 4294967295 and args.timeout > 0, "invalid campaign bounds")
-    if args.kind == "cycle":
-        require(args.certificate is not None and args.evidence_root is not None,
-                "cycle campaign requires an exact stateful --certificate and --evidence-root; no implicit certification")
-    else:
-        require(all(value is None for value in (args.trace_source, args.source_provenance, args.certificate,
-                args.evidence_root, args.library)), "metric campaigns do not accept cycle-provider inputs")
     require(args.scu_mode is None or args.kind == "scu" or (args.kind == COMBINED and args.scu_mode == "aggregate"),
             f"--scu-mode applies to scu ({COMBINED} collects aggregate SCU only)")
-    require(args.kind == COMBINED or (args.workers, args.threads, args.threads_batch, args.reuse_shards,
-                                      args.terminal_lm_head) == (None, None, None, None, None),
-            f"--workers, --threads, --threads-batch, --reuse-shards and --terminal-lm-head apply to {COMBINED} only")
+    require(args.kind == COMBINED or (args.workers, args.threads, args.threads_batch, args.reuse_shards) == (None, None, None, None),
+            f"--workers, --threads, --threads-batch, --reuse-shards apply to {COMBINED} only")
     require(args.kind != COMBINED or (args.workload_manifest, args.evaluation_manifest) == (None, None),
             f"{COMBINED} collects its three metrics from one workload; no shared manifests")
     started = time.monotonic()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or REPO.parent / ("evaluation-campaign-" + stamp) / args.kind).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    im2p = args.im2p.resolve(strict=True)
     bits = 4 if args.precision == "a4w4" else 8
     model = (args.model_path or REPO / "models" / args.model / f"{args.model}.Q{bits}_HP1.gguf").resolve(strict=True)
     tokenizer, architecture, blocks, file_type = model_metadata(model)
@@ -138,7 +119,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "model is not the requested GPT-2 124M or Llama-3.2-1B architecture")
     dataset = dataset_input(args.dataset_manifest, REPO / "wikitext-2-raw/wiki.test.raw", output / "dataset_manifest.json")
     if args.prepared_build is None:
-        runner = build(args.kind, args.precision, args.dim, output / "build", im2p, args.jobs)
+        runner = build(args.kind, args.precision, args.dim, output / "build", args.jobs)
     else:
         prepared = args.prepared_build.resolve(strict=True)
         receipt = read_json(prepared / "build-receipt.json")
@@ -152,13 +133,6 @@ def run_campaign(args: argparse.Namespace) -> Path:
     head = text(build_receipt, "producer_git_sha")
     policy = f"METRIC_PREFILL_256:split=test:max_chunks={args.max_chunks}:context=256:tail=drop:output=second_half"
     producer_hash = sha256(runner)
-    if args.kind == "cycle" and args.trace_source is not None:
-        require(args.max_chunks == 1, "existing source replay is exactly one certified chunk")
-        require(args.source_provenance is not None, "source replay requires original inference provenance")
-        original = read_json(args.source_provenance)
-        head = text(record(record(original["source"])["llama_cpp_gemmini"]), "head")
-        producer_hash = text(record(original["build"]), "binary_sha256")
-        policy = "CERTIFIED_SOURCE_PREFILL_256:split=test:chunk=0:output=last_token:sample=1:decode=0"
     manifest_path = output / "evaluation_manifest.json"
     model_name = "GPT-2 124M" if args.model == "gpt2" else "Llama-3.2-1B"
     if args.evaluation_manifest is None:
@@ -167,7 +141,6 @@ def run_campaign(args: argparse.Namespace) -> Path:
             "precision": args.precision.upper(), "dim": args.dim, "DIM": args.dim, "BK": 32,
             "seed": args.seed, "git_sha": head, "build_hash": producer_hash, "chunk_policy": policy})
     else:
-        require(args.kind != "cycle", "cycle campaigns bind the manifest through their trace certificate")
         shared = read_json(args.evaluation_manifest.resolve(strict=True))
         require(shared.get("model") == model_name and shared.get("tokenizer_sha256") == tokenizer and
                 shared.get("precision") == args.precision.upper() and shared.get("dim") == args.dim and
@@ -184,33 +157,14 @@ def run_campaign(args: argparse.Namespace) -> Path:
         "command": [sys.executable, *sys.argv], "scope": "ONE_CHUNK_SMOKE" if args.max_chunks == 1 else
         "ALL_COMPLETE_CHUNKS" if args.max_chunks == 0 else "BOUNDED_CHUNKS",
         "E2E_RECONSTRUCTION_READY": "NOT_READY", "PAPER_CAMPAIGN_COMPLETE": "NOT_RUN",
-        "measurement_domain": "legacy-cycle-replay" if args.kind == "cycle" else "metric",
+        "measurement_domain": "metric",
         # Same frozen model identity as the performance runs; the instrumentation build stays its own.
         "model_manifest": model_entry(args.model_manifest, model) if args.model_manifest is not None else None}
-    if args.kind == "cycle":
-        options: Record = {key: str(getattr(args, key)) if getattr(args, key) is not None else None
-            for key in ("trace_source", "source_provenance", "certificate", "evidence_root", "library")}
-        options.update({"im2p": str(im2p), "jobs": args.jobs, "max_chunks": args.max_chunks,
-                        "seed": args.seed, "timeout": args.timeout})
-        request = output / "cycle-request.json"
-        write_json(request, {"options": options, "runner": str(runner), "model": str(model),
-            "dataset": str(dataset), "manifest": manifest.identity(), "output": str(output), "binding": binding})
-        try:
-            command([sys.executable, "-B", str(Path(__file__).with_name("campaign_cycle.py")), str(im2p), str(request)],
-                    output, "stateful-provider", args.timeout)
-        except (ValueError, OSError, subprocess.SubprocessError) as error:
-            write_json(output / "failure.json", {"manifest_sha256": manifest.sha256, "error": str(error),
-                       "EVALUATION_CYCLE_CAMPAIGN_READY": "NOT_READY"})
-            checksums(output)
-            raise
-        binding = read_json(output / "cycle-binding.json")
-    elif args.kind == COMBINED:
+    if args.kind == COMBINED:
         threads = args.threads or 1
-        terminal = args.terminal_lm_head or "full"
         raws, collected = collect_combined(runner, model, dataset, manifest_path, output / "collection", args.max_chunks,
                                            args.workers or 1, threads, args.threads_batch or threads, args.timeout,
-                                           args.reuse_shards.resolve(strict=True) if args.reuse_shards else None,
-                                           terminal)
+                                           args.reuse_shards.resolve(strict=True) if args.reuse_shards else None)
         workload = record(collected["workload"])
         raw_chunks = workload["chunks"]
         chunks = {integer(record(row), "chunk_id") for row in raw_chunks} if isinstance(raw_chunks, list) else set()
@@ -236,7 +190,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
                         "collector_sha256": {source: sha256(REPO / source) for source in sources},
                         "threads": threads, "threads_batch": args.threads_batch or threads,
                         "workers": collected["workers"], "reused_shards": collected["reused_shards"],
-                        "metric_execution": metric_execution(terminal), "timing": timing})
+                        "timing": timing})
     else:
         recipe = "scale" if args.kind == "scu" else args.kind
         validate_metric_recipe(info, recipe)

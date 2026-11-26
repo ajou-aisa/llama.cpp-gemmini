@@ -7,23 +7,16 @@ function(expect_gemmini script expected)
         COMMAND env -u GGML_GEMMINI BUILD_JOBS=1 bash
             "${TEST_SOURCE_DIR}/${script}" --dry-run ${ARGN}
         RESULT_VARIABLE result
-        ERROR_VARIABLE error)
+        OUTPUT_VARIABLE output ERROR_VARIABLE error)
     if(NOT result EQUAL 0)
         message(FATAL_ERROR "${script} rejected GGML_GEMMINI=${expected}: ${error}")
     endif()
-    string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
-    string(JSON enabled GET "${CMAKE_MATCH_1}" effective GGML_GEMMINI)
-    if(NOT enabled STREQUAL "${expected}")
-        message(FATAL_ERROR "${script} expected GGML_GEMMINI=${expected}: ${summary}")
+    string(REGEX MATCHALL "-DGGML_GEMMINI(:[A-Za-z]+)?=(ON|OFF)" choices "${output}")
+    list(GET choices -1 enabled)
+    if(NOT enabled MATCHES "=${expected}$")
+        message(FATAL_ERROR "${script} expected GGML_GEMMINI=${expected}: ${output}")
     endif()
-    if(script STREQUAL "build-arm64.sh" AND expected STREQUAL "ON" AND
-       CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-        string(JSON option GET "${CMAKE_MATCH_1}" effective GGML_GEMMINI_OPTION)
-        string(JSON rmd GET "${CMAKE_MATCH_1}" effective GGML_GEMMINI_DEFAULT_RMD_BACKEND)
-        if(NOT option STREQUAL "CPU" OR NOT rmd STREQUAL "CPU")
-            message(FATAL_ERROR "macOS default requires CPU+RMD CPU, got ${option}+RMD ${rmd}")
-        endif()
-    endif()
+
 endfunction()
 
 expect_gemmini(build-arm64.sh OFF)

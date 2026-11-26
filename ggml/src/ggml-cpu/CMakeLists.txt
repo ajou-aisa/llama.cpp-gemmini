@@ -39,15 +39,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     # added by zerogod; no Gemmini SDK header path (ggml-cpu includes none)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu
-        ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini-utils/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml-npu-common/profiling/include
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE
-        CYCLE_SIM=${CYCLE_SIM}
+
         LOG_CYCLE=${LOG_CYCLE}
         CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
 
-    if (LOG_CYCLE OR GGML_CPU_CYCLE_LOG OR CYCLE_SIM)
-        target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-gemmini-utils)
+    if (LOG_CYCLE OR GGML_CPU_CYCLE_LOG)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-npu-profiling)
     endif()
 
     if (APPLE AND GGML_ACCELERATE)

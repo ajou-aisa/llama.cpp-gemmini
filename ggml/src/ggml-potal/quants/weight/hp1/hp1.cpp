@@ -1,8 +1,8 @@
 #include "hp1.hpp"
 
-#include "ggml-gemmini-args.h"
-#include "quants/common/hp1_scu.hpp"
-#include "quants/common/weight_route.hpp"
+#include "../../../../ggml-npu-common/types/matmul.hpp"
+#include "../../../../ggml-npu-common/quantization/common/hp1_scu.hpp"
+#include "../../../../ggml-npu-common/quantization/common/weight_route.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -13,7 +13,7 @@ namespace ggml::potal::quants::weight::hp1 {
 
 namespace {
 
-namespace wroute = ggml::gemmini::quants::wroute;
+namespace wroute = ggml::npu::quants::wroute;
 
 uint32_t float_bits(float v) {
     uint32_t bits;
@@ -35,7 +35,7 @@ const char * status_name(status s) {
     return "unknown";
 }
 
-status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
+status unpack(const npu_matmul_args & args, int8_t * B, size_t ldb, uint32_t * carriers, size_t cstride,
               float * channel_scale, stats * st, wreader::WeightReaderStatus * reader) {
     if (B == nullptr || carriers == nullptr || channel_scale == nullptr || st == nullptr || ldb < args.J ||
         cstride < args.J) {
@@ -96,7 +96,7 @@ status unpack(const ggml_gemmini_args_t & args, int8_t * B, size_t ldb, uint32_t
             if (float_bits(c.column_scale) != scale_bits) {
                 return status::scale_mismatch;
             }
-            if (c.carrier == ggml::gemmini::quants::hp1::zero_carrier) {
+            if (c.carrier == ggml::npu::quants::hp1::zero_carrier) {
                 s.zero_blocks++;
             } else {
                 if (zero_scale) {

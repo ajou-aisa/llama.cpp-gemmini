@@ -3,10 +3,10 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #if defined(GGML_GEMMINI_CUDA_CPU_EXACT)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-hp1-scu.h"
+#include "../ggml-npu-common/evaluation/cuda-exact/ggml-cuda-hp1-scu.h"
 #endif
 #if defined(GGML_GEMMINI_CUDA_RTN) || defined(GGML_GEMMINI_CUDA_RTN_ATTENTION)
-#include "../ggml-cuda/cpu-exact/ggml-cuda-rtn.h"
+#include "../ggml-npu-common/evaluation/cuda-rtn/ggml-cuda-rtn.h"
 #endif
 
 #if defined(GGML_GEMMINI_PB)

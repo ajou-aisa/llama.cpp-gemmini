@@ -1,37 +1,23 @@
-"""The measurement interface of the PoTal evaluation scripts, defined once: exactly three domains.
-
-`run_measurement.py` dispatches from these definitions, the README tables are generated from them and the tests check
-both. Terminology is fixed here:
-
-  Performance  TTFT / TPOT / CPU-NPU timing (run_cycle_evaluation.py --run performance)
-  Timeline     optional/export view of the stored scheduling result (same engine: --timeline compact, --run timeline)
-  Metrics      activation / residual / SCU (campaign.py activation|residual|scu)
-
-Perplexity/model-quality evaluation is intentionally outside this measurement interface and is run with
-llama-perplexity.
-"""
+"""Independent activation, residual and scale measurement interfaces."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from campaign_build import CYCLE_MODEL_OPTIONS, METRIC_SINKS, REPO, llama_plan
+from campaign_build import METRIC_SINKS, REPO, llama_plan
 from eval_common import Json, Record
 
 EVAL: Final = Path(__file__).resolve().parent
-RUNNER: Final = "run_cycle_evaluation.py"
 CAMPAIGN: Final = "campaign.py"
 # The official domains (the wrapper's commands) and the metric subtypes; nothing else is a measurement domain.
-DOMAINS: Final = ("performance", "timeline", "metric")
+DOMAINS: Final = ("metric",)
 METRIC_KINDS: Final = tuple(METRIC_SINKS)  # activation, residual, scu
 # `metric all` runs the three metric kinds over a model x precision x DIM matrix and aggregates them; it is an
 # orchestration layer (its own delegate), not a fourth metric kind and not a measurement row below.
 METRIC_ALL: Final = "all"
 SWEEP: Final = "metric_sweep.py"
-TERMINOLOGY: Final = {"performance": ("Performance", "TTFT / TPOT / CPU-NPU timing"),
-                      "timeline": ("Timeline", "optional/export view of the stored scheduling result"),
-                      "metric": ("Metrics", "activation / residual / SCU")}
+TERMINOLOGY: Final = {"metric": ("Metrics", "activation / residual / SCU")}
 OUTSIDE_INTERFACE: Final = ("Perplexity/model-quality evaluation is intentionally outside this measurement interface "
                             "and is run with llama-perplexity.")
 
@@ -45,9 +31,9 @@ MATRIX_COLUMNS: Final = (
 MATRIX_LABELS: Final = {"timeline": "timeline-only"}
 # Build flags shown in the build mapping (read from campaign_build.llama_plan, never restated).
 KEY_FLAGS: Final = (*(option for option, _ in METRIC_SINKS.values()),
-                    "CYCLE_SIM", "LOG_CYCLE", "GGML_CPU_CYCLE_LOG", "GGML_GEMMINI_OPTION",
+                    "LOG_CYCLE", "GGML_CPU_CYCLE_LOG", "GGML_GEMMINI_OPTION",
                     "GGML_GEMMINI_EXECUTION_BACKEND", "GGML_GEMMINI_DEFAULT_MATMUL_MODE")
-Build = tuple[str, str | None]  # (build kind, matmul mode); no matmul mode = the cycle-model library
+Build = tuple[str, str | None]  # (build kind, matmul mode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +79,7 @@ def _metric(kind: str, measures: str, raw: str, summary: str, layers: str,
         measures=measures,
         never="TTFT/TPOT, NPU cycle replay, scheduling, timeline; the other two metric sinks",
         inputs=("HP1 GGUF model (`--model gpt2|llama3.2-1B` or `--model-path`), WikiText-2 test text "
-                "(`--dataset-manifest`), IM2P.sim checkout (functional backend sources)"),
+                "(`--dataset-manifest`), internal Gemmini SDK"),
         outputs=("manifest.json", "request.json", "evaluation_manifest.json", "dataset_manifest.json", "build/",
                  f"collection/{raw}", f"raw.jsonl{'.gz' if raw.endswith('.gz') else ''}",
                  f"{summary} (= summary.json)", f"{layers} (= layers.json)", *extra, "SHA256SUMS"),
@@ -104,49 +90,6 @@ def _metric(kind: str, measures: str, raw: str, summary: str, layers: str,
 
 
 MEASUREMENTS: Final[dict[str, Measurement]] = {
-    "performance": Measurement(
-        domain="performance", title="Performance",
-        command=("performance",), delegate=(RUNNER, "--run", "performance"),
-        example=("python3 scripts/eval/run_measurement.py performance \\\n"
-                 "  --validation-mode nano-local --local-validation RECEIPT.json --model-manifest MANIFEST.json \\\n"
-                 "  --model models/gpt2/gpt2.Q8_HP1.gguf --prompt-file wikitext-2-raw/wiki.test.raw \\\n"
-                 "  --precision a8w8 --dim 32 [--reuse-collection RUN] [--timeline none|compact] \\\n"
-                 "  [--stage-cache DIR] [--npu-task-cache FILE|none] [--clock-selection CLOCK.json] [--output DIR]"),
-        builds=(("cycle-model", None), ("potal-host", "STRIPE_PIPELINE"), ("fullcpu-host", "FULL")),
-        build_note=("cycle model (nano-local: the library the validation receipt admits, never rebuilt); PoTal and "
-                    "FullCPU only for a fresh collection, none with `--reuse-collection`; all metric sinks 0"),
-        measures=("TTFT, 127 TPOT intervals and token-ready endpoints from the CPU/NPU schedule; CPU service PMU "
-                  "cycles, host elapsed ns and thread ns; NPU isolated-service cycles; optional timeline"),
-        never="activation/residual/SCU metrics; target E2E ms without clock, interface and target-host evidence",
-        inputs=("HP1 GGUF model and its model manifest, WikiText-2 test text, validation authority (nano-local "
-                "receipt or certificate set), optionally a retained collection and a clock selection"),
-        outputs=("manifest.json", "performance.json", "provenance.json", "timing-provenance.json", "build/",
-                 "replay/ (NPU results, dataset, lifecycle, IR, schedule.sqlite, schedule-performance.json)",
-                 "timeline/ (only with --timeline compact)", "SHA256SUMS"),
-        reuse=("`--build-cache`, `--stage-cache` (content-addressed stages), `--npu-task-cache` (per-work NPU "
-               "answers), `--reuse-collection` (CPU timing is then the reused collection's, not a new measurement)"),
-        default_output="runs/performance/<utc>-<model>-<precision>-d<dim>-hp1",
-        needs={"cycle_model": "yes", "potal": "fresh collection only", "fullcpu": "fresh collection only",
-               "pmu": "fresh collection only", "scheduler": "yes", "npu_clock": "optional (ms only)",
-               "wikitext": "yes", "metric_instrumentation": "no", "timeline": "optional (--timeline compact)"}),
-    "timeline": Measurement(
-        domain="timeline", title="Timeline",
-        command=("timeline",), delegate=(RUNNER, "--run", "timeline"),
-        example="python3 scripts/eval/run_measurement.py timeline --from-run PERFORMANCE_RUN [--format jsonl] [--output DIR]",
-        builds=(),
-        build_note="nothing is built",
-        measures=("nothing new: the rows of the stored schedule (CPU worker intervals, NPU works, request and token "
-                  "events with overlap, idle gaps and core provenance), the same rows `--timeline compact` writes"),
-        never=("collection, replay, join, lifecycle, IR, scheduling, metrics; a run without its stored schedule "
-               "fails instead of recomputing"),
-        inputs=("a completed performance run whose schedule, IR and NPU results are still stored (run directory "
-                "with `--keep-raw`, or its stage cache)"),
-        outputs=("manifest.json", "timeline.jsonl", "timeline-rows.json", "export.json", "SHA256SUMS"),
-        reuse="stored schedule, IR and NPU results, each verified against its stage receipt",
-        default_output="runs/timeline/<utc>-<source run name>",
-        needs={"cycle_model": "no", "potal": "no", "fullcpu": "no", "pmu": "no", "scheduler": "no (stored schedule)",
-               "npu_clock": "no (source run's axis)", "wikitext": "no", "metric_instrumentation": "no",
-               "timeline": "yes"}),
     "activation": _metric(
         "activation",
         "activation quantization and outlier statistics per layer and in aggregate (signed-row BK32 2-sigma "
@@ -169,87 +112,46 @@ MEASUREMENTS: Final[dict[str, Measurement]] = {
 
 # Every file of scripts/eval (and the build scripts next to it): (script, status, role, called by).
 STATUSES: Final = ("CANONICAL", "WRAPPER", "INTERNAL", "LEGACY", "CERTIFICATION_ONLY", "DEBUG/RESEARCH")
-SCRIPTS: Final[tuple[tuple[str, str, str, str], ...]] = (
-    ("run_measurement.py", "CANONICAL", "user entry point of the three domains; dispatch only", "user"),
-    ("run_cycle_evaluation.py", "CANONICAL", "performance and timeline export engine (`--run`)",
-     "run_measurement.py"),
-    ("campaign.py", "CANONICAL",
-     "metric engine: `activation`, `residual`, `scu` (its `cycle` kind is the legacy stateful replay adapter)",
-     "run_measurement.py, run_*_metrics.sh"),
+SCRIPTS: Final = (
+    ("run_measurement.py", "CANONICAL", "user entry point of the metric domains; dispatch only", "user"),
+    ("campaign.py", "CANONICAL", "metric engine: `activation`, `residual`, `scu` (independent metric sinks)", "run_measurement.py, run_*_metrics.sh"),
     ("run_activation_metrics.sh", "WRAPPER", "`campaign.py activation`", "user (kept)"),
     ("run_residual_metrics.sh", "WRAPPER", "`campaign.py residual`", "user (kept)"),
     ("run_scu_metrics.sh", "WRAPPER", "`campaign.py scu`", "user (kept)"),
     ("build_measurement.sh", "WRAPPER", "`campaign_build.py` CLI (separately verifiable build, `--dry-run`)", "user"),
-    ("activation_quant_metrics.py", "WRAPPER", "standalone activation collect/reduce with a prepared runner",
-     "user (advanced)"),
-    ("residual_path_metrics.py", "WRAPPER", "standalone residual collect/reduce with a prepared runner",
-     "user (advanced)"),
-    ("scale_alignment_metrics.py", "WRAPPER", "standalone SCU collect/reduce with a prepared runner",
-     "user (advanced)"),
-    ("measurement_domains.py", "INTERNAL", "domain definitions for the wrapper, README tables and tests",
-     "run_measurement.py"),
-    ("metric_sweep.py", "INTERNAL",
-     ("`metric all`: `campaign.py metrics-all` (one forward, all three sinks, chunk shards) or separate metric runs "
-      "over models x precisions x DIMs, identity checks and the aggregate JSON/CSV/tables; computes no metric"),
-     "run_measurement.py"),
-    ("metric_table.py", "INTERNAL", "deterministic stdout tables of metric summaries (display only)",
-     "metric_sweep.py, campaign.py"),
-    ("measurement_identity.py", "INTERNAL",
-     "read-only shared identity of finished runs (`run_measurement.py identity RUN...`)", "run_measurement.py"),
-    ("campaign_build.py", "INTERNAL",
-     "the build authority: every CMake option of every measurement build, receipts, build cache",
-     "run_cycle_evaluation.py, campaign.py, cycle scripts"),
-    ("metric_run.py", "INTERNAL", "native metric collection with sink isolation; body of the standalone reducers",
-     "campaign.py, *_metrics.py"),
+    ("activation_quant_metrics.py", "WRAPPER", "standalone activation collect/reduce with a prepared runner", "user (advanced)"),
+    ("residual_path_metrics.py", "WRAPPER", "standalone residual collect/reduce with a prepared runner", "user (advanced)"),
+    ("scale_alignment_metrics.py", "WRAPPER", "standalone SCU collect/reduce with a prepared runner", "user (advanced)"),
+    ("measurement_domains.py", "INTERNAL", "domain definitions for the wrapper, README tables and tests", "run_measurement.py"),
+    ("metric_sweep.py", "INTERNAL", "`metric all`: `campaign.py metrics-all` (one forward, all three sinks, chunk shards) or separate metric runs over models x precisions x DIMs, identity checks and the aggregate JSON/CSV/tables; computes no metric", "run_measurement.py"),
+    ("metric_table.py", "INTERNAL", "deterministic stdout tables of metric summaries (display only)", "metric_sweep.py, campaign.py"),
+    ("measurement_identity.py", "INTERNAL", "read-only shared identity of finished runs (`run_measurement.py identity RUN...`)", "run_measurement.py"),
+    ("campaign_build.py", "INTERNAL", "the build authority: every CMake option of every measurement build, receipts, build cache", "campaign.py, metric scripts"),
+    ("metric_run.py", "INTERNAL", "native metric collection with sink isolation; body of the standalone reducers", "campaign.py, *_metrics.py"),
     ("campaign_metrics.py", "INTERNAL", "aggregate and per-layer metric outputs", "campaign.py"),
-    ("campaign_inputs.py", "INTERNAL", "model/tokenizer/dataset identity, SHA256SUMS", "campaign.py, cycle scripts"),
+    ("campaign_inputs.py", "INTERNAL", "model/tokenizer/dataset identity, SHA256SUMS", "campaign.py, metric scripts"),
     ("campaign_stream.py", "INTERNAL", "streaming gzip sink for SCU observations", "metric_run.py"),
     ("campaign_verify.py", "INTERNAL", "verifier CLI for a finished metric run (manifest binding, checksums)", "user"),
-    ("e2e_timeline.py", "INTERNAL", "the one timeline row builder and performance accumulator",
-     "run_cycle_evaluation.py, schedule_engine.py"),
-    ("schedule_engine.py", "INTERNAL", "one scheduling pass with performance and timeline sinks",
-     "run_cycle_evaluation.py"),
-    ("stage_cache.py", "INTERNAL", "content-addressed offline stage cache", "run_cycle_evaluation.py"),
-    ("model_manifest.py", "INTERNAL", "frozen model manifest (create/verify CLI, `model_entry`)",
-     "run_cycle_evaluation.py, campaign.py"),
-    ("evaluation_host.py", "INTERNAL", "read-only host observations", "run_cycle_evaluation.py, e2e_run.py"),
-    ("pmu_probe.c", "INTERNAL", "PMU readiness probe compiled by the performance preflight",
-     "run_cycle_evaluation.py"),
-    ("eval_common.py", "INTERNAL", "shared helpers (certificate-pinned)", "all"),
-    ("end_to_end.py", "INTERNAL", "native collection (`collect`) and certified reconstruction (`reconstruct`) CLI",
-     "run_cycle_evaluation.py"),
+    ("stage_cache.py", "INTERNAL", "content-addressed offline stage cache", "native profiling tools"),
+    ("model_manifest.py", "INTERNAL", "frozen model manifest (create/verify CLI, `model_entry`)", "campaign.py"),
+    ("evaluation_host.py", "INTERNAL", "read-only host observations", "e2e_run.py"),
+    ("pmu_probe.c", "INTERNAL", "PMU readiness probe compiled by the performance preflight", "run_cycle_evaluation.py"),
+    ("eval_common.py", "INTERNAL", "shared metric and artifact helpers", "all"),
+    ("end_to_end.py", "INTERNAL", "native CPU and CUDA collection (`collect`) CLI", "native measurement tools"),
     ("e2e_run.py", "INTERNAL", "native collection logic", "end_to_end.py"),
-    ("run_stateful_integration_smoke.py", "INTERNAL", "256+1 smoke pair collector (`--smoke`)",
-     "run_cycle_evaluation.py"),
     ("paired_inputs.py", "INTERNAL", "PoTal/FullCPU pairing inputs", "e2e_run.py"),
-    ("application_results.py", "INTERNAL", "application endpoint results (certificate-pinned)",
-     "end_to_end.py, offline_pipeline.py"),
-    ("target_admission.py", "INTERNAL", "fail-closed publication gates (clock, target host, interface)",
-     "run_cycle_evaluation.py"),
-    ("metric_reducers.py", "LEGACY", "unbound ACT/RES reducers for historical streams (`--reduce` without a manifest)",
-     "metric_run.py"),
-    ("offline_pipeline.py", "CERTIFICATION_ONLY", "certified offline replay/join/IR (`--validation-mode certified`)",
-     "end_to_end.py"),
-    ("certified_reconstruction.py", "CERTIFICATION_ONLY", "certified reconstruction results", "offline_pipeline.py"),
-    ("scheduled_endpoints.py", "CERTIFICATION_ONLY", "scheduled endpoints of certified schedules",
-     "certified_reconstruction.py"),
-    ("e2e_cost_ownership.py", "CERTIFICATION_ONLY", "cost-ownership and interface contracts", "target_admission.py"),
-    ("e2e_integration_prep.py", "CERTIFICATION_ONLY", "stateful host+NPU integration prep on a certified trace",
-     "user"),
-    ("campaign_cycle.py", "CERTIFICATION_ONLY", "stateful provider replay behind `campaign.py cycle`",
-     "campaign.py, cycle_campaign.py"),
-    ("cycle_campaign.py", "CERTIFICATION_ONLY", "certified trace cycle accounting", "run_cycle_campaign.sh"),
-    ("run_cycle_campaign.sh", "CERTIFICATION_ONLY", "`cycle_campaign.py`", "user"),
-    ("cycle_trace_capture.py", "CERTIFICATION_ONLY", "actual-inference trace capture and certificate",
-     "run_cycle_trace_capture.sh"),
-    ("run_cycle_trace_capture.sh", "CERTIFICATION_ONLY", "`cycle_trace_capture.py`", "user"),
-    ("cycle_campaign_bundle.py", "CERTIFICATION_ONLY", "evaluation-cycle campaign bundle", "user"),
-    ("actual_cycle_bundle.py", "CERTIFICATION_ONLY", "actual-cycle campaign bundle", "user"),
-    ("cycle_accounting.py", "CERTIFICATION_ONLY", "cycle accounting definitions", "cycle_campaign.py"),
+    ("application_results.py", "INTERNAL", "native application endpoint results", "end_to_end.py"),
+    ("metric_reducers.py", "LEGACY", "unbound ACT/RES reducers for historical streams (`--reduce` without a manifest)", "metric_run.py"),
+    ("plot_potal_pipeline.py", "INTERNAL", "native PoTAL pipeline plotting", "native profiling tools"),
+    ("cycle_accounting.py", "INTERNAL", "event interval accounting with caller-supplied event layout", "native profiling tools"),
+    ("e2e_timeline.py", "INTERNAL", "host worker lanes and exact interval arithmetic", "native profiling tools"),
+    ("target_admission.py", "INTERNAL", "target host and interface measurement validation", "native measurement tools"),
+    ("certified_reconstruction.py", "INTERNAL", "hash-bound artifacts and publication rows", "native measurement tools"),
+    ("cpu_profiling.py", "INTERNAL", "Native CPU timing validity and PMU profiling", "native profiling tools"),
 )
 # Outside scripts/eval: never a measurement build or entry point.
 OUTSIDE: Final[tuple[tuple[str, str, str, str], ...]] = (
-    ("build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh", "DEBUG/RESEARCH",
+    ("build-arm64.sh, build-arm64-cpu.sh, build-x86.sh, build-riscv.sh", "DEBUG/RESEARCH",
      "developer builds with their own option defaults; never a measurement build", "developer"),
     ("scripts/experiment/, scripts/utils/", "DEBUG/RESEARCH", "cycle matrix experiments and log rendering helpers",
      "developer"),
@@ -261,44 +163,12 @@ OUTSIDE: Final[tuple[tuple[str, str, str, str], ...]] = (
 # build takes its options from campaign_build.py; no other script of this table defines a measurement option.
 BUILD_SCRIPT_FIELDS: Final = ("script", "caller", "build_kinds", "semantic_options", "platform_options", "output",
                               "status")
-BUILD_SCRIPTS: Final[tuple[tuple[str, str, str, str, str, str, str], ...]] = (
-    ("scripts/eval/campaign_build.py", "all measurement scripts; CLI through build_measurement.sh",
-     ("`cycle`, `activation`, `residual`, `scu`, `metrics-all` (all three sinks, `metric all`), `potal-host`, "
-      "`potal-host-nocpulog`, `fullcpu-host`, `cycle-model`"),
-     "defined here and nowhere else: `llama_plan()`, `METRIC_SINKS`, `CYCLE_MODEL_OPTIONS`",
-     ("`platform_profile()`: library suffix, binary format, install name; adds no CMake option today and may never "
-      "add a semantic one (`with_platform`)"),
-     ("build directory with configure/build/verify logs, `build-info.json`, `artifacts.json`, `build-receipt.json`; "
-      "`cached_*` entries under `--build-cache`"),
-     "ACTIVE (authority)"),
-    ("scripts/eval/build_measurement.sh", "user", "same kinds (`--kind`, `--dry-run`)", "from campaign_build.py",
-     "from campaign_build.py", "`--output DIR`", "ACTIVE (wrapper)"),
-    ("scripts/eval/run_cycle_evaluation.py", "run_measurement.py performance, timeline",
-     "performance: `cycle-model`, `potal-host` (STRIPE_PIPELINE), `fullcpu-host` (FULL); timeline: none",
-     "none of its own: `--precision`, `--dim` select the `llama_plan()` profile", "from campaign_build.py",
-     "`--build-cache/<kind>-<identity>`; per-build summary in `<run>/build/*.json`", "ACTIVE"),
-    ("scripts/eval/campaign.py", "run_measurement.py metric KIND, run_*_metrics.sh",
-     "`activation`, `residual`, `scu` (FULL); `cycle` only for its legacy adapter",
-     "none of its own: `--precision`, `--dim` select the `llama_plan()` profile", "from campaign_build.py",
-     "`<output>/build` (fresh) or a verified `--prepared-build`", "ACTIVE"),
-    ("scripts/eval/metric_sweep.py", "run_measurement.py metric all",
-     ("`metrics-all` (FULL), one per precision x DIM shared by both models; with `--collection separate` "
-      "`activation`, `residual`, `scu` each"),
-     "none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles", "from campaign_build.py",
-     ("`--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to "
-      "`campaign.py --prepared-build`"), "ACTIVE"),
-    ("scripts/eval/cycle_trace_capture.py", "run_cycle_trace_capture.sh", "`cycle` (STRIPE_PIPELINE)",
-     "none of its own", "from campaign_build.py", "`<config>/build` or `--prepared-build`", "CERTIFICATION_ONLY"),
-    ("scripts/eval/campaign_cycle.py", "campaign.py cycle", "`cycle-model`", "`CYCLE_MODEL_OPTIONS`",
-     "from campaign_build.py", "`<output>/cycle-library-build`", "CERTIFICATION_ONLY (legacy adapter)"),
-    ("build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh", "developer",
-     "none (developer builds, not a measurement kind)",
-     ("own environment defaults resolved by `scripts/im2p-build-options.py`; they differ from every measurement "
-      "profile (backend, DIM, bits, OpenMP, runtime matmul override)"),
-     "host and toolchain specific (native flags, OpenMP, cross toolchain)",
-     ("`build-arm64/`, `build-arm64-cpu/`, `build-arm64-fpga-uart/`, `build-x86/`, `build-riscv[-static]/`; no "
-      "receipt"),
-     "DEBUG/RESEARCH (never admitted by a runner)"),
+BUILD_SCRIPTS: Final = (
+    ("scripts/eval/campaign_build.py", "all measurement scripts; CLI through build_measurement.sh", "`activation`, `residual`, `scu`, `metrics-all` (all three sinks, `metric all`), `potal-host`, `potal-host-nocpulog`, `fullcpu-host`", "defined here and nowhere else: `llama_plan()`, `METRIC_SINKS`", "`platform_profile()`: library suffix, binary format, install name; adds no CMake option today and may never add a semantic one (`with_platform`)", "build directory with configure/build/verify logs, `build-info.json`, `artifacts.json`, `build-receipt.json`; `cached_*` entries under `--build-cache`", "ACTIVE (authority)"),
+    ("scripts/eval/build_measurement.sh", "user", "same kinds (`--kind`, `--dry-run`)", "from campaign_build.py", "from campaign_build.py", "`--output DIR`", "ACTIVE (wrapper)"),
+    ("scripts/eval/campaign.py", "run_measurement.py metric KIND, run_*_metrics.sh", "`activation`, `residual`, `scu` (FULL); `cycle` only for its legacy adapter", "none of its own: `--precision`, `--dim` select the `llama_plan()` profile", "from campaign_build.py", "`<output>/build` (fresh) or a verified `--prepared-build`", "ACTIVE"),
+    ("scripts/eval/metric_sweep.py", "run_measurement.py metric all", "`metrics-all` (FULL), one per precision x DIM shared by both models; with `--collection separate` `activation`, `residual`, `scu` each", "none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles", "from campaign_build.py", "`--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to `campaign.py --prepared-build`", "ACTIVE"),
+    ("build-arm64.sh, build-arm64-cpu.sh, build-x86.sh, build-riscv.sh", "developer", "none (developer builds, not a measurement kind)", "environment build defaults resolved by cmake/npu-config.cmake", "host and toolchain specific (native flags, OpenMP, cross toolchain)", "`build-arm64/`, `build-arm64-cpu/`, `build-x86/`, `build-riscv[-static]/`; no receipt", "DEBUG/RESEARCH (never admitted by a runner)"),
 )
 
 
@@ -320,12 +190,7 @@ def build_mapping(precision: str = "a8w8", dim: int = 32) -> list[Record]:
         if not row.builds:
             rows.append({"measurement": name, "build_kind": None, "flags": {}, "binary": None})
         for kind, matmul in row.builds:
-            if matmul is None:
-                flags: Record = {key: value for key, value in CYCLE_MODEL_OPTIONS.items()}
-                rows.append({"measurement": name, "build_kind": kind, "flags": flags,
-                             "binary": "libim2p_cycle_model (IM2P.sim sim/cycle)"})
-                continue
-            plan = llama_plan(kind, precision, dim, REPO.parent / "IM2P.sim", matmul)
+            plan = llama_plan(kind, precision, dim, matmul)
             shown: Record = {key: plan.options[key] for key in KEY_FLAGS if key in plan.options}
             rows.append({"measurement": name, "build_kind": kind, "flags": shown,
                          "binary": "llama-eval-workload",

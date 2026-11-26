@@ -87,6 +87,7 @@ struct BlockObservation {
     const float * s_b;      // J scales for this block.
     const float * output;   // FP32 accumulation after this block.
     size_t row_stride, column_stride;
+    uint64_t config_commands = 0, loop_commands = 0, drains = 0; // actual functional transport deltas
 };
 using BlockObserver = void (*)(const BlockObservation &, void *);
 void set_block_observer(BlockObserver observer, void * context);

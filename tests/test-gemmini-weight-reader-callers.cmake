@@ -1,7 +1,7 @@
 set(_production_files
-    "${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-npu-common/residual/direct/direct-executor.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/../ggml/src/ggml-npu-common/residual/rmd/rmd-reference.cpp")
 
 set(_caller_files 0)
 foreach(_file IN LISTS _production_files)

@@ -1,0 +1,45 @@
+{
+  "schema": "socmulator.baseline.software/1",
+  "recorded": "2026-11-26",
+  "llama_cpp": {
+    "repository": "git@github.com:ajou-aisa/llama.cpp-gemmini.git",
+    "branch": "socmulator-dev",
+    "commit": "64a072afa5a7a22dec74e94d599ffa4b848c9a20",
+    "upstream_tracking": "origin/socmulator-dev (in sync at start; also equal to origin/potal)",
+    "working_tree_at_start": "clean (git status -sb: '## socmulator-dev...origin/socmulator-dev', no diff, no staged changes)",
+    "baseline_worktree": "/Users/zerogod/aisa-lab/DynDNN/reference/llama.cpp-baseline-64a072a (git worktree, detached at the commit above)"
+  },
+  "socmulator_superproject": {
+    "commit": "9e81e7f",
+    "submodules": {
+      "llama.cpp": "64a072afa5a7a22dec74e94d599ffa4b848c9a20",
+      "gem5": "9d368896ce119c17e1289dcbb18f33624724b843",
+      "PytorchSim-aisa": "509f42554202edb29cf8d31ddf619776f465e717"
+    },
+    "modified": false
+  },
+  "external_gemmini_sdk": {
+    "selected": {
+      "repository": "https://github.com/ajou-aisa/RISC-V-DynDNN-gemmini-include",
+      "branch": "develop (== m-r)",
+      "commit": "fcfcf5ce7c4670bd789365f11810177f97016f81",
+      "files": {
+        "gemmini.h": { "bytes": 208174, "sha256": "a6d7207ddee555f0fbcd00b9952a12507b458ee43a899c7c1e60a131af53b15f", "git_blob": "cd15b5479a59c62e549e14103ae2386440ffeb60" },
+        "gemmini_params.h": { "sha256": "d6db18f8edbfeb854780286d8c2afb81ae3b9103224522478a9047d5550272e5", "git_blob": "768ebf218afc60f5f28c2ecf378bd03eb96001fd" },
+        "gemmini_counter.h": { "git_blob": "6050ed742186dda54e05263422c0b40f9e76bb03" }
+      },
+      "selection_evidence": "Only branch whose gemmini.h compiles against llama.cpp 64a072a (baseline gemmini-int8-d16-cpu/ws builds). It has no rocc-software/src/xcustom.h, so RISC-V builds against it fail (rv-gemmini-int8-d16-ws: 'rocc-software/src/xcustom.h: No such file or directory')."
+    },
+    "rejected": [
+      { "source": "gemmini-aisa aisa-customizations 185293e8 software/gemmini-rocc-tests/include/gemmini.h", "bytes": 204951, "sha256": "9c872cdabb865dd3aee77937f090855b51120178fc181a66f0b1cb50bbf9fcf4", "reason": "does not compile: no member 'layer_type' in ggml_gemmini_args_t, no 'q8_h1', exsia::Meta has no 'outliers'" },
+      { "source": "RISC-V-DynDNN-gemmini-include main edcdb15f", "bytes": 137300, "sha256": "d34a57cc7c55e401c48c27e6d3a851788e5de57eb16d7fb1b7150f65e668655a", "reason": "older 137 KB variant without the GGML adapters" }
+    ]
+  },
+  "toolchains": {
+    "macos_host": { "os": "Darwin 25.5.0 arm64 (Apple M5 Pro)", "c_cxx": "Apple clang 21.0.0 (clang-2100.1.1.101)", "cmake": "4.3.0", "ninja": "1.13.2" },
+    "linux_container": { "image": "socm-baseline:ubuntu24 (build-baseline/linux/Dockerfile, ubuntu:24.04 arm64)", "c_cxx": "gcc 13.3.0", "cmake": "3.28.3" },
+    "riscv_cross": { "compiler": "riscv64-linux-gnu-gcc 13.3.0 (Ubuntu)", "note": "Ubuntu's Linux toolchain, not the FireSim riscv-tools; GGML_RVV=ON fails in ggml-cpu-quants.c with this GCC (RVV intrinsic API mismatch)" },
+    "firesim_riscv_tools": "NOT AVAILABLE on this machine (cmake/riscv*.cmake hardcoded /home/alveo/firesim/.conda-env/riscv-tools)"
+  },
+  "hardware": "NOT AVAILABLE: no Gemmini/PoTAL FPGA or FireSim target was reachable; no hardware command, counter or cycle was measured"
+}

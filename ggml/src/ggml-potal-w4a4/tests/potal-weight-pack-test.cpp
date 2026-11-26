@@ -2,10 +2,9 @@
 // Compile weight_reader.cpp and this file with GGML_GEMMINI_TESTING for actual
 // address-resolution counts. No hardware, model files, or timing measurements.
 #include "quants/weight/hp1/hp1.hpp"
-#include "ggml-gemmini-args.h"
-#include "quants/common/hp1_scu.hpp"
+#include "../../ggml-npu-common/types/matmul.hpp"
+#include "../../ggml-npu-common/quantization/common/hp1_scu.hpp"
 
-#include <gemmini_params.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -14,8 +13,8 @@
 #include <vector>
 
 namespace hp = ggml::potal::quants::weight::hp1;
-namespace wr = ggml::gemmini::quants::wreader;
-namespace route = ggml::gemmini::quants::wroute;
+namespace wr = ggml::npu::quants::wreader;
+namespace route = ggml::npu::quants::wroute;
 using RS = wr::WeightReaderStatus;
 
 namespace {
@@ -28,11 +27,11 @@ uint32_t bits(float v) {
 
 // Retain the old checked metadata and K-then-N scalar read/write order.
 // Deliberately use neither the tile reader nor the packed-pair helper.
-hp::status scalar(const ggml_gemmini_args_t & a, int8_t * B, size_t ldb,
+hp::status scalar(const npu_matmul_args & a, int8_t * B, size_t ldb,
                   uint32_t * carriers, size_t stride, float * scales,
                   hp::stats * out, RS * reader) {
     if (!B || !carriers || !scales || !out || ldb < a.J || stride < a.J || (ldb & 1) ||
-        a.weight_format != ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1) {
+        a.weight_format != npu_matmul_args::weight_format_t::q4_hp1) {
         return hp::status::invalid;
     }
     const auto p = route::resolve_weight_route_plan(a, route::WeightScaleInfoMode::ResidualHp1Scu);
@@ -66,7 +65,7 @@ hp::status scalar(const ggml_gemmini_args_t & a, int8_t * B, size_t ldb,
                 return hp::status::metadata;
             }
             if (bits(c.column_scale) != bits(scale)) return hp::status::scale_mismatch;
-            if (c.carrier == ggml::gemmini::quants::hp1::zero_carrier) {
+            if (c.carrier == ggml::npu::quants::hp1::zero_carrier) {
                 ++s.zero_blocks;
             } else {
                 if (zero) return hp::status::channel_scale;
@@ -133,9 +132,9 @@ bool same_stats(const hp::stats & a, const hp::stats & b) {
            bits(a.max_channel_scale) == bits(b.max_channel_scale);
 }
 
-ggml_gemmini_args_t args_for(const std::vector<block_q4_hp1> & blocks, size_t N, size_t K) {
-    ggml_gemmini_args_t a;
-    a.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+npu_matmul_args args_for(const std::vector<block_q4_hp1> & blocks, size_t N, size_t K) {
+    npu_matmul_args a;
+    a.weight_format = npu_matmul_args::weight_format_t::q4_hp1;
     a.block_size_k = 32;
     a.J = N;
     a.K = K;
@@ -168,7 +167,7 @@ std::vector<block_q4_hp1> fixture(size_t N, size_t K) {
 int cases = 0, failures = 0;
 
 // null_output: 1 B, 2 carriers, 3 scales, 4 stats, 5 reader (optional).
-void compare(const char * name, const ggml_gemmini_args_t & a, size_t ldb, size_t stride,
+void compare(const char * name, const npu_matmul_args & a, size_t ldb, size_t stride,
              hp::status want, int null_output = 0) {
     output ref(a.K, a.J, ldb, stride), got = ref;
     auto invoke = [&](auto fn, output & o) {
@@ -222,7 +221,7 @@ void compare(const char * name, const ggml_gemmini_args_t & a, size_t ldb, size_
 #if defined(GGML_GEMMINI_TESTING)
     const size_t addresses = wr::test_weight_reader_code_address_resolutions();
     const size_t validations = wr::test_weight_reader_storage_validations();
-    const size_t tile_k = std::min(static_cast<size_t>(DIM), size_t(32));
+    const size_t tile_k = std::min(static_cast<size_t>(NPU_D), size_t(32));
     ok = ok && validations == scalar_validations;
     if (gs == hp::status::ok) {
         ok = ok && validations == 1 && scalar_addresses == a.J * a.K &&
@@ -303,7 +302,7 @@ int main() {
             reinterpret_cast<const uint8_t *>(b.data()) + 1);
     });
     check("wrong-format", hp::status::invalid, [](auto &, auto & a) {
-        a.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_h0;
+        a.weight_format = npu_matmul_args::weight_format_t::q4_h0;
     });
     const auto a = args_for(original, N, K);
     compare("short-ldb", a, 32, stride, hp::status::invalid);
