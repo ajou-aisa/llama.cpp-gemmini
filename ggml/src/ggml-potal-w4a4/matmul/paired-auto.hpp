@@ -525,9 +525,9 @@ struct potal_paired_request {
     // consecutive-original-block Residual windows read their live Main Scale
     // allocation; their logical release becomes a checked global Fence.
     bool                    ktile_scale_reuse = false;
-    // Opt-in, also by GGML_POTAL_WINDOW_SCALE_ISSUE: Scale windows go through the
-    // window calls of potal.h. The command stream does not change.
-    bool                    window_scale_issue = false;
+    // Scale windows use the checked window calls by default. false or
+    // GGML_POTAL_WINDOW_SCALE_ISSUE=OFF/0 selects the per-column baseline.
+    bool                    window_scale_issue = true;
     bool                    next_k_prefetch = false; // explicit managed-H2 load admission; publication still requires global drain
     bool                    early_k_prefetch = false; // capability-gated original LdB, Main then admission then extra Fence
     potal_observation_counter_fn early_counter = nullptr; // software sink only; hardware reads COUNTER directly
@@ -608,6 +608,7 @@ class potal_paired_staging {
     size_t         bytes() const { return bytes_; }
 
     std::vector<window> windows; // plan order (panel-major)
+    std::vector<size_t> op_windows; // op id -> staged window; no_index for other ops
     size_t              rows = 0;
 
   private:
@@ -631,6 +632,10 @@ struct potal_paired_prepared {
     std::vector<uint32_t>       queue_entries;  // resident_k of every plan Index entry, slot order
     size_t                      index_windows = 0; // index_program ops: the Queue allocations needed
     std::vector<size_t>         scale_owner;    // K-tile Scale reuse only
+    std::vector<potal_paired_loop_ws> loops;    // immutable fields by op id; generation/alias bound at issue
+    const int8_t *              main_a = nullptr;
+    size_t                     main_lda = 0;
+    const hp1_weight *         weight = nullptr; // descriptor operands must remain the prepared operands
 };
 
 // req.plan must be given (the plan made to choose the route); it is moved into `out`

@@ -6,6 +6,7 @@
 #include "include/potal-int4.h"
 #include "trace/hw-window.hpp"
 #include "trace/timeline.hpp"
+#include "trace/issuer-profile.h"
 
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
 #include "planning-profile.hpp"
@@ -1596,13 +1597,12 @@ bool plan_live_scan_enabled() {
     return enabled;
 }
 
-// GGML_POTAL_WINDOW_SCALE_ISSUE, read once per process: ON or 1 issues each Scale
-// window through the window calls of potal.h. Unset, OFF, 0 and any other value
-// keep the per-column calls. The command stream is the same either way.
+// GGML_POTAL_WINDOW_SCALE_ISSUE, read once per process: OFF or 0 selects the
+// per-column baseline. The checked window path is otherwise the default.
 bool window_scale_issue_enabled() {
     static const bool enabled = [] {
         const char * v = std::getenv("GGML_POTAL_WINDOW_SCALE_ISSUE");
-        return v != nullptr && (std::strcmp(v, "ON") == 0 || std::strcmp(v, "1") == 0);
+        return v == nullptr || (std::strcmp(v, "OFF") != 0 && std::strcmp(v, "0") != 0);
     }();
     return enabled;
 }
@@ -1649,7 +1649,8 @@ void potal_paired_staging::abandon() {
 }
 
 potal_paired_staging::potal_paired_staging(potal_paired_staging && other) noexcept :
-    windows(std::move(other.windows)), rows(other.rows), buffer_(other.buffer_), bytes_(other.bytes_) {
+    windows(std::move(other.windows)), op_windows(std::move(other.op_windows)),
+    rows(other.rows), buffer_(other.buffer_), bytes_(other.bytes_) {
     other.buffer_ = nullptr;
     other.bytes_  = 0;
     other.rows    = 0;
@@ -1660,6 +1661,7 @@ potal_paired_staging & potal_paired_staging::operator=(potal_paired_staging && o
     if (this != &other) {
         std::free(buffer_);
         windows       = std::move(other.windows);
+        op_windows    = std::move(other.op_windows);
         rows          = other.rows;
         buffer_       = other.buffer_;
         bytes_        = other.bytes_;
@@ -1713,6 +1715,7 @@ potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan
     const potal_paired_tile_plan & tile = plan.tile;
     const size_t                   D    = hw.dim;
     out.windows.clear();
+    out.op_windows.assign(plan.ops.size(), potal_paired_no_index);
     out.rows = 0;
     std::free(out.buffer_);
     out.buffer_ = nullptr;
@@ -1730,7 +1733,10 @@ potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan
                 pitch = std::max(pitch, 2 * align_up(potal_int4_row_bytes(window.k_tiles * D), POTAL_HW_MAX_BYTES));
     }
     size_t bytes = 0;
+    std::vector<size_t> panel_windows;
+    panel_windows.reserve(tile.panels.size());
     for (const potal_paired_k_panel & panel : tile.panels) {
+        panel_windows.push_back(out.windows.size());
         for (const potal_paired_index_window & w : panel.windows) {
             potal_paired_staging::window sw;
             sw.panel  = panel.index;
@@ -1750,6 +1756,21 @@ potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan
         explain(why, "staging: window count differs from the plan");
         return potal_paired_status::invalid_argument;
     }
+    for (const auto & op : plan.ops) {
+        if (op.kind != potal_paired_op_kind::index_program &&
+            op.kind != potal_paired_op_kind::residual_gemm) continue;
+        if (op.id >= out.op_windows.size() || op.panel >= tile.panels.size() ||
+            op.window >= tile.panels[op.panel].windows.size()) {
+            explain(why, "staging: index window not in the plan's panels");
+            return potal_paired_status::invalid_argument;
+        }
+        const size_t wi = panel_windows[op.panel] + op.window;
+        if (out.windows[wi].panel != op.panel || out.windows[wi].index != op.window) {
+            explain(why, "staging: index window not in the plan's panels");
+            return potal_paired_status::invalid_argument;
+        }
+        out.op_windows[op.id] = wi;
+    }
     out.rows    = residual.rows.size();
     out.buffer_ = static_cast<int8_t *>(dma_alloc(bytes == 0 ? POTAL_HW_MAX_BYTES : bytes)); // zeroed
     if (out.buffer_ == nullptr) {
@@ -1763,14 +1784,7 @@ potal_paired_status potal_paired_pack_residual(const potal_paired_execution_plan
         if (op.kind != potal_paired_op_kind::index_program || op.j_group != 0) {
             continue;
         }
-        size_t wi = 0;
-        while (wi < out.windows.size() && !(out.windows[wi].panel == op.panel && out.windows[wi].index == op.window)) {
-            ++wi;
-        }
-        if (wi == out.windows.size()) {
-            explain(why, "staging: index window not in the plan's panels");
-            return potal_paired_status::invalid_argument;
-        }
+        const size_t wi = out.op_windows[op.id];
         const potal_paired_staging::window & sw = out.windows[wi];
         size_t values = 0;
         if (!mul(out.rows, sw.cols, values)) {
@@ -1846,6 +1860,7 @@ struct executor {
     bool                         strict      = false; // req.prepared: record issuer.wait_hw around drains
     bool                         window_scale = false; // Scale windows through the window calls of potal.h
     std::vector<uint32_t>         queue_entries; // prepared before issue
+    std::vector<potal_paired_loop_ws> loops; // producer-prepared immutable descriptor fields
     // Read once on the executing thread: unregistered threads (serial route) record nothing,
     // and per-entry spans exist only in the detail profile.
     const bool                    tl_on     = ::potal::timeline::active();
@@ -3531,6 +3546,7 @@ struct executor {
     }
 
     potal_paired_status main_gemm(const potal_paired_op & op) {
+        POTAL_ISSUER_SCOPE(POTAL_ISSUER_MAIN_OP);
         const potal_paired_tile_plan & t   = report.tile;
         const potal_paired_k_panel &   pan = t.panels[op.panel];
         if (op.first && pending_readback[0] != potal_paired_no_index) {
@@ -3539,29 +3555,31 @@ struct executor {
                 return hw_fail("fence", st, &op);
             }
         }
-        potal_paired_loop_ws l   = {};
-        l.loop.a                 = req.a + pan.k_begin / 2;
-        l.loop.b                 = req.weight->b + (pan.k_begin * req.weight->ldb + op.j_group * t.tile_J * hw.dim) / 2;
-        l.loop.c                 = nullptr;
-        l.loop.lda               = req.lda;
-        l.loop.ldb               = req.weight->ldb;
-        l.loop.ldc               = 0;
-        l.loop.i_tiles           = (uint32_t) op.i_tiles;
-        l.loop.j_tiles           = (uint32_t) op.j_tiles;
-        l.loop.k_tiles           = (uint32_t) op.k_tiles;
-        l.loop.pad_i             = (uint32_t) op.pad_i;
-        l.loop.pad_j             = (uint32_t) op.pad_j;
-        l.loop.pad_k             = (uint32_t) op.pad_k;
+        potal_paired_loop_ws l   = strict ? loops[op.id] : potal_paired_loop_ws{};
+        if (!strict) {
+            l.loop.a                 = req.a + pan.k_begin / 2;
+            l.loop.b                 = req.weight->b + (pan.k_begin * req.weight->ldb + op.j_group * t.tile_J * hw.dim) / 2;
+            l.loop.c                 = nullptr;
+            l.loop.lda               = req.lda;
+            l.loop.ldb               = req.weight->ldb;
+            l.loop.ldc               = 0;
+            l.loop.i_tiles           = (uint32_t) op.i_tiles;
+            l.loop.j_tiles           = (uint32_t) op.j_tiles;
+            l.loop.k_tiles           = (uint32_t) op.k_tiles;
+            l.loop.pad_i             = (uint32_t) op.pad_i;
+            l.loop.pad_j             = (uint32_t) op.pad_j;
+            l.loop.pad_k             = (uint32_t) op.pad_k;
+            l.loop.passes_per_block  = t.passes_per_block;
+            l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
+            l.path                   = POTAL_PAIRED_MAIN;
+            l.pair                   = (uint32_t) op.pair;
+            l.a_offset_tiles         = 0;
+            l.resident_b             = 0;
+            l.indexed                = 0;
+        }
         l.loop.scale_base        = (uint32_t) (streaming() ? stream_scale_base[op.scale_window] :
                                               report.plan.scale_windows[op.scale_window].slot_base);
         l.loop.scale_generation  = hw_generation[op.scale_window];
-        l.loop.passes_per_block  = t.passes_per_block;
-        l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
-        l.path                   = POTAL_PAIRED_MAIN;
-        l.pair                   = (uint32_t) op.pair;
-        l.a_offset_tiles         = 0;
-        l.resident_b             = 0;
-        l.indexed                = 0;
         const potal_paired_status st = issue_loop(l, "main_loop_ws", op);
         if (st == potal_paired_status::ok) {
             report.counts.main_loop_ws++;
@@ -3592,6 +3610,25 @@ struct executor {
             return st == POTAL_OK ? potal_paired_status::ok : hw_fail("index_queue", st, &op);
         }
         const auto   t    = time_now();
+        if (!tl_detail && !window_profile && index_profile.op == no_index &&
+            !window_diag && !streaming() && !req.next_k_prefetch) {
+            uint64_t written = 0;
+            const potal_status st = timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, cfg.active_rows,
+                [&] { return potal_paired_index_window_issue(session, &cfg, queue_entries.data() + op.entry_begin,
+                                                            op.entry_end - op.entry_begin, &written); });
+            report.issued = true;
+            report.counts.index_writes += written;
+            // CONFIG opens the transaction only after its successful reply. The
+            // failed-call query preserves the scalar failure stage and counters.
+            const bool configured = st == POTAL_OK ||
+                potal_paired_session_query(session).index_transaction_open != 0;
+            if (configured) ++report.counts.index_configs;
+            const double elapsed = seconds_since(t);
+            report.counts.issue_s += elapsed;
+            if (profile) index_s += elapsed;
+            return st == POTAL_OK ? potal_paired_status::ok :
+                hw_fail(configured ? "index_write" : "index_config", st, &op);
+        }
         auto * config_record = window_begin(window_kind::index_config, op.id);
         potal_status st   = timeline_call(::potal::timeline::stage::acc_index_scalar, op.id, cfg.active_rows,
             [&] { return potal_paired_index_config(session, &cfg); });
@@ -3638,6 +3675,7 @@ struct executor {
     }
 
     potal_paired_status residual_gemm(const potal_paired_op & op) {
+        POTAL_ISSUER_SCOPE(POTAL_ISSUER_RESIDUAL_OP);
         if (op.first && pending_readback[1] != potal_paired_no_index) {
             const potal_status st = ensure_complete(pending_readback[1]);
             if (st != POTAL_OK) {
@@ -3649,30 +3687,32 @@ struct executor {
             return hw_fail("fence", ds, &op);
         }
         auto * descriptor_record = window_begin(window_kind::descriptor, op.id, 0);
-        size_t wi = 0;
-        while (wi < staging.windows.size() && !(staging.windows[wi].panel == op.panel && staging.windows[wi].index == op.window)) {
-            ++wi;
+        const size_t wi = staging.op_windows[op.id];
+        potal_paired_loop_ws l   = strict ? loops[op.id] : potal_paired_loop_ws{};
+        if (!strict) {
+            l.loop.a                 = staging.a(wi);
+            l.loop.b                 = nullptr;
+            l.loop.c                 = nullptr;
+            l.loop.lda               = staging.windows[wi].lda;
+            l.loop.ldb               = 0;
+            l.loop.ldc               = 0;
+            l.loop.i_tiles           = (uint32_t) op.i_tiles;
+            l.loop.j_tiles           = (uint32_t) op.j_tiles;
+            l.loop.k_tiles           = (uint32_t) op.k_tiles;
+            l.loop.pad_i             = (uint32_t) op.pad_i;
+            l.loop.pad_j             = (uint32_t) op.pad_j;
+            l.loop.pad_k             = (uint32_t) op.pad_k;
+            l.loop.passes_per_block  = 1; // one carrier per fragment
+            l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
+            l.path                   = POTAL_PAIRED_RESIDUAL;
+            l.pair                   = (uint32_t) op.pair;
+            l.a_offset_tiles         = (uint32_t) op.a_offset_tiles;
+            l.resident_b             = 1;
+            l.indexed                = 1;
         }
-        if (wi == staging.windows.size()) {
-            return fail(potal_paired_status::invalid_execution_plan, "staging", "no staged window for the op", POTAL_OK);
-        }
-        potal_paired_loop_ws l   = {};
-        l.loop.a                 = staging.a(wi);
-        l.loop.b                 = nullptr;
-        l.loop.c                 = nullptr;
-        l.loop.lda               = staging.windows[wi].lda;
-        l.loop.ldb               = 0;
-        l.loop.ldc               = 0;
-        l.loop.i_tiles           = (uint32_t) op.i_tiles;
-        l.loop.j_tiles           = (uint32_t) op.j_tiles;
-        l.loop.k_tiles           = (uint32_t) op.k_tiles;
-        l.loop.pad_i             = (uint32_t) op.pad_i;
-        l.loop.pad_j             = (uint32_t) op.pad_j;
-        l.loop.pad_k             = (uint32_t) op.pad_k;
         l.loop.scale_base        = (uint32_t) (streaming() ? stream_scale_base[op.scale_window] :
                                               report.plan.scale_windows[op.scale_window].slot_base);
         l.loop.scale_generation  = hw_generation[op.scale_window];
-        l.loop.passes_per_block  = 1; // one carrier per fragment
         if (!streaming() && req.ktile_scale_reuse && scale_owner[op.scale_window] != op.scale_window) {
             const auto & main = report.plan.scale_windows[scale_owner[op.scale_window]];
             const auto & panel = report.tile.panels[op.panel];
@@ -3680,12 +3720,6 @@ struct executor {
             const size_t first = report.tile.fragments[window.fragment_begin].block_id;
             l.loop.scale_base = (uint32_t) (main.slot_base + (first - panel.block_begin) * main.j_tiles);
         }
-        l.loop.flags             = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
-        l.path                   = POTAL_PAIRED_RESIDUAL;
-        l.pair                   = (uint32_t) op.pair;
-        l.a_offset_tiles         = (uint32_t) op.a_offset_tiles;
-        l.resident_b             = 1;
-        l.indexed                = 1;
         window_end(descriptor_record, POTAL_OK);
         const potal_paired_status st = issue_loop(l, "residual_loop_ws", op);
         if (st == potal_paired_status::ok) {
@@ -4159,6 +4193,7 @@ potal_paired_status potal_paired_run_session(const potal_paired_request & req, c
 
 potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, potal_paired_session * session,
                                              potal_paired_report & report) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_REQUEST);
 #if defined(POTAL_PLANNING_DIAGNOSTICS)
     planning_profile::Root planning_root(planning_profile::Phase::executor, req.rows, req.n, req.k);
 #endif
@@ -4180,7 +4215,7 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
                        "W4A4 requires scalar Index commands", POTAL_ERR_UNSUPPORTED);
     }
     ex.strict = req.prepared != nullptr;
-    ex.window_scale = (req.window_scale_issue || window_scale_issue_enabled()) && !ex.tl_detail && !ex.streaming() &&
+    ex.window_scale = req.window_scale_issue && window_scale_issue_enabled() && !ex.tl_detail && !ex.streaming() &&
                       hw.dim == POTAL_HW_DIM;
     const char * window_option = std::getenv("POTAL_INDEX_WINDOW_PROFILE");
     ex.window_profile = window_option && std::strcmp(window_option, "1") == 0;
@@ -4278,30 +4313,34 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             // Strict issuer: the producer validated, planned and staged this request
             // (potal_paired_prepare). Only ownership moves here; the Queue budget is session state.
             potal_paired_prepared & p = *req.prepared;
-            if (!p.ready || ex.streaming() || req.plan != nullptr) {
+            if (!p.ready || ex.streaming() || req.plan != nullptr ||
+                p.main_a != req.a || p.main_lda != req.lda || p.weight != req.weight ||
+                p.loops.size() != p.plan.ops.size()) {
                 return ex.fail(potal_paired_status::invalid_argument, "prepared",
-                               "prepared job not ready, stream mode or a second plan", POTAL_OK);
+                               "prepared job not ready, incompatible mode, plan or descriptor operands", POTAL_OK);
             }
             p.ready      = false;
             report.plan  = std::move(p.plan);
             report.tile  = std::move(p.tile);
             ex.staging   = std::move(p.staging);
             ex.scale_owner = std::move(p.scale_owner);
+            ex.loops = std::move(p.loops);
+            ex.queue_entries = std::move(p.queue_entries);
             if (report.tile.rows != req.rows || report.tile.n != req.n || report.tile.k != req.k ||
                 report.tile.residual != has_residual ||
                 (req.ktile_scale_reuse && ex.scale_owner.size() != report.plan.scale_windows.size())) {
                 return ex.fail(potal_paired_status::invalid_argument, "prepared",
                                "the prepared job describes another request", POTAL_OK);
             }
+            if (ex.queue_entries.size() != report.plan.index_entries.size()) {
+                return ex.fail(potal_paired_status::invalid_argument, "prepared",
+                               "prepared Index entries differ from the plan", POTAL_OK);
+            }
             if (ex.index_queue) {
                 const uint32_t remaining = potal_index_queue_remaining();
                 if (!remaining || p.index_windows > remaining)
                     return ex.fail(potal_paired_status::execution_failed, "index_queue_preflight",
                                    "request exceeds admitted process Queue budget", POTAL_ERR_CAPACITY);
-                if (p.queue_entries.size() != report.plan.index_entries.size())
-                    return ex.fail(potal_paired_status::invalid_argument, "prepared",
-                                   "prepared Queue entries differ from the plan", POTAL_OK);
-                ex.queue_entries = std::move(p.queue_entries);
             }
         } else {
         if (req.plan != nullptr) {
@@ -4373,9 +4412,9 @@ potal_paired_status potal_paired_matmul_auto(const potal_paired_request & req, p
             if (!remaining || windows > remaining)
                 return ex.fail(potal_paired_status::execution_failed, "index_queue_preflight",
                                "request exceeds admitted process Queue budget", POTAL_ERR_CAPACITY);
-            ex.queue_entries.reserve(report.plan.index_entries.size());
-            for (const auto & entry : report.plan.index_entries) ex.queue_entries.push_back(uint32_t(entry.resident_k));
         }
+        ex.queue_entries.reserve(report.plan.index_entries.size());
+        for (const auto & entry : report.plan.index_entries) ex.queue_entries.push_back(uint32_t(entry.resident_k));
         // 2. Residual staging (DMA-ready, slot order), before any command.
         if (report.tile.residual) {
             ::potal::timeline::scoped_span pack_span(ex.tl_on, ::potal::timeline::stage::exec_pack_residual, tl_run,
@@ -4508,6 +4547,45 @@ potal_paired_status potal_paired_prepare(const potal_paired_request & req, potal
         }
         out.scale_owner.clear();
         if (req.ktile_scale_reuse) out.scale_owner = compute_scale_owner(out.plan, out.tile);
+        if (req.a == nullptr || req.weight == nullptr || req.weight->b == nullptr) {
+            return refuse(potal_paired_status::invalid_argument, "request", "missing descriptor operands");
+        }
+        out.main_a = req.a;
+        out.main_lda = req.lda;
+        out.weight = req.weight;
+        out.loops.assign(out.plan.ops.size(), potal_paired_loop_ws{});
+        for (const auto & op : out.plan.ops) {
+            if (op.kind != potal_paired_op_kind::main_gemm &&
+                op.kind != potal_paired_op_kind::residual_gemm) continue;
+            auto & l = out.loops[op.id];
+            l.loop.i_tiles = uint32_t(op.i_tiles);
+            l.loop.j_tiles = uint32_t(op.j_tiles);
+            l.loop.k_tiles = uint32_t(op.k_tiles);
+            l.loop.pad_i = uint32_t(op.pad_i);
+            l.loop.pad_j = uint32_t(op.pad_j);
+            l.loop.pad_k = uint32_t(op.pad_k);
+            l.loop.flags = op.first ? 0 : POTAL_GEMM_ACCUMULATE;
+            l.pair = uint32_t(op.pair);
+            if (op.kind == potal_paired_op_kind::main_gemm) {
+                const auto & panel = out.tile.panels[op.panel];
+                l.loop.a = req.a + panel.k_begin / 2;
+                l.loop.b = req.weight->b + (panel.k_begin * req.weight->ldb +
+                                           op.j_group * out.tile.tile_J * hw.dim) / 2;
+                l.loop.lda = req.lda;
+                l.loop.ldb = req.weight->ldb;
+                l.loop.passes_per_block = out.tile.passes_per_block;
+                l.path = POTAL_PAIRED_MAIN;
+            } else {
+                const size_t wi = out.staging.op_windows[op.id];
+                l.loop.a = out.staging.a(wi);
+                l.loop.lda = out.staging.windows[wi].lda;
+                l.loop.passes_per_block = 1;
+                l.path = POTAL_PAIRED_RESIDUAL;
+                l.a_offset_tiles = uint32_t(op.a_offset_tiles);
+                l.resident_b = 1;
+                l.indexed = 1;
+            }
+        }
         out.ready = true;
         return potal_paired_status::ok;
     } catch (const std::bad_alloc &) {

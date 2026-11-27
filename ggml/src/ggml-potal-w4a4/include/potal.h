@@ -720,6 +720,23 @@ potal_status potal_paired_scale_release_columns(potal_paired_session *session, c
                                                 uint32_t first_column, uint64_t *columns_done);
 potal_status potal_paired_index_config(potal_paired_session *session, const potal_index_config *cfg);
 potal_status potal_paired_index_write(potal_paired_session *session, const potal_index_write *w);
+/*
+ * Checked scalar INDEX_CONFIG followed by INDEX_WRITEs to slots 0..count-1.
+ * cfg, resident_k and written must be non-NULL; count must equal active_rows.
+ * These shape errors issue nothing. Inputs remain immutable and do not alias
+ * written for the duration of the call. When written is non-NULL, *written is
+ * zeroed on entry and counts only successful writes (CONFIG is not counted).
+ *
+ * Entries are checked in order, immediately before dispatch: an invalid entry
+ * or failed command stops at the same successful prefix as the scalar calls.
+ * A validation error leaves the transaction open for corrected scalar writes;
+ * a raw error retains the scalar sticky failure, stage and cleanup obligations.
+ * Progress is published after each successful write; index_valid is published
+ * only after the final successful write. No Fence, Release or Queue command is
+ * added. Managed modes retain scalar admission and callback behavior.
+ */
+potal_status potal_paired_index_window_issue(potal_paired_session *session, const potal_index_config *cfg,
+    const uint32_t *resident_k, size_t count, uint64_t *written);
 potal_status potal_paired_loop_ws_issue(potal_paired_session *session, const potal_paired_loop_ws *loop);
 potal_status potal_paired_acc_readback_issue(potal_paired_session *session, const potal_acc_readback *r);
 /* Requires drained prior work. Later LOOP_WS, readback, flush and close require its fence. */

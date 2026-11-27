@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "log.hpp"
 #include "stripe-api.hpp"
+#include "../trace/issuer-profile.h"
 
 #include "potal_hw_params.h"
 
@@ -456,6 +457,7 @@ void issuer::main_loop() {
         std::string  why;
         potal_status status = POTAL_OK;
         const bool   fatal  = (*task)(why, status);
+        potal_issuer_profile_flush(stderr);
         lock.lock();
         if (fatal) {
             failure        = why;

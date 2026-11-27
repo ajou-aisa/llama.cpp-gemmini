@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "matmul/dense.hpp"
 #include "matmul/paired-auto.hpp"
+#include "../trace/issuer-profile.h"
 #include "../../ggml-npu-common/quantization/activation/exsia/types.hpp"
 #include "../../ggml-npu-common/residual/rmd/rmd-builder.hpp"
 
@@ -199,14 +200,19 @@ void mutations(const fixture & f) {
 
 // Flat machine values allow exact IPC comparison without hashing or struct padding.
 std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_plan & plan,
-                             bool queue, potal_paired_stream_mode stream, bool prepared, bool refuse) {
+                             bool queue, potal_paired_stream_mode stream, bool prepared, bool refuse,
+                             int window_scale = -1, uint32_t fail_funct = 0) {
     potal_test::h2_emulator emulator;
+    if (fail_funct) {
+        emulator.fail_funct = fail_funct;
+        emulator.fail_status = POTAL_HW_INVALID_ADDRESS;
+    }
     std::unique_ptr<int32_t, decltype(&std::free)> cm(
         static_cast<int32_t *>(dma_alloc(32 * LD * sizeof(int32_t))), std::free);
     std::unique_ptr<int32_t, decltype(&std::free)> cr(
         static_cast<int32_t *>(dma_alloc(32 * LD * sizeof(int32_t))), std::free);
     require(cm && cr, "readback allocation");
-    uint32_t generation = 0;
+    uint32_t generation = prepared ? 250 : 0;
     potal_paired_request req;
     req.rows = M; req.n = N; req.k = K;
     req.main_plan = &f.main; req.weight = &f.weight;
@@ -215,6 +221,7 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
     req.c_residual = cr.get(); req.ldc_residual = LD;
     req.generation = &generation; req.plan = &plan;
     req.ktile_scale_reuse = true;
+    if (window_scale >= 0) req.window_scale_issue = window_scale != 0;
     req.stream = stream;
     req.stream_counter = stream == potal_paired_stream_mode::off ? nullptr : potal_test::h2_emulator::on_counter;
     potal_paired_prepared job;
@@ -231,6 +238,15 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
         req.prepared = &job;
     }
     const auto sink = emulator.sink();
+    if (prepared && !queue) {
+        auto rebound = req;
+        rebound.a += POTAL_HW_MAX_BYTES;
+        potal_paired_report rejected;
+        require(potal_paired_run_session(rebound, &sink, rejected) == potal_paired_status::invalid_argument &&
+                    rejected.stage && std::strcmp(rejected.stage, "prepared") == 0 &&
+                    !rejected.issued && !rejected.fatal && job.ready && emulator.records.empty(),
+                "prepared operand identity is rejected without consuming ownership or issuing commands");
+    }
     potal_paired_report report;
     const auto status = potal_paired_run_session(req, &sink, report);
     if (queue) {
@@ -245,6 +261,23 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
         if (prepared) require(job.ready, "unsupported Queue request consumed prepared ownership");
         return {uint64_t(status), uint64_t(report.hw_status), potal_index_queue_remaining()};
     }
+    if (fail_funct) {
+        const bool config = fail_funct == POTAL_FUNCT_INDEX_CONFIG;
+        require(status == potal_paired_status::execution_failed && report.stage &&
+                    std::strcmp(report.stage, config ? "index_config" : "index_write") == 0 &&
+                    report.hw_status == POTAL_HW_INVALID_ADDRESS && report.cleaned && !report.fatal &&
+                    report.counts.index_configs == (config ? 0u : 1u) && report.counts.index_writes == 0,
+                "Index window preserves CONFIG/first-WRITE failure stage, prefix and cleanup");
+        bool failed = false, fenced = false, released = false;
+        for (const auto & command : emulator.records) {
+            if (command.funct == fail_funct) failed = true;
+            if (failed && command.funct == POTAL_FUNCT_FENCE) fenced = true;
+            if (failed && command.funct == POTAL_FUNCT_SCALE_RELEASE) released = true;
+        }
+        require(fenced && released, "answered Index failure drains Main and releases live Scale");
+        return {uint64_t(status), uint64_t(report.hw_status), report.counts.index_configs,
+                report.counts.index_writes, uint64_t(report.cleaned), uint64_t(report.fatal)};
+    }
     require(status == potal_paired_status::ok && !report.fatal && report.issued && emulator.errors.empty(),
             std::string(report.stage ? report.stage : "run") + ": " + report.detail + emulator.errors);
     const auto & c = report.counts;
@@ -257,7 +290,8 @@ std::vector<uint64_t> execute(const fixture & f, const potal_paired_execution_pl
                 c.index_writes == (queue ? 0 : plan.index_writes) &&
                 emulator.queue_allocations == c.queue_allocations && emulator.queue_applied == c.queue_allocations,
             "unchanged scalar writes / Queue installations");
-    if (prepared) require(!job.ready, "prepared job consumed");
+    if (prepared) require(!job.ready && job.loops.empty() && job.staging.op_windows.empty(),
+                          "prepared metadata ownership consumed");
     if (stream != potal_paired_stream_mode::off) {
         // Counts from the fixture's six odd run lengths, not index_entries.size()/j_groups.
         require(c.residual_valid_bytes == f.decoded.rows.size() * 21 &&
@@ -379,17 +413,25 @@ int main() {
         "scalar supplied", "Queue supplied rejection", "scalar prepared", "Queue prepared rejection",
         "bounded scalar residual_valid_bytes", "bounded Queue rejection",
         "continuous scalar residual_valid_bytes", "continuous Queue rejection",
-        "Queue supplied rejection preserves credits", "Queue prepared rejection preserves credits"
+        "Queue supplied rejection preserves credits", "Queue prepared rejection preserves credits",
+        "default Scale window supplied equivalence", "default Scale window prepared equivalence",
+        "Scale window OFF override equivalence", "prepared CONFIG failure cleanup",
+        "prepared first-WRITE failure cleanup"
     };
     // Each case has a fresh process lifetime; production never exposes a test reset.
-    for (int mode = 0; mode < 10; ++mode) {
+    for (int mode = 0; mode < 15; ++mode) {
         std::fflush(nullptr);
         const pid_t pid = fork();
         if (pid == 0) {
             try {
                 setenv("POTAL_INDEX_QUEUE_FRESH", "1", 1);
                 setenv("POTAL_INDEX_QUEUE_BUDGET", mode >= 8 ? "3" : "255", 1);
-                setenv("GGML_POTAL_INDEX_QUEUE", (mode % 2 || mode >= 8) ? "ON" : "OFF", 1);
+                setenv("GGML_POTAL_INDEX_QUEUE", (mode < 10 && (mode % 2 || mode >= 8)) ? "ON" : "OFF", 1);
+                unsetenv("GGML_POTAL_WINDOW_SCALE_ISSUE");
+                if (mode == 12) setenv("GGML_POTAL_WINDOW_SCALE_ISSUE", "OFF", 1);
+#if defined(POTAL_ISSUER_DIAGNOSTICS)
+                if (mode >= 10 && mode <= 12) setenv("POTAL_ISSUER_CPU_PROFILE", "1", 1);
+#endif
                 setenv("POTAL_PAIRED_TIMING", "0", 1);
                 for (const char * name : {"POTAL_PAIRED_PROFILE", "POTAL_RAW_TRACE", "POTAL_EARLY_TRACE",
                                          "POTAL_PAIRED_WINDOW_DIAG", "POTAL_GRAPH_CPU", "POTAL_STREAM_COUNTERS"})
@@ -397,7 +439,29 @@ int main() {
                 fixture f;
                 mutations(f);
                 const bool queue = mode % 2;
-                if (mode >= 8) {
+                if (mode >= 13) {
+                    const uint32_t funct = mode == 13 ? POTAL_FUNCT_INDEX_CONFIG : POTAL_FUNCT_INDEX_WRITE;
+                    const auto shared = execute(f, f.shared, false, potal_paired_stream_mode::off,
+                                                true, false, -1, funct);
+                    const auto expanded = execute(f, f.expanded, false, potal_paired_stream_mode::off,
+                                                  true, false, -1, funct);
+                    require(shared == expanded, "Index failure semantics depend on payload storage");
+                } else if (mode >= 10) {
+                    const bool prepared = mode != 10;
+                    const auto scalar = execute(f, f.shared, false, potal_paired_stream_mode::off, prepared, false, 0);
+#if defined(POTAL_ISSUER_DIAGNOSTICS)
+                    potal_issuer_profile_stats before{}, after{};
+                    potal_issuer_profile_snapshot(&before);
+#endif
+                    const auto normal = execute(f, f.shared, false, potal_paired_stream_mode::off, prepared, false);
+                    require(scalar == normal, "Scale default/override changed command words, results or counters");
+#if defined(POTAL_ISSUER_DIAGNOSTICS)
+                    potal_issuer_profile_snapshot(&after);
+                    const bool window_called = after.scope[POTAL_ISSUER_SCALE_WINDOW].calls >
+                                               before.scope[POTAL_ISSUER_SCALE_WINDOW].calls;
+                    require(window_called == (mode != 12), "Scale default and OFF override did not reach the selected API");
+#endif
+                } else if (mode >= 8) {
                     const auto shared = execute(f, f.shared, true, potal_paired_stream_mode::off, mode == 9, true);
                     const auto expanded = execute(f, f.expanded, true, potal_paired_stream_mode::off, mode == 9, true);
                     require(shared == expanded, "Queue rejection differs between storage representations");
