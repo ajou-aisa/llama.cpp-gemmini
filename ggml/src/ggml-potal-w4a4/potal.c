@@ -3,6 +3,7 @@
 #include "potal.h"
 
 #include "potal_hw_params.h"
+#include "trace/issuer-profile.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -12,6 +13,12 @@
 
 #if defined(__riscv)
 #include "potal_rocc.h"
+static inline void issuer_cpu_fence(uint32_t completion) {
+    (void)completion;
+    POTAL_ISSUER_FENCE_BEGIN(completion);
+    potal_cpu_fence_rw();
+    POTAL_ISSUER_FENCE_END(completion);
+}
 #endif
 
 /*
@@ -1330,12 +1337,19 @@ static potal_status paired_raw(
     uint64_t rs2,
     int xd
 ) {
+    POTAL_ISSUER_RAW_BEGIN(funct);
+    potal_status status;
 #if defined(__riscv) || defined(POTAL_TEST_RAW_TRACE)
     if (s->trace_enabled) {
-        return paired_raw_traced(s, funct, rs1, rs2, xd);
+        status = paired_raw_traced(s, funct, rs1, rs2, xd);
+    } else {
+        status = paired_raw_untraced(s, funct, rs1, rs2, xd);
     }
+#else
+    status = paired_raw_untraced(s, funct, rs1, rs2, xd);
 #endif
-    return paired_raw_untraced(s, funct, rs1, rs2, xd);
+    POTAL_ISSUER_RAW_END(funct, status);
+    return status;
 }
 
 #define PAIRED_RAW(session, funct, rs1, rs2, xd, stage)                                  \
@@ -1637,6 +1651,7 @@ static potal_status paired_index_write_core(potal_paired_session *s, const potal
 
 potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                       uint32_t column, uint32_t carrier) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_SCALE_WRITE);
     if (s && s->resident) return POTAL_ERR_BUSY;
     if (s && s->h2) {
         const potal_status ready = paired_ready(s);
@@ -1648,6 +1663,7 @@ potal_status potal_paired_scale_write(potal_paired_session *s, uint32_t slot, ui
 
 potal_status potal_paired_scale_release(potal_paired_session *s, uint32_t slot, uint32_t generation,
                                         uint32_t column) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_SCALE_RELEASE);
     if (s && s->resident) return resident_ws_release(s, slot, generation, column);
     return paired_scale_release_core(s, slot, generation, column);
 }
@@ -1673,21 +1689,27 @@ static uint64_t scale_column_mask(uint32_t columns) {
 }
 
 static inline potal_status scale_column_issue(potal_paired_session *s, uint32_t funct, uint64_t rs1, uint64_t rs2) {
+    POTAL_ISSUER_RAW_BEGIN(funct);
     s->commands++;
+    potal_status status;
     if (s->sink.cmd != NULL) {
         const potal_paired_cmd_record rec = { funct, 1u, rs1, rs2 };
-        return s->sink.cmd(s->sink.ctx, &rec);
-    }
+        status = s->sink.cmd(s->sink.ctx, &rec);
+    } else {
 #if defined(__riscv)
-    return hw_status(funct == POTAL_FUNCT_SCALE_WRITE ? potal_rocc_scale_write(rs1, rs2)
-                                                      : potal_rocc_scale_release(rs1, rs2));
+        status = hw_status(funct == POTAL_FUNCT_SCALE_WRITE ? potal_rocc_scale_write(rs1, rs2)
+                                                          : potal_rocc_scale_release(rs1, rs2));
 #else
-    return POTAL_ERR_NO_HARDWARE;
+        status = POTAL_ERR_NO_HARDWARE;
 #endif
+    }
+    POTAL_ISSUER_RAW_END(funct, status);
+    return status;
 }
 
 potal_status potal_paired_scale_write_columns(potal_paired_session *s, const potal_paired_scale_columns *w,
                                               const uint32_t *const *block_carriers, uint64_t *columns_done) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_SCALE_WINDOW);
     if (w == NULL || block_carriers == NULL || columns_done == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
@@ -1752,6 +1774,7 @@ potal_status potal_paired_scale_write_columns(potal_paired_session *s, const pot
 
 potal_status potal_paired_scale_release_columns(potal_paired_session *s, const potal_paired_scale_columns *w,
                                                 uint32_t first_column, uint64_t *columns_done) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_RELEASE_WINDOW);
     if (w == NULL || columns_done == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
@@ -1840,11 +1863,13 @@ static potal_status paired_index_admit(potal_paired_session *s, const potal_inde
 }
 
 potal_status potal_paired_index_config(potal_paired_session *s, const potal_index_config *cfg) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_INDEX_CONFIG);
     const potal_status status = paired_index_admit(s, cfg);
     return status == POTAL_OK ? paired_index_config_core(s, cfg) : status;
 }
 
 potal_status potal_paired_index_write(potal_paired_session *s, const potal_index_write *w) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_INDEX_WRITE);
     if (s && s->resident) return POTAL_ERR_BUSY;
     if (s && s->h2) {
         const potal_status ready = paired_ready(s);
@@ -1852,6 +1877,44 @@ potal_status potal_paired_index_write(potal_paired_session *s, const potal_index
         if (s->h2->status.pending_b || s->h2->status.control_pending) return POTAL_ERR_BUSY;
     }
     return paired_index_write_core(s, w);
+}
+
+potal_status potal_paired_index_window_issue(potal_paired_session *s, const potal_index_config *cfg,
+    const uint32_t *resident_k, size_t count, uint64_t *written) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_INDEX_WINDOW);
+    if (written == NULL) return POTAL_ERR_INVALID_ARGUMENT;
+    *written = 0;
+    if (cfg == NULL || resident_k == NULL || count != cfg->active_rows)
+        return POTAL_ERR_INVALID_ARGUMENT;
+    potal_status status = potal_paired_index_config(s, cfg);
+    if (status != POTAL_OK) return status;
+    if (s->resident || s->h2 || s->stream || s->observation_active || s->trace_enabled) {
+        for (size_t i = 0; i < count; ++i) {
+            const potal_index_write entry = { (uint32_t)i, resident_k[i] };
+            status = potal_paired_index_write(s, &entry);
+            if (status != POTAL_OK) return status;
+            ++*written;
+        }
+        return POTAL_OK;
+    }
+    /*
+     * CONFIG already checked the immutable header, ownership, transport and
+     * transaction. Ordinary sessions have no managed callback admission state.
+     * Keep per-entry range checks and progress publication in scalar order;
+     * a refused entry or raw failure leaves exactly the successful prefix.
+     */
+    const uint32_t source_k_rows = s->index_cfg.source_k_rows;
+    for (uint32_t slot = 0; slot < count; ++slot) {
+        if (resident_k[slot] >= source_k_rows) return POTAL_ERR_INVALID_ARGUMENT;
+        PAIRED_RAW(s, POTAL_FUNCT_INDEX_WRITE, slot, resident_k[slot], 1, "index_write");
+        ++s->index_written;
+        ++*written;
+    }
+    paired_pair_state *pr = &s->pair[s->index_pair];
+    pr->index_valid = 1;
+    pr->index = s->index_cfg;
+    s->index_open = 0;
+    return POTAL_OK;
 }
 
 /* Global, like paired_owner: calls are serialized by the sole process issuer. */
@@ -2008,7 +2071,7 @@ potal_status potal_index_queue_install(potal_paired_session *s, const potal_inde
 static potal_status paired_issue_program_view(potal_paired_session *s, const potal_gemm_ws_program *p,
     const potal_rocc_cmd *view, const char *stage) {
 #if defined(__riscv)
-    potal_cpu_fence_rw(); /* prior CPU stores to A/B visible before the DMA reads them */
+    issuer_cpu_fence(0); /* prior CPU stores to A/B visible before the DMA reads them */
 #endif
     PAIRED_RAW(s, POTAL_FUNCT_CONFIG, p->config_ld_a.rs1, p->config_ld_a.rs2, 0, stage);
     PAIRED_RAW(s, POTAL_FUNCT_CONFIG, p->config_ld_b.rs1, p->config_ld_b.rs2, 0, stage);
@@ -2031,6 +2094,7 @@ static potal_status paired_issue_program(potal_paired_session *s, const potal_ge
 }
 
 potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_paired_loop_ws *pl) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_LOOP);
     if (s && (s->resident || s->h2 || s->stream)) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
@@ -2087,6 +2151,7 @@ potal_status potal_paired_loop_ws_issue(potal_paired_session *s, const potal_pai
 }
 
 potal_status potal_paired_acc_readback_issue(potal_paired_session *s, const potal_acc_readback *r) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_READBACK);
     if (s && s->resident) return POTAL_ERR_BUSY;
     const potal_status ready = paired_ready(s);
     if (ready != POTAL_OK) {
@@ -2163,7 +2228,7 @@ potal_status potal_paired_acc_bias_issue(potal_paired_session *s, const potal_ac
         return POTAL_ERR_NO_HARDWARE;
     }
 #if defined(__riscv)
-    potal_cpu_fence_rw();
+    issuer_cpu_fence(0);
 #endif
     PAIRED_RAW(s, POTAL_FUNCT_CONFIG, config_ld.rs1, config_ld.rs2, 0, "acc_bias");
     for (uint32_t i = 0; i < count; ++i) {
@@ -2192,7 +2257,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
     if (s->outstanding_loops != 0 || s->outstanding_readbacks != 0 || s->outstanding_acc_updates != 0) {
         const potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
 #if defined(__riscv)
-        potal_cpu_fence_rw();
+        issuer_cpu_fence(1);
 #endif
         if (status != POTAL_OK) {
             return paired_fail(s, status, "fence");
@@ -2220,6 +2285,7 @@ potal_status potal_paired_session_cleanup(potal_paired_session *s) {
 }
 
 potal_status potal_paired_fence(potal_paired_session *s) {
+    POTAL_ISSUER_SCOPE(POTAL_ISSUER_DRAIN);
     if (s == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
     }
@@ -2234,7 +2300,7 @@ potal_status potal_paired_fence(potal_paired_session *s) {
     }
     const potal_status status = paired_raw(s, POTAL_FUNCT_FENCE, 0, 0, 1);
 #if defined(__riscv)
-    potal_cpu_fence_rw(); /* later CPU reads of readback buffers after the drained DMA stores */
+    issuer_cpu_fence(1); /* later CPU reads of readback buffers after the drained DMA stores */
 #endif
     if (status != POTAL_OK) {
         return paired_fail(s, status, "fence"); /* outstanding work stays outstanding */
@@ -2278,7 +2344,7 @@ static int h2_pending(const potal_paired_session *s) {
 static void h2_completed(potal_paired_session *s) {
     h2_state *h = s->h2;
 #if defined(__riscv)
-    potal_cpu_fence_rw();
+    issuer_cpu_fence(1);
 #endif
     /* Keep every CPU visibility fence, even when only host stores repeat.
      * Failure/cleanup cannot reuse a healthy publication certificate. */
@@ -2341,7 +2407,7 @@ potal_status potal_paired_h2_begin(potal_paired_session *s, const potal_h2_weigh
     /* Publish the entire immutable borrowed B allocation while idle.
      * Rocket stalls a CPU fence on RoCC busy; repeating it at prefetch
      * would serialize the load behind the current Execute work. */
-    potal_cpu_fence_rw();
+    issuer_cpu_fence(0);
 #endif
     h->owner = ++h2_owner_sequence;
     h->status.active = 1;
@@ -3010,7 +3076,7 @@ potal_status potal_paired_stream_begin(potal_paired_session *s, const potal_stre
         return POTAL_ERR_UNSUPPORTED;
     }
 #if defined(__riscv)
-    potal_cpu_fence_rw(); /* publish ALL immutable input allocations, exactly once */
+    issuer_cpu_fence(0); /* publish ALL immutable input allocations, exactly once */
 #endif
     h->control_pending = 1;
     PAIRED_RAW(s, POTAL_FUNCT_STREAM, c->early_b_only ? 6 : c->continuous ? 2 : 1, 0, 1, "stream_begin");
@@ -3395,7 +3461,7 @@ static potal_status resident_ws_failed(potal_paired_session *s, potal_status sta
 static void resident_ws_completed(potal_paired_session *s) {
     resident_ws_state *r = s->resident;
 #if defined(__riscv)
-    potal_cpu_fence_rw();
+    issuer_cpu_fence(1);
 #endif
     int publish = !s->failed && r->issue_complete;
     if (r->kind == RESIDENT_WS_LOAD) {
@@ -3723,7 +3789,7 @@ potal_status potal_paired_resident_load_issue(potal_paired_session *s,
     r->issue_complete = 0;
     r->in_call = 1;
 #if defined(__riscv)
-    potal_cpu_fence_rw();
+    issuer_cpu_fence(0);
 #endif
     status = paired_raw(s, POTAL_FUNCT_CONFIG, config_ld_rs1(0), d.source_stride, 0);
     const uint32_t nk = resident_ws_tiles(d.k_rows), nj = resident_ws_tiles(d.j_columns);

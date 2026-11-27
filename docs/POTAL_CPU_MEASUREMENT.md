@@ -4,6 +4,11 @@ This measurement path is shared by W4A4 and W8A8. It changes instrumentation,
 not quantization, rounding, residual selection, GEMM ordering, or scheduling.
 Use a separate instrumented run; clock reads and trace storage have overhead.
 
+For W4A4 issuer request/API software, raw-command round trips, and explicit CPU
+fences, see [POTAL_ISSUER_CPU_PROFILE.md](POTAL_ISSUER_CPU_PROFILE.md). That optional
+counter-only diagnostic preserves the Scale/Index fast paths; it does not turn
+raw round-trip latency into a measurement of pure hardware admission waiting.
+
 ## Enable and collect
 
 Keep the existing board-specific SDK, hardware parameters and build options.
